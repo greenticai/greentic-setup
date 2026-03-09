@@ -1,0 +1,32 @@
+[package]
+name = "greentic-setup"
+version = "0.4.0"
+edition = "2024"
+license = "MIT"
+description = "End-to-end bundle setup engine for the Greentic platform — pack discovery, QA-driven configuration, secrets persistence, and bundle lifecycle management"
+repository = "https://github.com/greenticai/greentic-setup"
+homepage = "https://github.com/greenticai/greentic-setup"
+readme = "README.md"
+keywords = ["greentic", "setup", "bundle", "qa", "secrets"]
+categories = ["command-line-utilities", "config"]
+
+[features]
+default = ["oci"]
+oci = ["greentic-distributor-client"]
+
+[dependencies]
+anyhow = "1"
+greentic-distributor-client = { version = "0.4", default-features = false, features = ["pack-fetch"], optional = true }
+greentic-secrets-lib = { version = "0.4", features = ["providers-dev"] }
+qa-spec = "0.4"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_cbor = "0.11"
+serde_json = "1"
+serde_yaml_bw = { package = "serde_yaml_gtc", version = "2.5.2" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
