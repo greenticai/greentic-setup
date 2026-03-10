@@ -6,8 +6,10 @@
 pub mod admin;
 pub mod bundle;
 pub mod card_setup;
+pub mod config_envelope;
 pub mod discovery;
 pub mod engine;
+pub mod flow;
 pub mod plan;
 pub mod reload;
 pub mod secret_name;

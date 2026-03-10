@@ -9,8 +9,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// A setup session that tracks multi-step card-based onboarding.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,17 +116,68 @@ fn default_ttl_secs() -> u64 {
 impl SetupLinkConfig {
     /// Generate a setup URL for the given session.
     ///
-    /// Format: `{base_url}/setup?session={session_id}&token={token}`
+    /// If a `signing_key` is configured, a signed JWT token is included.
+    /// Otherwise falls back to session ID.
     pub fn generate_url(&self, session: &CardSetupSession) -> String {
-        // Token is the session_id itself for now.
-        // In production, this should be a signed JWT.
+        let token = if let Some(ref key) = self.signing_key {
+            sign_session_token(key, session)
+        } else {
+            session.session_id.clone()
+        };
         format!(
-            "{}/setup?session={}&provider={}",
+            "{}/setup?session={}&token={}&provider={}",
             self.base_url.trim_end_matches('/'),
             session.session_id,
+            token,
             session.provider_id,
         )
     }
+
+    /// Verify a token against a session.
+    ///
+    /// Returns `true` if the token is valid for this session.
+    pub fn verify_token(&self, token: &str, session: &CardSetupSession) -> bool {
+        if let Some(ref key) = self.signing_key {
+            verify_session_token(key, token, session)
+        } else {
+            token == session.session_id
+        }
+    }
+}
+
+/// Sign a session token using HMAC-SHA256.
+///
+/// Payload: `{session_id}.{expires_at}.{provider_id}`
+/// Token format: `{base64(payload)}.{base64(signature)}`
+fn sign_session_token(key: &str, session: &CardSetupSession) -> String {
+    let payload = format!(
+        "{}.{}.{}",
+        session.session_id, session.expires_at, session.provider_id
+    );
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+
+    let mut mac =
+        HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(payload_b64.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig);
+
+    format!("{payload_b64}.{sig_b64}")
+}
+
+/// Verify a session token against a session.
+fn verify_session_token(key: &str, token: &str, session: &CardSetupSession) -> bool {
+    let expected = sign_session_token(key, session);
+    // Constant-time comparison
+    if token.len() != expected.len() {
+        return false;
+    }
+    token
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// Result of processing a card setup submission.
@@ -208,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_link_generation() {
+    fn setup_link_generation_unsigned() {
         let config = SetupLinkConfig {
             base_url: "https://operator.example.com".into(),
             ttl_secs: 1800,
@@ -224,5 +280,36 @@ mod tests {
         let url = config.generate_url(&session);
         assert!(url.starts_with("https://operator.example.com/setup?session="));
         assert!(url.contains("provider=telegram"));
+        assert!(config.verify_token(&session.session_id, &session));
+    }
+
+    #[test]
+    fn setup_link_generation_signed() {
+        let config = SetupLinkConfig {
+            base_url: "https://operator.example.com".into(),
+            ttl_secs: 1800,
+            signing_key: Some("my-secret-key-256".into()),
+        };
+        let session = CardSetupSession::new(
+            PathBuf::from("/bundle"),
+            "telegram".into(),
+            "demo".into(),
+            None,
+            Duration::from_secs(1800),
+        );
+        let url = config.generate_url(&session);
+        assert!(url.contains("token="));
+        assert!(url.contains("provider=telegram"));
+
+        // Extract token from URL
+        let token = url
+            .split("token=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+        assert!(config.verify_token(token, &session));
+        assert!(!config.verify_token("bad-token", &session));
     }
 }
