@@ -156,8 +156,7 @@ fn sign_session_token(key: &str, session: &CardSetupSession) -> String {
     );
     let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
 
-    let mut mac =
-        HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(payload_b64.as_bytes());
     let sig = mac.finalize().into_bytes();
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig);
