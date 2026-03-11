@@ -151,7 +151,10 @@ impl BundleSource {
     /// Returns true if this is a remote source (Oci, Repo, or Store).
     #[cfg(feature = "oci")]
     pub fn is_remote(&self) -> bool {
-        matches!(self, Self::Oci { .. } | Self::Repo { .. } | Self::Store { .. })
+        matches!(
+            self,
+            Self::Oci { .. } | Self::Repo { .. } | Self::Store { .. }
+        )
     }
 }
 
@@ -177,11 +180,11 @@ fn percent_decode(input: &str) -> String {
     while let Some(ch) = chars.next() {
         if ch == '%' {
             let hex: String = chars.by_ref().take(2).collect();
-            if hex.len() == 2 {
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    result.push(byte as char);
-                    continue;
-                }
+            if hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(&hex, 16)
+            {
+                result.push(byte as char);
+                continue;
             }
             result.push('%');
             result.push_str(&hex);
@@ -204,7 +207,10 @@ fn resolve_local_path(path: &Path) -> anyhow::Result<PathBuf> {
     };
 
     if !canonical.exists() {
-        return Err(anyhow!("bundle path does not exist: {}", canonical.display()));
+        return Err(anyhow!(
+            "bundle path does not exist: {}",
+            canonical.display()
+        ));
     }
 
     Ok(canonical)

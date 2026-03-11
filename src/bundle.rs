@@ -163,10 +163,10 @@ fn read_tenants_from_dir(dir: &Path) -> anyhow::Result<Option<Vec<String>>> {
             continue;
         }
 
-        if path.is_file() {
-            if let Some(stem) = path.file_stem().and_then(|v| v.to_str()) {
-                tenants.insert(stem.to_string());
-            }
+        if path.is_file()
+            && let Some(stem) = path.file_stem().and_then(|v| v.to_str())
+        {
+            tenants.insert(stem.to_string());
         }
     }
 

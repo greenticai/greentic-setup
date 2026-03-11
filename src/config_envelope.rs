@@ -389,8 +389,7 @@ mod tests {
             "signatures": [],
             "extensions": {}
         });
-        let bytes =
-            canonical::to_canonical_cbor(&manifest).map_err(|err| anyhow!("{err}"))?;
+        let bytes = canonical::to_canonical_cbor(&manifest).map_err(|err| anyhow!("{err}"))?;
         zip.write_all(&bytes)?;
         zip.finish()?;
         Ok(())

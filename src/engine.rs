@@ -202,17 +202,25 @@ impl SetupEngine {
             for provider in discovered.providers {
                 let provider_id = provider.provider_id.clone();
                 if !setup_answers.contains_key(&provider_id) {
-                    // Load the setup spec from the pack and create empty answers
-                    if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
-                        let mut template = JsonMap::new();
+                    // Load the setup spec from the pack and create template
+                    let template = if let Some(spec) =
+                        setup_input::load_setup_spec(&provider.pack_path)?
+                    {
+                        // Pack has setup.yaml - extract questions
+                        let mut entries = JsonMap::new();
                         for question in spec.questions {
                             let default_value = question
                                 .default
                                 .unwrap_or_else(|| Value::String(String::new()));
-                            template.insert(question.name, default_value);
+                            entries.insert(question.name, default_value);
                         }
-                        setup_answers.insert(provider_id, Value::Object(template));
-                    }
+                        entries
+                    } else {
+                        // Pack uses flow-based setup or has no questions
+                        // Add empty entry so user knows pack exists
+                        JsonMap::new()
+                    };
+                    setup_answers.insert(provider_id, Value::Object(template));
                 }
             }
         }
@@ -304,7 +312,8 @@ impl SetupEngine {
         resolved_packs: &[ResolvedPackInfo],
     ) -> anyhow::Result<()> {
         for pack in resolved_packs {
-            let target_dir = bundle_path.join("packs");
+            // Determine target directory based on pack ID domain prefix
+            let target_dir = Self::get_pack_target_dir(bundle_path, &pack.pack_id);
             std::fs::create_dir_all(&target_dir)?;
 
             let target_path = target_dir.join(format!("{}.gtpack", pack.pack_id));
@@ -319,6 +328,31 @@ impl SetupEngine {
             }
         }
         Ok(())
+    }
+
+    /// Determine the target directory for a pack based on its ID.
+    ///
+    /// Packs with domain prefixes (e.g., `messaging-telegram`, `events-webhook`)
+    /// go to `providers/<domain>/`. Other packs go to `packs/`.
+    fn get_pack_target_dir(bundle_path: &Path, pack_id: &str) -> PathBuf {
+        const DOMAIN_PREFIXES: &[&str] = &[
+            "messaging-",
+            "events-",
+            "oauth-",
+            "secrets-",
+            "mcp-",
+            "state-",
+        ];
+
+        for prefix in DOMAIN_PREFIXES {
+            if pack_id.starts_with(prefix) {
+                let domain = prefix.trim_end_matches('-');
+                return bundle_path.join("providers").join(domain);
+            }
+        }
+
+        // Default to packs/ for non-provider packs
+        bundle_path.join("packs")
     }
 
     fn execute_apply_pack_setup(
@@ -337,8 +371,12 @@ impl SetupEngine {
             let config_path = config_dir.join("setup-answers.json");
             let content = serde_json::to_string_pretty(answers)
                 .context("failed to serialize setup answers")?;
-            std::fs::write(&config_path, content)
-                .with_context(|| format!("failed to write setup answers to: {}", config_path.display()))?;
+            std::fs::write(&config_path, content).with_context(|| {
+                format!(
+                    "failed to write setup answers to: {}",
+                    config_path.display()
+                )
+            })?;
 
             count += 1;
         }
@@ -352,7 +390,8 @@ impl SetupEngine {
         metadata: &SetupPlanMetadata,
     ) -> anyhow::Result<()> {
         for tenant_sel in &metadata.tenants {
-            let gmap_path = bundle::gmap_path(bundle_path, &tenant_sel.tenant, tenant_sel.team.as_deref());
+            let gmap_path =
+                bundle::gmap_path(bundle_path, &tenant_sel.tenant, tenant_sel.team.as_deref());
 
             if let Some(parent) = gmap_path.parent() {
                 std::fs::create_dir_all(parent)?;

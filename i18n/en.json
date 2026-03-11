@@ -82,5 +82,16 @@
   "setup.qa.question_prompt": "{}",
   "setup.qa.required_field": "This field is required",
   "setup.qa.invalid_choice": "Invalid choice. Options: {}",
-  "setup.qa.secret_input": "Enter secret value (hidden):"
+  "setup.qa.secret_input": "Enter secret value (hidden):",
+  "cli.bundle.status.bundle_label": "Bundle: {}",
+  "cli.simple.bundle_required": "Bundle path required. Usage: greentic-setup [OPTIONS] <BUNDLE>",
+  "cli.simple.header": "Greentic Setup",
+  "cli.simple.interactive_mode": "Interactive wizard mode",
+  "cli.simple.wizard_not_impl": "interactive wizard not yet implemented - use --answers <file>",
+  "cli.simple.emit_usage": "Edit and use with: greentic-setup --answers {} {}",
+  "cli.simple.dry_run": "[dry-run] Would setup bundle: {}",
+  "cli.simple.extracting": "Extracting .gtbundle archive...",
+  "cli.simple.extracted_to": "  Extracted to: {}",
+  "cli.simple.expected_bundle_format": "expected directory or .gtbundle file: {}",
+  "cli.help.for_help": "For help: greentic-setup --help"
 }

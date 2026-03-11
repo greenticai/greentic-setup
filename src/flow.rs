@@ -3,10 +3,10 @@
 //! Converts a flat `FormSpec` into a directed-graph `QAFlowSpec` where
 //! questions with `visible_if` expressions become decision branches.
 
+use qa_spec::FormSpec;
 use qa_spec::spec::flow::{
     CardMode, DecisionCase, DecisionStep, MessageStep, QAFlowSpec, QuestionStep, StepId, StepSpec,
 };
-use qa_spec::FormSpec;
 use std::collections::BTreeMap;
 
 fn sid(s: &str) -> StepId {
@@ -77,10 +77,10 @@ pub fn build_qa_flow(form_spec: &FormSpec) -> QAFlowSpec {
     step_order.push(end_id);
 
     // Patch welcome → first real step
-    if step_order.len() > 2 {
-        if let Some(StepSpec::Message(msg)) = steps.get_mut(&welcome_id) {
-            msg.next = Some(step_order[1].clone());
-        }
+    if step_order.len() > 2
+        && let Some(StepSpec::Message(msg)) = steps.get_mut(&welcome_id)
+    {
+        msg.next = Some(step_order[1].clone());
     }
 
     QAFlowSpec {
@@ -210,11 +210,11 @@ pub fn auto_sections(form_spec: &FormSpec) -> Vec<FlowSection> {
             .unwrap_or(&question.id)
             .to_string();
 
-        if let Some(section) = sections.last_mut() {
-            if section.title == prefix {
-                section.question_ids.push(question.id.clone());
-                continue;
-            }
+        if let Some(section) = sections.last_mut()
+            && section.title == prefix
+        {
+            section.question_ids.push(question.id.clone());
+            continue;
         }
 
         sections.push(FlowSection {
