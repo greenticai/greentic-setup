@@ -25,11 +25,14 @@ Provides a library and CLI for discovering, configuring, and deploying Greentic 
 ```
 greentic-setup
 ├── bin/
-│   └── greentic_setup  CLI binary (bundle init/add/setup/update/remove/build/list/status)
+│   └── greentic_setup  CLI binary (simple mode + bundle subcommands)
+├── cli_i18n        CLI localization helper (CliI18n wrapper)
 ├── engine          SetupEngine: plan → execute orchestration
 ├── plan            SetupPlan, SetupStep, SetupMode, metadata types
 ├── bundle          Bundle directory creation, gmap paths, provider registry
+├── bundle_source   Pack source resolution (file://, oci://, path)
 ├── discovery       Pack discovery from .gtpack files (CBOR + JSON manifests)
+├── gtbundle        Portable .gtbundle archive format (zip/squashfs)
 ├── qa/
 │   ├── bridge      Provider QA JSON → FormSpec conversion (+ visible_if)
 │   ├── wizard      Interactive wizard, validation, card rendering
@@ -50,7 +53,48 @@ Previously embedded in greentic-operator (~5,000 lines). Extracted as a standalo
 
 ## Usage
 
-### CLI (bundle lifecycle)
+### Simple Mode (recommended)
+
+The simplest way to use greentic-setup — just point it at a bundle:
+
+```bash
+# Interactive wizard - prompts for all configuration
+greentic-setup ./my-bundle
+
+# Preview what will happen (dry-run)
+greentic-setup --dry-run ./my-bundle
+
+# Generate answers template file
+greentic-setup --dry-run --emit-answers answers.yaml ./my-bundle
+
+# Apply answers from file (non-interactive)
+greentic-setup --answers answers.yaml ./my-bundle
+
+# Works with .gtbundle archives too
+greentic-setup ./my-bundle.gtbundle
+```
+
+**Options:**
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview setup plan without executing |
+| `--emit-answers <FILE>` | Generate answers template to file |
+| `-a, --answers <FILE>` | Apply answers from file |
+| `-t, --tenant <TENANT>` | Tenant identifier (default: demo) |
+| `--team <TEAM>` | Team identifier |
+| `-e, --env <ENV>` | Environment: dev/staging/prod (default: dev) |
+
+### Via gtc passthrough
+
+```bash
+gtc setup ./my-bundle
+gtc setup --answers answers.yaml ./my-bundle
+gtc setup bundle status --bundle ./my-bundle
+```
+
+### Advanced: Bundle Subcommands
+
+For fine-grained control over bundle lifecycle:
 
 ```bash
 # Initialize a new bundle
@@ -59,8 +103,14 @@ greentic-setup bundle init ./my-bundle --name "My Bundle"
 # Add a pack to the bundle
 greentic-setup bundle add telegram-pack.gtpack --bundle ./my-bundle
 
-# Setup providers with answers file
+# Interactive setup (wizard mode)
+greentic-setup bundle setup --bundle ./my-bundle
+
+# Setup with answers file
 greentic-setup bundle setup --bundle ./my-bundle --answers answers.yaml
+
+# Generate answers template
+greentic-setup bundle setup --bundle ./my-bundle --emit-answers answers.yaml
 
 # Setup specific provider
 greentic-setup bundle setup messaging-telegram --bundle ./my-bundle --answers telegram.yaml
@@ -71,7 +121,7 @@ greentic-setup bundle update messaging-telegram --bundle ./my-bundle --answers t
 # Remove a provider
 greentic-setup bundle remove messaging-telegram --bundle ./my-bundle --force
 
-# Build portable bundle
+# Build portable bundle (.gtbundle archive)
 greentic-setup bundle build --bundle ./my-bundle --out ./dist
 
 # List packs in bundle
@@ -79,13 +129,6 @@ greentic-setup bundle list --bundle ./my-bundle --domain messaging
 
 # Show bundle status
 greentic-setup bundle status --bundle ./my-bundle --format json
-```
-
-Via gtc passthrough (after integration):
-```bash
-gtc setup bundle init ./my-bundle
-gtc setup bundle add telegram-pack.gtpack
-gtc setup bundle status
 ```
 
 ### As a library
@@ -195,18 +238,6 @@ gtc op demo start --setup-input answers.json
 gtc op demo setup-wizard
 ```
 
-### Direct CLI usage
-
-```bash
-# Direct invocation
-greentic-setup bundle init ./my-bundle
-greentic-setup bundle status --bundle ./my-bundle
-
-# Via gtc passthrough (after integration in greentic repo)
-gtc setup bundle init ./my-bundle
-gtc setup bundle status
-```
-
 ## Modules
 
 | Module | Description |
@@ -214,7 +245,10 @@ gtc setup bundle status
 | `engine` | `SetupEngine` — orchestrates plan building for create/update/remove |
 | `plan` | Plan types: `SetupPlan`, `SetupStep`, `SetupMode`, metadata |
 | `bundle` | Bundle directory structure creation and management |
+| `bundle_source` | Pack source resolution (`file://`, `oci://`, path) |
 | `discovery` | Pack discovery from `.gtpack` files (CBOR + JSON manifests) |
+| `gtbundle` | Portable `.gtbundle` archive format (zip/squashfs) |
+| `cli_i18n` | CLI localization helper for user-facing messages |
 | `qa::bridge` | Provider QA JSON → FormSpec conversion with `visible_if` support |
 | `qa::wizard` | Interactive wizard, validation, card rendering, visibility evaluation |
 | `qa::persist` | Secrets + config persistence (visibility-aware) |
