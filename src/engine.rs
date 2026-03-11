@@ -203,23 +203,22 @@ impl SetupEngine {
                 let provider_id = provider.provider_id.clone();
                 if !setup_answers.contains_key(&provider_id) {
                     // Load the setup spec from the pack and create template
-                    let template = if let Some(spec) =
-                        setup_input::load_setup_spec(&provider.pack_path)?
-                    {
-                        // Pack has setup.yaml - extract questions
-                        let mut entries = JsonMap::new();
-                        for question in spec.questions {
-                            let default_value = question
-                                .default
-                                .unwrap_or_else(|| Value::String(String::new()));
-                            entries.insert(question.name, default_value);
-                        }
-                        entries
-                    } else {
-                        // Pack uses flow-based setup or has no questions
-                        // Add empty entry so user knows pack exists
-                        JsonMap::new()
-                    };
+                    let template =
+                        if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
+                            // Pack has setup.yaml - extract questions
+                            let mut entries = JsonMap::new();
+                            for question in spec.questions {
+                                let default_value = question
+                                    .default
+                                    .unwrap_or_else(|| Value::String(String::new()));
+                                entries.insert(question.name, default_value);
+                            }
+                            entries
+                        } else {
+                            // Pack uses flow-based setup or has no questions
+                            // Add empty entry so user knows pack exists
+                            JsonMap::new()
+                        };
                     setup_answers.insert(provider_id, Value::Object(template));
                 }
             }

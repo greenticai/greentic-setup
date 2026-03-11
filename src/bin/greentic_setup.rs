@@ -1207,7 +1207,9 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, _only_used: bool) -> Result<
 ///
 /// Discovers packs, builds FormSpec for each, and prompts the user
 /// for configuration answers interactively.
-fn run_interactive_wizard(bundle_path: &std::path::Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+fn run_interactive_wizard(
+    bundle_path: &std::path::Path,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
     use serde_json::Value;
 
     let mut all_answers = serde_json::Map::new();
@@ -1220,7 +1222,10 @@ fn run_interactive_wizard(bundle_path: &std::path::Path) -> Result<serde_json::M
         return Ok(all_answers);
     }
 
-    println!("Found {} provider(s) to configure:", discovered.providers.len());
+    println!(
+        "Found {} provider(s) to configure:",
+        discovered.providers.len()
+    );
     for provider in &discovered.providers {
         println!("  - {} ({})", provider.provider_id, provider.domain);
     }
@@ -1245,7 +1250,10 @@ fn run_interactive_wizard(bundle_path: &std::path::Path) -> Result<serde_json::M
             all_answers.insert(provider_id.clone(), answers);
         } else {
             // No FormSpec available - provider uses flow-based setup or has no questions
-            println!("Provider {}: No setup questions found (may use flow-based setup).", provider_id);
+            println!(
+                "Provider {}: No setup questions found (may use flow-based setup).",
+                provider_id
+            );
             all_answers.insert(provider_id.clone(), Value::Object(serde_json::Map::new()));
         }
 
