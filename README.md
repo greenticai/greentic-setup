@@ -2,7 +2,11 @@
 
 End-to-end bundle setup engine for the Greentic platform.
 
-Provides a library for discovering, configuring, and deploying Greentic bundles — including pack resolution, QA-driven setup (via greentic-qa), secrets persistence, webhook registration, admin API types, hot reload, and adaptive card setup flows. Designed as a library (not CLI) to reduce moving parts in production.
+Provides a library and CLI for discovering, configuring, and deploying Greentic bundles — including pack resolution, QA-driven setup (via greentic-qa), secrets persistence, webhook registration, admin API types, hot reload, and adaptive card setup flows.
+
+**Dual-mode:**
+- **Library** — core APIs for programmatic use by greentic-operator, runner, and other tools
+- **CLI binary** — `greentic-setup bundle ...` commands for bundle lifecycle management (invoked via `gtc setup` passthrough)
 
 ## Features
 
@@ -20,6 +24,8 @@ Provides a library for discovering, configuring, and deploying Greentic bundles 
 
 ```
 greentic-setup
+├── bin/
+│   └── greentic_setup  CLI binary (bundle init/add/setup/update/remove/build/list/status)
 ├── engine          SetupEngine: plan → execute orchestration
 ├── plan            SetupPlan, SetupStep, SetupMode, metadata types
 ├── bundle          Bundle directory creation, gmap paths, provider registry
@@ -44,7 +50,45 @@ Previously embedded in greentic-operator (~5,000 lines). Extracted as a standalo
 
 ## Usage
 
-### As a library (primary use case)
+### CLI (bundle lifecycle)
+
+```bash
+# Initialize a new bundle
+greentic-setup bundle init ./my-bundle --name "My Bundle"
+
+# Add a pack to the bundle
+greentic-setup bundle add telegram-pack.gtpack --bundle ./my-bundle
+
+# Setup providers with answers file
+greentic-setup bundle setup --bundle ./my-bundle --answers answers.yaml
+
+# Setup specific provider
+greentic-setup bundle setup messaging-telegram --bundle ./my-bundle --answers telegram.yaml
+
+# Update provider configuration
+greentic-setup bundle update messaging-telegram --bundle ./my-bundle --answers telegram.yaml
+
+# Remove a provider
+greentic-setup bundle remove messaging-telegram --bundle ./my-bundle --force
+
+# Build portable bundle
+greentic-setup bundle build --bundle ./my-bundle --out ./dist
+
+# List packs in bundle
+greentic-setup bundle list --bundle ./my-bundle --domain messaging
+
+# Show bundle status
+greentic-setup bundle status --bundle ./my-bundle --format json
+```
+
+Via gtc passthrough (after integration):
+```bash
+gtc setup bundle init ./my-bundle
+gtc setup bundle add telegram-pack.gtpack
+gtc setup bundle status
+```
+
+### As a library
 
 ```rust
 use greentic_setup::{SetupEngine, SetupMode};
@@ -151,6 +195,18 @@ gtc op demo start --setup-input answers.json
 gtc op demo setup-wizard
 ```
 
+### Direct CLI usage
+
+```bash
+# Direct invocation
+greentic-setup bundle init ./my-bundle
+greentic-setup bundle status --bundle ./my-bundle
+
+# Via gtc passthrough (after integration in greentic repo)
+gtc setup bundle init ./my-bundle
+gtc setup bundle status
+```
+
 ## Modules
 
 | Module | Description |
@@ -233,6 +289,10 @@ tools/i18n.sh translate  # generate translations (200 per batch)
 ```
 
 Requires `greentic-i18n` repo at `../greentic-i18n/`.
+
+## Documentation
+
+- **[Demo Guide](./docs/demo-guide.md)** — Complete guide for creating and running bundles
 
 ## License
 

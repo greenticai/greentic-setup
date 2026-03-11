@@ -17,7 +17,9 @@ oci = ["greentic-distributor-client"]
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
 greentic-distributor-client = { version = "0.4", default-features = false, features = ["pack-fetch"], optional = true }
+greentic-i18n = "0.4"
 greentic-secrets-lib = { version = "0.4", features = ["providers-dev"] }
 greentic-types = { version = "0.4", features = ["serde"] }
 hmac = "0.12"
@@ -31,6 +33,10 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "greentic-setup"
+path = "src/bin/greentic_setup.rs"
 
 [dev-dependencies]
 tempfile = "3"

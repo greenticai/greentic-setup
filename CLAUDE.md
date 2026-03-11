@@ -4,9 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-greentic-setup is a Rust library crate (v0.4.x) providing end-to-end bundle setup for the Greentic platform. It handles pack discovery, QA-driven configuration (via greentic-qa FormSpec), secrets persistence, admin API types, hot reload diffing, and bundle lifecycle management. Designed as a library (not CLI binary) to reduce moving parts in production.
+greentic-setup is a Rust crate (v0.4.x) providing end-to-end bundle setup for the Greentic platform. It handles pack discovery, QA-driven configuration (via greentic-qa FormSpec), secrets persistence, admin API types, hot reload diffing, and bundle lifecycle management.
 
 Part of the greentic-ai mono-workspace (33 repos). greentic-operator is the primary consumer, delegating all setup logic here.
+
+**Dual-mode:**
+- **Library** — core APIs for programmatic use by greentic-operator, runner, and other tools
+- **CLI binary** — `greentic-setup bundle ...` commands for bundle lifecycle management (used by `gtc setup` passthrough)
 
 ## Build & Test
 
@@ -43,6 +47,8 @@ src/
 ├── webhook.rs          Webhook URL validation stub
 ├── reload.rs           BundleDiff, ReloadPlan for hot reload
 ├── card_setup.rs       CardSetupSession for adaptive card flows
+├── bin/
+│   └── greentic_setup.rs  CLI binary (bundle init/add/setup/update/remove/build/list/status)
 ├── qa/
 │   ├── bridge.rs       Provider QA JSON → FormSpec (+ visible_if parsing)
 │   ├── wizard.rs       Interactive wizard, validation, visibility evaluation
@@ -64,10 +70,25 @@ src/
 ## Conventions
 
 - Edition 2024, version 0.4.x (matches greentic ecosystem)
-- **Library-only** — no `[[bin]]` targets
+- **Library + CLI** — exports library APIs and `greentic-setup` CLI binary
 - **Reuse-first**: uses greentic-types, greentic-secrets-lib, qa-spec, greentic-distributor-client
 - All user-facing strings via greentic-i18n (keys in `i18n/en.json`)
 - Follow `.codex/global_rules.md` for PR workflow (repo overview + CI check)
+
+## CLI Commands
+
+```bash
+greentic-setup bundle init [PATH] --name <NAME>     # Initialize bundle directory
+greentic-setup bundle add <PACK_REF> --bundle <DIR> # Add pack to bundle
+greentic-setup bundle setup [PROVIDER_ID] --answers <FILE>  # Run setup flow
+greentic-setup bundle update [PROVIDER_ID] --answers <FILE> # Update provider config
+greentic-setup bundle remove <PROVIDER_ID> --force  # Remove provider
+greentic-setup bundle build --out <DIR>             # Build portable bundle
+greentic-setup bundle list --domain <DOMAIN>        # List packs/flows
+greentic-setup bundle status [--format json]        # Show bundle status
+```
+
+This binary is invoked via `gtc setup ...` passthrough in the greentic repo.
 
 ## Implementation Status
 
@@ -78,7 +99,8 @@ src/
 | Phase 3 | Admin endpoint types (mTLS) | Done (types only) |
 | Phase 4 | Hot reload diffing | Done (diff + plan) |
 | Phase 5 | Adaptive card setup | Done (session types) |
-| Phase 6 | Operator passthrough | TODO — replace operator code with greentic-setup dependency |
+| Phase 6 | CLI binary | Done (bundle init/add/setup/update/remove/build/list/status) |
+| Phase 7 | gtc passthrough | TODO — add `gtc setup` → `greentic-setup` delegation in greentic repo |
 
 ## Release
 
