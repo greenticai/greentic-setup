@@ -5,11 +5,13 @@
 
 pub mod admin;
 pub mod bundle;
+pub mod bundle_source;
 pub mod card_setup;
 pub mod config_envelope;
 pub mod discovery;
 pub mod engine;
 pub mod flow;
+pub mod gtbundle;
 pub mod plan;
 pub mod reload;
 pub mod secret_name;
@@ -26,6 +28,7 @@ pub mod qa {
     pub mod wizard;
 }
 
+pub use bundle_source::BundleSource;
 pub use engine::SetupEngine;
 pub use plan::{SetupMode, SetupPlan, SetupStep, SetupStepKind};
 

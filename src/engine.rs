@@ -5,11 +5,15 @@
 //! use to drive bundle setup.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
+use serde_json::{Map as JsonMap, Value};
 
+use crate::bundle;
+use crate::discovery;
 use crate::plan::*;
+use crate::setup_input;
 
 /// The request object that drives plan building.
 #[derive(Clone, Debug, Default)]
@@ -27,6 +31,16 @@ pub struct SetupRequest {
     pub tenants_remove: Vec<TenantSelection>,
     pub access_changes: Vec<AccessChangeSelection>,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
+    /// Filter by provider domain (messaging, events, secrets, oauth).
+    pub domain_filter: Option<String>,
+    /// Number of parallel setup operations.
+    pub parallel: usize,
+    /// Backup existing config before setup.
+    pub backup: bool,
+    /// Skip secrets initialization.
+    pub skip_secrets_init: bool,
+    /// Continue on error (best effort).
+    pub best_effort: bool,
 }
 
 /// Configuration for the setup engine.
@@ -70,6 +84,323 @@ impl SetupEngine {
     /// Access the engine configuration.
     pub fn config(&self) -> &SetupConfig {
         &self.config
+    }
+
+    /// Execute a setup plan.
+    ///
+    /// Runs each step in the plan, performing the actual bundle setup operations.
+    /// Returns an execution report with details about what was done.
+    pub fn execute(&self, plan: &SetupPlan) -> anyhow::Result<SetupExecutionReport> {
+        if plan.dry_run {
+            return Err(anyhow!("cannot execute a dry-run plan"));
+        }
+
+        let bundle = &plan.bundle;
+        let mut report = SetupExecutionReport {
+            bundle: bundle.clone(),
+            resolved_packs: Vec::new(),
+            resolved_manifests: Vec::new(),
+            provider_updates: 0,
+            warnings: Vec::new(),
+        };
+
+        for step in &plan.steps {
+            match step.kind {
+                SetupStepKind::NoOp => {
+                    if self.config.verbose {
+                        println!("  [skip] {}", step.description);
+                    }
+                }
+                SetupStepKind::CreateBundle => {
+                    self.execute_create_bundle(bundle, &plan.metadata)?;
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+                SetupStepKind::ResolvePacks => {
+                    let resolved = self.execute_resolve_packs(bundle, &plan.metadata)?;
+                    report.resolved_packs.extend(resolved);
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+                SetupStepKind::AddPacksToBundle => {
+                    self.execute_add_packs_to_bundle(bundle, &report.resolved_packs)?;
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+                SetupStepKind::ApplyPackSetup => {
+                    let count = self.execute_apply_pack_setup(bundle, &plan.metadata)?;
+                    report.provider_updates += count;
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+                SetupStepKind::WriteGmapRules => {
+                    self.execute_write_gmap_rules(bundle, &plan.metadata)?;
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+                SetupStepKind::RunResolver => {
+                    // Resolver is typically run by the runtime, not setup
+                    if self.config.verbose {
+                        println!("  [skip] {} (deferred to runtime)", step.description);
+                    }
+                }
+                SetupStepKind::CopyResolvedManifest => {
+                    let manifests = self.execute_copy_resolved_manifests(bundle, &plan.metadata)?;
+                    report.resolved_manifests.extend(manifests);
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+                SetupStepKind::ValidateBundle => {
+                    self.execute_validate_bundle(bundle)?;
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Emit an answers template JSON file.
+    ///
+    /// Discovers all packs in the bundle and generates a template with all
+    /// setup questions. Users fill this in and pass it via `--answers`.
+    pub fn emit_answers(&self, plan: &SetupPlan, output_path: &Path) -> anyhow::Result<()> {
+        let bundle = &plan.bundle;
+
+        // Build the answers document structure
+        let mut answers_doc = serde_json::json!({
+            "greentic_setup_version": "1.0.0",
+            "bundle_source": bundle.display().to_string(),
+            "tenant": self.config.tenant,
+            "team": self.config.team,
+            "env": self.config.env,
+            "setup_answers": {}
+        });
+
+        // Discover packs and extract their QA specs
+        let setup_answers = answers_doc
+            .get_mut("setup_answers")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| anyhow!("internal error: setup_answers not an object"))?;
+
+        // Add existing answers from the plan metadata
+        for (provider_id, answers) in &plan.metadata.setup_answers {
+            setup_answers.insert(provider_id.clone(), answers.clone());
+        }
+
+        // Discover packs and add template entries for any missing providers
+        if bundle.exists() {
+            let discovered = discovery::discover(bundle)?;
+            for provider in discovered.providers {
+                let provider_id = provider.provider_id.clone();
+                if !setup_answers.contains_key(&provider_id) {
+                    // Load the setup spec from the pack and create empty answers
+                    if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
+                        let mut template = JsonMap::new();
+                        for question in spec.questions {
+                            let default_value = question
+                                .default
+                                .unwrap_or_else(|| Value::String(String::new()));
+                            template.insert(question.name, default_value);
+                        }
+                        setup_answers.insert(provider_id, Value::Object(template));
+                    }
+                }
+            }
+        }
+
+        // Write the answers document to the output path
+        let output_content = serde_json::to_string_pretty(&answers_doc)
+            .context("failed to serialize answers document")?;
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+        }
+
+        std::fs::write(output_path, output_content)
+            .with_context(|| format!("failed to write answers to: {}", output_path.display()))?;
+
+        println!("Answers template written to: {}", output_path.display());
+        Ok(())
+    }
+
+    /// Load answers from a JSON/YAML file.
+    pub fn load_answers(&self, answers_path: &Path) -> anyhow::Result<JsonMap<String, Value>> {
+        let raw = setup_input::load_setup_input(answers_path)?;
+        match raw {
+            Value::Object(map) => {
+                // Check if this is a full answers document or just setup_answers
+                if let Some(Value::Object(setup_answers)) = map.get("setup_answers") {
+                    Ok(setup_answers.clone())
+                } else {
+                    Ok(map)
+                }
+            }
+            _ => Err(anyhow!("answers file must be a JSON/YAML object")),
+        }
+    }
+
+    // ── Step executors ─────────────────────────────────────────────────────
+
+    fn execute_create_bundle(
+        &self,
+        bundle_path: &Path,
+        metadata: &SetupPlanMetadata,
+    ) -> anyhow::Result<()> {
+        bundle::create_demo_bundle_structure(bundle_path, metadata.bundle_name.as_deref())
+            .context("failed to create bundle structure")
+    }
+
+    fn execute_resolve_packs(
+        &self,
+        _bundle_path: &Path,
+        metadata: &SetupPlanMetadata,
+    ) -> anyhow::Result<Vec<ResolvedPackInfo>> {
+        let mut resolved = Vec::new();
+
+        for pack_ref in &metadata.pack_refs {
+            // For now, we only support local pack refs (file paths)
+            // OCI resolution requires async and the distributor client
+            let path = PathBuf::from(pack_ref);
+            if path.exists() {
+                resolved.push(ResolvedPackInfo {
+                    source_ref: pack_ref.clone(),
+                    mapped_ref: pack_ref.clone(),
+                    resolved_digest: format!("sha256:{}", compute_simple_hash(pack_ref)),
+                    pack_id: path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    entry_flows: Vec::new(),
+                    cached_path: path.clone(),
+                    output_path: path,
+                });
+            } else if pack_ref.starts_with("oci://")
+                || pack_ref.starts_with("repo://")
+                || pack_ref.starts_with("store://")
+            {
+                // Remote packs need async resolution via distributor-client
+                // For now, we'll skip and let the caller handle this
+                tracing::warn!("remote pack ref requires async resolution: {}", pack_ref);
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    fn execute_add_packs_to_bundle(
+        &self,
+        bundle_path: &Path,
+        resolved_packs: &[ResolvedPackInfo],
+    ) -> anyhow::Result<()> {
+        for pack in resolved_packs {
+            let target_dir = bundle_path.join("packs");
+            std::fs::create_dir_all(&target_dir)?;
+
+            let target_path = target_dir.join(format!("{}.gtpack", pack.pack_id));
+            if pack.cached_path.exists() && !target_path.exists() {
+                std::fs::copy(&pack.cached_path, &target_path).with_context(|| {
+                    format!(
+                        "failed to copy pack {} to {}",
+                        pack.cached_path.display(),
+                        target_path.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_apply_pack_setup(
+        &self,
+        bundle_path: &Path,
+        metadata: &SetupPlanMetadata,
+    ) -> anyhow::Result<usize> {
+        let mut count = 0;
+
+        // Persist setup answers to local config files
+        for (provider_id, answers) in &metadata.setup_answers {
+            // Write answers to provider config directory
+            let config_dir = bundle_path.join("state").join("config").join(provider_id);
+            std::fs::create_dir_all(&config_dir)?;
+
+            let config_path = config_dir.join("setup-answers.json");
+            let content = serde_json::to_string_pretty(answers)
+                .context("failed to serialize setup answers")?;
+            std::fs::write(&config_path, content)
+                .with_context(|| format!("failed to write setup answers to: {}", config_path.display()))?;
+
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    fn execute_write_gmap_rules(
+        &self,
+        bundle_path: &Path,
+        metadata: &SetupPlanMetadata,
+    ) -> anyhow::Result<()> {
+        for tenant_sel in &metadata.tenants {
+            let gmap_path = bundle::gmap_path(bundle_path, &tenant_sel.tenant, tenant_sel.team.as_deref());
+
+            if let Some(parent) = gmap_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Build gmap content from allow_paths
+            let mut content = String::new();
+            if tenant_sel.allow_paths.is_empty() {
+                content.push_str("_ = forbidden\n");
+            } else {
+                for path in &tenant_sel.allow_paths {
+                    content.push_str(&format!("{} = allowed\n", path));
+                }
+                content.push_str("_ = forbidden\n");
+            }
+
+            std::fs::write(&gmap_path, content)
+                .with_context(|| format!("failed to write gmap: {}", gmap_path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn execute_copy_resolved_manifests(
+        &self,
+        bundle_path: &Path,
+        metadata: &SetupPlanMetadata,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut manifests = Vec::new();
+        let resolved_dir = bundle_path.join("resolved");
+        std::fs::create_dir_all(&resolved_dir)?;
+
+        for tenant_sel in &metadata.tenants {
+            let filename =
+                bundle::resolved_manifest_filename(&tenant_sel.tenant, tenant_sel.team.as_deref());
+            let manifest_path = resolved_dir.join(&filename);
+
+            // Create an empty manifest placeholder if it doesn't exist
+            if !manifest_path.exists() {
+                std::fs::write(&manifest_path, "# Resolved manifest placeholder\n")?;
+            }
+            manifests.push(manifest_path);
+        }
+
+        Ok(manifests)
+    }
+
+    fn execute_validate_bundle(&self, bundle_path: &Path) -> anyhow::Result<()> {
+        bundle::validate_bundle_exists(bundle_path)
     }
 }
 
@@ -531,6 +862,16 @@ fn build_metadata_with_ops(
     meta
 }
 
+/// Compute a simple hash for a string (used for digest placeholders).
+fn compute_simple_hash(input: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +895,7 @@ mod tests {
             tenants_remove: Vec::new(),
             access_changes: Vec::new(),
             setup_answers: serde_json::Map::new(),
+            ..Default::default()
         }
     }
 
@@ -588,6 +930,7 @@ mod tests {
             tenants_remove: Vec::new(),
             access_changes: Vec::new(),
             setup_answers: serde_json::Map::new(),
+            ..Default::default()
         };
         let plan = apply_create(&req, true).unwrap();
         assert_eq!(

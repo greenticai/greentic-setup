@@ -118,6 +118,61 @@ pub fn find_provider_pack_path(bundle: &Path, provider_id: &str) -> Option<PathB
     None
 }
 
+/// Discover tenants inside the bundle.
+///
+/// Scans `{bundle}/tenants/` for subdirectories and files, returning
+/// tenant names (directory names or file stems without extension).
+///
+/// If `domain` is provided, first checks `{bundle}/{domain}/tenants/`
+/// and falls back to the general `{bundle}/tenants/` directory.
+pub fn discover_tenants(bundle: &Path, domain: Option<&str>) -> anyhow::Result<Vec<String>> {
+    // Try domain-specific tenants directory first
+    if let Some(domain_name) = domain {
+        let domain_dir = bundle.join(domain_name).join("tenants");
+        if let Some(tenants) = read_tenants_from_dir(&domain_dir)? {
+            return Ok(tenants);
+        }
+    }
+
+    // Fall back to general tenants directory
+    let general_dir = bundle.join("tenants");
+    if let Some(tenants) = read_tenants_from_dir(&general_dir)? {
+        return Ok(tenants);
+    }
+
+    Ok(Vec::new())
+}
+
+/// Read tenant names from a directory.
+fn read_tenants_from_dir(dir: &Path) -> anyhow::Result<Option<Vec<String>>> {
+    use std::collections::BTreeSet;
+
+    if !dir.exists() {
+        return Ok(None);
+    }
+
+    let mut tenants = BTreeSet::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
+                tenants.insert(name.to_string());
+            }
+            continue;
+        }
+
+        if path.is_file() {
+            if let Some(stem) = path.file_stem().and_then(|v| v.to_str()) {
+                tenants.insert(stem.to_string());
+            }
+        }
+    }
+
+    Ok(Some(tenants.into_iter().collect()))
+}
+
 /// Read and parse the provider registry JSON from a bundle.
 pub fn load_provider_registry(bundle: &Path) -> anyhow::Result<serde_json::Value> {
     let path = bundle.join("providers").join("providers.json");
@@ -178,5 +233,38 @@ mod tests {
             resolved_manifest_filename("demo", Some("ops")),
             "demo.ops.yaml"
         );
+    }
+
+    #[test]
+    fn discover_tenants_reads_dirs_and_files() {
+        let bundle = tempfile::tempdir().unwrap();
+        let tenants_dir = bundle.path().join("tenants");
+        std::fs::create_dir_all(tenants_dir.join("alpha")).unwrap();
+        std::fs::write(tenants_dir.join("beta.json"), "{}").unwrap();
+
+        let tenants = discover_tenants(bundle.path(), None).unwrap();
+        assert!(tenants.contains(&"alpha".to_string()));
+        assert!(tenants.contains(&"beta".to_string()));
+    }
+
+    #[test]
+    fn discover_tenants_domain_specific() {
+        let bundle = tempfile::tempdir().unwrap();
+        let domain_dir = bundle.path().join("messaging").join("tenants");
+        std::fs::create_dir_all(domain_dir.join("gamma")).unwrap();
+
+        let tenants = discover_tenants(bundle.path(), Some("messaging")).unwrap();
+        assert_eq!(tenants, vec!["gamma".to_string()]);
+    }
+
+    #[test]
+    fn discover_tenants_falls_back_to_general() {
+        let bundle = tempfile::tempdir().unwrap();
+        let tenants_dir = bundle.path().join("tenants");
+        std::fs::create_dir_all(tenants_dir.join("delta")).unwrap();
+
+        // No domain-specific directory, should fall back
+        let tenants = discover_tenants(bundle.path(), Some("events")).unwrap();
+        assert_eq!(tenants, vec!["delta".to_string()]);
     }
 }
