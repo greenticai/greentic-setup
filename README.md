@@ -181,6 +181,28 @@ let (answers, form_spec) = run_qa_setup(
 ).unwrap();
 ```
 
+### Bundle-level static hosting policy
+
+Answers files can now carry bundle/platform static hosting policy separately from provider answers:
+
+```yaml
+bundle_source: ./my-bundle
+env: dev
+tenant: demo
+platform_setup:
+  static_routes:
+    public_web_enabled: false
+    public_surface_policy: disabled
+    default_route_prefix_policy: pack_declared
+    tenant_path_policy: pack_declared
+setup_answers:
+  messaging-telegram:
+    bot_token: "your-bot-token"
+```
+
+When setup executes, it persists the normalized bundle-level artifact to
+`state/config/platform/static-routes.json`.
+
 ### Pack discovery
 
 ```rust

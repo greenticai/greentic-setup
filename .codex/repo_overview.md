@@ -2,7 +2,7 @@
 
 ## 1. High-Level Purpose
 
-greentic-setup is a Rust library crate (v0.4.x) that provides end-to-end bundle setup for the Greentic platform. It handles pack discovery, QA-driven configuration (via greentic-qa FormSpec with conditional `visible_if` support), secrets persistence, admin API types, hot reload diffing, and bundle lifecycle management (create/update/remove).
+greentic-setup is a Rust crate (v0.4.x) that provides end-to-end bundle setup for the Greentic platform. It handles pack discovery, QA-driven configuration (via greentic-qa FormSpec with conditional `visible_if` support), bundle-level static hosting policy collection, secrets persistence, admin API types, hot reload diffing, and bundle lifecycle management (create/update/remove).
 
 Previously this logic was embedded in greentic-operator (~5,000 lines). This crate extracts it into a reusable library so it can be consumed by the operator, runner, CLI tools, and admin APIs.
 
@@ -16,9 +16,11 @@ Previously this logic was embedded in greentic-operator (~5,000 lines). This cra
 - **Re-exports:** `SetupEngine`, `SetupMode`, `SetupPlan`, `SetupStep`, `SetupStepKind`
 
 ### Setup Engine (`src/engine.rs`)
-- Orchestrates plan building for create/update/remove workflows
+- Orchestrates plan building and basic execution for create/update/remove workflows
 - Types: `SetupEngine`, `SetupRequest`, `SetupConfig`
-- Functions: `apply_create()`, `apply_update()`, `apply_remove()`, `print_plan_summary()`
+- Functions: `apply_create()`, `apply_update()`, `apply_remove()`, `print_plan_summary()`, `emit_answers()`, `load_answers()`
+- Persists provider setup answers to `state/config/<provider>/setup-answers.json`
+- Persists normalized bundle-level static hosting policy to `state/config/platform/static-routes.json`
 
 ### Plan Types (`src/plan.rs`)
 - `SetupPlan`, `SetupStep`, `SetupStepKind`, `SetupMode`, `SetupPlanMetadata`
@@ -46,6 +48,12 @@ Previously this logic was embedded in greentic-operator (~5,000 lines). This cra
 ### Setup Input (`src/setup_input.rs`, `src/setup_to_formspec.rs`)
 - Answers loading from JSON/YAML, legacy setup.yaml → FormSpec conversion
 
+### Platform Setup (`src/platform_setup.rs`)
+- Bundle-level static hosting policy types and normalization
+- Interactive prompting for public web/static hosting enablement
+- Validation for origin-style `public_base_url`, `public_surface_policy`, and default policy normalization
+- Persistence helpers for `state/config/platform/static-routes.json`
+
 ### Admin API Types (`src/admin/`)
 - **tls.rs:** `AdminTlsConfig` for mTLS endpoint configuration with validation
 - **routes.rs:** `AdminRequest`, `AdminResponse`, `BundleDeployRequest`, `QaSubmitRequest`, `BundleStatus`
@@ -72,7 +80,7 @@ Previously this logic was embedded in greentic-operator (~5,000 lines). This cra
 
 | Location | Status | Description |
 |----------|--------|-------------|
-| `src/engine.rs` | done (plan only) | Plan building complete. Execution logic not ported — depends on operator-specific modules. |
+| `src/engine.rs` | partial | Bundle execution writes provider setup answers and bundle-level static hosting policy, but resolver/runtime/operator-specific execution remains outside this crate. |
 | `src/webhook.rs` | stub | Only `has_webhook_url()`. Actual webhook registration requires operator WASM runtime. |
 | `src/admin/` | done (types) | Request/response types + TLS config. Actual HTTP server lives in operator. |
 | `src/reload.rs` | done (diff+plan) | Diff and plan generation. Actual runtime reload (ArcSwap, drain) lives in operator. |
@@ -81,20 +89,22 @@ Previously this logic was embedded in greentic-operator (~5,000 lines). This cra
 
 ## 4. Broken, Failing, or Conflicting Areas
 
-None. All checks pass:
+None. Current checks pass:
 - `cargo fmt --check` — clean
 - `cargo clippy -- -D warnings` — clean
-- `cargo test` — 69 tests pass
+- `cargo test` — 108 tests pass
 - `cargo doc` — clean (no warnings)
-- `cargo package --dry-run` — clean
-- `ci/local_check.sh` — all 6/6 checks pass
+- `cargo package --allow-dirty` — clean
+- `cargo publish --dry-run --allow-dirty` — clean
+- `ci/local_check.sh` — steps 1-5 pass locally; package/publish dry-run steps require network access to crates.io in this environment
 
 ## 5. Notes for Future Work
 
 - **Execution logic:** Plan execution functions depend on operator-specific modules (distributor-client fetch, gmap policy, project sync). Will be ported in Phase 6.
+- **Static hosting policy:** bundle-level replay and persistence now exist, but runtime route assembly and serving still belong to start/operator.
 - **Operator integration:** greentic-operator should add `greentic-setup` as dependency and delegate, removing ~4,944 lines of duplicated logic.
 - **Admin server:** Actual HTTP server with mTLS needs `axum-server` + `rustls` in the consumer.
 - **Hot reload runtime:** ArcSwap-based component swapping and connection draining live in operator.
 - **JWT signing:** `card_setup.rs` uses session_id as token. Production should use signed JWTs.
 - **Reuse-first:** uses qa-spec, greentic-secrets-lib, greentic-distributor-client.
-- **Version:** 0.4.x (matches greentic ecosystem). Library-only, no CLI binary.
+- **Version:** 0.4.x (matches greentic ecosystem). Includes both library APIs and the `greentic-setup` CLI binary.

@@ -26,8 +26,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use greentic_setup::cli_i18n::CliI18n;
-use greentic_setup::engine::{SetupConfig, SetupRequest};
+use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
 use greentic_setup::plan::TenantSelection;
+use greentic_setup::platform_setup::{
+    PlatformSetupAnswers, StaticRoutesPolicy, load_static_routes_artifact,
+    prompt_static_routes_policy,
+};
 use greentic_setup::qa::wizard;
 use greentic_setup::setup_to_formspec;
 use greentic_setup::{SetupEngine, SetupMode, bundle, discovery};
@@ -185,7 +189,7 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
     let engine = SetupEngine::new(config);
 
     // Load answers if provided
-    let setup_answers = if let Some(answers_path) = &cli.answers {
+    let loaded_answers = if let Some(answers_path) = &cli.answers {
         println!(
             "{}",
             i18n.tf(
@@ -196,17 +200,12 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
         engine
             .load_answers(answers_path)
             .context(i18n.t("cli.error.failed_read_answers"))?
-    } else if cli.emit_answers.is_some() {
-        // Empty answers for emit mode
-        serde_json::Map::new()
-    } else if cli.dry_run {
-        // Dry run without answers - will show wizard preview
-        serde_json::Map::new()
+    } else if cli.emit_answers.is_some() || cli.dry_run {
+        LoadedAnswers::default()
     } else {
-        // Interactive mode - run wizard for each discovered pack
         println!("{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir)?
+        run_interactive_wizard(&bundle_dir, &cli.env)?
     };
 
     let request = SetupRequest {
@@ -216,7 +215,12 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
             team: cli.team.clone(),
             allow_paths: Vec::new(),
         }],
-        setup_answers,
+        static_routes: StaticRoutesPolicy::normalize(
+            loaded_answers.platform_setup.static_routes.as_ref(),
+            &cli.env,
+        )
+        .context(i18n.t("cli.error.failed_read_answers"))?,
+        setup_answers: loaded_answers.setup_answers,
         ..Default::default()
     };
 
@@ -647,20 +651,18 @@ fn setup(args: BundleSetupArgs) -> Result<()> {
     let engine = SetupEngine::new(config);
 
     // Load answers (not required if --emit-answers is provided)
-    let setup_answers = if let Some(answers_path) = &args.answers {
+    let loaded_answers = if let Some(answers_path) = &args.answers {
         engine
             .load_answers(answers_path)
             .context(i18n.t("cli.error.failed_read_answers"))?
     } else if args.emit_answers.is_some() {
-        // Empty answers for emit mode - will generate template
-        serde_json::Map::new()
+        LoadedAnswers::default()
     } else if args.non_interactive {
         bail!("{}", i18n.t("cli.error.answers_required"));
     } else {
-        // Interactive mode - run wizard for discovered packs
         println!("\n{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir)?
+        run_interactive_wizard(&bundle_dir, &args.env)?
     };
 
     let providers = args
@@ -676,7 +678,12 @@ fn setup(args: BundleSetupArgs) -> Result<()> {
             team: args.team,
             allow_paths: Vec::new(),
         }],
-        setup_answers,
+        static_routes: StaticRoutesPolicy::normalize(
+            loaded_answers.platform_setup.static_routes.as_ref(),
+            &args.env,
+        )
+        .context(i18n.t("cli.error.failed_read_answers"))?,
+        setup_answers: loaded_answers.setup_answers,
         domain_filter: if args.domain == "all" {
             None
         } else {
@@ -763,20 +770,18 @@ fn update(args: BundleSetupArgs) -> Result<()> {
     };
     let engine = SetupEngine::new(config);
 
-    let setup_answers = if let Some(answers_path) = &args.answers {
+    let loaded_answers = if let Some(answers_path) = &args.answers {
         engine
             .load_answers(answers_path)
             .context(i18n.t("cli.error.failed_read_answers"))?
     } else if args.emit_answers.is_some() {
-        // Empty answers for emit mode - will generate template
-        serde_json::Map::new()
+        LoadedAnswers::default()
     } else if args.non_interactive {
         bail!("{}", i18n.t("cli.error.answers_required"));
     } else {
-        // Interactive mode - run wizard for discovered packs
         println!("\n{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir)?
+        run_interactive_wizard(&bundle_dir, &args.env)?
     };
 
     let providers = args
@@ -792,7 +797,12 @@ fn update(args: BundleSetupArgs) -> Result<()> {
             team: args.team,
             allow_paths: Vec::new(),
         }],
-        setup_answers,
+        static_routes: StaticRoutesPolicy::normalize(
+            loaded_answers.platform_setup.static_routes.as_ref(),
+            &args.env,
+        )
+        .context(i18n.t("cli.error.failed_read_answers"))?,
+        setup_answers: loaded_answers.setup_answers,
         domain_filter: if args.domain == "all" {
             None
         } else {
@@ -1224,19 +1234,24 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, _only_used: bool) -> Result<
 ///
 /// Discovers packs, builds FormSpec for each, and prompts the user
 /// for configuration answers interactively.
-fn run_interactive_wizard(
-    bundle_path: &std::path::Path,
-) -> Result<serde_json::Map<String, serde_json::Value>> {
+fn run_interactive_wizard(bundle_path: &std::path::Path, env: &str) -> Result<LoadedAnswers> {
     use serde_json::Value;
 
     let mut all_answers = serde_json::Map::new();
+    let existing_static_routes = load_static_routes_artifact(bundle_path)?;
+    let static_routes = prompt_static_routes_policy(env, existing_static_routes.as_ref())?;
 
     // Discover packs in the bundle
     let discovered = discovery::discover(bundle_path)?;
 
     if discovered.providers.is_empty() {
         println!("No providers found in bundle. Nothing to configure.");
-        return Ok(all_answers);
+        return Ok(LoadedAnswers {
+            platform_setup: PlatformSetupAnswers {
+                static_routes: Some(static_routes.to_answers()),
+            },
+            setup_answers: all_answers,
+        });
     }
 
     println!(
@@ -1277,5 +1292,10 @@ fn run_interactive_wizard(
         println!();
     }
 
-    Ok(all_answers)
+    Ok(LoadedAnswers {
+        platform_setup: PlatformSetupAnswers {
+            static_routes: Some(static_routes.to_answers()),
+        },
+        setup_answers: all_answers,
+    })
 }

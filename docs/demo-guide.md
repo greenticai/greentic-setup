@@ -111,6 +111,14 @@ This creates `answers.json`:
   "bundle_source": "./telegram-demo",
   "env": "dev",
   "tenant": "demo",
+  "platform_setup": {
+    "static_routes": {
+      "public_web_enabled": false,
+      "public_surface_policy": "disabled",
+      "default_route_prefix_policy": "pack_declared",
+      "tenant_path_policy": "pack_declared"
+    }
+  },
   "setup_answers": {
     "messaging-telegram": {
       "bot_token": "",
@@ -128,6 +136,15 @@ Edit `answers.json`:
   "bundle_source": "./telegram-demo",
   "env": "dev",
   "tenant": "demo",
+  "platform_setup": {
+    "static_routes": {
+      "public_web_enabled": true,
+      "public_base_url": "https://abc123.ngrok.io",
+      "public_surface_policy": "enabled",
+      "default_route_prefix_policy": "pack_declared",
+      "tenant_path_policy": "pack_declared"
+    }
+  },
   "setup_answers": {
     "messaging-telegram": {
       "bot_token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
@@ -167,6 +184,14 @@ gtc op demo start --bundle ./telegram-demo
   "env": "dev",
   "tenant": "demo",
   "team": "default",
+  "platform_setup": {
+    "static_routes": {
+      "public_web_enabled": false,
+      "public_surface_policy": "disabled",
+      "default_route_prefix_policy": "pack_declared",
+      "tenant_path_policy": "pack_declared"
+    }
+  },
   "setup_answers": {
     "messaging-telegram": {
       "bot_token": "your-bot-token",

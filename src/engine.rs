@@ -13,7 +13,17 @@ use serde_json::{Map as JsonMap, Value};
 use crate::bundle;
 use crate::discovery;
 use crate::plan::*;
+use crate::platform_setup::{
+    PlatformSetupAnswers, StaticRoutesPolicy, load_static_routes_artifact,
+    persist_static_routes_artifact,
+};
 use crate::setup_input;
+
+#[derive(Clone, Debug, Default)]
+pub struct LoadedAnswers {
+    pub platform_setup: PlatformSetupAnswers,
+    pub setup_answers: JsonMap<String, Value>,
+}
 
 /// The request object that drives plan building.
 #[derive(Clone, Debug, Default)]
@@ -30,6 +40,7 @@ pub struct SetupRequest {
     pub providers_remove: Vec<String>,
     pub tenants_remove: Vec<TenantSelection>,
     pub access_changes: Vec<AccessChangeSelection>,
+    pub static_routes: StaticRoutesPolicy,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
     /// Filter by provider domain (messaging, events, secrets, oauth).
     pub domain_filter: Option<String>,
@@ -182,8 +193,19 @@ impl SetupEngine {
             "tenant": self.config.tenant,
             "team": self.config.team,
             "env": self.config.env,
+            "platform_setup": {
+                "static_routes": plan.metadata.static_routes.to_answers()
+            },
             "setup_answers": {}
         });
+
+        if !plan.metadata.static_routes.public_web_enabled
+            && plan.metadata.static_routes.public_base_url.is_none()
+            && let Some(existing) = load_static_routes_artifact(bundle)?
+        {
+            answers_doc["platform_setup"]["static_routes"] =
+                serde_json::to_value(existing.to_answers())?;
+        }
 
         // Discover packs and extract their QA specs
         let setup_answers = answers_doc
@@ -241,15 +263,38 @@ impl SetupEngine {
     }
 
     /// Load answers from a JSON/YAML file.
-    pub fn load_answers(&self, answers_path: &Path) -> anyhow::Result<JsonMap<String, Value>> {
+    pub fn load_answers(&self, answers_path: &Path) -> anyhow::Result<LoadedAnswers> {
         let raw = setup_input::load_setup_input(answers_path)?;
         match raw {
             Value::Object(map) => {
-                // Check if this is a full answers document or just setup_answers
+                let platform_setup = map
+                    .get("platform_setup")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .context("parse platform_setup answers")?
+                    .unwrap_or_default();
+
                 if let Some(Value::Object(setup_answers)) = map.get("setup_answers") {
-                    Ok(setup_answers.clone())
+                    Ok(LoadedAnswers {
+                        platform_setup,
+                        setup_answers: setup_answers.clone(),
+                    })
+                } else if map.contains_key("bundle_source")
+                    || map.contains_key("tenant")
+                    || map.contains_key("team")
+                    || map.contains_key("env")
+                    || map.contains_key("platform_setup")
+                {
+                    Ok(LoadedAnswers {
+                        platform_setup,
+                        setup_answers: JsonMap::new(),
+                    })
                 } else {
-                    Ok(map)
+                    Ok(LoadedAnswers {
+                        platform_setup,
+                        setup_answers: map,
+                    })
                 }
             }
             _ => Err(anyhow!("answers file must be a JSON/YAML object")),
@@ -290,7 +335,9 @@ impl SetupEngine {
             };
 
             if resolved_path.exists() {
-                let canonical = resolved_path.canonicalize().unwrap_or(resolved_path.clone());
+                let canonical = resolved_path
+                    .canonicalize()
+                    .unwrap_or(resolved_path.clone());
                 resolved.push(ResolvedPackInfo {
                     source_ref: pack_ref.clone(),
                     mapped_ref: canonical.display().to_string(),
@@ -313,7 +360,11 @@ impl SetupEngine {
                 tracing::warn!("remote pack ref requires async resolution: {}", pack_ref);
             } else {
                 // Log warning for unresolved local paths
-                tracing::warn!("pack ref not found: {} (resolved to: {})", pack_ref, resolved_path.display());
+                tracing::warn!(
+                    "pack ref not found: {} (resolved to: {})",
+                    pack_ref,
+                    resolved_path.display()
+                );
             }
         }
 
@@ -394,6 +445,8 @@ impl SetupEngine {
 
             count += 1;
         }
+
+        persist_static_routes_artifact(bundle_path, &metadata.static_routes)?;
 
         Ok(count)
     }
@@ -800,6 +853,7 @@ pub fn apply_remove(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             providers_remove: request.providers_remove.clone(),
             tenants_remove: request.tenants_remove.clone(),
             access_changes: request.access_changes.clone(),
+            static_routes: request.static_routes.clone(),
             setup_answers: request.setup_answers.clone(),
         },
     })
@@ -900,6 +954,7 @@ fn build_metadata(
         providers_remove: request.providers_remove.clone(),
         tenants_remove: request.tenants_remove.clone(),
         access_changes: request.access_changes.clone(),
+        static_routes: request.static_routes.clone(),
         setup_answers: request.setup_answers.clone(),
     }
 }
@@ -928,6 +983,9 @@ fn compute_simple_hash(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle;
+    use crate::platform_setup::static_routes_artifact_path;
+    use serde_json::json;
 
     fn empty_request(bundle: PathBuf) -> SetupRequest {
         SetupRequest {
@@ -947,6 +1005,7 @@ mod tests {
             providers_remove: Vec::new(),
             tenants_remove: Vec::new(),
             access_changes: Vec::new(),
+            static_routes: StaticRoutesPolicy::default(),
             setup_answers: serde_json::Map::new(),
             ..Default::default()
         }
@@ -982,6 +1041,7 @@ mod tests {
             providers_remove: Vec::new(),
             tenants_remove: Vec::new(),
             access_changes: Vec::new(),
+            static_routes: StaticRoutesPolicy::default(),
             setup_answers: serde_json::Map::new(),
             ..Default::default()
         };
@@ -1015,5 +1075,151 @@ mod tests {
             ..empty_request(PathBuf::from("x"))
         };
         assert!(apply_create(&req, true).is_err());
+    }
+
+    #[test]
+    fn load_answers_reads_platform_setup_and_provider_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers_path = temp.path().join("answers.yaml");
+        std::fs::write(
+            &answers_path,
+            r#"
+bundle_source: ./bundle
+env: prod
+platform_setup:
+  static_routes:
+    public_web_enabled: true
+    public_base_url: https://example.com/base/
+setup_answers:
+  messaging-webchat:
+    jwt_signing_key: abc
+"#,
+        )
+        .unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: None,
+            env: "prod".into(),
+            offline: false,
+            verbose: false,
+        });
+        let loaded = engine.load_answers(&answers_path).unwrap();
+        assert_eq!(
+            loaded
+                .platform_setup
+                .static_routes
+                .as_ref()
+                .and_then(|v| v.public_base_url.as_deref()),
+            Some("https://example.com/base/")
+        );
+        assert_eq!(
+            loaded
+                .setup_answers
+                .get("messaging-webchat")
+                .and_then(|v| v.get("jwt_signing_key"))
+                .and_then(Value::as_str),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn emit_answers_includes_platform_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: None,
+            env: "prod".into(),
+            offline: false,
+            verbose: false,
+        });
+        let request = SetupRequest {
+            bundle: bundle_root.clone(),
+            tenants: vec![TenantSelection {
+                tenant: "demo".into(),
+                team: None,
+                allow_paths: Vec::new(),
+            }],
+            static_routes: StaticRoutesPolicy {
+                public_web_enabled: true,
+                public_base_url: Some("https://example.com".into()),
+                public_surface_policy: "enabled".into(),
+                default_route_prefix_policy: "pack_declared".into(),
+                tenant_path_policy: "pack_declared".into(),
+                ..StaticRoutesPolicy::default()
+            },
+            ..Default::default()
+        };
+        let plan = engine.plan(SetupMode::Create, &request, true).unwrap();
+        let output = temp.path().join("answers.json");
+        engine.emit_answers(&plan, &output).unwrap();
+        let emitted: Value =
+            serde_json::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(
+            emitted["platform_setup"]["static_routes"]["public_base_url"],
+            json!("https://example.com")
+        );
+    }
+
+    #[test]
+    fn execute_persists_static_routes_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: None,
+            env: "prod".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut metadata = build_metadata(&empty_request(bundle_root.clone()), Vec::new(), vec![]);
+        metadata.static_routes = StaticRoutesPolicy {
+            public_web_enabled: true,
+            public_base_url: Some("https://example.com".into()),
+            public_surface_policy: "enabled".into(),
+            default_route_prefix_policy: "pack_declared".into(),
+            tenant_path_policy: "pack_declared".into(),
+            ..StaticRoutesPolicy::default()
+        };
+
+        engine
+            .execute_apply_pack_setup(&bundle_root, &metadata)
+            .unwrap();
+        let artifact = static_routes_artifact_path(&bundle_root);
+        assert!(artifact.exists());
+        let stored: Value =
+            serde_json::from_str(&std::fs::read_to_string(artifact).unwrap()).unwrap();
+        assert_eq!(stored["public_web_enabled"], json!(true));
+    }
+
+    #[test]
+    fn update_plan_preserves_static_routes_policy() {
+        let req = SetupRequest {
+            bundle: PathBuf::from("bundle"),
+            tenants: vec![TenantSelection {
+                tenant: "demo".into(),
+                team: None,
+                allow_paths: Vec::new(),
+            }],
+            static_routes: StaticRoutesPolicy {
+                public_web_enabled: true,
+                public_base_url: Some("https://example.com/new".into()),
+                public_surface_policy: "enabled".into(),
+                default_route_prefix_policy: "pack_declared".into(),
+                tenant_path_policy: "pack_declared".into(),
+                ..StaticRoutesPolicy::default()
+            },
+            ..Default::default()
+        };
+        let plan = apply_update(&req, true).unwrap();
+        assert_eq!(
+            plan.metadata.static_routes.public_base_url.as_deref(),
+            Some("https://example.com/new")
+        );
     }
 }

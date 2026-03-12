@@ -14,6 +14,7 @@ pub mod engine;
 pub mod flow;
 pub mod gtbundle;
 pub mod plan;
+pub mod platform_setup;
 pub mod reload;
 pub mod secret_name;
 pub mod secrets;

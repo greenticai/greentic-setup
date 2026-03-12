@@ -6,6 +6,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::platform_setup::StaticRoutesPolicy;
+
 /// The operation mode for a setup plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupMode {
@@ -48,6 +50,7 @@ pub struct SetupPlanMetadata {
     pub providers_remove: Vec<String>,
     pub tenants_remove: Vec<TenantSelection>,
     pub access_changes: Vec<AccessChangeSelection>,
+    pub static_routes: StaticRoutesPolicy,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
 }
 
