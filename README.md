@@ -326,7 +326,20 @@ Requires `greentic-i18n` repo at `../greentic-i18n/`.
 
 ## Documentation
 
-- **[Demo Guide](./docs/demo-guide.md)** — Complete guide for creating and running bundles
+| Document | Description |
+|----------|-------------|
+| **[Demo Guide](./docs/demo-guide.md)** | Complete guide for creating and running bundles |
+| **[Admin API Reference](./docs/admin-api.md)** | Full admin endpoint documentation with examples |
+| **[Adaptive Cards Guide](./docs/adaptive-cards.md)** | Card-based setup flow with security details |
+| **[mTLS Setup Guide](./docs/mtls-setup.md)** | Certificate generation and configuration |
+| **[Demo Features](./DEMO_SETUP_FEATURES.md)** | Advanced features demo (conditional QA, secrets, hot reload) |
+| **[Manual Testing](./docs/manual-testing.md)** | Step-by-step testing guide for all features |
+
+### API Reference (rustdoc)
+
+```bash
+cargo doc --open
+```
 
 ## License
 

@@ -278,19 +278,31 @@ impl SetupEngine {
             // For now, we only support local pack refs (file paths)
             // OCI resolution requires async and the distributor client
             let path = PathBuf::from(pack_ref);
-            if path.exists() {
+
+            // Try to canonicalize the path to handle relative paths correctly
+            let resolved_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()
+                    .ok()
+                    .map(|cwd| cwd.join(&path))
+                    .unwrap_or_else(|| path.clone())
+            };
+
+            if resolved_path.exists() {
+                let canonical = resolved_path.canonicalize().unwrap_or(resolved_path.clone());
                 resolved.push(ResolvedPackInfo {
                     source_ref: pack_ref.clone(),
-                    mapped_ref: pack_ref.clone(),
+                    mapped_ref: canonical.display().to_string(),
                     resolved_digest: format!("sha256:{}", compute_simple_hash(pack_ref)),
-                    pack_id: path
+                    pack_id: canonical
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown")
                         .to_string(),
                     entry_flows: Vec::new(),
-                    cached_path: path.clone(),
-                    output_path: path,
+                    cached_path: canonical.clone(),
+                    output_path: canonical,
                 });
             } else if pack_ref.starts_with("oci://")
                 || pack_ref.starts_with("repo://")
@@ -299,6 +311,9 @@ impl SetupEngine {
                 // Remote packs need async resolution via distributor-client
                 // For now, we'll skip and let the caller handle this
                 tracing::warn!("remote pack ref requires async resolution: {}", pack_ref);
+            } else {
+                // Log warning for unresolved local paths
+                tracing::warn!("pack ref not found: {} (resolved to: {})", pack_ref, resolved_path.display());
             }
         }
 

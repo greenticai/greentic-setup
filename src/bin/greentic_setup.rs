@@ -34,13 +34,26 @@ use greentic_setup::{SetupEngine, SetupMode, bundle, discovery};
 
 /// Global i18n instance (initialized once at startup).
 fn get_i18n() -> &'static CliI18n {
+    get_i18n_with_locale(None)
+}
+
+/// Get i18n instance with optional locale override.
+fn get_i18n_with_locale(locale: Option<&str>) -> &'static CliI18n {
     use std::sync::OnceLock;
     static I18N: OnceLock<CliI18n> = OnceLock::new();
-    I18N.get_or_init(|| CliI18n::from_request(None).expect("failed to initialize i18n"))
+    I18N.get_or_init(|| CliI18n::from_request(locale).expect("failed to initialize i18n"))
+}
+
+/// Initialize i18n with the specified locale (call early in main).
+fn init_i18n(locale: Option<&str>) {
+    let _ = get_i18n_with_locale(locale);
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Initialize i18n with CLI locale
+    init_i18n(cli.locale.as_deref());
 
     match cli.command {
         Some(Command::Bundle(cmd)) => match cmd {
@@ -110,6 +123,10 @@ struct Cli {
     /// Environment (dev/staging/prod)
     #[arg(long = "env", short = 'e', default_value = "dev", global = true)]
     env: String,
+
+    /// UI locale (BCP-47 tag, e.g., en, ja, id)
+    #[arg(long = "locale", global = true)]
+    locale: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
