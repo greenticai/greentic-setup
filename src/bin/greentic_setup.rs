@@ -1495,7 +1495,11 @@ fn resolve_pack_source(source: &str) -> Result<PathBuf> {
 ///
 /// Discovers packs, builds FormSpec for each, and prompts the user
 /// for configuration answers interactively.
-fn run_interactive_wizard(bundle_path: &std::path::Path, env: &str, advanced: bool) -> Result<LoadedAnswers> {
+fn run_interactive_wizard(
+    bundle_path: &std::path::Path,
+    env: &str,
+    advanced: bool,
+) -> Result<LoadedAnswers> {
     use serde_json::Value;
 
     let mut all_answers = serde_json::Map::new();
