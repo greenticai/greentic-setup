@@ -1340,8 +1340,9 @@ fn prompt_setup_params(cli: &Cli) -> Result<SetupParams> {
     // Add packs loop
     println!();
     println!("  Add packs to bundle");
-    println!("  Enter path to a .gtpack file, or press Enter to skip.");
-    println!("  Examples: ./messaging-telegram.gtpack  ../packs/state-redis.gtpack");
+    println!("  Enter path to a .gtpack file or OCI reference, or press Enter to skip.");
+    println!("  Local:  ./messaging-telegram.gtpack  ../packs/state-redis.gtpack");
+    println!("  OCI:    oci://ghcr.io/greentic-ai-org/packs/mcp-github.gtpack:latest");
     loop {
         print!("  add pack> ");
         io::stdout().flush()?;
@@ -1352,27 +1353,26 @@ fn prompt_setup_params(cli: &Cli) -> Result<SetupParams> {
             break;
         }
 
-        let pack_path = PathBuf::from(pack_str);
-        if !pack_path.exists() {
-            println!("    File not found: {pack_str}");
-            continue;
+        match resolve_pack_source(pack_str) {
+            Ok(pack_path) => {
+                let filename = pack_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("pack.gtpack");
+                let domain = detect_domain_from_filename(filename);
+
+                let target_dir = bundle_dir.join("providers").join(domain);
+                std::fs::create_dir_all(&target_dir)?;
+
+                let target = target_dir.join(filename);
+                std::fs::copy(&pack_path, &target)?;
+                println!("    Added {filename} -> providers/{domain}/");
+            }
+            Err(e) => {
+                println!("    Error: {e}");
+                continue;
+            }
         }
-        if pack_path.extension().and_then(|e| e.to_str()) != Some("gtpack") {
-            println!("    Not a .gtpack file: {pack_str}");
-            continue;
-        }
-
-        // Detect domain from filename prefix
-        let filename = pack_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let domain = detect_domain_from_filename(filename);
-
-        // Ensure target directory exists
-        let target_dir = bundle_dir.join("providers").join(domain);
-        std::fs::create_dir_all(&target_dir)?;
-
-        let target = target_dir.join(filename);
-        std::fs::copy(&pack_path, &target)?;
-        println!("    Added {filename} -> providers/{domain}/");
     }
 
     // Tenant
@@ -1463,6 +1463,31 @@ fn detect_domain_from_filename(filename: &str) -> &'static str {
         "secrets"
     } else {
         "messaging" // default fallback
+    }
+}
+
+/// Resolve a pack source (local path or OCI reference) to a local file path.
+///
+/// Supports:
+/// - Local paths: `./messaging-telegram.gtpack`, `../packs/state-redis.gtpack`
+/// - OCI references: `oci://ghcr.io/org/packs/mcp-github.gtpack:latest`
+fn resolve_pack_source(source: &str) -> Result<PathBuf> {
+    use greentic_setup::bundle_source::BundleSource;
+
+    let parsed = BundleSource::parse(source)?;
+
+    if parsed.is_local() {
+        let path = parsed.resolve()?;
+        if path.extension().and_then(|e| e.to_str()) != Some("gtpack") {
+            anyhow::bail!("Not a .gtpack file: {source}");
+        }
+        Ok(path)
+    } else {
+        // OCI / repo / store — fetch via distributor-client
+        println!("    Fetching from registry...");
+        let path = parsed.resolve()?;
+        println!("    Downloaded to cache: {}", path.display());
+        Ok(path)
     }
 }
 
