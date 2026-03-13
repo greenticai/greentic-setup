@@ -149,21 +149,30 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
 
 fn read_pack_id_from_manifest(path: &Path) -> anyhow::Result<Option<String>> {
     let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-
-    if let Some(id) = read_manifest_cbor(&mut archive)? {
-        return Ok(Some(id));
-    }
-    if let Some(id) = read_manifest_json(&mut archive, "pack.manifest.json")? {
-        return Ok(Some(id));
+    match zip::ZipArchive::new(file) {
+        Ok(mut archive) => {
+            if let Some(id) = read_manifest_cbor(&mut archive)? {
+                return Ok(Some(id));
+            }
+            if let Some(id) = read_manifest_json(&mut archive, "pack.manifest.json")? {
+                return Ok(Some(id));
+            }
+        }
+        Err(_) => {
+            if let Some(id) = read_manifest_cbor_from_tar(path)? {
+                return Ok(Some(id));
+            }
+        }
     }
     Ok(None)
 }
 
 fn read_pack_id_cbor_only(path: &Path) -> anyhow::Result<Option<String>> {
     let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    read_manifest_cbor(&mut archive)
+    match zip::ZipArchive::new(file) {
+        Ok(mut archive) => read_manifest_cbor(&mut archive),
+        Err(_) => read_manifest_cbor_from_tar(path),
+    }
 }
 
 fn read_manifest_cbor(
@@ -200,6 +209,22 @@ fn read_manifest_json(
         && let Some(id) = meta.get("pack_id").and_then(|v| v.as_str())
     {
         return Ok(Some(id.to_string()));
+    }
+    Ok(None)
+}
+
+fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_ref() != Path::new("manifest.cbor") {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+        let value: CborValue = serde_cbor::from_slice(&bytes)?;
+        return extract_pack_id_from_cbor(&value);
     }
     Ok(None)
 }
