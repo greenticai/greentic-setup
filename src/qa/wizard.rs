@@ -32,6 +32,7 @@ pub fn run_qa_setup(
     setup_input: Option<&SetupInputAnswers>,
     interactive: bool,
     qa_form_spec: Option<FormSpec>,
+    advanced: bool,
 ) -> Result<(Value, Option<FormSpec>)> {
     let form_spec =
         qa_form_spec.or_else(|| setup_to_formspec::pack_to_form_spec(pack_path, provider_id));
@@ -52,7 +53,7 @@ pub fn run_qa_setup(
         if spec.questions.is_empty() {
             Value::Object(JsonMap::new())
         } else if interactive {
-            prompt_form_spec_answers(spec, provider_id)?
+            prompt_form_spec_answers(spec, provider_id, advanced)?
         } else {
             return Err(anyhow!(
                 "setup answers required for {provider_id} but run is non-interactive"
@@ -162,9 +163,14 @@ pub fn compute_visibility(spec: &FormSpec, answers: &Value) -> qa_spec::Visibili
 ///
 /// Evaluates `visible_if` expressions after each answer so that conditional
 /// questions are shown/hidden dynamically as answers are collected.
-pub fn prompt_form_spec_answers(spec: &FormSpec, provider_id: &str) -> Result<Value> {
+pub fn prompt_form_spec_answers(
+    spec: &FormSpec,
+    provider_id: &str,
+    advanced: bool,
+) -> Result<Value> {
     let display = setup_to_formspec::strip_domain_prefix(provider_id);
-    println!("\nConfiguring {display}: {}", spec.title);
+    let mode_label = if advanced { " (advanced)" } else { "" };
+    println!("\nConfiguring {display}: {}{mode_label}", spec.title);
     if let Some(ref pres) = spec.presentation
         && let Some(ref intro) = pres.intro
     {
@@ -174,6 +180,10 @@ pub fn prompt_form_spec_answers(spec: &FormSpec, provider_id: &str) -> Result<Va
     let mut answers = JsonMap::new();
     for question in &spec.questions {
         if question.id.is_empty() {
+            continue;
+        }
+        // In normal mode, skip optional questions.
+        if !advanced && !question.required {
             continue;
         }
         // Re-evaluate visibility with answers collected so far.
@@ -192,13 +202,24 @@ pub fn prompt_form_spec_answers(spec: &FormSpec, provider_id: &str) -> Result<Va
 }
 
 fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> {
+    // Print question header
+    let marker = if question.required {
+        " (required)"
+    } else {
+        " (optional)"
+    };
+    println!();
+    println!("  {}{marker}", question.title);
+
+    // Print description as contextual help
     if let Some(ref desc) = question.description
         && !desc.is_empty()
     {
         println!("  {desc}");
     }
+
     if let Some(ref choices) = question.choices {
-        println!("  Choices:");
+        println!();
         for (idx, choice) in choices.iter().enumerate() {
             println!("    {}) {choice}", idx + 1);
         }
@@ -249,18 +270,18 @@ fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> {
 }
 
 fn build_form_spec_prompt(question: &QuestionSpec) -> String {
-    let marker = if question.required { "*" } else { "" };
-    let mut prompt = format!("{}{marker}", question.title);
+    let mut prompt = String::from("  > ");
     match question.kind {
-        QuestionType::Boolean => prompt.push_str(" [boolean]"),
-        QuestionType::Number | QuestionType::Integer => prompt.push_str(" [number]"),
-        QuestionType::Enum => prompt.push_str(" [choice]"),
+        QuestionType::Boolean => prompt.push_str("[yes/no] "),
+        QuestionType::Number | QuestionType::Integer => prompt.push_str("[number] "),
+        QuestionType::Enum => prompt.push_str("[choice] "),
         _ => {}
     }
-    if let Some(ref default) = question.default_value {
-        prompt = format!("{prompt} [default: {default}]");
+    if let Some(ref default) = question.default_value
+        && !default.is_empty()
+    {
+        prompt.push_str(&format!("(default: {default}) "));
     }
-    prompt.push_str(": ");
     prompt
 }
 
@@ -558,5 +579,34 @@ mod tests {
         assert!(matches_pattern("http://localhost:8080", r"^https?://\S+"));
         assert!(!matches_pattern("not-a-url", r"^https?://\S+"));
         assert!(!matches_pattern("https://", r"^https?://\S+")); // too short
+    }
+
+    #[test]
+    fn normal_mode_skips_optional_questions() {
+        let spec = test_form_spec();
+        let advanced = false;
+        let visible: Vec<&str> = spec
+            .questions
+            .iter()
+            .filter(|q| !q.id.is_empty() && (advanced || q.required))
+            .map(|q| q.id.as_str())
+            .collect();
+        // Normal mode: only required questions shown
+        assert_eq!(visible, vec!["api_url", "token"]);
+        assert!(!visible.contains(&"optional"));
+    }
+
+    #[test]
+    fn advanced_mode_shows_all_questions() {
+        let spec = test_form_spec();
+        let advanced = true;
+        let visible: Vec<&str> = spec
+            .questions
+            .iter()
+            .filter(|q| !q.id.is_empty() && (advanced || q.required))
+            .map(|q| q.id.as_str())
+            .collect();
+        // Advanced mode: all questions shown
+        assert_eq!(visible, vec!["api_url", "token", "optional"]);
     }
 }

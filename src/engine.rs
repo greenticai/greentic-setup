@@ -141,6 +141,20 @@ impl SetupEngine {
                         println!("  [done] {}", step.description);
                     }
                 }
+                SetupStepKind::ValidateCapabilities => {
+                    let cap_report = crate::capabilities::validate_and_upgrade_packs(bundle)?;
+                    for warn in &cap_report.warnings {
+                        report.warnings.push(warn.message.clone());
+                    }
+                    if self.config.verbose {
+                        println!(
+                            "  [done] {} (checked={}, upgraded={})",
+                            step.description,
+                            cap_report.checked,
+                            cap_report.upgraded.len()
+                        );
+                    }
+                }
                 SetupStepKind::ApplyPackSetup => {
                     let count = self.execute_apply_pack_setup(bundle, &plan.metadata)?;
                     report.provider_updates += count;
@@ -218,22 +232,29 @@ impl SetupEngine {
             setup_answers.insert(provider_id.clone(), answers.clone());
         }
 
-        // Discover packs and add template entries for any missing providers
+        // Discover packs and populate question templates for all providers.
+        // If a provider entry already exists but is empty, merge in the
+        // questions from setup.yaml so the user sees what needs to be filled.
         if bundle.exists() {
             let discovered = discovery::discover(bundle)?;
             for provider in discovered.providers {
                 let provider_id = provider.provider_id.clone();
-                if !setup_answers.contains_key(&provider_id) {
+                let existing_is_empty = setup_answers
+                    .get(&provider_id)
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|m| m.is_empty());
+                if !setup_answers.contains_key(&provider_id) || existing_is_empty {
                     // Load the setup spec from the pack and create template
                     let template =
                         if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
                             // Pack has setup.yaml - extract questions
                             let mut entries = JsonMap::new();
-                            for question in spec.questions {
+                            for question in &spec.questions {
                                 let default_value = question
                                     .default
+                                    .clone()
                                     .unwrap_or_else(|| Value::String(String::new()));
-                                entries.insert(question.name, default_value);
+                                entries.insert(question.name.clone(), default_value);
                             }
                             entries
                         } else {
@@ -427,7 +448,18 @@ impl SetupEngine {
     ) -> anyhow::Result<usize> {
         let mut count = 0;
 
-        // Persist setup answers to local config files
+        // Auto-install provider packs that are referenced in setup_answers
+        // but not yet present in the bundle.
+        self.auto_install_provider_packs(bundle_path, metadata);
+
+        // Discover packs so we can find pack_path for secret alias seeding
+        let discovered = if bundle_path.exists() {
+            discovery::discover(bundle_path).ok()
+        } else {
+            None
+        };
+
+        // Persist setup answers to local config files and dev secrets store
         for (provider_id, answers) in &metadata.setup_answers {
             // Write answers to provider config directory
             let config_dir = bundle_path.join("state").join("config").join(provider_id);
@@ -443,12 +475,172 @@ impl SetupEngine {
                 )
             })?;
 
+            // Persist all answer values to the dev secrets store so that
+            // WASM components can read them via the secrets API at runtime.
+            let pack_path = discovered.as_ref().and_then(|d| {
+                d.providers
+                    .iter()
+                    .find(|p| p.provider_id == *provider_id)
+                    .map(|p| p.pack_path.as_path())
+            });
+            let env = crate::resolve_env(Some(&self.config.env));
+            let rt = tokio::runtime::Runtime::new()
+                .context("failed to create tokio runtime for secrets persistence")?;
+            let persisted = rt.block_on(crate::qa::persist::persist_all_config_as_secrets(
+                bundle_path,
+                &env,
+                &self.config.tenant,
+                self.config.team.as_deref(),
+                provider_id,
+                answers,
+                pack_path,
+            ))?;
+            if self.config.verbose && !persisted.is_empty() {
+                println!(
+                    "  [secrets] persisted {} key(s) for {provider_id}",
+                    persisted.len()
+                );
+            }
+
+            // Register webhooks if the provider needs one (e.g. Telegram, Slack, Webex)
+            if let Some(result) = crate::webhook::register_webhook(
+                provider_id,
+                answers,
+                &self.config.tenant,
+                self.config.team.as_deref(),
+            ) {
+                let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                if ok {
+                    println!("  [webhook] registered for {provider_id}");
+                } else {
+                    let err = result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    println!("  [webhook] WARNING: registration failed for {provider_id}: {err}");
+                }
+            }
+
             count += 1;
         }
 
         persist_static_routes_artifact(bundle_path, &metadata.static_routes)?;
 
+        // Print post-setup instructions for providers needing manual steps
+        let provider_configs: Vec<(String, Value)> = metadata
+            .setup_answers
+            .iter()
+            .map(|(id, val)| (id.clone(), val.clone()))
+            .collect();
+        let team = self.config.team.as_deref().unwrap_or("default");
+        crate::webhook::print_post_setup_instructions(&provider_configs, &self.config.tenant, team);
+
         Ok(count)
+    }
+
+    /// Search sibling bundles for provider packs referenced in setup_answers
+    /// and install them into this bundle if missing.
+    fn auto_install_provider_packs(&self, bundle_path: &Path, metadata: &SetupPlanMetadata) {
+        let bundle_abs =
+            std::fs::canonicalize(bundle_path).unwrap_or_else(|_| bundle_path.to_path_buf());
+
+        for provider_id in metadata.setup_answers.keys() {
+            let target_dir = Self::get_pack_target_dir(bundle_path, provider_id);
+            let target_path = target_dir.join(format!("{provider_id}.gtpack"));
+            if target_path.exists() {
+                continue;
+            }
+
+            // Determine the provider domain from the ID
+            let domain = Self::domain_from_provider_id(provider_id);
+
+            // Search for the pack in sibling bundles and build output
+            if let Some(source) = Self::find_provider_pack_source(provider_id, domain, &bundle_abs)
+            {
+                if let Err(err) = std::fs::create_dir_all(&target_dir) {
+                    eprintln!(
+                        "  [provider] WARNING: failed to create {}: {err}",
+                        target_dir.display()
+                    );
+                    continue;
+                }
+                match std::fs::copy(&source, &target_path) {
+                    Ok(_) => println!(
+                        "  [provider] installed {provider_id}.gtpack from {}",
+                        source.display()
+                    ),
+                    Err(err) => eprintln!(
+                        "  [provider] WARNING: failed to copy {}: {err}",
+                        source.display()
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "  [provider] WARNING: {provider_id}.gtpack not found in sibling bundles"
+                );
+            }
+        }
+    }
+
+    /// Extract domain from a provider ID (e.g. "messaging-telegram" → "messaging").
+    fn domain_from_provider_id(provider_id: &str) -> &str {
+        const DOMAIN_PREFIXES: &[&str] = &[
+            "messaging-",
+            "events-",
+            "oauth-",
+            "secrets-",
+            "mcp-",
+            "state-",
+            "telemetry-",
+        ];
+        for prefix in DOMAIN_PREFIXES {
+            if provider_id.starts_with(prefix) {
+                return prefix.trim_end_matches('-');
+            }
+        }
+        "messaging" // default
+    }
+
+    /// Search known locations for a provider pack file.
+    ///
+    /// Search order:
+    /// 1. Sibling bundle directories: `../<bundle>/providers/<domain>/<id>.gtpack`
+    /// 2. Build output: `../greentic-messaging-providers/target/packs/<id>.gtpack`
+    fn find_provider_pack_source(
+        provider_id: &str,
+        domain: &str,
+        bundle_abs: &Path,
+    ) -> Option<PathBuf> {
+        let parent = bundle_abs.parent()?;
+        let filename = format!("{provider_id}.gtpack");
+
+        // 1. Sibling bundles
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let sibling = entry.path();
+                if sibling == *bundle_abs || !sibling.is_dir() {
+                    continue;
+                }
+                let candidate = sibling.join("providers").join(domain).join(&filename);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        // 2. Build output from greentic-messaging-providers
+        for ancestor in parent.ancestors().take(4) {
+            let candidate = ancestor
+                .join("greentic-messaging-providers")
+                .join("target")
+                .join("packs")
+                .join(&filename);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        None
     }
 
     fn execute_write_gmap_rules(
@@ -546,9 +738,26 @@ pub fn apply_create(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             [("count", pack_refs.len().to_string())],
         ));
         steps.push(step(
+            SetupStepKind::ValidateCapabilities,
+            "Validate provider packs have capabilities extension",
+            [("check", "greentic.ext.capabilities.v1".to_string())],
+        ));
+        steps.push(step(
             SetupStepKind::ApplyPackSetup,
             "Apply pack-declared setup outputs through internal setup hooks",
             [("status", "planned".to_string())],
+        ));
+    } else if !request.setup_answers.is_empty() {
+        // No new packs to fetch, but answers were provided for existing packs
+        steps.push(step(
+            SetupStepKind::ValidateCapabilities,
+            "Validate provider packs have capabilities extension",
+            [("check", "greentic.ext.capabilities.v1".to_string())],
+        ));
+        steps.push(step(
+            SetupStepKind::ApplyPackSetup,
+            "Apply setup answers to existing bundle packs",
+            [("providers", request.setup_answers.len().to_string())],
         ));
     } else {
         steps.push(step(

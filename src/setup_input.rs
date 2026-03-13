@@ -61,6 +61,8 @@ pub struct SetupSpec {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub questions: Vec<SetupQuestion>,
 }
 
@@ -83,6 +85,23 @@ pub struct SetupQuestion {
     pub secret: bool,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
+    pub visible_if: Option<SetupVisibleIf>,
+}
+
+/// Conditional visibility for a setup question.
+///
+/// Example in setup.yaml:
+/// ```yaml
+/// visible_if:
+///   field: public_base_url_mode
+///   eq: static
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct SetupVisibleIf {
+    pub field: String,
+    #[serde(default)]
+    pub eq: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -90,6 +109,9 @@ fn default_kind() -> String {
 }
 
 /// Load a `SetupSpec` from `assets/setup.yaml` inside a `.gtpack` archive.
+///
+/// Falls back to reading `setup.yaml` from the filesystem next to the pack
+/// (sibling or `assets/` subdirectory) when the archive does not contain it.
 pub fn load_setup_spec(pack_path: &Path) -> anyhow::Result<Option<SetupSpec>> {
     let file = File::open(pack_path)?;
     let mut archive = match ZipArchive::new(file) {
@@ -99,7 +121,10 @@ pub fn load_setup_spec(pack_path: &Path) -> anyhow::Result<Option<SetupSpec>> {
     };
     let contents = match read_setup_yaml(&mut archive)? {
         Some(value) => value,
-        None => return Ok(None),
+        None => match read_setup_yaml_from_filesystem(pack_path)? {
+            Some(value) => value,
+            None => return Ok(None),
+        },
     };
     let spec: SetupSpec =
         serde_yaml_bw::from_str(&contents).context("parse provider setup spec")?;
@@ -116,6 +141,47 @@ fn read_setup_yaml(archive: &mut ZipArchive<File>) -> anyhow::Result<Option<Stri
             }
             Err(ZipError::FileNotFound) => continue,
             Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(None)
+}
+
+/// Fallback: look for `setup.yaml` on the filesystem near the `.gtpack` file.
+///
+/// Searches sibling paths relative to the pack file:
+///   1. `<pack_dir>/assets/setup.yaml`
+///   2. `<pack_dir>/setup.yaml`
+///
+/// Also searches based on pack filename (e.g. for `messaging-telegram.gtpack`):
+///   3. `<pack_dir>/../../../packs/messaging-telegram/assets/setup.yaml`
+///   4. `<pack_dir>/../../../packs/messaging-telegram/setup.yaml`
+fn read_setup_yaml_from_filesystem(pack_path: &Path) -> anyhow::Result<Option<String>> {
+    let pack_dir = pack_path.parent().unwrap_or(Path::new("."));
+    let pack_stem = pack_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+    let candidates = [
+        pack_dir.join("assets/setup.yaml"),
+        pack_dir.join("setup.yaml"),
+    ];
+
+    // Also try a source-layout path: packs/<pack_stem>/assets/setup.yaml
+    let mut all_candidates: Vec<std::path::PathBuf> = candidates.to_vec();
+    if !pack_stem.is_empty() {
+        // Walk up to find a packs/ directory (common in greentic-messaging-providers layout)
+        for ancestor in pack_dir.ancestors().skip(1).take(4) {
+            let source_dir = ancestor.join("packs").join(pack_stem);
+            if source_dir.is_dir() {
+                all_candidates.push(source_dir.join("assets/setup.yaml"));
+                all_candidates.push(source_dir.join("setup.yaml"));
+                break;
+            }
+        }
+    }
+
+    for candidate in &all_candidates {
+        if candidate.is_file() {
+            let contents = fs::read_to_string(candidate)?;
+            return Ok(Some(contents));
         }
     }
     Ok(None)

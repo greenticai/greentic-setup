@@ -59,7 +59,33 @@ pub fn create_demo_bundle_structure(root: &Path, bundle_name: Option<&str>) -> a
             .join("team.gmap"),
         "_ = forbidden\n",
     )?;
+
+    // Write embedded welcome default.gtpack so the operator has a flow to execute.
+    write_default_pack_if_missing(root);
+
     Ok(())
+}
+
+/// Embedded welcome pack bytes (built from `assets/default-welcome.gtpack`).
+///
+/// This pack contains a single-node flow using the adaptive-card component
+/// that replies with a welcome/setup-instructions card to any incoming message.
+const EMBEDDED_WELCOME_PACK: &[u8] = include_bytes!("../assets/default-welcome.gtpack");
+
+/// Write the embedded welcome pack as `packs/default.gtpack` if not already present.
+fn write_default_pack_if_missing(bundle_root: &Path) {
+    let target = bundle_root.join("packs").join("default.gtpack");
+    if target.exists() {
+        return;
+    }
+    if let Err(err) = std::fs::write(&target, EMBEDDED_WELCOME_PACK) {
+        eprintln!(
+            "  [scaffold] WARNING: failed to write default.gtpack: {}",
+            err,
+        );
+    } else {
+        println!("  [scaffold] created default.gtpack (welcome flow)");
+    }
 }
 
 /// Write a file only if it doesn't already exist.
@@ -209,6 +235,33 @@ mod tests {
         assert!(root.join("greentic.demo.yaml").exists());
         assert!(root.join("providers/messaging").exists());
         assert!(root.join("tenants/demo/teams/default/team.gmap").exists());
+    }
+
+    #[test]
+    fn embedded_welcome_pack_written_when_no_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("new-bundle");
+        create_demo_bundle_structure(&root, Some("test")).unwrap();
+        let pack = root.join("packs").join("default.gtpack");
+        assert!(pack.exists(), "embedded welcome pack should be written");
+        assert!(
+            pack.metadata().unwrap().len() > 1000,
+            "pack should not be empty"
+        );
+    }
+
+    #[test]
+    fn embedded_welcome_pack_not_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("existing-bundle");
+        std::fs::create_dir_all(root.join("packs")).unwrap();
+        std::fs::write(root.join("packs").join("default.gtpack"), b"custom").unwrap();
+        create_demo_bundle_structure(&root, Some("test")).unwrap();
+        let contents = std::fs::read(root.join("packs").join("default.gtpack")).unwrap();
+        assert_eq!(
+            contents, b"custom",
+            "existing pack should not be overwritten"
+        );
     }
 
     #[test]

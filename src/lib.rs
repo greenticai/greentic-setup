@@ -6,6 +6,7 @@
 pub mod admin;
 pub mod bundle;
 pub mod bundle_source;
+pub mod capabilities;
 pub mod card_setup;
 pub mod cli_i18n;
 pub mod config_envelope;

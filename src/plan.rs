@@ -70,6 +70,7 @@ pub enum SetupStepKind {
     ResolvePacks,
     CreateBundle,
     AddPacksToBundle,
+    ValidateCapabilities,
     ApplyPackSetup,
     WriteGmapRules,
     RunResolver,

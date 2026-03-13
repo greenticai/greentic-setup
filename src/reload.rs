@@ -205,6 +205,8 @@ mod tests {
                 messaging: true,
                 events: false,
                 oauth: false,
+                state: false,
+                secrets: false,
             },
             providers,
         }

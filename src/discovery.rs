@@ -20,6 +20,8 @@ pub struct DetectedDomains {
     pub messaging: bool,
     pub events: bool,
     pub oauth: bool,
+    pub state: bool,
+    pub secrets: bool,
 }
 
 /// Metadata for a discovered provider pack.
@@ -51,6 +53,8 @@ const DOMAIN_DIRS: &[(&str, &str)] = &[
     ("messaging", "providers/messaging"),
     ("events", "providers/events"),
     ("oauth", "providers/oauth"),
+    ("state", "providers/state"),
+    ("secrets", "providers/secrets"),
 ];
 
 /// Discover provider packs in a bundle root directory.
@@ -114,6 +118,8 @@ pub fn discover_with_options(
         messaging: providers.iter().any(|p| p.domain == "messaging"),
         events: providers.iter().any(|p| p.domain == "events"),
         oauth: providers.iter().any(|p| p.domain == "oauth"),
+        state: providers.iter().any(|p| p.domain == "state"),
+        secrets: providers.iter().any(|p| p.domain == "secrets"),
     };
 
     Ok(DiscoveryResult { domains, providers })

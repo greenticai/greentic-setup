@@ -132,6 +132,10 @@ struct Cli {
     #[arg(long = "locale", global = true)]
     locale: Option<String>,
 
+    /// Advanced mode — show all questions including optional ones
+    #[arg(long = "advanced", global = true)]
+    advanced: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -146,16 +150,40 @@ enum Command {
 /// Run simple setup mode: greentic-setup [OPTIONS] <BUNDLE>
 fn run_simple_setup(cli: &Cli) -> Result<()> {
     let i18n = get_i18n();
-    let bundle_path = cli.bundle.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}\n\n{}",
-            i18n.t("cli.simple.bundle_required"),
-            i18n.t("cli.help.for_help")
+
+    // If no bundle path given and no flags, run fully interactive mode
+    let (bundle_path, tenant, team, env, advanced) = if cli.bundle.is_none()
+        && cli.answers.is_none()
+        && cli.emit_answers.is_none()
+        && !cli.dry_run
+    {
+        let params = prompt_setup_params(cli)?;
+        (
+            params.bundle,
+            params.tenant,
+            params.team,
+            params.env,
+            params.advanced,
         )
-    })?;
+    } else {
+        let path = cli.bundle.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}\n\n{}",
+                i18n.t("cli.simple.bundle_required"),
+                i18n.t("cli.help.for_help")
+            )
+        })?;
+        (
+            path,
+            cli.tenant.clone(),
+            cli.team.clone(),
+            cli.env.clone(),
+            cli.advanced,
+        )
+    };
 
     // Resolve bundle source (directory or .gtbundle file)
-    let bundle_dir = resolve_bundle_source(bundle_path)?;
+    let bundle_dir = resolve_bundle_source(&bundle_path)?;
 
     // Validate bundle exists
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
@@ -168,21 +196,21 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
             &[&bundle_path.display().to_string()]
         )
     );
-    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&cli.tenant]));
+    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&tenant]));
     println!(
         "{}",
         i18n.tf(
             "cli.bundle.add.team",
-            &[cli.team.as_deref().unwrap_or("default")]
+            &[team.as_deref().unwrap_or("default")]
         )
     );
-    println!("{}", i18n.tf("cli.bundle.add.env", &[&cli.env]));
+    println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!();
 
     let config = SetupConfig {
-        tenant: cli.tenant.clone(),
-        team: cli.team.clone(),
-        env: cli.env.clone(),
+        tenant: tenant.clone(),
+        team: team.clone(),
+        env: env.clone(),
         offline: false,
         verbose: true,
     };
@@ -205,14 +233,14 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
     } else {
         println!("{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir, &cli.env)?
+        run_interactive_wizard(&bundle_dir, &cli.env, advanced)?
     };
 
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
         tenants: vec![TenantSelection {
-            tenant: cli.tenant.clone(),
-            team: cli.team.clone(),
+            tenant: tenant.clone(),
+            team: team.clone(),
             allow_paths: Vec::new(),
         }],
         static_routes: StaticRoutesPolicy::normalize(
@@ -435,6 +463,9 @@ struct BundleSetupArgs {
     /// Emit answers template JSON (use with --dry-run)
     #[arg(long = "emit-answers")]
     emit_answers: Option<PathBuf>,
+    /// Advanced mode — show all questions including optional ones
+    #[arg(long = "advanced")]
+    advanced: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -662,7 +693,7 @@ fn setup(args: BundleSetupArgs) -> Result<()> {
     } else {
         println!("\n{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir, &args.env)?
+        run_interactive_wizard(&bundle_dir, &args.env, args.advanced)?
     };
 
     let providers = args
@@ -781,7 +812,7 @@ fn update(args: BundleSetupArgs) -> Result<()> {
     } else {
         println!("\n{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir, &args.env)?
+        run_interactive_wizard(&bundle_dir, &args.env, args.advanced)?
     };
 
     let providers = args
@@ -1230,11 +1261,216 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, _only_used: bool) -> Result<
     Ok(())
 }
 
+/// Parameters collected from interactive prompts.
+struct SetupParams {
+    bundle: PathBuf,
+    tenant: String,
+    team: Option<String>,
+    env: String,
+    advanced: bool,
+}
+
+/// Prompt the user for setup parameters when no arguments are given.
+fn prompt_setup_params(cli: &Cli) -> Result<SetupParams> {
+    use std::io::{self, Write as _};
+
+    println!();
+    println!("Greentic Setup");
+    println!("==============");
+    println!();
+    println!("Configure a bundle for deployment. A bundle is a directory or");
+    println!(".gtbundle archive containing provider packs and configuration.");
+    println!();
+
+    // Bundle name
+    println!("  Bundle name (required)");
+    println!("  A short name for this bundle (used as the directory name).");
+    println!("  Examples: my-demo  telecom-bot  customer-support");
+    print!("  > ");
+    io::stdout().flush()?;
+    let mut name_input = String::new();
+    io::stdin().read_line(&mut name_input)?;
+    let bundle_name = name_input.trim().to_string();
+    if bundle_name.is_empty() {
+        anyhow::bail!("Bundle name is required.");
+    }
+    println!();
+
+    // Bundle path
+    let default_path = format!("./{bundle_name}");
+    println!("  Bundle path");
+    println!("  Path to a bundle directory or .gtbundle file.");
+    println!("  Press Enter to use: {default_path}");
+    print!("  > ");
+    io::stdout().flush()?;
+    let mut bundle_input = String::new();
+    io::stdin().read_line(&mut bundle_input)?;
+    let bundle_str = bundle_input.trim();
+    let bundle = if bundle_str.is_empty() {
+        PathBuf::from(&default_path)
+    } else {
+        PathBuf::from(bundle_str)
+    };
+
+    // Resolve bundle and discover existing packs
+    let bundle_dir = resolve_bundle_source(&bundle)?;
+    let discovered =
+        discovery::discover(&bundle_dir).unwrap_or_else(|_| discovery::DiscoveryResult {
+            domains: discovery::DetectedDomains {
+                messaging: false,
+                events: false,
+                oauth: false,
+                state: false,
+                secrets: false,
+            },
+            providers: Vec::new(),
+        });
+
+    // Show existing packs
+    println!();
+    if discovered.providers.is_empty() {
+        println!("  No packs found in bundle.");
+    } else {
+        println!("  Found {} pack(s) in bundle:", discovered.providers.len());
+        for p in &discovered.providers {
+            println!("    - {} ({})", p.provider_id, p.domain);
+        }
+    }
+
+    // Add packs loop
+    println!();
+    println!("  Add packs to bundle");
+    println!("  Enter path to a .gtpack file, or press Enter to skip.");
+    println!("  Examples: ./messaging-telegram.gtpack  ../packs/state-redis.gtpack");
+    loop {
+        print!("  add pack> ");
+        io::stdout().flush()?;
+        let mut pack_input = String::new();
+        io::stdin().read_line(&mut pack_input)?;
+        let pack_str = pack_input.trim();
+        if pack_str.is_empty() {
+            break;
+        }
+
+        let pack_path = PathBuf::from(pack_str);
+        if !pack_path.exists() {
+            println!("    File not found: {pack_str}");
+            continue;
+        }
+        if pack_path.extension().and_then(|e| e.to_str()) != Some("gtpack") {
+            println!("    Not a .gtpack file: {pack_str}");
+            continue;
+        }
+
+        // Detect domain from filename prefix
+        let filename = pack_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let domain = detect_domain_from_filename(filename);
+
+        // Ensure target directory exists
+        let target_dir = bundle_dir.join("providers").join(domain);
+        std::fs::create_dir_all(&target_dir)?;
+
+        let target = target_dir.join(filename);
+        std::fs::copy(&pack_path, &target)?;
+        println!("    Added {filename} -> providers/{domain}/");
+    }
+
+    // Tenant
+    let default_tenant = &cli.tenant;
+    println!();
+    println!("  Tenant (optional)");
+    println!("  Tenant identifier for multi-tenant isolation.");
+    print!("  > (default: {default_tenant}) ");
+    io::stdout().flush()?;
+    let mut tenant_input = String::new();
+    io::stdin().read_line(&mut tenant_input)?;
+    let tenant = if tenant_input.trim().is_empty() {
+        default_tenant.clone()
+    } else {
+        tenant_input.trim().to_string()
+    };
+
+    // Team
+    println!();
+    println!("  Team (optional)");
+    println!("  Team within the tenant. Leave blank for default.");
+    print!("  > ");
+    io::stdout().flush()?;
+    let mut team_input = String::new();
+    io::stdin().read_line(&mut team_input)?;
+    let team = if team_input.trim().is_empty() {
+        None
+    } else {
+        Some(team_input.trim().to_string())
+    };
+
+    // Env
+    let default_env = &cli.env;
+    println!();
+    println!("  Environment (optional)");
+    println!("  Deployment environment for secrets and configuration.");
+    print!("  > (default: {default_env}) ");
+    io::stdout().flush()?;
+    let mut env_input = String::new();
+    io::stdin().read_line(&mut env_input)?;
+    let env = if env_input.trim().is_empty() {
+        default_env.clone()
+    } else {
+        env_input.trim().to_string()
+    };
+
+    // Advanced mode
+    println!();
+    println!("  Advanced mode");
+    println!("  Show all configuration options including optional ones.");
+    print!("  > [y/N] ");
+    io::stdout().flush()?;
+    let mut adv_input = String::new();
+    io::stdin().read_line(&mut adv_input)?;
+    let advanced = matches!(
+        adv_input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "true" | "1"
+    );
+
+    println!();
+
+    Ok(SetupParams {
+        bundle,
+        tenant,
+        team,
+        env,
+        advanced,
+    })
+}
+
+/// Detect provider domain from .gtpack filename prefix.
+///
+/// Known prefixes: messaging-, state-, telemetry-, events-, oauth-, secrets-.
+/// Falls back to "messaging" for unrecognized prefixes.
+fn detect_domain_from_filename(filename: &str) -> &'static str {
+    let stem = filename.strip_suffix(".gtpack").unwrap_or(filename);
+    // messaging-, state-, telemetry- all live in providers/messaging/
+    if stem.starts_with("messaging-")
+        || stem.starts_with("state-")
+        || stem.starts_with("telemetry-")
+    {
+        "messaging"
+    } else if stem.starts_with("events-") || stem.starts_with("event-") {
+        "events"
+    } else if stem.starts_with("oauth-") {
+        "oauth"
+    } else if stem.starts_with("secrets-") {
+        "secrets"
+    } else {
+        "messaging" // default fallback
+    }
+}
+
 /// Run interactive wizard for all discovered packs in the bundle.
 ///
 /// Discovers packs, builds FormSpec for each, and prompts the user
 /// for configuration answers interactively.
-fn run_interactive_wizard(bundle_path: &std::path::Path, env: &str) -> Result<LoadedAnswers> {
+fn run_interactive_wizard(bundle_path: &std::path::Path, env: &str, advanced: bool) -> Result<LoadedAnswers> {
     use serde_json::Value;
 
     let mut all_answers = serde_json::Map::new();
@@ -1278,7 +1514,7 @@ fn run_interactive_wizard(bundle_path: &std::path::Path, env: &str) -> Result<Lo
             }
 
             // Run interactive prompts for this provider
-            let answers = wizard::prompt_form_spec_answers(&spec, provider_id)?;
+            let answers = wizard::prompt_form_spec_answers(&spec, provider_id, advanced)?;
             all_answers.insert(provider_id.clone(), answers);
         } else {
             // No FormSpec available - provider uses flow-based setup or has no questions

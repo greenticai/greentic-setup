@@ -167,9 +167,34 @@ tail -f /tmp/telegram-demo/logs/*.log
 
 ## Key Points untuk Presentasi
 
-1. **Simple Mode** - Cukup `greentic-setup ./bundle`, tidak perlu subcommand
+1. **Simple Mode** - Cukup `gtc setup ./bundle`, tidak perlu subcommand
 2. **Interactive Wizard** - Tanpa --answers, wizard akan prompt
 3. **66 Languages** - Full i18n support
-4. **gtc Integration** - Unified CLI experience
+4. **gtc Integration** - Unified CLI experience via passthrough
 5. **Portable Bundles** - .gtbundle untuk deployment
 6. **CI/CD Ready** - answers.json dari secrets manager
+7. **Refactored from Operator** - Setup logic extracted ke standalone crate (69 tests)
+8. **Greentic-QA Complex Questions** - Conditional jumps (`visible_if`), secret masking, nested expressions
+9. **Admin Endpoint (mTLS)** - Runtime bundle lifecycle: deploy, setup, update, remove via API
+10. **Adaptive Card Setup** - Setup via interactive cards di messaging channels (nice-to-have)
+
+### Demo Narrative: Setup Evolution
+
+```
+OLD WAY (operator-embedded):
+  gtc op demo wizard --answers answers.json --bundle ./bundle --execute
+  ↓ tightly coupled to operator, hard to test, no reuse
+
+NEW WAY (standalone greentic-setup):
+  gtc setup --answers answers.json ./bundle        # CLI setup
+  POST /admin/v1/bundle/deploy                     # API setup (mTLS)
+  [Adaptive Card in Teams/WebChat]                 # Card setup (future)
+```
+
+### Key Architecture Slides
+
+1. **Setup extracted from operator** → reusable by CLI, admin API, card flows
+2. **Greentic-QA FormSpec** → complex question sets with conditional visibility, secret masking
+3. **Admin endpoint** → mTLS-secured HTTP for runtime bundle add/update/remove
+4. **Hot reload** → diff-based detection, in-place provider swap without restart
+5. **Adaptive card setup** → secure one-time token + card rendering in any messaging channel
