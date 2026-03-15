@@ -18,6 +18,10 @@ use crate::discovery;
 
 const EXT_CAPABILITIES_V1: &str = "greentic.ext.capabilities.v1";
 
+fn canonicalize_or_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Result of validating and upgrading packs in a bundle.
 pub struct UpgradeReport {
     pub checked: usize,
@@ -63,14 +67,13 @@ fn read_has_capabilities(pack_path: &Path) -> anyhow::Result<bool> {
 /// 1. Sibling bundles in the same parent directory
 /// 2. `greentic-messaging-providers/target/packs/` in ancestor dirs
 fn find_replacement_pack(pack_filename: &str, bundle_path: &Path, domain: &str) -> Option<PathBuf> {
-    let bundle_abs =
-        std::fs::canonicalize(bundle_path).unwrap_or_else(|_| bundle_path.to_path_buf());
+    let bundle_abs = canonicalize_or_path(bundle_path);
     let parent = bundle_abs.parent()?;
 
     // 1. Sibling bundles: ../*/providers/{domain}/{filename}
     if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.flatten() {
-            let candidate_bundle = entry.path();
+            let candidate_bundle = canonicalize_or_path(&entry.path());
             if candidate_bundle == bundle_abs || !candidate_bundle.is_dir() {
                 continue;
             }
@@ -261,7 +264,9 @@ mod tests {
 
         let result = find_replacement_pack("messaging-test.gtpack", &bundle_a, "messaging");
         assert!(result.is_some());
-        assert!(result.unwrap().starts_with(bundle_b));
+        assert!(
+            canonicalize_or_path(&result.unwrap()).starts_with(canonicalize_or_path(&bundle_b))
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub fn init(args: BundleInitArgs, i18n: &CliI18n) -> Result<()> {
     let bundle_dir = args.path.unwrap_or_else(|| std::path::PathBuf::from("."));
     let bundle_path = bundle_dir.display().to_string();
 
-    if bundle_dir.join("greentic.demo.yaml").exists() {
+    if bundle::is_bundle_root(&bundle_dir) {
         println!("{}", i18n.tf("cli.bundle.init.exists", &[&bundle_path]));
         return Ok(());
     }
@@ -49,7 +49,7 @@ pub fn add(args: BundleAddArgs, i18n: &CliI18n) -> Result<()> {
     );
     println!("{}", i18n.tf("cli.bundle.add.env", &[&args.env]));
 
-    if !bundle_dir.join("greentic.demo.yaml").exists() {
+    if !bundle::is_bundle_root(&bundle_dir) {
         bundle::create_demo_bundle_structure(&bundle_dir, None)
             .context(i18n.t("cli.error.failed_create_bundle"))?;
         println!(
@@ -464,7 +464,7 @@ pub fn status(args: BundleStatusArgs, i18n: &CliI18n) -> Result<()> {
         return Ok(());
     }
 
-    let is_valid = bundle_dir.join("greentic.demo.yaml").exists();
+    let is_valid = bundle::is_bundle_root(&bundle_dir);
 
     let providers_dir = bundle_dir.join("providers");
     let packs_dir = bundle_dir.join("packs");

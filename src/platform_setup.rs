@@ -159,7 +159,7 @@ pub fn prompt_static_routes_policy(
         .unwrap_or(0);
     let public_surface_policy = policies[Select::new()
         .with_prompt("Public surface policy")
-        .items(&policies)
+        .items(policies)
         .default(surface_index)
         .interact()?]
     .to_string();

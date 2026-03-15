@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 
+pub const LEGACY_BUNDLE_MARKER: &str = "greentic.demo.yaml";
+pub const BUNDLE_WORKSPACE_MARKER: &str = "bundle.yaml";
+
 /// Create the standard demo bundle directory structure.
 pub fn create_demo_bundle_structure(root: &Path, bundle_name: Option<&str>) -> anyhow::Result<()> {
     let directories = [
@@ -41,7 +44,7 @@ pub fn create_demo_bundle_structure(root: &Path, bundle_name: Option<&str>) -> a
     if let Some(name) = bundle_name.filter(|v| !v.trim().is_empty()) {
         demo_yaml.push_str(&format!("bundle_name: \"{}\"\n", name.replace('"', "")));
     }
-    write_if_missing(&root.join("greentic.demo.yaml"), &demo_yaml)?;
+    write_if_missing(&root.join(LEGACY_BUNDLE_MARKER), &demo_yaml)?;
     write_if_missing(
         &root.join("tenants").join("default").join("tenant.gmap"),
         "_ = forbidden\n",
@@ -105,13 +108,19 @@ pub fn validate_bundle_exists(bundle: &Path) -> anyhow::Result<()> {
     if !bundle.exists() {
         return Err(anyhow!("bundle path {} does not exist", bundle.display()));
     }
-    if !bundle.join("greentic.demo.yaml").exists() {
+    if !is_bundle_root(bundle) {
         return Err(anyhow!(
-            "bundle {} missing greentic.demo.yaml",
-            bundle.display()
+            "bundle {} missing {} or {}",
+            bundle.display(),
+            LEGACY_BUNDLE_MARKER,
+            BUNDLE_WORKSPACE_MARKER,
         ));
     }
     Ok(())
+}
+
+pub fn is_bundle_root(bundle: &Path) -> bool {
+    bundle.join(LEGACY_BUNDLE_MARKER).exists() || bundle.join(BUNDLE_WORKSPACE_MARKER).exists()
 }
 
 /// Compute the gmap file path for a tenant/team in a bundle.
@@ -232,7 +241,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("demo-bundle");
         create_demo_bundle_structure(&root, Some("test")).unwrap();
-        assert!(root.join("greentic.demo.yaml").exists());
+        assert!(root.join(LEGACY_BUNDLE_MARKER).exists());
         assert!(root.join("providers/messaging").exists());
         assert!(root.join("tenants/demo/teams/default/team.gmap").exists());
     }
@@ -268,6 +277,17 @@ mod tests {
     fn validate_bundle_exists_fails_for_missing() {
         let result = validate_bundle_exists(Path::new("/nonexistent"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_bundle_exists_accepts_bundle_yaml_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle-workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(BUNDLE_WORKSPACE_MARKER), "schema_version: 1\n").unwrap();
+
+        validate_bundle_exists(&root).unwrap();
+        assert!(is_bundle_root(&root));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! my-bundle.gtbundle (SquashFS or ZIP archive)
-//! ├── greentic.demo.yaml
+//! ├── greentic.demo.yaml or bundle.yaml
 //! ├── packs/
 //! ├── providers/
 //! ├── resolved/
@@ -416,22 +416,34 @@ fn add_directory_to_zip<W: Write + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::{BUNDLE_WORKSPACE_MARKER, LEGACY_BUNDLE_MARKER};
     use std::fs;
     use tempfile::tempdir;
 
     fn create_test_bundle(bundle_dir: &Path) {
         fs::create_dir_all(bundle_dir).unwrap();
-        fs::write(bundle_dir.join("greentic.demo.yaml"), "name: test").unwrap();
+        fs::write(bundle_dir.join(LEGACY_BUNDLE_MARKER), "name: test").unwrap();
         fs::create_dir_all(bundle_dir.join("packs")).unwrap();
         fs::write(bundle_dir.join("packs/test.txt"), "hello").unwrap();
     }
 
     fn verify_extracted_bundle(extract_dir: &Path) {
-        assert!(extract_dir.join("greentic.demo.yaml").exists());
+        assert!(extract_dir.join(LEGACY_BUNDLE_MARKER).exists());
         assert!(extract_dir.join("packs/test.txt").exists());
 
         let content = fs::read_to_string(extract_dir.join("packs/test.txt")).unwrap();
         assert_eq!(content, "hello");
+    }
+
+    fn create_test_bundle_workspace(bundle_dir: &Path) {
+        fs::create_dir_all(bundle_dir).unwrap();
+        fs::write(
+            bundle_dir.join(BUNDLE_WORKSPACE_MARKER),
+            "schema_version: 1\n",
+        )
+        .unwrap();
+        fs::create_dir_all(bundle_dir.join("packs")).unwrap();
+        fs::write(bundle_dir.join("packs/test.txt"), "hello").unwrap();
     }
 
     #[test]
@@ -495,6 +507,22 @@ mod tests {
         // Extract archive
         extract_gtbundle(&gtbundle_path, &extract_dir).unwrap();
         verify_extracted_bundle(&extract_dir);
+    }
+
+    #[test]
+    fn test_create_and_extract_gtbundle_with_bundle_yaml_root() {
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("test-bundle");
+        let gtbundle_path = temp.path().join("test.gtbundle");
+        let extract_dir = temp.path().join("extracted");
+
+        create_test_bundle_workspace(&bundle_dir);
+
+        create_gtbundle(&bundle_dir, &gtbundle_path).unwrap();
+        extract_gtbundle(&gtbundle_path, &extract_dir).unwrap();
+
+        assert!(extract_dir.join(BUNDLE_WORKSPACE_MARKER).exists());
+        assert!(extract_dir.join("packs/test.txt").exists());
     }
 
     #[test]
