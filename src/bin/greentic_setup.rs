@@ -23,14 +23,15 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
+use greentic_setup::bundle;
+use greentic_setup::cli;
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{SetupConfig, SetupRequest};
+use greentic_setup::gtbundle;
 use greentic_setup::plan::TenantSelection;
-use greentic_setup::qa::wizard;
-use greentic_setup::setup_to_formspec;
-use greentic_setup::{SetupEngine, SetupMode, bundle, discovery};
+use greentic_setup::{SetupEngine, SetupMode};
 
 /// Global i18n instance (initialized once at startup).
 fn get_i18n() -> &'static CliI18n {
@@ -50,25 +51,34 @@ fn init_i18n(locale: Option<&str>) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli_args = Cli::parse();
 
     // Initialize i18n with CLI locale
-    init_i18n(cli.locale.as_deref());
+    init_i18n(cli_args.locale.as_deref());
 
-    match cli.command {
-        Some(Command::Bundle(cmd)) => match cmd {
-            BundleCommand::Init(args) => init(args),
-            BundleCommand::Add(args) => add(args),
-            BundleCommand::Setup(args) => setup(args),
-            BundleCommand::Update(args) => update(args),
-            BundleCommand::Remove(args) => remove(args),
-            BundleCommand::Build(args) => build(args),
-            BundleCommand::List(args) => list(args),
-            BundleCommand::Status(args) => status(args),
-        },
+    match cli_args.command {
+        Some(Command::Bundle(cmd)) => {
+            let i18n = get_i18n();
+            match cmd {
+                BundleCommand::Init(args) => cli::bundle::init(args, i18n),
+                BundleCommand::Add(args) => cli::bundle::add(args, i18n),
+                BundleCommand::Setup(args) => cli::bundle::setup(args, i18n),
+                BundleCommand::Update(args) => cli::bundle::update(args, i18n),
+                BundleCommand::Remove(args) => cli::bundle::remove(args, i18n),
+                BundleCommand::Build(args) => cli::bundle::build(args, i18n),
+                BundleCommand::List(args) => cli::bundle::list(args, i18n),
+                BundleCommand::Status(args) => cli::bundle::status(args, i18n),
+            }
+        }
+        Some(Command::Wizard(cmd)) => {
+            let i18n = get_i18n();
+            match cmd {
+                WizardCommand::Apply(args) => cli::wizard::apply(args, i18n),
+            }
+        }
         None => {
             // Simple mode: greentic-setup [OPTIONS] <BUNDLE>
-            run_simple_setup(&cli)
+            run_simple_setup(&cli_args)
         }
     }
 }
@@ -137,12 +147,42 @@ enum Command {
     /// Bundle lifecycle management (advanced)
     #[command(subcommand)]
     Bundle(BundleCommand),
+
+    /// Bundle wizard (create bundle with packs)
+    #[command(subcommand)]
+    Wizard(WizardCommand),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum BundleCommand {
+    /// Initialize a new bundle directory
+    Init(cli::BundleInitArgs),
+    /// Add a pack to a bundle
+    Add(cli::BundleAddArgs),
+    /// Run setup flow for provider(s) in a bundle
+    Setup(cli::BundleSetupArgs),
+    /// Update a provider's configuration in a bundle
+    Update(cli::BundleSetupArgs),
+    /// Remove a provider from a bundle
+    Remove(cli::BundleRemoveArgs),
+    /// Build a portable bundle (copy + resolve)
+    Build(cli::BundleBuildArgs),
+    /// List packs or flows in a bundle
+    List(cli::BundleListArgs),
+    /// Show bundle status
+    Status(cli::BundleStatusArgs),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum WizardCommand {
+    /// Apply bundle wizard from answer document
+    Apply(cli::WizardApplyArgs),
 }
 
 /// Run simple setup mode: greentic-setup [OPTIONS] <BUNDLE>
-fn run_simple_setup(cli: &Cli) -> Result<()> {
+fn run_simple_setup(cli_args: &Cli) -> Result<()> {
     let i18n = get_i18n();
-    let bundle_path = cli.bundle.as_ref().ok_or_else(|| {
+    let bundle_path = cli_args.bundle.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "{}\n\n{}",
             i18n.t("cli.simple.bundle_required"),
@@ -164,28 +204,28 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
             &[&bundle_path.display().to_string()]
         )
     );
-    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&cli.tenant]));
+    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&cli_args.tenant]));
     println!(
         "{}",
         i18n.tf(
             "cli.bundle.add.team",
-            &[cli.team.as_deref().unwrap_or("default")]
+            &[cli_args.team.as_deref().unwrap_or("default")]
         )
     );
-    println!("{}", i18n.tf("cli.bundle.add.env", &[&cli.env]));
+    println!("{}", i18n.tf("cli.bundle.add.env", &[&cli_args.env]));
     println!();
 
     let config = SetupConfig {
-        tenant: cli.tenant.clone(),
-        team: cli.team.clone(),
-        env: cli.env.clone(),
+        tenant: cli_args.tenant.clone(),
+        team: cli_args.team.clone(),
+        env: cli_args.env.clone(),
         offline: false,
         verbose: true,
     };
     let engine = SetupEngine::new(config);
 
     // Load answers if provided
-    let setup_answers = if let Some(answers_path) = &cli.answers {
+    let setup_answers = if let Some(answers_path) = &cli_args.answers {
         println!(
             "{}",
             i18n.tf(
@@ -196,31 +236,31 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
         engine
             .load_answers(answers_path)
             .context(i18n.t("cli.error.failed_read_answers"))?
-    } else if cli.emit_answers.is_some() {
+    } else if cli_args.emit_answers.is_some() {
         // Empty answers for emit mode
         serde_json::Map::new()
-    } else if cli.dry_run {
+    } else if cli_args.dry_run {
         // Dry run without answers - will show wizard preview
         serde_json::Map::new()
     } else {
         // Interactive mode - run wizard for each discovered pack
         println!("{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir)?
+        cli::bundle::run_interactive_wizard(&bundle_dir)?
     };
 
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
         tenants: vec![TenantSelection {
-            tenant: cli.tenant.clone(),
-            team: cli.team.clone(),
+            tenant: cli_args.tenant.clone(),
+            team: cli_args.team.clone(),
             allow_paths: Vec::new(),
         }],
         setup_answers,
         ..Default::default()
     };
 
-    let is_dry_run = cli.dry_run || cli.emit_answers.is_some();
+    let is_dry_run = cli_args.dry_run || cli_args.emit_answers.is_some();
     let plan = engine
         .plan(SetupMode::Create, &request, is_dry_run)
         .context(i18n.t("cli.error.failed_build_plan"))?;
@@ -228,7 +268,7 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
     engine.print_plan(&plan);
 
     // Emit answers template if requested
-    if let Some(emit_path) = &cli.emit_answers {
+    if let Some(emit_path) = &cli_args.emit_answers {
         engine
             .emit_answers(&plan, emit_path)
             .context(i18n.t("cli.error.failed_emit_answers"))?;
@@ -252,7 +292,7 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    if cli.dry_run {
+    if cli_args.dry_run {
         println!(
             "\n{}",
             i18n.tf("cli.simple.dry_run", &[&bundle_path.display().to_string()])
@@ -275,10 +315,8 @@ fn run_simple_setup(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Resolve bundle source - supports both directories and .gtbundle files
+/// Resolve bundle source - supports both directories and .gtbundle files.
 fn resolve_bundle_source(path: &std::path::Path) -> Result<PathBuf> {
-    use greentic_setup::gtbundle;
-
     let i18n = get_i18n();
 
     // Check if it's a .gtbundle file (archive)
@@ -333,949 +371,4 @@ fn resolve_bundle_source(path: &std::path::Path) -> Result<PathBuf> {
             )
         );
     }
-}
-
-#[derive(Subcommand, Debug, Clone)]
-enum BundleCommand {
-    /// Initialize a new bundle directory
-    Init(BundleInitArgs),
-    /// Add a pack to a bundle
-    Add(BundleAddArgs),
-    /// Run setup flow for provider(s) in a bundle
-    Setup(BundleSetupArgs),
-    /// Update a provider's configuration in a bundle
-    Update(BundleSetupArgs),
-    /// Remove a provider from a bundle
-    Remove(BundleRemoveArgs),
-    /// Build a portable bundle (copy + resolve)
-    Build(BundleBuildArgs),
-    /// List packs or flows in a bundle
-    List(BundleListArgs),
-    /// Show bundle status
-    Status(BundleStatusArgs),
-}
-
-#[derive(Args, Debug, Clone)]
-struct BundleInitArgs {
-    /// Bundle directory (default: current directory)
-    #[arg(value_name = "PATH")]
-    path: Option<PathBuf>,
-    /// Bundle name
-    #[arg(long = "name", short = 'n')]
-    name: Option<String>,
-}
-
-#[derive(Args, Debug, Clone)]
-struct BundleAddArgs {
-    /// Pack reference (local path or OCI reference)
-    #[arg(value_name = "PACK_REF")]
-    pack_ref: String,
-    /// Bundle directory (default: current directory)
-    #[arg(long = "bundle", short = 'b')]
-    bundle: Option<PathBuf>,
-    /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
-    tenant: String,
-    /// Team identifier
-    #[arg(long = "team")]
-    team: Option<String>,
-    /// Environment (dev/staging/prod)
-    #[arg(long = "env", short = 'e', default_value = "dev")]
-    env: String,
-    /// Dry run (don't actually add)
-    #[arg(long = "dry-run")]
-    dry_run: bool,
-}
-
-#[derive(Args, Debug, Clone)]
-struct BundleSetupArgs {
-    /// Provider ID to setup/update (optional, setup all if not specified)
-    #[arg(value_name = "PROVIDER_ID")]
-    provider_id: Option<String>,
-    /// Bundle directory (default: current directory)
-    #[arg(long = "bundle", short = 'b')]
-    bundle: Option<PathBuf>,
-    /// Answers file (JSON/YAML)
-    #[arg(long = "answers", short = 'a')]
-    answers: Option<PathBuf>,
-    /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
-    tenant: String,
-    /// Team identifier
-    #[arg(long = "team")]
-    team: Option<String>,
-    /// Environment (dev/staging/prod)
-    #[arg(long = "env", short = 'e', default_value = "dev")]
-    env: String,
-    /// Filter by domain (messaging/events/secrets/oauth/all)
-    #[arg(long = "domain", short = 'd', default_value = "all")]
-    domain: String,
-    /// Number of parallel setup operations
-    #[arg(long = "parallel", default_value = "1")]
-    parallel: usize,
-    /// Backup existing config before setup
-    #[arg(long = "backup")]
-    backup: bool,
-    /// Skip secrets initialization
-    #[arg(long = "skip-secrets-init")]
-    skip_secrets_init: bool,
-    /// Continue on error (best effort)
-    #[arg(long = "best-effort")]
-    best_effort: bool,
-    /// Non-interactive mode (require --answers)
-    #[arg(long = "non-interactive")]
-    non_interactive: bool,
-    /// Dry run (plan only, don't execute)
-    #[arg(long = "dry-run")]
-    dry_run: bool,
-    /// Emit answers template JSON (use with --dry-run)
-    #[arg(long = "emit-answers")]
-    emit_answers: Option<PathBuf>,
-}
-
-#[derive(Args, Debug, Clone)]
-struct BundleRemoveArgs {
-    /// Provider ID to remove
-    #[arg(value_name = "PROVIDER_ID")]
-    provider_id: String,
-    /// Bundle directory (default: current directory)
-    #[arg(long = "bundle", short = 'b')]
-    bundle: Option<PathBuf>,
-    /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
-    tenant: String,
-    /// Team identifier
-    #[arg(long = "team")]
-    team: Option<String>,
-    /// Force removal without confirmation
-    #[arg(long = "force", short = 'f')]
-    force: bool,
-}
-
-#[derive(Args, Debug, Clone)]
-struct BundleBuildArgs {
-    /// Bundle directory (default: current directory)
-    #[arg(long = "bundle", short = 'b')]
-    bundle: Option<PathBuf>,
-    /// Output directory for portable bundle
-    #[arg(long = "out", short = 'o')]
-    out: PathBuf,
-    /// Tenant identifier
-    #[arg(long = "tenant", short = 't')]
-    tenant: Option<String>,
-    /// Team identifier
-    #[arg(long = "team")]
-    team: Option<String>,
-    /// Only include used providers
-    #[arg(long = "only-used-providers")]
-    only_used_providers: bool,
-    /// Run doctor validation after build
-    #[arg(long = "doctor")]
-    doctor: bool,
-    /// Skip doctor validation
-    #[arg(long = "skip-doctor")]
-    skip_doctor: bool,
-}
-
-#[derive(Args, Debug, Clone)]
-struct BundleListArgs {
-    /// Bundle directory (default: current directory)
-    #[arg(long = "bundle", short = 'b')]
-    bundle: Option<PathBuf>,
-    /// Filter by domain (messaging/events/secrets/oauth)
-    #[arg(long = "domain", short = 'd', default_value = "messaging")]
-    domain: String,
-    /// Show flows for a specific pack
-    #[arg(long = "pack", short = 'p')]
-    pack: Option<String>,
-    /// Output format (text/json)
-    #[arg(long = "format", default_value = "text")]
-    format: String,
-}
-
-#[derive(Args, Debug, Clone)]
-struct BundleStatusArgs {
-    /// Bundle directory (default: current directory)
-    #[arg(long = "bundle", short = 'b')]
-    bundle: Option<PathBuf>,
-    /// Output format (text/json)
-    #[arg(long = "format", default_value = "text")]
-    format: String,
-}
-
-// ── Command Implementations ─────────────────────────────────────────────────
-
-fn init(args: BundleInitArgs) -> Result<()> {
-    let i18n = get_i18n();
-    let bundle_dir = args.path.unwrap_or_else(|| PathBuf::from("."));
-    let bundle_path = bundle_dir.display().to_string();
-
-    if bundle_dir.join("greentic.demo.yaml").exists() {
-        println!("{}", i18n.tf("cli.bundle.init.exists", &[&bundle_path]));
-        return Ok(());
-    }
-
-    println!("{}", i18n.tf("cli.bundle.init.creating", &[&bundle_path]));
-
-    bundle::create_demo_bundle_structure(&bundle_dir, args.name.as_deref())
-        .context(i18n.t("cli.error.failed_create_bundle"))?;
-
-    println!("{}", i18n.tf("cli.bundle.init.created", &[&bundle_path]));
-    println!("\n{}", i18n.t("cli.bundle.init.next_steps"));
-    println!("{}", i18n.tf("cli.bundle.init.step_add", &[&bundle_path]));
-    println!("{}", i18n.tf("cli.bundle.init.step_setup", &[&bundle_path]));
-
-    Ok(())
-}
-
-fn add(args: BundleAddArgs) -> Result<()> {
-    let i18n = get_i18n();
-    let bundle_dir = resolve_bundle_dir(args.bundle)?;
-    let bundle_path = bundle_dir.display().to_string();
-
-    println!("{}", i18n.t("cli.bundle.add.adding"));
-    println!("{}", i18n.tf("cli.bundle.add.pack_ref", &[&args.pack_ref]));
-    println!("{}", i18n.tf("cli.bundle.add.bundle", &[&bundle_path]));
-    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&args.tenant]));
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.add.team",
-            &[args.team.as_deref().unwrap_or("default")]
-        )
-    );
-    println!("{}", i18n.tf("cli.bundle.add.env", &[&args.env]));
-
-    // Create bundle structure if it doesn't exist
-    if !bundle_dir.join("greentic.demo.yaml").exists() {
-        bundle::create_demo_bundle_structure(&bundle_dir, None)
-            .context(i18n.t("cli.error.failed_create_bundle"))?;
-        println!(
-            "{}",
-            i18n.tf("cli.bundle.add.created_structure", &[&bundle_path])
-        );
-    }
-
-    // Build setup request
-    let request = SetupRequest {
-        bundle: bundle_dir.clone(),
-        pack_refs: vec![args.pack_ref.clone()],
-        tenants: vec![TenantSelection {
-            tenant: args.tenant.clone(),
-            team: args.team.clone(),
-            allow_paths: Vec::new(),
-        }],
-        ..Default::default()
-    };
-
-    let config = SetupConfig {
-        tenant: args.tenant,
-        team: args.team,
-        env: args.env,
-        offline: false,
-        verbose: true,
-    };
-    let engine = SetupEngine::new(config);
-    let plan = engine
-        .plan(SetupMode::Create, &request, args.dry_run)
-        .context(i18n.t("cli.error.failed_build_plan"))?;
-
-    engine.print_plan(&plan);
-
-    if args.dry_run {
-        println!("\n{}", i18n.t("cli.bundle.add.dry_run"));
-        return Ok(());
-    }
-
-    let report = engine
-        .execute(&plan)
-        .context(i18n.t("cli.error.failed_execute_plan"))?;
-
-    println!("\n{}", i18n.t("cli.bundle.add.success"));
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.add.resolved",
-            &[&report.resolved_packs.len().to_string()]
-        )
-    );
-
-    Ok(())
-}
-
-fn setup(args: BundleSetupArgs) -> Result<()> {
-    let i18n = get_i18n();
-    let bundle_dir = resolve_bundle_dir(args.bundle)?;
-
-    bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
-
-    let provider_display = args
-        .provider_id
-        .clone()
-        .unwrap_or_else(|| "all".to_string());
-
-    println!("{}", i18n.t("cli.bundle.setup.setting_up"));
-    println!(
-        "{}",
-        i18n.tf("cli.bundle.setup.provider", &[&provider_display])
-    );
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.add.bundle",
-            &[&bundle_dir.display().to_string()]
-        )
-    );
-    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&args.tenant]));
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.add.team",
-            &[args.team.as_deref().unwrap_or("default")]
-        )
-    );
-    println!("{}", i18n.tf("cli.bundle.add.env", &[&args.env]));
-    println!("{}", i18n.tf("cli.bundle.setup.domain", &[&args.domain]));
-
-    let config = SetupConfig {
-        tenant: args.tenant.clone(),
-        team: args.team.clone(),
-        env: args.env.clone(),
-        offline: false,
-        verbose: true,
-    };
-    let engine = SetupEngine::new(config);
-
-    // Load answers (not required if --emit-answers is provided)
-    let setup_answers = if let Some(answers_path) = &args.answers {
-        engine
-            .load_answers(answers_path)
-            .context(i18n.t("cli.error.failed_read_answers"))?
-    } else if args.emit_answers.is_some() {
-        // Empty answers for emit mode - will generate template
-        serde_json::Map::new()
-    } else if args.non_interactive {
-        bail!("{}", i18n.t("cli.error.answers_required"));
-    } else {
-        // Interactive mode - run wizard for discovered packs
-        println!("\n{}", i18n.t("cli.simple.interactive_mode"));
-        println!();
-        run_interactive_wizard(&bundle_dir)?
-    };
-
-    let providers = args
-        .provider_id
-        .clone()
-        .map_or_else(Vec::new, |id| vec![id]);
-
-    let request = SetupRequest {
-        bundle: bundle_dir.clone(),
-        providers,
-        tenants: vec![TenantSelection {
-            tenant: args.tenant,
-            team: args.team,
-            allow_paths: Vec::new(),
-        }],
-        setup_answers,
-        domain_filter: if args.domain == "all" {
-            None
-        } else {
-            Some(args.domain.clone())
-        },
-        parallel: args.parallel,
-        backup: args.backup,
-        skip_secrets_init: args.skip_secrets_init,
-        best_effort: args.best_effort,
-        ..Default::default()
-    };
-
-    let plan = engine
-        .plan(
-            SetupMode::Create,
-            &request,
-            args.dry_run || args.emit_answers.is_some(),
-        )
-        .context(i18n.t("cli.error.failed_build_plan"))?;
-
-    engine.print_plan(&plan);
-
-    // Emit answers template if requested
-    if let Some(emit_path) = &args.emit_answers {
-        let emit_path_str = emit_path.display().to_string();
-        engine
-            .emit_answers(&plan, emit_path)
-            .context(i18n.t("cli.error.failed_emit_answers"))?;
-        println!(
-            "\n{}",
-            i18n.tf("cli.bundle.setup.emit_written", &[&emit_path_str])
-        );
-        println!(
-            "{}",
-            i18n.tf("cli.bundle.setup.emit_usage", &[&emit_path_str])
-        );
-        return Ok(());
-    }
-
-    if args.dry_run {
-        println!(
-            "\n{}",
-            i18n.tf("cli.bundle.setup.dry_run", &[&provider_display])
-        );
-        return Ok(());
-    }
-
-    engine
-        .execute(&plan)
-        .context(i18n.t("cli.error.failed_execute_plan"))?;
-
-    println!(
-        "\n{}",
-        i18n.tf("cli.bundle.setup.complete", &[&provider_display])
-    );
-
-    Ok(())
-}
-
-fn update(args: BundleSetupArgs) -> Result<()> {
-    let i18n = get_i18n();
-    let bundle_dir = resolve_bundle_dir(args.bundle)?;
-
-    bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
-
-    let provider_display = args
-        .provider_id
-        .clone()
-        .unwrap_or_else(|| "all".to_string());
-
-    println!("{}", i18n.t("cli.bundle.update.updating"));
-    println!(
-        "{}",
-        i18n.tf("cli.bundle.setup.provider", &[&provider_display])
-    );
-    println!("{}", i18n.tf("cli.bundle.setup.domain", &[&args.domain]));
-
-    let config = SetupConfig {
-        tenant: args.tenant.clone(),
-        team: args.team.clone(),
-        env: args.env.clone(),
-        offline: false,
-        verbose: true,
-    };
-    let engine = SetupEngine::new(config);
-
-    let setup_answers = if let Some(answers_path) = &args.answers {
-        engine
-            .load_answers(answers_path)
-            .context(i18n.t("cli.error.failed_read_answers"))?
-    } else if args.emit_answers.is_some() {
-        // Empty answers for emit mode - will generate template
-        serde_json::Map::new()
-    } else if args.non_interactive {
-        bail!("{}", i18n.t("cli.error.answers_required"));
-    } else {
-        // Interactive mode - run wizard for discovered packs
-        println!("\n{}", i18n.t("cli.simple.interactive_mode"));
-        println!();
-        run_interactive_wizard(&bundle_dir)?
-    };
-
-    let providers = args
-        .provider_id
-        .clone()
-        .map_or_else(Vec::new, |id| vec![id]);
-
-    let request = SetupRequest {
-        bundle: bundle_dir.clone(),
-        providers,
-        tenants: vec![TenantSelection {
-            tenant: args.tenant,
-            team: args.team,
-            allow_paths: Vec::new(),
-        }],
-        setup_answers,
-        domain_filter: if args.domain == "all" {
-            None
-        } else {
-            Some(args.domain.clone())
-        },
-        parallel: args.parallel,
-        backup: args.backup,
-        skip_secrets_init: args.skip_secrets_init,
-        best_effort: args.best_effort,
-        ..Default::default()
-    };
-
-    let plan = engine
-        .plan(
-            SetupMode::Update,
-            &request,
-            args.dry_run || args.emit_answers.is_some(),
-        )
-        .context(i18n.t("cli.error.failed_build_plan"))?;
-
-    engine.print_plan(&plan);
-
-    // Emit answers template if requested
-    if let Some(emit_path) = &args.emit_answers {
-        let emit_path_str = emit_path.display().to_string();
-        engine
-            .emit_answers(&plan, emit_path)
-            .context(i18n.t("cli.error.failed_emit_answers"))?;
-        println!(
-            "\n{}",
-            i18n.tf("cli.bundle.setup.emit_written", &[&emit_path_str])
-        );
-        println!(
-            "{}",
-            i18n.tf("cli.bundle.update.emit_usage", &[&emit_path_str])
-        );
-        return Ok(());
-    }
-
-    if args.dry_run {
-        println!(
-            "\n{}",
-            i18n.tf("cli.bundle.update.dry_run", &[&provider_display])
-        );
-        return Ok(());
-    }
-
-    engine
-        .execute(&plan)
-        .context(i18n.t("cli.error.failed_execute_plan"))?;
-
-    println!(
-        "\n{}",
-        i18n.tf("cli.bundle.update.complete", &[&provider_display])
-    );
-
-    Ok(())
-}
-
-fn remove(args: BundleRemoveArgs) -> Result<()> {
-    let i18n = get_i18n();
-    let bundle_dir = resolve_bundle_dir(args.bundle)?;
-
-    bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
-
-    println!("{}", i18n.t("cli.bundle.remove.removing"));
-    println!(
-        "{}",
-        i18n.tf("cli.bundle.setup.provider", &[&args.provider_id])
-    );
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.add.bundle",
-            &[&bundle_dir.display().to_string()]
-        )
-    );
-
-    if !args.force {
-        println!("\n{}", i18n.t("cli.bundle.remove.confirm"));
-        println!("{}", i18n.t("cli.bundle.remove.use_force"));
-        bail!("{}", i18n.t("cli.bundle.remove.cancelled"));
-    }
-
-    let request = SetupRequest {
-        bundle: bundle_dir.clone(),
-        providers_remove: vec![args.provider_id.clone()],
-        tenants: vec![TenantSelection {
-            tenant: args.tenant.clone(),
-            team: args.team.clone(),
-            allow_paths: Vec::new(),
-        }],
-        ..Default::default()
-    };
-
-    let config = SetupConfig {
-        tenant: args.tenant,
-        team: args.team,
-        env: "dev".to_string(),
-        offline: false,
-        verbose: true,
-    };
-    let engine = SetupEngine::new(config);
-    let plan = engine
-        .plan(SetupMode::Remove, &request, false)
-        .context(i18n.t("cli.error.failed_build_plan"))?;
-
-    engine.print_plan(&plan);
-    engine
-        .execute(&plan)
-        .context(i18n.t("cli.error.failed_execute_plan"))?;
-
-    println!(
-        "\n{}",
-        i18n.tf("cli.bundle.remove.complete", &[&args.provider_id])
-    );
-
-    Ok(())
-}
-
-fn build(args: BundleBuildArgs) -> Result<()> {
-    use greentic_setup::gtbundle;
-
-    let i18n = get_i18n();
-    let bundle_dir = resolve_bundle_dir(args.bundle)?;
-
-    bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
-
-    let out_str = args.out.to_string_lossy();
-    let is_archive = out_str.ends_with(".gtbundle");
-
-    println!("{}", i18n.t("cli.bundle.build.building"));
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.add.bundle",
-            &[&bundle_dir.display().to_string()]
-        )
-    );
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.build.output",
-            &[&args.out.display().to_string()]
-        )
-    );
-    println!(
-        "  Format: {}",
-        if is_archive {
-            "archive (.gtbundle)"
-        } else {
-            "directory"
-        }
-    );
-
-    if let Some(ref tenant) = args.tenant {
-        println!("{}", i18n.tf("cli.bundle.add.tenant", &[tenant]));
-    }
-
-    if args.doctor && !args.skip_doctor {
-        println!("\n{}", i18n.t("cli.bundle.build.running_doctor"));
-        // TODO: Integrate with mcp doctor
-    }
-
-    if is_archive {
-        // Create .gtbundle archive
-        gtbundle::create_gtbundle(&bundle_dir, &args.out)
-            .context("failed to create .gtbundle archive")?;
-    } else {
-        // Copy to directory
-        std::fs::create_dir_all(&args.out).context("failed to create output directory")?;
-        copy_dir_recursive(&bundle_dir, &args.out, args.only_used_providers)
-            .context("failed to copy bundle")?;
-    }
-
-    println!(
-        "\n{}",
-        i18n.tf(
-            "cli.bundle.build.success",
-            &[&args.out.display().to_string()]
-        )
-    );
-
-    Ok(())
-}
-
-fn list(args: BundleListArgs) -> Result<()> {
-    let i18n = get_i18n();
-    let bundle_dir = resolve_bundle_dir(args.bundle)?;
-
-    bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
-
-    let mut packs = Vec::new();
-    let providers_dir = bundle_dir.join("providers");
-    let packs_dir = bundle_dir.join("packs");
-
-    // Check providers/<domain>/ directory
-    let domain_dir = providers_dir.join(&args.domain);
-    if domain_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&domain_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "gtpack")
-                && let Some(name) = path.file_stem().and_then(|n| n.to_str())
-            {
-                packs.push((name.to_string(), args.domain.clone()));
-            }
-        }
-    }
-
-    // Check packs/ directory
-    if packs_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&packs_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "gtpack")
-                && let Some(name) = path.file_stem().and_then(|n| n.to_str())
-            {
-                packs.push((name.to_string(), "pack".to_string()));
-            }
-        }
-    }
-
-    // Filter by specific pack if requested
-    if let Some(ref pack_filter) = args.pack {
-        packs.retain(|(name, _)| name.contains(pack_filter));
-    }
-
-    if args.format == "json" {
-        let output = serde_json::json!({
-            "bundle": bundle_dir.display().to_string(),
-            "domain": args.domain,
-            "pack_count": packs.len(),
-            "packs": packs.iter().map(|(name, domain)| {
-                serde_json::json!({
-                    "name": name,
-                    "domain": domain,
-                })
-            }).collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!(
-            "{}",
-            i18n.tf(
-                "cli.bundle.list.bundle",
-                &[&bundle_dir.display().to_string()]
-            )
-        );
-        println!("{}", i18n.tf("cli.bundle.list.domain", &[&args.domain]));
-        println!(
-            "{}",
-            i18n.tf("cli.bundle.list.packs_found", &[&packs.len().to_string()])
-        );
-
-        for (name, domain) in &packs {
-            println!("  - {} ({})", name, domain);
-        }
-    }
-
-    Ok(())
-}
-
-fn status(args: BundleStatusArgs) -> Result<()> {
-    let i18n = get_i18n();
-    let bundle_dir = resolve_bundle_dir(args.bundle)?;
-
-    if !bundle_dir.exists() {
-        if args.format == "json" {
-            println!(r#"{{"exists": false, "path": "{}"}}"#, bundle_dir.display());
-        } else {
-            println!(
-                "{}",
-                i18n.tf(
-                    "cli.bundle.status.not_found",
-                    &[&bundle_dir.display().to_string()]
-                )
-            );
-        }
-        return Ok(());
-    }
-
-    let is_valid = bundle_dir.join("greentic.demo.yaml").exists();
-
-    let providers_dir = bundle_dir.join("providers");
-    let packs_dir = bundle_dir.join("packs");
-    let mut pack_count = 0;
-    let mut packs = Vec::new();
-
-    // Check providers/<domain>/ directories
-    if providers_dir.exists() {
-        for domain in &[
-            "messaging",
-            "events",
-            "oauth",
-            "secrets",
-            "mcp",
-            "state",
-            "other",
-        ] {
-            let domain_dir = providers_dir.join(domain);
-            if domain_dir.exists()
-                && let Ok(entries) = std::fs::read_dir(&domain_dir)
-            {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "gtpack") {
-                        pack_count += 1;
-                        if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                            packs.push(format!("providers/{}/{}", domain, name));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Check packs/ directory
-    if packs_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&packs_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "gtpack") {
-                pack_count += 1;
-                if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                    packs.push(format!("packs/{}", name));
-                }
-            }
-        }
-    }
-
-    // Count tenants
-    let tenants_dir = bundle_dir.join("tenants");
-    let mut tenant_count = 0;
-    let mut tenants = Vec::new();
-
-    if tenants_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&tenants_dir)
-    {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                tenant_count += 1;
-                if let Some(name) = entry.file_name().to_str() {
-                    tenants.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    if args.format == "json" {
-        let status = serde_json::json!({
-            "exists": true,
-            "valid": is_valid,
-            "path": bundle_dir.display().to_string(),
-            "pack_count": pack_count,
-            "packs": packs,
-            "tenant_count": tenant_count,
-            "tenants": tenants,
-        });
-        println!("{}", serde_json::to_string_pretty(&status)?);
-    } else {
-        println!(
-            "{}",
-            i18n.tf(
-                "cli.bundle.status.bundle_label",
-                &[&bundle_dir.display().to_string()]
-            )
-        );
-        let valid_status = if is_valid {
-            i18n.t("cli.bundle.status.valid_yes")
-        } else {
-            i18n.t("cli.bundle.status.valid_no")
-        };
-        println!("Valid: {}", valid_status);
-        println!(
-            "{}",
-            i18n.tf("cli.bundle.status.packs", &[&pack_count.to_string()])
-        );
-        for pack in &packs {
-            println!("  - {}", pack);
-        }
-        println!(
-            "{}",
-            i18n.tf("cli.bundle.status.tenants", &[&tenant_count.to_string()])
-        );
-        for tenant in &tenants {
-            println!("  - {}", tenant);
-        }
-    }
-
-    Ok(())
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn resolve_bundle_dir(bundle: Option<PathBuf>) -> Result<PathBuf> {
-    match bundle {
-        Some(path) => Ok(path),
-        None => std::env::current_dir().context("failed to get current directory"),
-    }
-}
-
-fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, _only_used: bool) -> Result<()> {
-    if !src.is_dir() {
-        bail!("source is not a directory: {}", src.display());
-    }
-
-    std::fs::create_dir_all(dst)?;
-
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path, _only_used)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Run interactive wizard for all discovered packs in the bundle.
-///
-/// Discovers packs, builds FormSpec for each, and prompts the user
-/// for configuration answers interactively.
-fn run_interactive_wizard(
-    bundle_path: &std::path::Path,
-) -> Result<serde_json::Map<String, serde_json::Value>> {
-    use serde_json::Value;
-
-    let mut all_answers = serde_json::Map::new();
-
-    // Discover packs in the bundle
-    let discovered = discovery::discover(bundle_path)?;
-
-    if discovered.providers.is_empty() {
-        println!("No providers found in bundle. Nothing to configure.");
-        return Ok(all_answers);
-    }
-
-    println!(
-        "Found {} provider(s) to configure:",
-        discovered.providers.len()
-    );
-    for provider in &discovered.providers {
-        println!("  - {} ({})", provider.provider_id, provider.domain);
-    }
-    println!();
-
-    // Run wizard for each provider
-    for provider in &discovered.providers {
-        let provider_id = &provider.provider_id;
-
-        // Try to build FormSpec from setup.yaml or pack manifest
-        let form_spec = setup_to_formspec::pack_to_form_spec(&provider.pack_path, provider_id);
-
-        if let Some(spec) = form_spec {
-            if spec.questions.is_empty() {
-                println!("Provider {}: No configuration required.", provider_id);
-                all_answers.insert(provider_id.clone(), Value::Object(serde_json::Map::new()));
-                continue;
-            }
-
-            // Run interactive prompts for this provider
-            let answers = wizard::prompt_form_spec_answers(&spec, provider_id)?;
-            all_answers.insert(provider_id.clone(), answers);
-        } else {
-            // No FormSpec available - provider uses flow-based setup or has no questions
-            println!(
-                "Provider {}: No setup questions found (may use flow-based setup).",
-                provider_id
-            );
-            all_answers.insert(provider_id.clone(), Value::Object(serde_json::Map::new()));
-        }
-
-        println!();
-    }
-
-    Ok(all_answers)
 }
