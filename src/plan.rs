@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::deployment_targets::DeploymentTargetRecord;
 use crate::platform_setup::StaticRoutesPolicy;
 
 /// The operation mode for a setup plan.
@@ -51,6 +52,7 @@ pub struct SetupPlanMetadata {
     pub tenants_remove: Vec<TenantSelection>,
     pub access_changes: Vec<AccessChangeSelection>,
     pub static_routes: StaticRoutesPolicy,
+    pub deployment_targets: Vec<DeploymentTargetRecord>,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
 }
 

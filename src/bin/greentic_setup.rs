@@ -26,7 +26,8 @@ use clap::Parser;
 use greentic_setup::cli_args::{BundleCommand, Cli, Command};
 use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
-    prompt_setup_params, resolve_bundle_source, run_interactive_wizard,
+    complete_loaded_answers_with_prompts, ensure_deployment_targets_present, prompt_setup_params,
+    resolve_bundle_source, run_interactive_wizard,
 };
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
@@ -146,15 +147,31 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             )
         );
         engine
-            .load_answers(answers_path)
+            .load_answers(answers_path, cli.key.as_deref(), true)
             .context(i18n.t("cli.error.failed_read_answers"))?
     } else if cli.emit_answers.is_some() || cli.dry_run {
         LoadedAnswers::default()
     } else {
         println!("{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir, &cli.env, advanced)?
+        run_interactive_wizard(&bundle_dir, &tenant, team.as_deref(), &cli.env, advanced)?
     };
+
+    let loaded_answers = if cli.answers.is_some() {
+        complete_loaded_answers_with_prompts(
+            &bundle_dir,
+            &tenant,
+            team.as_deref(),
+            &cli.env,
+            advanced,
+            loaded_answers,
+        )?
+    } else {
+        loaded_answers
+    };
+    if cli.answers.is_some() {
+        ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
+    }
 
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
@@ -168,6 +185,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             &cli.env,
         )
         .context(i18n.t("cli.error.failed_read_answers"))?,
+        deployment_targets: loaded_answers.platform_setup.deployment_targets,
         setup_answers: loaded_answers.setup_answers,
         ..Default::default()
     };
@@ -181,7 +199,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
 
     if let Some(emit_path) = &cli.emit_answers {
         engine
-            .emit_answers(&plan, emit_path)
+            .emit_answers(&plan, emit_path, cli.key.as_deref(), true)
             .context(i18n.t("cli.error.failed_emit_answers"))?;
         println!(
             "\n{}",

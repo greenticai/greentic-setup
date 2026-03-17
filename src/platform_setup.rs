@@ -8,6 +8,8 @@ use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::deployment_targets::DeploymentTargetRecord;
+
 const STATIC_ROUTES_VERSION: u32 = 1;
 const PACK_DECLARED_POLICY: &str = "pack_declared";
 const SURFACE_ENABLED: &str = "enabled";
@@ -17,6 +19,8 @@ const SURFACE_DISABLED: &str = "disabled";
 pub struct PlatformSetupAnswers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_routes: Option<StaticRoutesAnswers>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deployment_targets: Vec<DeploymentTargetRecord>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +198,58 @@ pub fn load_static_routes_artifact(bundle_root: &Path) -> Result<Option<StaticRo
     let policy = serde_json::from_str(&raw)
         .or_else(|_| serde_yaml_bw::from_str(&raw))
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(policy))
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeEndpoints {
+    #[allow(dead_code)]
+    tenant: Option<String>,
+    #[allow(dead_code)]
+    team: Option<String>,
+    public_base_url: Option<String>,
+}
+
+pub fn load_runtime_public_base_url(
+    bundle_root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+) -> Result<Option<String>> {
+    let team = team.unwrap_or("default");
+    let path = bundle_root
+        .join("state")
+        .join("runtime")
+        .join(format!("{tenant}.{team}"))
+        .join("endpoints.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let endpoints: RuntimeEndpoints = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(endpoints
+        .public_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string))
+}
+
+pub fn load_effective_static_routes_defaults(
+    bundle_root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+) -> Result<Option<StaticRoutesPolicy>> {
+    let mut policy = load_static_routes_artifact(bundle_root)?.unwrap_or_default();
+    if policy.public_base_url.is_none()
+        && let Some(runtime_url) = load_runtime_public_base_url(bundle_root, tenant, team)?
+    {
+        policy.public_base_url = Some(runtime_url);
+    }
+    if policy == StaticRoutesPolicy::disabled() {
+        return Ok(None);
+    }
     Ok(Some(policy))
 }
 
@@ -402,5 +458,28 @@ mod tests {
         assert!(path.exists());
         let loaded = load_static_routes_artifact(temp.path()).unwrap().unwrap();
         assert_eq!(loaded, policy);
+    }
+
+    #[test]
+    fn effective_defaults_fall_back_to_runtime_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp
+            .path()
+            .join("state")
+            .join("runtime")
+            .join("demo.default");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            r#"{"tenant":"demo","team":"default","public_base_url":"https://runtime.example.com"}"#,
+        )
+        .unwrap();
+
+        let loaded =
+            load_effective_static_routes_defaults(temp.path(), "demo", Some("default")).unwrap();
+        assert_eq!(
+            loaded.and_then(|policy| policy.public_base_url),
+            Some("https://runtime.example.com".to_string())
+        );
     }
 }

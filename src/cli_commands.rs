@@ -3,7 +3,10 @@
 use anyhow::{Context, Result, bail};
 
 use crate::cli_args::*;
-use crate::cli_helpers::{copy_dir_recursive, resolve_bundle_dir, run_interactive_wizard};
+use crate::cli_helpers::{
+    complete_loaded_answers_with_prompts, copy_dir_recursive, ensure_deployment_targets_present,
+    resolve_bundle_dir, run_interactive_wizard,
+};
 use crate::cli_i18n::CliI18n;
 use crate::engine::{LoadedAnswers, SetupConfig, SetupRequest};
 use crate::plan::TenantSelection;
@@ -153,7 +156,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
 
     let loaded_answers = if let Some(answers_path) = &args.answers {
         engine
-            .load_answers(answers_path)
+            .load_answers(answers_path, args.key.as_deref(), !args.non_interactive)
             .context(i18n.t("cli.error.failed_read_answers"))?
     } else if args.emit_answers.is_some() {
         LoadedAnswers::default()
@@ -162,8 +165,29 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     } else {
         println!("\n{}", i18n.t("cli.simple.interactive_mode"));
         println!();
-        run_interactive_wizard(&bundle_dir, &args.env, args.advanced)?
+        run_interactive_wizard(
+            &bundle_dir,
+            &args.tenant,
+            args.team.as_deref(),
+            &args.env,
+            args.advanced,
+        )?
     };
+    let loaded_answers = if args.answers.is_some() && !args.non_interactive {
+        complete_loaded_answers_with_prompts(
+            &bundle_dir,
+            &args.tenant,
+            args.team.as_deref(),
+            &args.env,
+            args.advanced,
+            loaded_answers,
+        )?
+    } else {
+        loaded_answers
+    };
+    if args.non_interactive {
+        ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
+    }
 
     let providers = args
         .provider_id
@@ -183,6 +207,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
             &args.env,
         )
         .context(i18n.t("cli.error.failed_read_answers"))?,
+        deployment_targets: loaded_answers.platform_setup.deployment_targets,
         setup_answers: loaded_answers.setup_answers,
         domain_filter: if args.domain == "all" {
             None
@@ -205,7 +230,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     if let Some(emit_path) = &args.emit_answers {
         let emit_path_str = emit_path.display().to_string();
         engine
-            .emit_answers(&plan, emit_path)
+            .emit_answers(&plan, emit_path, args.key.as_deref(), !args.non_interactive)
             .context(i18n.t("cli.error.failed_emit_answers"))?;
         println!(
             "\n{}",

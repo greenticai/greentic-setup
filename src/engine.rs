@@ -10,11 +10,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use serde_json::{Map as JsonMap, Value};
 
+use crate::answers_crypto;
 use crate::bundle;
 use crate::discovery;
 use crate::plan::*;
 use crate::platform_setup::{
-    PlatformSetupAnswers, StaticRoutesPolicy, load_static_routes_artifact,
+    PlatformSetupAnswers, StaticRoutesPolicy, load_effective_static_routes_defaults,
     persist_static_routes_artifact,
 };
 use crate::setup_input;
@@ -41,6 +42,7 @@ pub struct SetupRequest {
     pub tenants_remove: Vec<TenantSelection>,
     pub access_changes: Vec<AccessChangeSelection>,
     pub static_routes: StaticRoutesPolicy,
+    pub deployment_targets: Vec<crate::deployment_targets::DeploymentTargetRecord>,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
     /// Filter by provider domain (messaging, events, secrets, oauth).
     pub domain_filter: Option<String>,
@@ -137,6 +139,10 @@ impl SetupEngine {
                 }
                 SetupStepKind::AddPacksToBundle => {
                     self.execute_add_packs_to_bundle(bundle, &report.resolved_packs)?;
+                    let _ = crate::deployment_targets::persist_explicit_deployment_targets(
+                        bundle,
+                        &plan.metadata.deployment_targets,
+                    );
                     if self.config.verbose {
                         println!("  [done] {}", step.description);
                     }
@@ -197,7 +203,13 @@ impl SetupEngine {
     ///
     /// Discovers all packs in the bundle and generates a template with all
     /// setup questions. Users fill this in and pass it via `--answers`.
-    pub fn emit_answers(&self, plan: &SetupPlan, output_path: &Path) -> anyhow::Result<()> {
+    pub fn emit_answers(
+        &self,
+        plan: &SetupPlan,
+        output_path: &Path,
+        key: Option<&str>,
+        interactive: bool,
+    ) -> anyhow::Result<()> {
         let bundle = &plan.bundle;
 
         // Build the answers document structure
@@ -208,14 +220,19 @@ impl SetupEngine {
             "team": self.config.team,
             "env": self.config.env,
             "platform_setup": {
-                "static_routes": plan.metadata.static_routes.to_answers()
+                "static_routes": plan.metadata.static_routes.to_answers(),
+                "deployment_targets": plan.metadata.deployment_targets
             },
             "setup_answers": {}
         });
 
         if !plan.metadata.static_routes.public_web_enabled
             && plan.metadata.static_routes.public_base_url.is_none()
-            && let Some(existing) = load_static_routes_artifact(bundle)?
+            && let Some(existing) = load_effective_static_routes_defaults(
+                bundle,
+                &self.config.tenant,
+                self.config.team.as_deref(),
+            )?
         {
             answers_doc["platform_setup"]["static_routes"] =
                 serde_json::to_value(existing.to_answers())?;
@@ -267,6 +284,8 @@ impl SetupEngine {
             }
         }
 
+        self.encrypt_secret_answers(bundle, &mut answers_doc, key, interactive)?;
+
         // Write the answers document to the output path
         let output_content = serde_json::to_string_pretty(&answers_doc)
             .context("failed to serialize answers document")?;
@@ -284,8 +303,27 @@ impl SetupEngine {
     }
 
     /// Load answers from a JSON/YAML file.
-    pub fn load_answers(&self, answers_path: &Path) -> anyhow::Result<LoadedAnswers> {
+    pub fn load_answers(
+        &self,
+        answers_path: &Path,
+        key: Option<&str>,
+        interactive: bool,
+    ) -> anyhow::Result<LoadedAnswers> {
         let raw = setup_input::load_setup_input(answers_path)?;
+        let raw = if answers_crypto::has_encrypted_values(&raw) {
+            let resolved_key = match key {
+                Some(value) => value.to_string(),
+                None if interactive => answers_crypto::prompt_for_key("decrypting answers")?,
+                None => {
+                    return Err(anyhow!(
+                        "answers file contains encrypted secret values; rerun with --key or interactive input"
+                    ));
+                }
+            };
+            answers_crypto::decrypt_tree(&raw, &resolved_key)?
+        } else {
+            raw
+        };
         match raw {
             Value::Object(map) => {
                 let platform_setup = map
@@ -320,6 +358,78 @@ impl SetupEngine {
             }
             _ => Err(anyhow!("answers file must be a JSON/YAML object")),
         }
+    }
+
+    fn encrypt_secret_answers(
+        &self,
+        bundle: &Path,
+        answers_doc: &mut Value,
+        key: Option<&str>,
+        interactive: bool,
+    ) -> anyhow::Result<()> {
+        let setup_answers = answers_doc
+            .get_mut("setup_answers")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("internal error: setup_answers not an object"))?;
+        let discovered = if bundle.exists() {
+            discovery::discover(bundle)?
+        } else {
+            return Ok(());
+        };
+
+        let mut secret_paths = Vec::new();
+        for provider in discovered.providers {
+            let Some(form_spec) = crate::setup_to_formspec::pack_to_form_spec(
+                &provider.pack_path,
+                &provider.provider_id,
+            ) else {
+                continue;
+            };
+            let Some(provider_answers) = setup_answers
+                .get_mut(&provider.provider_id)
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            for question in form_spec.questions {
+                if !question.secret {
+                    continue;
+                }
+                let Some(value) = provider_answers.get(&question.id).cloned() else {
+                    continue;
+                };
+                if value.is_null() || value == Value::String(String::new()) {
+                    continue;
+                }
+                secret_paths.push((provider.provider_id.clone(), question.id.clone(), value));
+            }
+        }
+
+        if secret_paths.is_empty() {
+            return Ok(());
+        }
+
+        let resolved_key = match key {
+            Some(value) => value.to_string(),
+            None if interactive => answers_crypto::prompt_for_key("encrypting answers")?,
+            None => {
+                return Err(anyhow!(
+                    "answer document includes secret values; rerun with --key or interactive input"
+                ));
+            }
+        };
+
+        for (provider_id, field_id, value) in secret_paths {
+            let encrypted = answers_crypto::encrypt_value(&value, &resolved_key)?;
+            if let Some(provider_answers) = setup_answers
+                .get_mut(&provider_id)
+                .and_then(Value::as_object_mut)
+            {
+                provider_answers.insert(field_id, encrypted);
+            }
+        }
+
+        Ok(())
     }
 
     // ── Step executors ─────────────────────────────────────────────────────
@@ -448,6 +558,11 @@ impl SetupEngine {
     ) -> anyhow::Result<usize> {
         let mut count = 0;
 
+        if !metadata.providers_remove.is_empty() {
+            count +=
+                self.execute_remove_provider_artifacts(bundle_path, &metadata.providers_remove)?;
+        }
+
         // Auto-install provider packs that are referenced in setup_answers
         // but not yet present in the bundle.
         self.auto_install_provider_packs(bundle_path, metadata);
@@ -525,6 +640,10 @@ impl SetupEngine {
         }
 
         persist_static_routes_artifact(bundle_path, &metadata.static_routes)?;
+        let _ = crate::deployment_targets::persist_explicit_deployment_targets(
+            bundle_path,
+            &metadata.deployment_targets,
+        );
 
         // Print post-setup instructions for providers needing manual steps
         let provider_configs: Vec<(String, Value)> = metadata
@@ -536,6 +655,53 @@ impl SetupEngine {
         crate::webhook::print_post_setup_instructions(&provider_configs, &self.config.tenant, team);
 
         Ok(count)
+    }
+
+    fn execute_remove_provider_artifacts(
+        &self,
+        bundle_path: &Path,
+        providers_remove: &[String],
+    ) -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        let discovered = discovery::discover(bundle_path).ok();
+        for provider_id in providers_remove {
+            if let Some(discovered) = discovered.as_ref()
+                && let Some(provider) = discovered
+                    .providers
+                    .iter()
+                    .find(|provider| provider.provider_id == *provider_id)
+            {
+                if provider.pack_path.exists() {
+                    std::fs::remove_file(&provider.pack_path).with_context(|| {
+                        format!(
+                            "failed to remove provider pack {}",
+                            provider.pack_path.display()
+                        )
+                    })?;
+                }
+                removed += 1;
+            } else {
+                let target_dir = Self::get_pack_target_dir(bundle_path, provider_id);
+                let target_path = target_dir.join(format!("{provider_id}.gtpack"));
+                if target_path.exists() {
+                    std::fs::remove_file(&target_path).with_context(|| {
+                        format!("failed to remove provider pack {}", target_path.display())
+                    })?;
+                    removed += 1;
+                }
+            }
+
+            let config_dir = bundle_path.join("state").join("config").join(provider_id);
+            if config_dir.exists() {
+                std::fs::remove_dir_all(&config_dir).with_context(|| {
+                    format!(
+                        "failed to remove provider config dir {}",
+                        config_dir.display()
+                    )
+                })?;
+            }
+        }
+        Ok(removed)
     }
 
     /// Search sibling bundles for provider packs referenced in setup_answers
@@ -1063,6 +1229,7 @@ pub fn apply_remove(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             tenants_remove: request.tenants_remove.clone(),
             access_changes: request.access_changes.clone(),
             static_routes: request.static_routes.clone(),
+            deployment_targets: request.deployment_targets.clone(),
             setup_answers: request.setup_answers.clone(),
         },
     })
@@ -1164,6 +1331,7 @@ fn build_metadata(
         tenants_remove: request.tenants_remove.clone(),
         access_changes: request.access_changes.clone(),
         static_routes: request.static_routes.clone(),
+        deployment_targets: request.deployment_targets.clone(),
         setup_answers: request.setup_answers.clone(),
     }
 }
@@ -1299,6 +1467,10 @@ platform_setup:
   static_routes:
     public_web_enabled: true
     public_base_url: https://example.com/base/
+  deployment_targets:
+    - target: aws
+      provider_pack: packs/aws.gtpack
+      default: true
 setup_answers:
   messaging-webchat:
     jwt_signing_key: abc
@@ -1313,7 +1485,7 @@ setup_answers:
             offline: false,
             verbose: false,
         });
-        let loaded = engine.load_answers(&answers_path).unwrap();
+        let loaded = engine.load_answers(&answers_path, None, false).unwrap();
         assert_eq!(
             loaded
                 .platform_setup
@@ -1330,6 +1502,8 @@ setup_answers:
                 .and_then(Value::as_str),
             Some("abc")
         );
+        assert_eq!(loaded.platform_setup.deployment_targets.len(), 1);
+        assert_eq!(loaded.platform_setup.deployment_targets[0].target, "aws");
     }
 
     #[test]
@@ -1364,12 +1538,56 @@ setup_answers:
         };
         let plan = engine.plan(SetupMode::Create, &request, true).unwrap();
         let output = temp.path().join("answers.json");
-        engine.emit_answers(&plan, &output).unwrap();
+        engine.emit_answers(&plan, &output, None, false).unwrap();
         let emitted: Value =
             serde_json::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
         assert_eq!(
             emitted["platform_setup"]["static_routes"]["public_base_url"],
             json!("https://example.com")
+        );
+        assert_eq!(emitted["platform_setup"]["deployment_targets"], json!([]));
+    }
+
+    #[test]
+    fn emit_answers_falls_back_to_runtime_public_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        let runtime_dir = bundle_root
+            .join("state")
+            .join("runtime")
+            .join("demo.default");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            r#"{"tenant":"demo","team":"default","public_base_url":"https://runtime.example.com"}"#,
+        )
+        .unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "prod".into(),
+            offline: false,
+            verbose: false,
+        });
+        let request = SetupRequest {
+            bundle: bundle_root.clone(),
+            tenants: vec![TenantSelection {
+                tenant: "demo".into(),
+                team: Some("default".into()),
+                allow_paths: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let plan = engine.plan(SetupMode::Create, &request, true).unwrap();
+        let output = temp.path().join("answers-runtime.json");
+        engine.emit_answers(&plan, &output, None, false).unwrap();
+        let emitted: Value =
+            serde_json::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(
+            emitted["platform_setup"]["static_routes"]["public_base_url"],
+            json!("https://runtime.example.com")
         );
     }
 
@@ -1404,6 +1622,45 @@ setup_answers:
         let stored: Value =
             serde_json::from_str(&std::fs::read_to_string(artifact).unwrap()).unwrap();
         assert_eq!(stored["public_web_enabled"], json!(true));
+    }
+
+    #[test]
+    fn remove_execute_deletes_provider_artifact_and_config_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        let provider_dir = bundle_root.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let provider_pack = provider_dir.join("messaging-webchat.gtpack");
+        std::fs::copy(
+            bundle_root.join("packs").join("default.gtpack"),
+            &provider_pack,
+        )
+        .unwrap();
+        let config_dir = bundle_root
+            .join("state")
+            .join("config")
+            .join("messaging-webchat");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("setup-answers.json"), "{}").unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: None,
+            env: "prod".into(),
+            offline: false,
+            verbose: false,
+        });
+        let request = SetupRequest {
+            bundle: bundle_root.clone(),
+            providers_remove: vec!["messaging-webchat".into()],
+            ..Default::default()
+        };
+        let plan = engine.plan(SetupMode::Remove, &request, false).unwrap();
+        engine.execute(&plan).unwrap();
+
+        assert!(!provider_pack.exists());
+        assert!(!config_dir.exists());
     }
 
     #[test]

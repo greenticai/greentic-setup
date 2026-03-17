@@ -9,7 +9,7 @@ use crate::cli_i18n::CliI18n;
 use crate::discovery;
 use crate::engine::LoadedAnswers;
 use crate::platform_setup::{
-    PlatformSetupAnswers, load_static_routes_artifact, prompt_static_routes_policy,
+    PlatformSetupAnswers, load_effective_static_routes_defaults, prompt_static_routes_policy,
 };
 use crate::qa::wizard;
 use crate::setup_to_formspec;
@@ -326,14 +326,19 @@ pub fn prompt_setup_params(cli: &Cli, i18n: &CliI18n) -> Result<SetupParams> {
 /// Run interactive wizard for all discovered packs in the bundle.
 pub fn run_interactive_wizard(
     bundle_path: &std::path::Path,
+    tenant: &str,
+    team: Option<&str>,
     env: &str,
     advanced: bool,
 ) -> Result<LoadedAnswers> {
     use serde_json::Value;
 
     let mut all_answers = serde_json::Map::new();
-    let existing_static_routes = load_static_routes_artifact(bundle_path)?;
+    let existing_static_routes = load_effective_static_routes_defaults(bundle_path, tenant, team)?;
     let static_routes = prompt_static_routes_policy(env, existing_static_routes.as_ref())?;
+    let deployment_targets = crate::deployment_targets::prompt_deployment_targets(
+        &crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?,
+    )?;
 
     let discovered = discovery::discover(bundle_path)?;
 
@@ -342,6 +347,7 @@ pub fn run_interactive_wizard(
         return Ok(LoadedAnswers {
             platform_setup: PlatformSetupAnswers {
                 static_routes: Some(static_routes.to_answers()),
+                deployment_targets,
             },
             setup_answers: all_answers,
         });
@@ -383,7 +389,79 @@ pub fn run_interactive_wizard(
     Ok(LoadedAnswers {
         platform_setup: PlatformSetupAnswers {
             static_routes: Some(static_routes.to_answers()),
+            deployment_targets,
         },
         setup_answers: all_answers,
     })
+}
+
+pub fn complete_loaded_answers_with_prompts(
+    bundle_path: &std::path::Path,
+    tenant: &str,
+    team: Option<&str>,
+    env: &str,
+    advanced: bool,
+    mut loaded: LoadedAnswers,
+) -> Result<LoadedAnswers> {
+    if loaded.platform_setup.static_routes.is_none() {
+        let existing_static_routes =
+            load_effective_static_routes_defaults(bundle_path, tenant, team)?;
+        let static_routes = prompt_static_routes_policy(env, existing_static_routes.as_ref())?;
+        loaded.platform_setup.static_routes = Some(static_routes.to_answers());
+    }
+    if loaded.platform_setup.deployment_targets.is_empty() {
+        loaded.platform_setup.deployment_targets =
+            crate::deployment_targets::prompt_deployment_targets(
+                &crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?,
+            )?;
+    }
+
+    let discovered = discovery::discover(bundle_path)?;
+    for provider in &discovered.providers {
+        let provider_id = &provider.provider_id;
+        let existing = loaded
+            .setup_answers
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let form_spec = setup_to_formspec::pack_to_form_spec(&provider.pack_path, provider_id);
+        let completed = if let Some(spec) = form_spec {
+            if spec.questions.is_empty() {
+                existing
+            } else {
+                wizard::prompt_form_spec_answers_with_existing(
+                    &spec,
+                    provider_id,
+                    advanced,
+                    &existing,
+                )?
+            }
+        } else {
+            existing
+        };
+        loaded.setup_answers.insert(provider_id.clone(), completed);
+    }
+
+    Ok(loaded)
+}
+
+pub fn ensure_deployment_targets_present(
+    bundle_path: &std::path::Path,
+    loaded: &LoadedAnswers,
+) -> Result<()> {
+    if !loaded.platform_setup.deployment_targets.is_empty() {
+        return Ok(());
+    }
+    let candidates = crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "bundle contains deployer packs ({}) but answers did not define platform_setup.deployment_targets",
+        candidates
+            .iter()
+            .map(|value| value.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }

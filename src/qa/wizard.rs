@@ -168,6 +168,20 @@ pub fn prompt_form_spec_answers(
     provider_id: &str,
     advanced: bool,
 ) -> Result<Value> {
+    prompt_form_spec_answers_with_existing(
+        spec,
+        provider_id,
+        advanced,
+        &Value::Object(JsonMap::new()),
+    )
+}
+
+pub fn prompt_form_spec_answers_with_existing(
+    spec: &FormSpec,
+    provider_id: &str,
+    advanced: bool,
+    initial_answers: &Value,
+) -> Result<Value> {
     let display = setup_to_formspec::strip_domain_prefix(provider_id);
     let mode_label = if advanced { " (advanced)" } else { "" };
     println!("\nConfiguring {display}: {}{mode_label}", spec.title);
@@ -177,13 +191,9 @@ pub fn prompt_form_spec_answers(
         println!("{intro}");
     }
 
-    let mut answers = JsonMap::new();
+    let mut answers = initial_answers.as_object().cloned().unwrap_or_default();
     for question in &spec.questions {
         if question.id.is_empty() {
-            continue;
-        }
-        // In normal mode, skip optional questions.
-        if !advanced && !question.required {
             continue;
         }
         // Re-evaluate visibility with answers collected so far.
@@ -194,11 +204,46 @@ pub fn prompt_form_spec_answers(
                 continue;
             }
         }
+        let existing = answers.get(&question.id);
+        if existing
+            .filter(|value| answer_satisfies_question(question, value))
+            .is_some()
+        {
+            continue;
+        }
+        // In normal mode, skip optional missing questions.
+        if !advanced && !question.required {
+            continue;
+        }
         if let Some(value) = ask_form_spec_question(question)? {
             answers.insert(question.id.clone(), value);
         }
     }
     Ok(Value::Object(answers))
+}
+
+fn answer_satisfies_question(question: &QuestionSpec, value: &Value) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    if let Some(ref choices) = question.choices
+        && !choices.is_empty()
+    {
+        let Some(candidate) = value.as_str() else {
+            return false;
+        };
+        if !choices.iter().any(|choice| choice == candidate) {
+            return false;
+        }
+    }
+    if let Some(ref constraint) = question.constraint
+        && let Some(ref pattern) = constraint.pattern
+        && let Some(candidate) = value.as_str()
+        && !matches_pattern(candidate, pattern)
+    {
+        return false;
+    }
+    true
 }
 
 fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> {

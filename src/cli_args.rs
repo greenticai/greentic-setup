@@ -43,6 +43,10 @@ pub struct Cli {
     #[arg(long = "answers", short = 'a', value_name = "FILE", global = true)]
     pub answers: Option<PathBuf>,
 
+    /// Encryption/decryption key for answer documents that include secrets
+    #[arg(long = "key", value_name = "KEY", global = true)]
+    pub key: Option<String>,
+
     /// Tenant identifier
     #[arg(long = "tenant", short = 't', default_value = "demo", global = true)]
     pub tenant: String,
@@ -137,6 +141,9 @@ pub struct BundleSetupArgs {
     /// Answers file (JSON/YAML)
     #[arg(long = "answers", short = 'a')]
     pub answers: Option<PathBuf>,
+    /// Encryption/decryption key for answer documents that include secrets
+    #[arg(long = "key", value_name = "KEY")]
+    pub key: Option<String>,
     /// Tenant identifier
     #[arg(long = "tenant", short = 't', default_value = "demo")]
     pub tenant: String,

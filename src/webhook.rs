@@ -10,6 +10,31 @@
 
 use serde_json::{Value, json};
 
+pub fn registration_result_from_declared_ops(config: &Value) -> Option<Value> {
+    let webhook_ops = config.get("webhook_ops")?.as_array()?;
+    if webhook_ops.is_empty() {
+        return None;
+    }
+    let subscription_ops = config
+        .get("subscription_ops")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let oauth_ops = config
+        .get("oauth_ops")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Some(json!({
+        "ok": true,
+        "mode": "declared_ops",
+        "webhook_ops": webhook_ops,
+        "subscription_ops": subscription_ops,
+        "oauth_ops": oauth_ops,
+    }))
+}
+
 /// Check whether a provider's answers contain a valid `public_base_url`
 /// suitable for webhook registration.
 pub fn has_webhook_url(answers: &Value) -> Option<&str> {
@@ -31,6 +56,10 @@ pub fn register_webhook(
     tenant: &str,
     team: Option<&str>,
 ) -> Option<Value> {
+    if let Some(result) = registration_result_from_declared_ops(config) {
+        return Some(result);
+    }
+
     let public_base_url = config.get("public_base_url").and_then(Value::as_str)?;
     if public_base_url.is_empty() || !public_base_url.starts_with("https://") {
         return None;
@@ -707,6 +736,38 @@ mod tests {
     fn has_webhook_url_valid() {
         let config = json!({"public_base_url": "https://example.com"});
         assert_eq!(has_webhook_url(&config), Some("https://example.com"));
+    }
+
+    #[test]
+    fn registration_result_from_declared_ops_uses_declared_ops() {
+        let config = json!({
+            "webhook_ops": [{"op": "register", "url": "https://example.com/webhook"}],
+            "subscription_ops": [{"op": "sync"}],
+            "oauth_ops": []
+        });
+        let result =
+            registration_result_from_declared_ops(&config).expect("declared ops registration");
+        assert_eq!(result["ok"], Value::Bool(true));
+        assert_eq!(result["mode"], Value::String("declared_ops".to_string()));
+        assert_eq!(
+            result["webhook_ops"][0]["op"],
+            Value::String("register".to_string())
+        );
+    }
+
+    #[test]
+    fn register_webhook_prefers_declared_ops() {
+        let config = json!({
+            "public_base_url": "http://example.com",
+            "webhook_ops": [{"op": "register", "url": "https://example.com/webhook"}]
+        });
+        let result = register_webhook("messaging-unknown", &config, "demo", None)
+            .expect("declared ops fallback");
+        assert_eq!(result["mode"], Value::String("declared_ops".to_string()));
+        assert_eq!(
+            result["webhook_ops"][0]["url"],
+            "https://example.com/webhook"
+        );
     }
 
     #[test]
