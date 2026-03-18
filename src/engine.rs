@@ -196,6 +196,14 @@ impl SetupEngine {
             }
         }
 
+        // Persist bundle-level platform metadata even when no provider pack setup
+        // steps ran, so create-only flows still materialize runtime/deployment config.
+        persist_static_routes_artifact(bundle, &plan.metadata.static_routes)?;
+        let _ = crate::deployment_targets::persist_explicit_deployment_targets(
+            bundle,
+            &plan.metadata.deployment_targets,
+        );
+
         Ok(report)
     }
 
@@ -1622,6 +1630,52 @@ setup_answers:
         let stored: Value =
             serde_json::from_str(&std::fs::read_to_string(artifact).unwrap()).unwrap();
         assert_eq!(stored["public_web_enabled"], json!(true));
+    }
+
+    #[test]
+    fn execute_create_persists_platform_metadata_without_provider_steps() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "prod".into(),
+            offline: false,
+            verbose: false,
+        });
+        let request = SetupRequest {
+            bundle: bundle_root.clone(),
+            static_routes: StaticRoutesPolicy {
+                public_web_enabled: true,
+                public_base_url: Some("https://example.com".into()),
+                public_surface_policy: "enabled".into(),
+                default_route_prefix_policy: "pack_declared".into(),
+                tenant_path_policy: "pack_declared".into(),
+                ..StaticRoutesPolicy::default()
+            },
+            deployment_targets: vec![crate::deployment_targets::DeploymentTargetRecord {
+                target: "runtime".into(),
+                provider_pack: None,
+                default: Some(true),
+            }],
+            ..empty_request(bundle_root.clone())
+        };
+
+        let plan = engine.plan(SetupMode::Create, &request, false).unwrap();
+        engine.execute(&plan).unwrap();
+
+        let routes_artifact = static_routes_artifact_path(&bundle_root);
+        assert!(routes_artifact.exists());
+
+        let targets_artifact = bundle_root
+            .join(".greentic")
+            .join("deployment-targets.json");
+        assert!(targets_artifact.exists());
+        let stored: Value =
+            serde_json::from_str(&std::fs::read_to_string(targets_artifact).unwrap()).unwrap();
+        assert_eq!(stored["targets"][0]["target"], json!("runtime"));
+        assert_eq!(stored["targets"][0]["default"], json!(true));
     }
 
     #[test]

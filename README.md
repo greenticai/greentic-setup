@@ -128,4 +128,5 @@ RUST_LOG=debug gtc start ./telecom.gtbundle
 ## Links
 
 - [Greentic Documentation](https://greentic.ai/docs)
+- [Extension Pack HTTP Ingress And public_base_url](docs/extension-pack-ingress-http.md)
 - [Report Issues](https://github.com/greenticai/demos/issues)
