@@ -1,6 +1,8 @@
 //! CLI helper functions for greentic-setup.
 
+use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -9,7 +11,8 @@ use crate::cli_i18n::CliI18n;
 use crate::discovery;
 use crate::engine::LoadedAnswers;
 use crate::platform_setup::{
-    PlatformSetupAnswers, load_effective_static_routes_defaults, prompt_static_routes_policy,
+    PlatformSetupAnswers, StaticRoutesPolicy, load_effective_static_routes_defaults,
+    prompt_static_routes_policy, prompt_static_routes_policy_with_answers,
 };
 use crate::qa::wizard;
 use crate::setup_to_formspec;
@@ -26,6 +29,21 @@ pub struct SetupParams {
 /// Resolve bundle source - supports both directories and .gtbundle files.
 pub fn resolve_bundle_source(path: &std::path::Path, i18n: &CliI18n) -> Result<PathBuf> {
     use crate::gtbundle;
+
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with("https://") || path_str.starts_with("http://") {
+        println!("{}", i18n.t("cli.simple.extracting"));
+        let temp_dir = download_and_extract_remote_bundle(&path_str)
+            .context("failed to fetch and extract remote bundle archive")?;
+        println!(
+            "{}",
+            i18n.tf(
+                "cli.simple.extracted_to",
+                &[&temp_dir.display().to_string()]
+            )
+        );
+        return Ok(temp_dir);
+    }
 
     if gtbundle::is_gtbundle_file(path) {
         println!("{}", i18n.t("cli.simple.extracting"));
@@ -44,8 +62,6 @@ pub fn resolve_bundle_source(path: &std::path::Path, i18n: &CliI18n) -> Result<P
     if gtbundle::is_gtbundle_dir(path) {
         return Ok(path.to_path_buf());
     }
-
-    let path_str = path.to_string_lossy();
     if path_str.ends_with(".gtbundle") && !path.exists() {
         bail!(
             "{}",
@@ -75,6 +91,39 @@ pub fn resolve_bundle_source(path: &std::path::Path, i18n: &CliI18n) -> Result<P
             )
         );
     }
+}
+
+fn download_and_extract_remote_bundle(url: &str) -> Result<PathBuf> {
+    use crate::gtbundle;
+
+    let response = ureq::get(url)
+        .call()
+        .map_err(|err| anyhow::anyhow!("failed to fetch {url}: {err}"))?;
+    let bytes = response
+        .into_body()
+        .read_to_vec()
+        .map_err(|err| anyhow::anyhow!("failed to read {url}: {err}"))?;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("greentic-setup-remote-{nonce}"));
+    fs::create_dir_all(&base)?;
+
+    let file_name = url
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("bundle.gtbundle");
+    let archive_path = base.join(file_name);
+    fs::write(&archive_path, bytes)?;
+
+    if !gtbundle::is_gtbundle_file(&archive_path) {
+        bail!("remote bundle URL must point to a .gtbundle archive: {url}");
+    }
+
+    gtbundle::extract_gtbundle_to_temp(&archive_path)
 }
 
 /// Resolve bundle directory from optional path argument.
@@ -403,10 +452,22 @@ pub fn complete_loaded_answers_with_prompts(
     advanced: bool,
     mut loaded: LoadedAnswers,
 ) -> Result<LoadedAnswers> {
-    if loaded.platform_setup.static_routes.is_none() {
-        let existing_static_routes =
-            load_effective_static_routes_defaults(bundle_path, tenant, team)?;
-        let static_routes = prompt_static_routes_policy(env, existing_static_routes.as_ref())?;
+    let existing_static_routes = load_effective_static_routes_defaults(bundle_path, tenant, team)?;
+    let static_routes_need_prompt = match loaded.platform_setup.static_routes.as_ref() {
+        None => true,
+        Some(answers) => StaticRoutesPolicy::normalize(Some(answers), env).is_err(),
+    };
+    if static_routes_need_prompt {
+        let static_routes =
+            if let Some(current_answers) = loaded.platform_setup.static_routes.as_ref() {
+                prompt_static_routes_policy_with_answers(
+                    env,
+                    Some(current_answers),
+                    existing_static_routes.as_ref(),
+                )?
+            } else {
+                prompt_static_routes_policy(env, existing_static_routes.as_ref())?
+            };
         loaded.platform_setup.static_routes = Some(static_routes.to_answers());
     }
     if loaded.platform_setup.deployment_targets.is_empty() {

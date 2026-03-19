@@ -49,10 +49,24 @@ impl SetupInputAnswers {
 
 /// Reads a JSON/YAML answers file.
 pub fn load_setup_input(path: &Path) -> anyhow::Result<Value> {
-    let raw = fs::read_to_string(path)?;
+    let raw = load_text_from_path_or_url(path)?;
     serde_json::from_str(&raw)
         .or_else(|_| serde_yaml_bw::from_str(&raw))
         .with_context(|| format!("parse setup input {}", path.display()))
+}
+
+fn load_text_from_path_or_url(path: &Path) -> anyhow::Result<String> {
+    let raw = path.to_string_lossy();
+    if raw.starts_with("https://") || raw.starts_with("http://") {
+        let response = ureq::get(raw.as_ref())
+            .call()
+            .map_err(|err| anyhow!("failed to fetch {}: {err}", raw))?;
+        return response
+            .into_body()
+            .read_to_string()
+            .map_err(|err| anyhow!("failed to read {}: {err}", raw));
+    }
+    fs::read_to_string(path).with_context(|| format!("read setup input {}", path.display()))
 }
 
 /// Represents a provider setup spec extracted from `assets/setup.yaml`.

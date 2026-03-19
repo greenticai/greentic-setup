@@ -141,6 +141,22 @@ pub fn prompt_static_routes_policy(
     current: Option<&StaticRoutesPolicy>,
 ) -> Result<StaticRoutesPolicy> {
     let current = current.cloned().unwrap_or_default();
+    prompt_static_routes_policy_from_current(env, current)
+}
+
+pub fn prompt_static_routes_policy_with_answers(
+    env: &str,
+    current_answers: Option<&StaticRoutesAnswers>,
+    existing: Option<&StaticRoutesPolicy>,
+) -> Result<StaticRoutesPolicy> {
+    let current = merge_prompt_seed(current_answers, existing);
+    prompt_static_routes_policy_from_current(env, current)
+}
+
+fn prompt_static_routes_policy_from_current(
+    env: &str,
+    current: StaticRoutesPolicy,
+) -> Result<StaticRoutesPolicy> {
     let public_web_enabled = Confirm::new()
         .with_prompt("Enable public web/static hosting for this bundle?")
         .default(current.public_web_enabled)
@@ -178,6 +194,54 @@ pub fn prompt_static_routes_policy(
         }),
         env,
     )
+}
+
+fn merge_prompt_seed(
+    current_answers: Option<&StaticRoutesAnswers>,
+    existing: Option<&StaticRoutesPolicy>,
+) -> StaticRoutesPolicy {
+    let mut current = existing.cloned().unwrap_or_default();
+    let Some(answers) = current_answers else {
+        return current;
+    };
+
+    if let Some(enabled) = answers.public_web_enabled {
+        current.public_web_enabled = enabled;
+    }
+    if let Some(url) = answers
+        .public_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        current.public_base_url = Some(url.to_string());
+    }
+    if let Some(policy) = answers
+        .public_surface_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        current.public_surface_policy = policy.to_string();
+    }
+    if let Some(policy) = answers
+        .default_route_prefix_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        current.default_route_prefix_policy = policy.to_string();
+    }
+    if let Some(policy) = answers
+        .tenant_path_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        current.tenant_path_policy = policy.to_string();
+    }
+
+    current
 }
 
 pub fn static_routes_artifact_path(bundle_root: &Path) -> PathBuf {
@@ -481,5 +545,32 @@ mod tests {
             loaded.and_then(|policy| policy.public_base_url),
             Some("https://runtime.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn merge_prompt_seed_overlays_partial_answers_on_existing_policy() {
+        let existing = StaticRoutesPolicy {
+            version: STATIC_ROUTES_VERSION,
+            public_web_enabled: false,
+            public_base_url: Some("https://existing.example.com".into()),
+            public_surface_policy: SURFACE_DISABLED.into(),
+            default_route_prefix_policy: PACK_DECLARED_POLICY.into(),
+            tenant_path_policy: PACK_DECLARED_POLICY.into(),
+        };
+        let answers = StaticRoutesAnswers {
+            public_web_enabled: Some(true),
+            public_base_url: None,
+            public_surface_policy: Some(SURFACE_ENABLED.into()),
+            default_route_prefix_policy: None,
+            tenant_path_policy: None,
+        };
+
+        let merged = merge_prompt_seed(Some(&answers), Some(&existing));
+        assert!(merged.public_web_enabled);
+        assert_eq!(
+            merged.public_base_url.as_deref(),
+            Some("https://existing.example.com")
+        );
+        assert_eq!(merged.public_surface_policy, SURFACE_ENABLED);
     }
 }
