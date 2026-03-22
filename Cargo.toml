@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 license = "MIT"
 description = "End-to-end bundle setup engine for the Greentic platform — pack discovery, QA-driven configuration, secrets persistence, and bundle lifecycle management"
