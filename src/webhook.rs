@@ -89,7 +89,12 @@ fn setup_telegram_webhook(
     tenant: &str,
     team: &str,
 ) -> Option<Value> {
-    let bot_token = config.get("bot_token").and_then(Value::as_str)?;
+    // Try bot_token first, then fall back to telegram_bot_token
+    // (secret-requirements.json uses TELEGRAM_BOT_TOKEN which becomes telegram_bot_token)
+    let bot_token = config
+        .get("bot_token")
+        .or_else(|| config.get("telegram_bot_token"))
+        .and_then(Value::as_str)?;
     if bot_token.is_empty() {
         return Some(json!({"ok": false, "error": "bot_token is empty"}));
     }
