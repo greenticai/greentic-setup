@@ -343,6 +343,12 @@ fn normalize_pack_declared_policy(field: &str, value: Option<&str>) -> Result<St
 }
 
 fn normalize_public_base_url(value: &str, env: &str) -> Result<String> {
+    // Accept environment variable placeholders as-is (e.g., "${PUBLIC_BASE_URL}")
+    // These will be resolved at runtime
+    if value.starts_with("${") && value.ends_with('}') {
+        return Ok(value.to_string());
+    }
+
     let url = Url::parse(value).map_err(|err| anyhow!("invalid public_base_url: {err}"))?;
     match url.scheme() {
         "https" => {}

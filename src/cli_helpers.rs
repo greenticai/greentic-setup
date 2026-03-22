@@ -1,6 +1,8 @@
 //! CLI helper functions for greentic-setup.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +18,208 @@ use crate::platform_setup::{
 };
 use crate::qa::wizard;
 use crate::setup_to_formspec;
+
+/// Represents an environment variable placeholder found in answers.
+#[derive(Debug, Clone)]
+pub struct EnvVarPlaceholder {
+    /// The placeholder string (e.g., "${PUBLIC_BASE_URL}")
+    pub placeholder: String,
+    /// The environment variable name (e.g., "PUBLIC_BASE_URL")
+    pub var_name: String,
+    /// The resolved value from environment, if available
+    pub resolved_value: Option<String>,
+    /// Which providers use this placeholder
+    pub used_by: Vec<String>,
+}
+
+/// Collect all environment variable placeholders from loaded answers.
+pub fn collect_env_var_placeholders(loaded: &LoadedAnswers) -> Vec<EnvVarPlaceholder> {
+    let mut placeholders: BTreeMap<String, EnvVarPlaceholder> = BTreeMap::new();
+
+    // Check platform_setup.static_routes.public_base_url
+    if let Some(ref routes) = loaded.platform_setup.static_routes
+        && let Some(ref value) = routes.public_base_url
+        && let Some(var_name) = extract_env_var_name(value)
+    {
+        let entry = placeholders
+            .entry(var_name.clone())
+            .or_insert_with(|| EnvVarPlaceholder {
+                placeholder: value.to_string(),
+                var_name: var_name.clone(),
+                resolved_value: std::env::var(&var_name).ok(),
+                used_by: Vec::new(),
+            });
+        entry.used_by.push("platform_setup".to_string());
+    }
+
+    // Check each provider's answers
+    for (provider_id, answers) in &loaded.setup_answers {
+        if let Some(obj) = answers.as_object() {
+            for (key, value) in obj {
+                if let Some(s) = value.as_str()
+                    && let Some(var_name) = extract_env_var_name(s)
+                {
+                    let entry =
+                        placeholders
+                            .entry(var_name.clone())
+                            .or_insert_with(|| EnvVarPlaceholder {
+                                placeholder: s.to_string(),
+                                var_name: var_name.clone(),
+                                resolved_value: std::env::var(&var_name).ok(),
+                                used_by: Vec::new(),
+                            });
+                    let provider_key = format!("{provider_id}.{key}");
+                    if !entry.used_by.contains(&provider_key) {
+                        entry.used_by.push(provider_key);
+                    }
+                }
+            }
+        }
+    }
+
+    placeholders.into_values().collect()
+}
+
+/// Extract environment variable name from a placeholder like "${VAR_NAME}".
+fn extract_env_var_name(value: &str) -> Option<String> {
+    if value.starts_with("${") && value.ends_with('}') {
+        Some(value[2..value.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+/// Display environment variable placeholders and prompt for missing values.
+///
+/// Returns a map of env var name -> resolved value (either from env or user input).
+/// Returns `Err` if user cancels.
+pub fn confirm_env_var_placeholders(
+    placeholders: &[EnvVarPlaceholder],
+) -> Result<std::collections::HashMap<String, String>> {
+    use rpassword::prompt_password;
+
+    let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    if placeholders.is_empty() {
+        return Ok(resolved);
+    }
+
+    println!();
+    println!("── Environment Variables ──");
+    println!("The following environment variables will be used:\n");
+
+    let mut missing: Vec<&EnvVarPlaceholder> = Vec::new();
+
+    for placeholder in placeholders {
+        match &placeholder.resolved_value {
+            Some(value) => {
+                // Mask sensitive values (tokens, passwords, secrets)
+                let display_value = if is_sensitive_var(&placeholder.var_name) {
+                    mask_value(value)
+                } else {
+                    value.clone()
+                };
+                println!(
+                    "  ${:<30} \x1b[32m✓\x1b[0m {}",
+                    placeholder.var_name, display_value
+                );
+                resolved.insert(placeholder.var_name.clone(), value.clone());
+            }
+            None => {
+                println!("  ${:<30} \x1b[31m✗ NOT SET\x1b[0m", placeholder.var_name);
+                missing.push(placeholder);
+            }
+        };
+    }
+
+    println!();
+
+    // Prompt for missing values
+    if !missing.is_empty() {
+        println!("Enter values for missing environment variables:");
+        println!("(Press Enter to skip and keep placeholder, or 'q' to cancel)\n");
+
+        for placeholder in missing {
+            let is_sensitive = is_sensitive_var(&placeholder.var_name);
+            let prompt = format!("  ${}: ", placeholder.var_name);
+
+            let input = if is_sensitive {
+                // Use secure password input for sensitive values
+                print!("{}", prompt);
+                io::stdout().flush()?;
+                prompt_password("").unwrap_or_default()
+            } else {
+                print!("{}", prompt);
+                io::stdout().flush()?;
+                let mut buf = String::new();
+                io::stdin().read_line(&mut buf)?;
+                buf.trim().to_string()
+            };
+
+            if input.eq_ignore_ascii_case("q") {
+                bail!("Setup cancelled by user");
+            }
+
+            if !input.is_empty() {
+                resolved.insert(placeholder.var_name.clone(), input);
+            }
+        }
+
+        println!();
+    }
+
+    Ok(resolved)
+}
+
+/// Apply resolved environment variable values to loaded answers.
+///
+/// Replaces `${VAR_NAME}` placeholders with actual values from the resolved map.
+fn apply_resolved_env_vars(
+    loaded: &mut LoadedAnswers,
+    resolved: &std::collections::HashMap<String, String>,
+) {
+    // Apply to platform_setup.static_routes.public_base_url
+    if let Some(ref mut routes) = loaded.platform_setup.static_routes
+        && let Some(ref mut value) = routes.public_base_url
+        && let Some(var_name) = extract_env_var_name(value)
+        && let Some(resolved_value) = resolved.get(&var_name)
+    {
+        *value = resolved_value.clone();
+    }
+
+    // Apply to each provider's answers
+    for (_provider_id, answers) in loaded.setup_answers.iter_mut() {
+        if let Some(obj) = answers.as_object_mut() {
+            for (_key, value) in obj.iter_mut() {
+                if let Some(s) = value.as_str()
+                    && let Some(var_name) = extract_env_var_name(s)
+                    && let Some(resolved_value) = resolved.get(&var_name)
+                {
+                    *value = serde_json::Value::String(resolved_value.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Check if a variable name suggests sensitive data.
+fn is_sensitive_var(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("secret")
+        || lower.contains("key")
+        || lower.contains("credential")
+}
+
+/// Mask a sensitive value, showing only first and last 4 characters.
+fn mask_value(value: &str) -> String {
+    if value.len() <= 12 {
+        "*".repeat(value.len())
+    } else {
+        format!("{}...{}", &value[..4], &value[value.len() - 4..])
+    }
+}
 
 /// Parameters collected from interactive prompts.
 pub struct SetupParams {
@@ -411,6 +615,36 @@ pub fn run_interactive_wizard(
     }
     println!();
 
+    // ── Collect and prompt shared questions once ────────────────────────────
+    // Build FormSpecs for all providers to identify shared questions
+    let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
+        .providers
+        .iter()
+        .filter_map(|provider| {
+            setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
+                |form_spec| wizard::ProviderFormSpec {
+                    provider_id: provider.provider_id.clone(),
+                    form_spec,
+                },
+            )
+        })
+        .collect();
+
+    // Prompt for shared questions (like public_base_url) once at the start
+    // In interactive mode, we have no existing answers so pass empty Value
+    let shared_answers = if provider_form_specs.len() > 1 {
+        let shared_result = wizard::collect_shared_questions(&provider_form_specs);
+        if !shared_result.shared_questions.is_empty() {
+            let empty = Value::Object(serde_json::Map::new());
+            wizard::prompt_shared_questions(&shared_result, advanced, &empty)?
+        } else {
+            Value::Object(serde_json::Map::new())
+        }
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    // ── Configure each provider ─────────────────────────────────────────────
     for provider in &discovered.providers {
         let provider_id = &provider.provider_id;
         let form_spec = setup_to_formspec::pack_to_form_spec(&provider.pack_path, provider_id);
@@ -422,7 +656,13 @@ pub fn run_interactive_wizard(
                 continue;
             }
 
-            let answers = wizard::prompt_form_spec_answers(&spec, provider_id, advanced)?;
+            // Use shared answers as initial values - already-answered questions will be skipped
+            let answers = wizard::prompt_form_spec_answers_with_existing(
+                &spec,
+                provider_id,
+                advanced,
+                &shared_answers,
+            )?;
             all_answers.insert(provider_id.clone(), answers);
         } else {
             println!(
@@ -477,7 +717,70 @@ pub fn complete_loaded_answers_with_prompts(
             )?;
     }
 
+    // ── Confirm environment variable placeholders ────────────────────────────
+    let env_placeholders = collect_env_var_placeholders(&loaded);
+    if !env_placeholders.is_empty() {
+        let resolved_env_vars = confirm_env_var_placeholders(&env_placeholders)?;
+
+        // Apply resolved env vars to the loaded answers
+        if !resolved_env_vars.is_empty() {
+            apply_resolved_env_vars(&mut loaded, &resolved_env_vars);
+        }
+    }
+
     let discovered = discovery::discover(bundle_path)?;
+
+    // ── Collect and prompt shared questions once ────────────────────────────
+    // Build FormSpecs for ALL providers to identify shared questions
+    let all_provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
+        .providers
+        .iter()
+        .filter_map(|provider| {
+            setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
+                |form_spec| wizard::ProviderFormSpec {
+                    provider_id: provider.provider_id.clone(),
+                    form_spec,
+                },
+            )
+        })
+        .collect();
+
+    // Extract existing shared values from loaded answers
+    // Look for values across all providers that might have shared questions
+    let mut existing_shared_values = serde_json::Map::new();
+    let shared_result = if all_provider_form_specs.len() > 1 {
+        let result = wizard::collect_shared_questions(&all_provider_form_specs);
+        // Find existing values for shared questions from any provider
+        for question in &result.shared_questions {
+            for (_provider_id, provider_answers) in &loaded.setup_answers {
+                if let Some(value) = provider_answers.get(&question.id) {
+                    // Use first non-empty value found
+                    if !(value.is_null() || value.is_string() && value.as_str() == Some("")) {
+                        existing_shared_values.insert(question.id.clone(), value.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        Some(result)
+    } else {
+        None
+    };
+
+    // Prompt for shared questions (like public_base_url) once at the start
+    // Pass existing values so already-answered questions are skipped
+    let shared_answers = if let Some(ref result) = shared_result {
+        if !result.shared_questions.is_empty() {
+            let existing = serde_json::Value::Object(existing_shared_values);
+            wizard::prompt_shared_questions(result, advanced, &existing)?
+        } else {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    // ── Complete answers for each provider ──────────────────────────────────
     for provider in &discovered.providers {
         let provider_id = &provider.provider_id;
         let existing = loaded
@@ -485,6 +788,22 @@ pub fn complete_loaded_answers_with_prompts(
             .get(provider_id)
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        // Merge shared answers with existing answers.
+        // Shared answers (user just entered) take precedence over existing values.
+        let mut merged = existing.as_object().cloned().unwrap_or_default();
+        if let Some(shared_obj) = shared_answers.as_object() {
+            for (key, value) in shared_obj {
+                // Only apply shared answer if it's non-empty
+                let is_non_empty =
+                    !(value.is_null() || value.is_string() && value.as_str() == Some(""));
+                if is_non_empty {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let merged_value = serde_json::Value::Object(merged);
+
         let form_spec = setup_to_formspec::pack_to_form_spec(&provider.pack_path, provider_id);
         let completed = if let Some(spec) = form_spec {
             if spec.questions.is_empty() {
@@ -494,7 +813,7 @@ pub fn complete_loaded_answers_with_prompts(
                     &spec,
                     provider_id,
                     advanced,
-                    &existing,
+                    &merged_value,
                 )?
             }
         } else {

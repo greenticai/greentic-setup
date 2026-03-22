@@ -13,7 +13,10 @@ use qa_spec::{
 };
 use serde_json::Value;
 
-use crate::setup_to_formspec::{capitalize, infer_question_properties, strip_domain_prefix};
+use crate::setup_to_formspec::{
+    capitalize, extract_default_from_help, infer_default_for_id, infer_question_properties,
+    strip_domain_prefix,
+};
 
 /// Convert provider QA spec JSON output + i18n translations into a `FormSpec`.
 ///
@@ -46,7 +49,7 @@ pub fn provider_qa_to_form_spec(
         .cloned()
         .unwrap_or_else(|| format!("{} setup", provider));
 
-    let questions = qa_output
+    let questions: Vec<QuestionSpec> = qa_output
         .get("questions")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -55,6 +58,17 @@ pub fn provider_qa_to_form_spec(
                 .collect()
         })
         .unwrap_or_default();
+
+    // Apply inferred defaults for well-known question IDs
+    let questions: Vec<QuestionSpec> = questions
+        .into_iter()
+        .map(|mut q| {
+            if q.default_value.is_none() {
+                q.default_value = infer_default_for_id(&q.id, provider);
+            }
+            q
+        })
+        .collect();
 
     let display_name = capitalize(&strip_domain_prefix(provider));
 
@@ -114,6 +128,12 @@ fn convert_question(
             Value::Bool(b) => Some(b.to_string()),
             Value::Number(n) => Some(n.to_string()),
             _ => None,
+        })
+        // Try extracting default from description text (e.g., "(default: https://...)")
+        .or_else(|| {
+            description
+                .as_ref()
+                .and_then(|d| extract_default_from_help(d))
         })
         .or_else(|| infer_default(&kind));
 

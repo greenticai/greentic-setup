@@ -18,7 +18,7 @@ use crate::platform_setup::{
     PlatformSetupAnswers, StaticRoutesPolicy, load_effective_static_routes_defaults,
     persist_static_routes_artifact,
 };
-use crate::setup_input;
+use crate::setup_input::{self, SetupQuestion};
 
 #[derive(Clone, Debug, Default)]
 pub struct LoadedAnswers {
@@ -275,10 +275,7 @@ impl SetupEngine {
                             // Pack has setup.yaml - extract questions
                             let mut entries = JsonMap::new();
                             for question in &spec.questions {
-                                let default_value = question
-                                    .default
-                                    .clone()
-                                    .unwrap_or_else(|| Value::String(String::new()));
+                                let default_value = infer_default_value(question);
                                 entries.insert(question.name.clone(), default_value);
                             }
                             entries
@@ -290,6 +287,11 @@ impl SetupEngine {
                     setup_answers.insert(provider_id, Value::Object(template));
                 }
             }
+        }
+
+        // Prompt for secret values if interactive
+        if interactive {
+            self.prompt_secret_answers(bundle, &mut answers_doc)?;
         }
 
         self.encrypt_secret_answers(bundle, &mut answers_doc, key, interactive)?;
@@ -366,6 +368,103 @@ impl SetupEngine {
             }
             _ => Err(anyhow!("answers file must be a JSON/YAML object")),
         }
+    }
+
+    /// Prompt user to fill in secret values interactively.
+    ///
+    /// Discovers all secret questions from packs and prompts user to enter
+    /// values using secure/hidden input. Updates the answers_doc in place.
+    fn prompt_secret_answers(&self, bundle: &Path, answers_doc: &mut Value) -> anyhow::Result<()> {
+        use rpassword::prompt_password;
+        use std::io::{self, Write as _};
+
+        let setup_answers = answers_doc
+            .get_mut("setup_answers")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("internal error: setup_answers not an object"))?;
+
+        let discovered = if bundle.exists() {
+            discovery::discover(bundle)?
+        } else {
+            return Ok(());
+        };
+
+        // Collect all secret questions that need prompting
+        let mut secret_questions: Vec<(String, String, String, bool)> = Vec::new(); // (provider_id, field_id, title, required)
+
+        for provider in &discovered.providers {
+            let Some(form_spec) = crate::setup_to_formspec::pack_to_form_spec(
+                &provider.pack_path,
+                &provider.provider_id,
+            ) else {
+                continue;
+            };
+
+            let provider_answers = setup_answers
+                .get(&provider.provider_id)
+                .and_then(Value::as_object);
+
+            for question in form_spec.questions {
+                if !question.secret {
+                    continue;
+                }
+
+                // Check if already has a non-empty value
+                let has_value = provider_answers
+                    .and_then(|m| m.get(&question.id))
+                    .is_some_and(|v| {
+                        !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(true)
+                    });
+
+                if !has_value {
+                    secret_questions.push((
+                        provider.provider_id.clone(),
+                        question.id.clone(),
+                        question.title.clone(),
+                        question.required,
+                    ));
+                }
+            }
+        }
+
+        if secret_questions.is_empty() {
+            return Ok(());
+        }
+
+        println!();
+        println!("── Secret Values ──");
+        println!("Enter values for secret fields (input is hidden):");
+        println!("(Press Enter to skip optional fields)\n");
+
+        for (provider_id, field_id, title, required) in secret_questions {
+            let display_provider = crate::setup_to_formspec::strip_domain_prefix(&provider_id);
+            let marker = if required {
+                " (required)"
+            } else {
+                " (optional)"
+            };
+
+            print!("  [{display_provider}] {title}{marker}: ");
+            io::stdout().flush()?;
+
+            let input = prompt_password("").unwrap_or_default();
+            let trimmed = input.trim();
+
+            if !trimmed.is_empty() {
+                // Update the answers_doc with the inputted value
+                if let Some(provider_answers) = setup_answers
+                    .get_mut(&provider_id)
+                    .and_then(Value::as_object_mut)
+                {
+                    provider_answers.insert(field_id, Value::String(trimmed.to_string()));
+                }
+            } else if required {
+                println!("    \x1b[33m⚠ Skipped (will need to be filled in later)\x1b[0m");
+            }
+        }
+
+        println!();
+        Ok(())
     }
 
     fn encrypt_secret_answers(
@@ -1365,6 +1464,53 @@ fn compute_simple_hash(input: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Infer a default value for a setup question.
+///
+/// Priority:
+/// 1. Explicit `default` field from setup.yaml
+/// 2. Extract from help text pattern "(default: VALUE)"
+/// 3. Return empty string
+fn infer_default_value(question: &SetupQuestion) -> Value {
+    // First, use explicit default if present
+    if let Some(default) = question.default.clone() {
+        return default;
+    }
+
+    // Try to extract default from help text
+    // Pattern: "(default: VALUE)" or "[default: VALUE]"
+    if let Some(ref help) = question.help
+        && let Some(default) = extract_default_from_help(help)
+    {
+        return Value::String(default);
+    }
+
+    // Fallback to empty string
+    Value::String(String::new())
+}
+
+/// Extract default value from help text.
+///
+/// Matches patterns like:
+/// - "(default: https://slack.com/api)"
+/// - "[default: true]"
+/// - "Default: some_value"
+fn extract_default_from_help(help: &str) -> Option<String> {
+    use regex::Regex;
+
+    // Pattern 1: (default: VALUE) or [default: VALUE]
+    let re = Regex::new(r"(?i)[\(\[]?\s*default:\s*([^\)\]\n,]+)\s*[\)\]]?").ok()?;
+    if let Some(caps) = re.captures(help) {
+        let value = caps.get(1)?.as_str().trim();
+        // Clean up the value - remove trailing punctuation
+        let cleaned = value.trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1741,5 +1887,84 @@ setup_answers:
             plan.metadata.static_routes.public_base_url.as_deref(),
             Some("https://example.com/new")
         );
+    }
+
+    #[test]
+    fn extract_default_from_help_parses_parenthesized() {
+        let help = "Slack API base URL (default: https://slack.com/api)";
+        let result = extract_default_from_help(help);
+        assert_eq!(result, Some("https://slack.com/api".to_string()));
+    }
+
+    #[test]
+    fn extract_default_from_help_parses_bracketed() {
+        let help = "Enable feature [default: true]";
+        let result = extract_default_from_help(help);
+        assert_eq!(result, Some("true".to_string()));
+    }
+
+    #[test]
+    fn extract_default_from_help_case_insensitive() {
+        let help = "Some setting (Default: custom_value)";
+        let result = extract_default_from_help(help);
+        assert_eq!(result, Some("custom_value".to_string()));
+    }
+
+    #[test]
+    fn extract_default_from_help_returns_none_without_default() {
+        let help = "Just a plain help text with no default";
+        let result = extract_default_from_help(help);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn infer_default_value_uses_explicit_default() {
+        let question = SetupQuestion {
+            name: "api_base_url".to_string(),
+            kind: "string".to_string(),
+            required: true,
+            help: Some("Some help (default: wrong_value)".to_string()),
+            choices: vec![],
+            default: Some(json!("https://explicit.com")),
+            secret: false,
+            title: None,
+            visible_if: None,
+        };
+        let result = infer_default_value(&question);
+        assert_eq!(result, json!("https://explicit.com"));
+    }
+
+    #[test]
+    fn infer_default_value_extracts_from_help() {
+        let question = SetupQuestion {
+            name: "api_base_url".to_string(),
+            kind: "string".to_string(),
+            required: true,
+            help: Some("Slack API base URL (default: https://slack.com/api)".to_string()),
+            choices: vec![],
+            default: None,
+            secret: false,
+            title: None,
+            visible_if: None,
+        };
+        let result = infer_default_value(&question);
+        assert_eq!(result, json!("https://slack.com/api"));
+    }
+
+    #[test]
+    fn infer_default_value_returns_empty_without_default() {
+        let question = SetupQuestion {
+            name: "bot_token".to_string(),
+            kind: "string".to_string(),
+            required: true,
+            help: Some("Your bot token".to_string()),
+            choices: vec![],
+            default: None,
+            secret: true,
+            title: None,
+            visible_if: None,
+        };
+        let result = infer_default_value(&question);
+        assert_eq!(result, json!(""));
     }
 }

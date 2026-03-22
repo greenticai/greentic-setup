@@ -105,17 +105,102 @@ pub struct SetupQuestion {
 
 /// Conditional visibility for a setup question.
 ///
-/// Example in setup.yaml:
+/// Example in setup.yaml (struct format):
 /// ```yaml
 /// visible_if:
 ///   field: public_base_url_mode
 ///   eq: static
 /// ```
-#[derive(Debug, Deserialize)]
-pub struct SetupVisibleIf {
-    pub field: String,
-    #[serde(default)]
-    pub eq: Option<String>,
+///
+/// Or string expression format:
+/// ```yaml
+/// visible_if: "preset != 'stdout'"
+/// ```
+#[derive(Debug)]
+pub enum SetupVisibleIf {
+    /// Struct format with field and optional eq
+    Struct { field: String, eq: Option<String> },
+    /// String expression format (e.g., "preset != 'stdout'")
+    Expr(String),
+}
+
+impl SetupVisibleIf {
+    /// Get the field name (for struct format, or parse from expr format).
+    pub fn field(&self) -> Option<&str> {
+        match self {
+            SetupVisibleIf::Struct { field, .. } => Some(field),
+            SetupVisibleIf::Expr(_) => None,
+        }
+    }
+
+    /// Get the equality value (for struct format only).
+    pub fn eq(&self) -> Option<&str> {
+        match self {
+            SetupVisibleIf::Struct { eq, .. } => eq.as_deref(),
+            SetupVisibleIf::Expr(_) => None,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SetupVisibleIf {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct SetupVisibleIfVisitor;
+
+        impl<'de> Visitor<'de> for SetupVisibleIfVisitor {
+            type Value = SetupVisibleIf;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter
+                    .write_str("a string expression or a struct with 'field' and optional 'eq'")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(SetupVisibleIf::Expr(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(SetupVisibleIf::Expr(value))
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut field: Option<String> = None;
+                let mut eq: Option<String> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "field" => {
+                            field = Some(map.next_value()?);
+                        }
+                        "eq" => {
+                            eq = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let field = field.ok_or_else(|| de::Error::missing_field("field"))?;
+                Ok(SetupVisibleIf::Struct { field, eq })
+            }
+        }
+
+        deserializer.deserialize_any(SetupVisibleIfVisitor)
+    }
 }
 
 fn default_kind() -> String {
