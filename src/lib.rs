@@ -40,6 +40,12 @@ pub use bundle_source::BundleSource;
 pub use engine::SetupEngine;
 pub use plan::{SetupMode, SetupPlan, SetupStep, SetupStepKind};
 
+// Re-export shared questions types and functions for convenient multi-provider setup
+pub use qa::wizard::{
+    ProviderFormSpec, SHARED_QUESTION_IDS, SharedQuestionsResult, build_provider_form_specs,
+    collect_shared_questions, prompt_shared_questions, run_qa_setup_with_shared,
+};
+
 /// Returns the crate version.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

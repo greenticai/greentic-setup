@@ -1470,6 +1470,7 @@ dependencies = [
  "hmac",
  "qa-spec",
  "rand 0.9.2",
+ "regex",
  "rpassword",
  "serde",
  "serde_cbor",

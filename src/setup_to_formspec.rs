@@ -26,7 +26,11 @@ pub fn setup_spec_to_form_spec(spec: &SetupSpec, provider_id: &str) -> FormSpec 
         .clone()
         .unwrap_or_else(|| format!("{display_name} setup"));
 
-    let questions: Vec<QuestionSpec> = spec.questions.iter().map(convert_setup_question).collect();
+    let questions: Vec<QuestionSpec> = spec
+        .questions
+        .iter()
+        .map(|q| convert_setup_question(q, provider_id))
+        .collect();
 
     FormSpec {
         id: format!("{provider_id}-setup"),
@@ -51,7 +55,7 @@ pub fn setup_spec_to_form_spec(spec: &SetupSpec, provider_id: &str) -> FormSpec 
     }
 }
 
-fn convert_setup_question(q: &SetupQuestion) -> QuestionSpec {
+fn convert_setup_question(q: &SetupQuestion, provider_id: &str) -> QuestionSpec {
     let kind = match q.kind.as_str() {
         "boolean" => QuestionType::Boolean,
         "number" => QuestionType::Number,
@@ -80,26 +84,47 @@ fn convert_setup_question(q: &SetupQuestion) -> QuestionSpec {
         Some(q.choices.clone())
     };
 
-    let default_value = q.default.as_ref().map(|v| match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        other => other.to_string(),
-    });
+    let default_value = q
+        .default
+        .as_ref()
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            other => other.to_string(),
+        })
+        .or_else(|| {
+            // Fallback: try to extract default from help text
+            q.help.as_ref().and_then(|h| extract_default_from_help(h))
+        })
+        .or_else(|| {
+            // Fallback: try to infer default from well-known question IDs
+            infer_default_for_id(&q.name, provider_id)
+        });
 
-    let visible_if = q.visible_if.as_ref().map(|v| {
-        if let Some(ref eq_val) = v.eq {
-            qa_spec::Expr::Eq {
-                left: Box::new(qa_spec::Expr::Answer {
-                    path: v.field.clone(),
-                }),
-                right: Box::new(qa_spec::Expr::Literal {
-                    value: serde_json::Value::String(eq_val.clone()),
-                }),
+    let visible_if = q.visible_if.as_ref().and_then(|v| {
+        use crate::setup_input::SetupVisibleIf;
+        match v {
+            SetupVisibleIf::Struct { field, eq } => {
+                if let Some(eq_val) = eq {
+                    Some(qa_spec::Expr::Eq {
+                        left: Box::new(qa_spec::Expr::Answer {
+                            path: field.clone(),
+                        }),
+                        right: Box::new(qa_spec::Expr::Literal {
+                            value: serde_json::Value::String(eq_val.clone()),
+                        }),
+                    })
+                } else {
+                    Some(qa_spec::Expr::Answer {
+                        path: field.clone(),
+                    })
+                }
             }
-        } else {
-            qa_spec::Expr::Answer {
-                path: v.field.clone(),
+            SetupVisibleIf::Expr(_expr) => {
+                // String expressions are not currently converted to FormSpec Expr.
+                // Return None to skip visibility handling for these.
+                None
             }
         }
     });
@@ -210,6 +235,28 @@ pub fn infer_question_properties(id: &str) -> (QuestionType, bool, Option<Constr
     }
 }
 
+/// Infer a default value for well-known question IDs.
+///
+/// Returns `Some(default)` for known fields with standard defaults:
+/// - `api_base_url` for Slack → `https://slack.com/api`
+/// - `api_base_url` for Telegram → `https://api.telegram.org`
+/// - `enabled` → `true`
+pub fn infer_default_for_id(id: &str, provider_id: &str) -> Option<String> {
+    match id {
+        "api_base_url" => {
+            if provider_id.contains("slack") {
+                Some("https://slack.com/api".to_string())
+            } else if provider_id.contains("telegram") {
+                Some("https://api.telegram.org".to_string())
+            } else {
+                None
+            }
+        }
+        "enabled" => Some("true".to_string()),
+        _ => None,
+    }
+}
+
 /// Strip common domain prefixes from a provider ID for display.
 pub fn strip_domain_prefix(provider_id: &str) -> String {
     provider_id
@@ -227,6 +274,29 @@ pub fn capitalize(s: &str) -> String {
         Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
         None => String::new(),
     }
+}
+
+/// Extract default value from help text.
+///
+/// Matches patterns like:
+/// - "(default: https://slack.com/api)"
+/// - "[default: true]"
+/// - "Default: some_value"
+pub fn extract_default_from_help(help: &str) -> Option<String> {
+    use regex::Regex;
+
+    // Pattern: (default: VALUE) or [default: VALUE]
+    let re = Regex::new(r"(?i)[\(\[]?\s*default:\s*([^\)\]\n,]+)\s*[\)\]]?").ok()?;
+    if let Some(caps) = re.captures(help) {
+        let value = caps.get(1)?.as_str().trim();
+        // Clean up the value - remove trailing punctuation
+        let cleaned = value.trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -430,5 +500,66 @@ mod tests {
         // Should use setup.yaml, not qa JSON
         assert_eq!(form.questions.len(), 1);
         assert_eq!(form.questions[0].id, "enabled");
+    }
+
+    #[test]
+    fn extract_default_from_help_slack_format() {
+        // Exact format from Slack's setup.yaml
+        let help = "Slack API base URL (default: https://slack.com/api)";
+        let result = extract_default_from_help(help);
+        assert_eq!(result, Some("https://slack.com/api".to_string()));
+    }
+
+    #[test]
+    fn extract_default_from_help_various_formats() {
+        // Parenthesized
+        assert_eq!(
+            extract_default_from_help("Some help (default: value)"),
+            Some("value".to_string())
+        );
+        // Bracketed
+        assert_eq!(
+            extract_default_from_help("Some help [default: value]"),
+            Some("value".to_string())
+        );
+        // Case insensitive
+        assert_eq!(
+            extract_default_from_help("(Default: VALUE)"),
+            Some("VALUE".to_string())
+        );
+        // With trailing punctuation
+        assert_eq!(
+            extract_default_from_help("Help (default: value.)"),
+            Some("value".to_string())
+        );
+        // No default
+        assert_eq!(extract_default_from_help("Just some help text"), None);
+    }
+
+    #[test]
+    fn converts_help_default_to_question_default_value() {
+        let spec = SetupSpec {
+            title: None,
+            description: None,
+            questions: vec![SetupQuestion {
+                name: "api_base_url".to_string(),
+                kind: "string".to_string(),
+                required: true,
+                help: Some("Slack API base URL (default: https://slack.com/api)".to_string()),
+                choices: vec![],
+                default: None, // No explicit default
+                secret: false,
+                title: Some("API base URL".to_string()),
+                visible_if: None,
+            }],
+        };
+
+        let form = setup_spec_to_form_spec(&spec, "messaging-slack");
+        assert_eq!(form.questions.len(), 1);
+        // Should extract default from help text
+        assert_eq!(
+            form.questions[0].default_value,
+            Some("https://slack.com/api".to_string())
+        );
     }
 }

@@ -15,6 +15,7 @@
   "cli.bundle.add.dry_run": "[dry-run] Would add pack to bundle",
   "cli.bundle.add.success": "Pack added to bundle successfully.",
   "cli.bundle.add.resolved": "  Resolved packs: {}",
+  "cli.bundle.add.version_warning": "Warning: Version {} validation failed: {}",
   "cli.bundle.setup.setting_up": "Setting up provider...",
   "cli.bundle.setup.provider": "  Provider: {}",
   "cli.bundle.setup.domain": "  Domain: {}",
