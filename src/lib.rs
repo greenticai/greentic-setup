@@ -33,6 +33,8 @@ pub mod qa {
     //! persistence, and setup input loading.
     pub mod bridge;
     pub mod persist;
+    pub mod prompts;
+    pub mod shared_questions;
     pub mod wizard;
 }
 
