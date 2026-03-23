@@ -4,21 +4,33 @@
 //! Provides both interactive CLI prompts and Adaptive Card rendering
 //! for collecting provider configuration answers.
 
-use std::io::{self, Write as _};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use qa_spec::spec::form::ProgressPolicy;
-use qa_spec::{
-    FormSpec, QuestionSpec, QuestionType, VisibilityMode, build_render_payload, render_card,
-    resolve_visibility,
-};
-use rpassword::prompt_password;
+use qa_spec::{FormSpec, VisibilityMode, build_render_payload, render_card, resolve_visibility};
 use serde_json::{Map as JsonMap, Value};
 
-use crate::qa::bridge;
 use crate::setup_input::SetupInputAnswers;
 use crate::setup_to_formspec;
+
+// Re-exports for backward compatibility (these are the public API)
+pub use crate::qa::prompts::{
+    answer_satisfies_question, ask_form_spec_question, has_required_questions, matches_pattern,
+    parse_typed_value, prompt_form_spec_answers, prompt_form_spec_answers_with_existing,
+};
+pub use crate::qa::shared_questions::{
+    ProviderFormSpec, SHARED_QUESTION_IDS, SharedQuestionsResult, build_provider_form_specs,
+    collect_shared_questions, merge_shared_with_provider_answers, prompt_shared_questions,
+};
+
+// Internal imports for use within this module (aliased to avoid conflicts with re-exports)
+use crate::qa::prompts::{
+    ask_form_spec_question as prompt_question, has_required_questions as check_required,
+    matches_pattern as pattern_match, prompt_form_spec_answers as do_prompt_answers,
+    prompt_form_spec_answers_with_existing as do_prompt_with_existing,
+};
+use crate::qa::shared_questions::merge_shared_with_provider_answers as merge_answers;
 
 /// Run the QA setup wizard for a provider pack.
 ///
@@ -39,12 +51,19 @@ pub fn run_qa_setup(
 
     let answers = if let Some(input) = setup_input {
         if let Some(value) = input.answers_for_provider(provider_id) {
-            let answers = crate::setup_input::ensure_object(value.clone())?;
+            let mut answers = crate::setup_input::ensure_object(value.clone())?;
             if let Some(ref spec) = form_spec {
+                // Check for missing required fields and prompt if needed
+                let missing = find_missing_required_fields(spec, &answers);
+                if !missing.is_empty() {
+                    let display = setup_to_formspec::strip_domain_prefix(provider_id);
+                    println!("\n⚠️  Missing required fields for {display}. Please provide values:");
+                    answers = prompt_for_missing_fields(spec, &answers, &missing)?;
+                }
                 validate_answers_against_form_spec(spec, &answers)?;
             }
             answers
-        } else if has_required_questions(form_spec.as_ref()) {
+        } else if check_required(form_spec.as_ref()) {
             return Err(anyhow!("setup input missing answers for {provider_id}"));
         } else {
             Value::Object(JsonMap::new())
@@ -53,7 +72,7 @@ pub fn run_qa_setup(
         if spec.questions.is_empty() {
             Value::Object(JsonMap::new())
         } else if interactive {
-            prompt_form_spec_answers(spec, provider_id, advanced)?
+            do_prompt_answers(spec, provider_id, advanced)?
         } else {
             return Err(anyhow!(
                 "setup answers required for {provider_id} but run is non-interactive"
@@ -138,7 +157,7 @@ pub fn validate_answers_against_form_spec(spec: &FormSpec, answers: &Value) -> R
             && let Some(s) = value.as_str()
             && let Some(ref constraint) = question.constraint
             && let Some(ref pattern) = constraint.pattern
-            && !matches_pattern(s, pattern)
+            && !pattern_match(s, pattern)
         {
             return Err(anyhow!(
                 "answer for '{}' does not match pattern: {}",
@@ -159,473 +178,13 @@ pub fn compute_visibility(spec: &FormSpec, answers: &Value) -> qa_spec::Visibili
     resolve_visibility(spec, answers, VisibilityMode::Visible)
 }
 
-/// Interactively prompt the user using FormSpec questions.
-///
-/// Evaluates `visible_if` expressions after each answer so that conditional
-/// questions are shown/hidden dynamically as answers are collected.
-pub fn prompt_form_spec_answers(
-    spec: &FormSpec,
-    provider_id: &str,
-    advanced: bool,
-) -> Result<Value> {
-    prompt_form_spec_answers_with_existing(
-        spec,
-        provider_id,
-        advanced,
-        &Value::Object(JsonMap::new()),
-    )
-}
-
-pub fn prompt_form_spec_answers_with_existing(
-    spec: &FormSpec,
-    provider_id: &str,
-    advanced: bool,
-    initial_answers: &Value,
-) -> Result<Value> {
-    let display = setup_to_formspec::strip_domain_prefix(provider_id);
-    let mode_label = if advanced { " (advanced)" } else { "" };
-    println!("\nConfiguring {display}: {}{mode_label}", spec.title);
-    if let Some(ref pres) = spec.presentation
-        && let Some(ref intro) = pres.intro
-    {
-        println!("{intro}");
-    }
-
-    let mut answers = initial_answers.as_object().cloned().unwrap_or_default();
-    for question in &spec.questions {
-        if question.id.is_empty() {
-            continue;
-        }
-        // Re-evaluate visibility with answers collected so far.
-        if question.visible_if.is_some() {
-            let current = Value::Object(answers.clone());
-            let vis = resolve_visibility(spec, &current, VisibilityMode::Visible);
-            if !vis.get(&question.id).copied().unwrap_or(true) {
-                continue;
-            }
-        }
-        let existing = answers.get(&question.id);
-        if existing
-            .filter(|value| answer_satisfies_question(question, value))
-            .is_some()
-        {
-            continue;
-        }
-        // In normal mode, skip optional missing questions.
-        if !advanced && !question.required {
-            continue;
-        }
-        if let Some(value) = ask_form_spec_question(question)? {
-            answers.insert(question.id.clone(), value);
-        }
-    }
-    Ok(Value::Object(answers))
-}
-
-fn answer_satisfies_question(question: &QuestionSpec, value: &Value) -> bool {
-    if value.is_null() {
-        return false;
-    }
-
-    // Check for environment variable placeholder (e.g., "${PUBLIC_BASE_URL}")
-    // These are considered valid values that will be resolved at runtime
-    if let Some(s) = value.as_str()
-        && s.starts_with("${")
-        && s.ends_with('}')
-    {
-        return true;
-    }
-
-    if let Some(ref choices) = question.choices
-        && !choices.is_empty()
-    {
-        let Some(candidate) = value.as_str() else {
-            return false;
-        };
-        if !choices.iter().any(|choice| choice == candidate) {
-            return false;
-        }
-    }
-    if let Some(ref constraint) = question.constraint
-        && let Some(ref pattern) = constraint.pattern
-        && let Some(candidate) = value.as_str()
-        && !matches_pattern(candidate, pattern)
-    {
-        return false;
-    }
-    true
-}
-
-fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> {
-    // Print question header
-    let marker = if question.required {
-        " (required)"
-    } else {
-        " (optional)"
-    };
-    println!();
-    println!("  {}{marker}", question.title);
-
-    // Print description as contextual help
-    if let Some(ref desc) = question.description
-        && !desc.is_empty()
-    {
-        println!("  {desc}");
-    }
-
-    if let Some(ref choices) = question.choices {
-        println!();
-        for (idx, choice) in choices.iter().enumerate() {
-            println!("    {}) {choice}", idx + 1);
-        }
-    }
-
-    loop {
-        let prompt = build_form_spec_prompt(question);
-        let input = read_input(&prompt, question.secret)?;
-        let trimmed = input.trim();
-
-        if trimmed.is_empty() {
-            if let Some(ref default) = question.default_value {
-                return Ok(Some(parse_typed_value(question.kind, default)));
-            }
-            if question.required {
-                println!("  This field is required.");
-                continue;
-            }
-            return Ok(None);
-        }
-
-        let normalized = bridge::normalize_answer(trimmed, question.kind);
-
-        if let Some(ref constraint) = question.constraint
-            && let Some(ref pattern) = constraint.pattern
-            && !matches_pattern(&normalized, pattern)
-        {
-            println!("  Invalid format. Expected pattern: {pattern}");
-            continue;
-        }
-
-        if let Some(ref choices) = question.choices
-            && !choices.is_empty()
-        {
-            if let Ok(idx) = normalized.parse::<usize>()
-                && let Some(choice) = choices.get(idx - 1)
-            {
-                return Ok(Some(Value::String(choice.clone())));
-            }
-            if !choices.contains(&normalized) {
-                println!("  Invalid choice. Options: {}", choices.join(", "));
-                continue;
-            }
-        }
-
-        return Ok(Some(parse_typed_value(question.kind, &normalized)));
-    }
-}
-
-fn build_form_spec_prompt(question: &QuestionSpec) -> String {
-    let mut prompt = String::from("  > ");
-    match question.kind {
-        QuestionType::Boolean => prompt.push_str("[yes/no] "),
-        QuestionType::Number | QuestionType::Integer => prompt.push_str("[number] "),
-        QuestionType::Enum => prompt.push_str("[choice] "),
-        _ => {}
-    }
-    if let Some(ref default) = question.default_value
-        && !default.is_empty()
-    {
-        prompt.push_str(&format!("(default: {default}) "));
-    }
-    prompt
-}
-
-fn read_input(prompt: &str, secret: bool) -> Result<String> {
-    if secret {
-        prompt_password(prompt).map_err(|err| anyhow!("read secret: {err}"))
-    } else {
-        print!("{prompt}");
-        io::stdout().flush()?;
-        let mut buffer = String::new();
-        io::stdin().read_line(&mut buffer)?;
-        Ok(buffer)
-    }
-}
-
-/// Simple pattern matching for common constraint patterns.
-///
-/// Supports the URL pattern `^https?://\S+` used by setup specs.
-pub fn matches_pattern(value: &str, pattern: &str) -> bool {
-    if pattern == r"^https?://\S+" {
-        (value.starts_with("http://") || value.starts_with("https://"))
-            && value.len() > 8
-            && !value.contains(char::is_whitespace)
-    } else {
-        // Unknown pattern — accept (validation is best-effort).
-        true
-    }
-}
-
-/// Parse a string input into the appropriate JSON value type.
-pub fn parse_typed_value(kind: QuestionType, input: &str) -> Value {
-    match kind {
-        QuestionType::Boolean => match input.to_ascii_lowercase().as_str() {
-            "true" | "yes" | "y" | "1" | "on" => Value::Bool(true),
-            "false" | "no" | "n" | "0" | "off" => Value::Bool(false),
-            _ => Value::String(input.to_string()),
-        },
-        QuestionType::Number | QuestionType::Integer => {
-            if let Ok(n) = input.parse::<i64>() {
-                Value::Number(n.into())
-            } else if let Ok(n) = input.parse::<f64>() {
-                serde_json::Number::from_f64(n)
-                    .map(Value::Number)
-                    .unwrap_or_else(|| Value::String(input.to_string()))
-            } else {
-                Value::String(input.to_string())
-            }
-        }
-        _ => Value::String(input.to_string()),
-    }
-}
-
-fn has_required_questions(spec: Option<&FormSpec>) -> bool {
-    spec.map(|s| s.questions.iter().any(|q| q.required))
-        .unwrap_or(false)
-}
-
-// ── Shared Questions Support ────────────────────────────────────────────────
-//
-// When setting up multiple providers, some questions (like `public_base_url`)
-// appear in all providers. Instead of asking the same question repeatedly,
-// we identify shared questions and prompt for them once upfront.
-
-/// Well-known question IDs that are commonly shared across providers.
-///
-/// These questions will be prompted once at the beginning of a multi-provider
-/// setup wizard, and their answers will be applied to all providers.
-pub const SHARED_QUESTION_IDS: &[&str] = &[
-    "public_base_url",
-    // NOTE: api_base_url is NOT shared - each provider has different API endpoints
-    // (e.g., slack.com, telegram.org, webexapis.com)
-];
-
-/// Information about a provider and its FormSpec for multi-provider setup.
-#[derive(Clone)]
-pub struct ProviderFormSpec {
-    /// Provider identifier (e.g., "messaging-telegram")
-    pub provider_id: String,
-    /// The FormSpec for this provider
-    pub form_spec: FormSpec,
-}
-
-/// Result of collecting shared questions across multiple providers.
-#[derive(Clone, Default)]
-pub struct SharedQuestionsResult {
-    /// Questions that appear in multiple providers (deduplicated).
-    /// Each question is taken from the first provider that defines it.
-    pub shared_questions: Vec<QuestionSpec>,
-    /// Provider IDs that contain each shared question ID.
-    pub question_providers: std::collections::HashMap<String, Vec<String>>,
-}
-
-/// Collect questions that are shared across multiple providers.
-///
-/// A question is considered "shared" if:
-/// 1. Its ID is in `SHARED_QUESTION_IDS`, OR
-/// 2. It appears in 2+ providers with the same ID
-///
-/// Returns deduplicated questions (taking the first occurrence) along with
-/// which providers contain each question.
-pub fn collect_shared_questions(providers: &[ProviderFormSpec]) -> SharedQuestionsResult {
-    use std::collections::HashMap;
-
-    if providers.len() <= 1 {
-        return SharedQuestionsResult::default();
-    }
-
-    // Count occurrences of each question ID across providers
-    let mut question_count: HashMap<String, Vec<String>> = HashMap::new();
-    let mut first_question: HashMap<String, QuestionSpec> = HashMap::new();
-
-    for provider in providers {
-        for question in &provider.form_spec.questions {
-            if question.id.is_empty() {
-                continue;
-            }
-            question_count
-                .entry(question.id.clone())
-                .or_default()
-                .push(provider.provider_id.clone());
-
-            // Keep the first occurrence of each question
-            first_question
-                .entry(question.id.clone())
-                .or_insert_with(|| question.clone());
-        }
-    }
-
-    // Find shared questions (must appear in 2+ providers to be truly shared)
-    // SHARED_QUESTION_IDS are hints for what questions are commonly shared,
-    // but we only share them if they actually appear in multiple providers.
-    //
-    // IMPORTANT: Exclude secrets and provider-specific fields from sharing.
-    // Each provider needs unique values for these fields.
-    let mut shared_questions = Vec::new();
-    let mut question_providers = HashMap::new();
-
-    // Questions that should NEVER be shared even if they appear in multiple providers
-    const NEVER_SHARE_IDS: &[&str] = &[
-        "api_base_url",   // Different API endpoints per provider
-        "bot_token",      // Provider-specific secrets
-        "access_token",   // Provider-specific secrets
-        "token",          // Provider-specific secrets
-        "app_id",         // Provider-specific IDs
-        "app_secret",     // Provider-specific secrets
-        "client_id",      // Provider-specific IDs
-        "client_secret",  // Provider-specific secrets
-        "webhook_secret", // Provider-specific secrets
-        "signing_secret", // Provider-specific secrets
-    ];
-
-    for (question_id, provider_ids) in &question_count {
-        let appears_multiple = provider_ids.len() >= 2;
-
-        // Only share questions that actually appear in 2+ providers
-        if appears_multiple && let Some(question) = first_question.get(question_id) {
-            // Skip secrets - they should never be shared across providers
-            if question.secret {
-                continue;
-            }
-
-            // Skip provider-specific fields that happen to have the same ID
-            if NEVER_SHARE_IDS.contains(&question_id.as_str()) {
-                continue;
-            }
-
-            shared_questions.push(question.clone());
-            question_providers.insert(question_id.clone(), provider_ids.clone());
-        }
-    }
-
-    // Sort by question ID for deterministic ordering
-    shared_questions.sort_by(|a, b| a.id.cmp(&b.id));
-
-    SharedQuestionsResult {
-        shared_questions,
-        question_providers,
-    }
-}
-
-/// Prompt for shared questions once at the beginning of multi-provider setup.
-///
-/// Returns a JSON object with answers for all shared questions.
-/// These answers can then be passed to each provider's `run_qa_setup` call
-/// via the `initial_answers` parameter.
-/// Prompt for shared questions that apply to multiple providers.
-///
-/// Takes existing answers from loaded setup file and only prompts for
-/// questions that don't already have a valid (non-empty) value.
-pub fn prompt_shared_questions(
-    shared: &SharedQuestionsResult,
-    advanced: bool,
-    existing_answers: &Value,
-) -> Result<Value> {
-    if shared.shared_questions.is_empty() {
-        return Ok(Value::Object(JsonMap::new()));
-    }
-
-    let existing_map = existing_answers.as_object();
-
-    // Check if all shared questions already have valid answers
-    let questions_needing_prompt: Vec<_> = shared
-        .shared_questions
-        .iter()
-        .filter(|q| {
-            // Skip optional questions in normal mode
-            if !advanced && !q.required {
-                return false;
-            }
-            // Check if this question already has a non-empty value
-            if let Some(map) = existing_map
-                && let Some(value) = map.get(&q.id)
-            {
-                // Skip if value is non-null and non-empty string
-                if !value.is_null() {
-                    if let Some(s) = value.as_str() {
-                        return s.is_empty(); // Need prompt if empty string
-                    }
-                    return false; // Has value, skip
-                }
-            }
-            true // Need prompt
-        })
-        .collect();
-
-    // If no questions need prompting, return existing answers
-    if questions_needing_prompt.is_empty() {
-        let mut answers = JsonMap::new();
-        if let Some(map) = existing_map {
-            for question in &shared.shared_questions {
-                if let Some(value) = map.get(&question.id) {
-                    answers.insert(question.id.clone(), value.clone());
-                }
-            }
-        }
-        return Ok(Value::Object(answers));
-    }
-
-    println!("\n── Shared Configuration ──");
-    println!("The following settings apply to all providers:\n");
-
-    let mut answers = JsonMap::new();
-
-    // Copy existing values first
-    if let Some(map) = existing_map {
-        for question in &shared.shared_questions {
-            if let Some(value) = map.get(&question.id)
-                && !value.is_null()
-                && !(value.is_string() && value.as_str() == Some(""))
-            {
-                answers.insert(question.id.clone(), value.clone());
-            }
-        }
-    }
-
-    for question in &shared.shared_questions {
-        // Skip if we already have a valid answer
-        if answers.contains_key(&question.id) {
-            continue;
-        }
-
-        // Skip optional questions in normal mode
-        if !advanced && !question.required {
-            continue;
-        }
-
-        // Show which providers use this question
-        if let Some(provider_ids) = shared.question_providers.get(&question.id) {
-            let providers_str = provider_ids
-                .iter()
-                .map(|id| setup_to_formspec::strip_domain_prefix(id))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("  Used by: {providers_str}");
-        }
-
-        if let Some(value) = ask_form_spec_question(question)? {
-            answers.insert(question.id.clone(), value);
-        }
-    }
-
-    println!();
-    Ok(Value::Object(answers))
-}
-
 /// Run QA setup for a provider with pre-filled shared answers.
 ///
 /// This is a convenience wrapper around `run_qa_setup` that merges shared
 /// answers with provider-specific answers from `setup_input`.
+///
+/// When using `--answers` file (non-interactive mode), if any required fields
+/// are missing or empty, the user will be prompted to fill them in.
 pub fn run_qa_setup_with_shared(
     pack_path: &Path,
     provider_id: &str,
@@ -639,7 +198,7 @@ pub fn run_qa_setup_with_shared(
         qa_form_spec.or_else(|| setup_to_formspec::pack_to_form_spec(pack_path, provider_id));
 
     // Merge shared answers with provider-specific answers from setup_input
-    let merged_initial = merge_shared_with_provider_answers(
+    let merged_initial = merge_answers(
         shared_answers,
         setup_input.and_then(|i| i.answers_for_provider(provider_id)),
     );
@@ -649,10 +208,19 @@ pub fn run_qa_setup_with_shared(
             Value::Object(JsonMap::new())
         } else if interactive {
             // Prompt with merged initial answers (shared + provider-specific)
-            prompt_form_spec_answers_with_existing(spec, provider_id, advanced, &merged_initial)?
+            do_prompt_with_existing(spec, provider_id, advanced, &merged_initial)?
         } else {
-            // Non-interactive: validate merged answers
-            let answers = crate::setup_input::ensure_object(merged_initial)?;
+            // Non-interactive: check for missing required fields
+            let mut answers = crate::setup_input::ensure_object(merged_initial)?;
+            let missing = find_missing_required_fields(spec, &answers);
+
+            if !missing.is_empty() {
+                // Prompt for missing required fields
+                let display = setup_to_formspec::strip_domain_prefix(provider_id);
+                println!("\n⚠️  Missing required fields for {display}. Please provide values:");
+                answers = prompt_for_missing_fields(spec, &answers, &missing)?;
+            }
+
             validate_answers_against_form_spec(spec, &answers)?;
             answers
         }
@@ -663,58 +231,76 @@ pub fn run_qa_setup_with_shared(
     Ok((answers, form_spec))
 }
 
-/// Merge shared answers with provider-specific answers.
+/// Find required fields that are missing or have empty values.
 ///
-/// Shared answers take precedence for non-empty values, but provider-specific
-/// answers can override if the shared value is empty.
-fn merge_shared_with_provider_answers(shared: &Value, provider_specific: Option<&Value>) -> Value {
-    let mut merged = JsonMap::new();
+/// Returns a list of question IDs that are required, visible, and either:
+/// - Missing from answers
+/// - Have null value
+/// - Have empty string value
+fn find_missing_required_fields(spec: &FormSpec, answers: &Value) -> Vec<String> {
+    let map = answers.as_object();
+    let visibility = resolve_visibility(spec, answers, VisibilityMode::Visible);
 
-    // Start with shared answers
-    if let Some(shared_map) = shared.as_object() {
-        for (key, value) in shared_map {
-            // Only include non-empty values
-            if !(value.is_null() || value.is_string() && value.as_str() == Some("")) {
-                merged.insert(key.clone(), value.clone());
+    spec.questions
+        .iter()
+        .filter(|q| {
+            // Must be required
+            if !q.required {
+                return false;
             }
-        }
-    }
-
-    // Add provider-specific answers (don't override non-empty shared values)
-    if let Some(provider_map) = provider_specific.and_then(Value::as_object) {
-        for (key, value) in provider_map {
-            // Only add if not already present with a non-empty value
-            if !merged.contains_key(key) {
-                merged.insert(key.clone(), value.clone());
+            // Must be visible
+            let visible = visibility.get(&q.id).copied().unwrap_or(true);
+            if !visible {
+                return false;
             }
-        }
-    }
-
-    Value::Object(merged)
+            // Check if missing or empty
+            match map.and_then(|m| m.get(&q.id)) {
+                None => true,                                   // Missing
+                Some(Value::Null) => true,                      // Null
+                Some(Value::String(s)) if s.is_empty() => true, // Empty string
+                _ => false,                                     // Has value
+            }
+        })
+        .map(|q| q.id.clone())
+        .collect()
 }
 
-/// Build FormSpecs for multiple providers from their pack paths.
+/// Prompt for specific missing required fields.
 ///
-/// Convenience function to prepare input for `collect_shared_questions`.
-pub fn build_provider_form_specs(
-    providers: &[(std::path::PathBuf, String)], // (pack_path, provider_id)
-) -> Vec<ProviderFormSpec> {
-    providers
-        .iter()
-        .filter_map(|(pack_path, provider_id)| {
-            setup_to_formspec::pack_to_form_spec(pack_path, provider_id).map(|form_spec| {
-                ProviderFormSpec {
-                    provider_id: provider_id.clone(),
-                    form_spec,
-                }
-            })
-        })
-        .collect()
+/// Only prompts for the questions whose IDs are in `missing_ids`.
+fn prompt_for_missing_fields(
+    spec: &FormSpec,
+    existing_answers: &Value,
+    missing_ids: &[String],
+) -> Result<Value> {
+    let mut answers = existing_answers.as_object().cloned().unwrap_or_default();
+
+    for question in &spec.questions {
+        if !missing_ids.contains(&question.id) {
+            continue;
+        }
+
+        // Re-evaluate visibility with answers collected so far
+        if question.visible_if.is_some() {
+            let current = Value::Object(answers.clone());
+            let vis = resolve_visibility(spec, &current, VisibilityMode::Visible);
+            if !vis.get(&question.id).copied().unwrap_or(true) {
+                continue;
+            }
+        }
+
+        if let Some(value) = prompt_question(question)? {
+            answers.insert(question.id.clone(), value);
+        }
+    }
+
+    Ok(Value::Object(answers))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qa_spec::{QuestionSpec, QuestionType};
     use serde_json::json;
 
     fn test_form_spec() -> FormSpec {
@@ -815,23 +401,6 @@ mod tests {
         let answers = json!({"api_url": "not-a-url", "token": "abc"});
         let err = validate_answers_against_form_spec(&spec, &answers).unwrap_err();
         assert!(err.to_string().contains("pattern"));
-    }
-
-    #[test]
-    fn parse_typed_values() {
-        assert_eq!(
-            parse_typed_value(QuestionType::Boolean, "true"),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            parse_typed_value(QuestionType::Boolean, "no"),
-            Value::Bool(false)
-        );
-        assert_eq!(parse_typed_value(QuestionType::Number, "42"), json!(42));
-        assert_eq!(
-            parse_typed_value(QuestionType::String, "hello"),
-            Value::String("hello".into())
-        );
     }
 
     #[test]
@@ -947,14 +516,6 @@ mod tests {
     }
 
     #[test]
-    fn matches_url_pattern() {
-        assert!(matches_pattern("https://example.com", r"^https?://\S+"));
-        assert!(matches_pattern("http://localhost:8080", r"^https?://\S+"));
-        assert!(!matches_pattern("not-a-url", r"^https?://\S+"));
-        assert!(!matches_pattern("https://", r"^https?://\S+")); // too short
-    }
-
-    #[test]
     fn normal_mode_skips_optional_questions() {
         let spec = test_form_spec();
         let advanced = false;
@@ -964,7 +525,6 @@ mod tests {
             .filter(|q| !q.id.is_empty() && (advanced || q.required))
             .map(|q| q.id.as_str())
             .collect();
-        // Normal mode: only required questions shown
         assert_eq!(visible, vec!["api_url", "token"]);
         assert!(!visible.contains(&"optional"));
     }
@@ -979,128 +539,131 @@ mod tests {
             .filter(|q| !q.id.is_empty() && (advanced || q.required))
             .map(|q| q.id.as_str())
             .collect();
-        // Advanced mode: all questions shown
         assert_eq!(visible, vec!["api_url", "token", "optional"]);
     }
 
-    // ── Shared Questions Tests ──────────────────────────────────────────────
+    // ── Missing Required Fields Tests ──────────────────────────────────────────
 
-    fn make_provider_form_spec(provider_id: &str, question_ids: &[&str]) -> ProviderFormSpec {
-        let questions = question_ids
-            .iter()
-            .map(|id| QuestionSpec {
-                id: id.to_string(),
-                kind: QuestionType::String,
-                title: format!("{} Question", id),
-                title_i18n: None,
-                description: None,
-                description_i18n: None,
-                required: true,
-                choices: None,
-                default_value: None,
-                secret: false,
-                visible_if: None,
-                constraint: None,
-                list: None,
-                computed: None,
-                policy: Default::default(),
-                computed_overridable: false,
-            })
-            .collect();
+    #[test]
+    fn find_missing_required_fields_detects_missing() {
+        let spec = test_form_spec();
+        let answers = json!({"api_url": "https://example.com"});
 
-        ProviderFormSpec {
-            provider_id: provider_id.to_string(),
-            form_spec: FormSpec {
-                id: format!("{}-setup", provider_id),
-                title: format!("{} Setup", provider_id),
-                version: "1.0.0".into(),
-                description: None,
-                presentation: None,
-                progress_policy: None,
-                secrets_policy: None,
-                store: vec![],
-                validations: vec![],
-                includes: vec![],
-                questions,
-            },
-        }
+        let missing = find_missing_required_fields(&spec, &answers);
+
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&"token".to_string()));
     }
 
     #[test]
-    fn collect_shared_questions_finds_common_questions() {
-        let providers = vec![
-            make_provider_form_spec("messaging-telegram", &["public_base_url", "bot_token"]),
-            make_provider_form_spec("messaging-slack", &["public_base_url", "slack_token"]),
-            make_provider_form_spec("messaging-teams", &["public_base_url", "teams_app_id"]),
-        ];
+    fn find_missing_required_fields_detects_empty_string() {
+        let spec = test_form_spec();
+        let answers = json!({"api_url": "https://example.com", "token": ""});
 
-        let result = collect_shared_questions(&providers);
+        let missing = find_missing_required_fields(&spec, &answers);
 
-        // public_base_url appears in all 3 providers
-        assert_eq!(result.shared_questions.len(), 1);
-        assert_eq!(result.shared_questions[0].id, "public_base_url");
-
-        // Check provider mapping
-        let providers_for_url = result.question_providers.get("public_base_url").unwrap();
-        assert_eq!(providers_for_url.len(), 3);
-        assert!(providers_for_url.contains(&"messaging-telegram".to_string()));
-        assert!(providers_for_url.contains(&"messaging-slack".to_string()));
-        assert!(providers_for_url.contains(&"messaging-teams".to_string()));
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&"token".to_string()));
     }
 
     #[test]
-    fn collect_shared_questions_excludes_single_provider_questions() {
-        // Questions appearing in only 1 provider should NOT be shared,
-        // even if they're in SHARED_QUESTION_IDS
-        let providers = vec![
-            make_provider_form_spec("messaging-telegram", &["public_base_url", "bot_token"]),
-            make_provider_form_spec("messaging-slack", &["slack_token"]), // no public_base_url
-        ];
+    fn find_missing_required_fields_detects_null() {
+        let spec = test_form_spec();
+        let answers = json!({"api_url": "https://example.com", "token": null});
 
-        let result = collect_shared_questions(&providers);
+        let missing = find_missing_required_fields(&spec, &answers);
 
-        // public_base_url only appears in 1 provider, so not shared
-        assert!(result.shared_questions.is_empty());
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&"token".to_string()));
     }
 
     #[test]
-    fn collect_shared_questions_returns_empty_for_single_provider() {
-        let providers = vec![make_provider_form_spec(
-            "messaging-telegram",
-            &["public_base_url", "bot_token"],
-        )];
+    fn find_missing_required_fields_returns_empty_when_all_filled() {
+        let spec = test_form_spec();
+        let answers = json!({"api_url": "https://example.com", "token": "abc123"});
 
-        let result = collect_shared_questions(&providers);
+        let missing = find_missing_required_fields(&spec, &answers);
 
-        // Single provider: no shared questions
-        assert!(result.shared_questions.is_empty());
+        assert!(missing.is_empty());
     }
 
     #[test]
-    fn collect_shared_questions_finds_non_wellknown_duplicates() {
-        let providers = vec![
-            make_provider_form_spec("provider-a", &["custom_field", "field_a"]),
-            make_provider_form_spec("provider-b", &["custom_field", "field_b"]),
-        ];
+    fn find_missing_required_fields_ignores_optional() {
+        let spec = test_form_spec();
+        let answers = json!({"api_url": "https://example.com", "token": "abc"});
 
-        let result = collect_shared_questions(&providers);
+        let missing = find_missing_required_fields(&spec, &answers);
 
-        // custom_field appears in 2 providers, so it's shared
-        assert_eq!(result.shared_questions.len(), 1);
-        assert_eq!(result.shared_questions[0].id, "custom_field");
+        assert!(missing.is_empty());
+        assert!(!missing.contains(&"optional".to_string()));
     }
 
     #[test]
-    fn collect_shared_questions_deduplicates() {
-        let providers = vec![
-            make_provider_form_spec("provider-a", &["public_base_url"]),
-            make_provider_form_spec("provider-b", &["public_base_url"]),
-            make_provider_form_spec("provider-c", &["public_base_url"]),
-        ];
+    fn find_missing_required_fields_respects_visibility() {
+        use qa_spec::Expr;
 
-        let result = collect_shared_questions(&providers);
+        let spec = FormSpec {
+            id: "vis-test".into(),
+            title: "Visibility Test".into(),
+            version: "1.0.0".into(),
+            description: None,
+            presentation: None,
+            progress_policy: None,
+            secrets_policy: None,
+            store: vec![],
+            validations: vec![],
+            includes: vec![],
+            questions: vec![
+                QuestionSpec {
+                    id: "trigger".into(),
+                    kind: QuestionType::Boolean,
+                    title: "Enable feature".into(),
+                    title_i18n: None,
+                    description: None,
+                    description_i18n: None,
+                    required: true,
+                    choices: None,
+                    default_value: None,
+                    secret: false,
+                    visible_if: None,
+                    constraint: None,
+                    list: None,
+                    computed: None,
+                    policy: Default::default(),
+                    computed_overridable: false,
+                },
+                QuestionSpec {
+                    id: "dependent".into(),
+                    kind: QuestionType::String,
+                    title: "Dependent field".into(),
+                    title_i18n: None,
+                    description: None,
+                    description_i18n: None,
+                    required: true,
+                    choices: None,
+                    default_value: None,
+                    secret: false,
+                    visible_if: Some(Expr::Answer {
+                        path: "trigger".to_string(),
+                    }),
+                    constraint: None,
+                    list: None,
+                    computed: None,
+                    policy: Default::default(),
+                    computed_overridable: false,
+                },
+            ],
+        };
 
-        // Should only have 1 question, not 3
-        assert_eq!(result.shared_questions.len(), 1);
+        // trigger=false → dependent is invisible → should NOT be in missing list
+        let answers = json!({"trigger": false});
+        let missing = find_missing_required_fields(&spec, &answers);
+        assert!(missing.is_empty());
+
+        // trigger=true → dependent is visible → should BE in missing list
+        let answers = json!({"trigger": true});
+        let missing = find_missing_required_fields(&spec, &answers);
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&"dependent".to_string()));
     }
 }

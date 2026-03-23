@@ -1,0 +1,340 @@
+//! Answers handling for the setup engine.
+//!
+//! Contains functions for emitting, loading, encrypting, and prompting
+//! for setup answers.
+
+use std::path::Path;
+
+use anyhow::{Context, anyhow};
+use serde_json::{Map as JsonMap, Value};
+
+use crate::plan::SetupPlan;
+use crate::platform_setup::load_effective_static_routes_defaults;
+use crate::{answers_crypto, discovery, setup_input};
+
+use super::plan_builders::infer_default_value;
+use super::types::{LoadedAnswers, SetupConfig};
+
+/// Emit an answers template JSON file.
+///
+/// Discovers all packs in the bundle and generates a template with all
+/// setup questions. Users fill this in and pass it via `--answers`.
+pub fn emit_answers(
+    config: &SetupConfig,
+    plan: &SetupPlan,
+    output_path: &Path,
+    key: Option<&str>,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    let bundle = &plan.bundle;
+
+    // Build the answers document structure
+    let mut answers_doc = serde_json::json!({
+        "greentic_setup_version": "1.0.0",
+        "bundle_source": bundle.display().to_string(),
+        "tenant": config.tenant,
+        "team": config.team,
+        "env": config.env,
+        "platform_setup": {
+            "static_routes": plan.metadata.static_routes.to_answers(),
+            "deployment_targets": plan.metadata.deployment_targets
+        },
+        "setup_answers": {}
+    });
+
+    if !plan.metadata.static_routes.public_web_enabled
+        && plan.metadata.static_routes.public_base_url.is_none()
+        && let Some(existing) =
+            load_effective_static_routes_defaults(bundle, &config.tenant, config.team.as_deref())?
+    {
+        answers_doc["platform_setup"]["static_routes"] =
+            serde_json::to_value(existing.to_answers())?;
+    }
+
+    // Discover packs and extract their QA specs
+    let setup_answers = answers_doc
+        .get_mut("setup_answers")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| anyhow!("internal error: setup_answers not an object"))?;
+
+    // Add existing answers from the plan metadata
+    for (provider_id, answers) in &plan.metadata.setup_answers {
+        setup_answers.insert(provider_id.clone(), answers.clone());
+    }
+
+    // Discover packs and populate question templates for all providers.
+    // If a provider entry already exists but is empty, merge in the
+    // questions from setup.yaml so the user sees what needs to be filled.
+    if bundle.exists() {
+        let discovered = discovery::discover(bundle)?;
+        for provider in discovered.providers {
+            let provider_id = provider.provider_id.clone();
+            let existing_is_empty = setup_answers
+                .get(&provider_id)
+                .and_then(|v| v.as_object())
+                .is_some_and(|m| m.is_empty());
+            if !setup_answers.contains_key(&provider_id) || existing_is_empty {
+                // Load the setup spec from the pack and create template
+                let template =
+                    if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
+                        // Pack has setup.yaml - extract questions
+                        let mut entries = JsonMap::new();
+                        for question in &spec.questions {
+                            let default_value = infer_default_value(question);
+                            entries.insert(question.name.clone(), default_value);
+                        }
+                        entries
+                    } else {
+                        // Pack uses flow-based setup or has no questions
+                        // Add empty entry so user knows pack exists
+                        JsonMap::new()
+                    };
+                setup_answers.insert(provider_id, Value::Object(template));
+            }
+        }
+    }
+
+    // Prompt for secret values if interactive
+    if interactive {
+        prompt_secret_answers(bundle, &mut answers_doc)?;
+    }
+
+    encrypt_secret_answers(bundle, &mut answers_doc, key, interactive)?;
+
+    // Write the answers document to the output path
+    let output_content = serde_json::to_string_pretty(&answers_doc)
+        .context("failed to serialize answers document")?;
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+    }
+
+    std::fs::write(output_path, output_content)
+        .with_context(|| format!("failed to write answers to: {}", output_path.display()))?;
+
+    println!("Answers template written to: {}", output_path.display());
+    Ok(())
+}
+
+/// Load answers from a JSON/YAML file.
+pub fn load_answers(
+    answers_path: &Path,
+    key: Option<&str>,
+    interactive: bool,
+) -> anyhow::Result<LoadedAnswers> {
+    let raw = setup_input::load_setup_input(answers_path)?;
+    let raw = if answers_crypto::has_encrypted_values(&raw) {
+        let resolved_key = match key {
+            Some(value) => value.to_string(),
+            None if interactive => answers_crypto::prompt_for_key("decrypting answers")?,
+            None => {
+                return Err(anyhow!(
+                    "answers file contains encrypted secret values; rerun with --key or interactive input"
+                ));
+            }
+        };
+        answers_crypto::decrypt_tree(&raw, &resolved_key)?
+    } else {
+        raw
+    };
+    match raw {
+        Value::Object(map) => {
+            let platform_setup = map
+                .get("platform_setup")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("parse platform_setup answers")?
+                .unwrap_or_default();
+
+            if let Some(Value::Object(setup_answers)) = map.get("setup_answers") {
+                Ok(LoadedAnswers {
+                    platform_setup,
+                    setup_answers: setup_answers.clone(),
+                })
+            } else if map.contains_key("bundle_source")
+                || map.contains_key("tenant")
+                || map.contains_key("team")
+                || map.contains_key("env")
+                || map.contains_key("platform_setup")
+            {
+                Ok(LoadedAnswers {
+                    platform_setup,
+                    setup_answers: JsonMap::new(),
+                })
+            } else {
+                Ok(LoadedAnswers {
+                    platform_setup,
+                    setup_answers: map,
+                })
+            }
+        }
+        _ => Err(anyhow!("answers file must be a JSON/YAML object")),
+    }
+}
+
+/// Prompt user to fill in secret values interactively.
+///
+/// Discovers all secret questions from packs and prompts user to enter
+/// values using secure/hidden input. Updates the answers_doc in place.
+pub fn prompt_secret_answers(bundle: &Path, answers_doc: &mut Value) -> anyhow::Result<()> {
+    use rpassword::prompt_password;
+    use std::io::{self, Write as _};
+
+    let setup_answers = answers_doc
+        .get_mut("setup_answers")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("internal error: setup_answers not an object"))?;
+
+    let discovered = if bundle.exists() {
+        discovery::discover(bundle)?
+    } else {
+        return Ok(());
+    };
+
+    // Collect all secret questions that need prompting
+    let mut secret_questions: Vec<(String, String, String, bool)> = Vec::new(); // (provider_id, field_id, title, required)
+
+    for provider in &discovered.providers {
+        let Some(form_spec) =
+            crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id)
+        else {
+            continue;
+        };
+
+        let provider_answers = setup_answers
+            .get(&provider.provider_id)
+            .and_then(Value::as_object);
+
+        for question in form_spec.questions {
+            if !question.secret {
+                continue;
+            }
+
+            // Check if already has a non-empty value
+            let has_value = provider_answers
+                .and_then(|m| m.get(&question.id))
+                .is_some_and(|v| !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(true));
+
+            if !has_value {
+                secret_questions.push((
+                    provider.provider_id.clone(),
+                    question.id.clone(),
+                    question.title.clone(),
+                    question.required,
+                ));
+            }
+        }
+    }
+
+    if secret_questions.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    println!("── Secret Values ──");
+    println!("Enter values for secret fields (input is hidden):");
+    println!("(Press Enter to skip optional fields)\n");
+
+    for (provider_id, field_id, title, required) in secret_questions {
+        let display_provider = crate::setup_to_formspec::strip_domain_prefix(&provider_id);
+        let marker = if required {
+            " (required)"
+        } else {
+            " (optional)"
+        };
+
+        print!("  [{display_provider}] {title}{marker}: ");
+        io::stdout().flush()?;
+
+        let input = prompt_password("").unwrap_or_default();
+        let trimmed = input.trim();
+
+        if !trimmed.is_empty() {
+            // Update the answers_doc with the inputted value
+            if let Some(provider_answers) = setup_answers
+                .get_mut(&provider_id)
+                .and_then(Value::as_object_mut)
+            {
+                provider_answers.insert(field_id, Value::String(trimmed.to_string()));
+            }
+        } else if required {
+            println!("    \x1b[33m⚠ Skipped (will need to be filled in later)\x1b[0m");
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Encrypt secret values in the answers document.
+pub fn encrypt_secret_answers(
+    bundle: &Path,
+    answers_doc: &mut Value,
+    key: Option<&str>,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    let setup_answers = answers_doc
+        .get_mut("setup_answers")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("internal error: setup_answers not an object"))?;
+    let discovered = if bundle.exists() {
+        discovery::discover(bundle)?
+    } else {
+        return Ok(());
+    };
+
+    let mut secret_paths = Vec::new();
+    for provider in discovered.providers {
+        let Some(form_spec) =
+            crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id)
+        else {
+            continue;
+        };
+        let Some(provider_answers) = setup_answers
+            .get_mut(&provider.provider_id)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for question in form_spec.questions {
+            if !question.secret {
+                continue;
+            }
+            let Some(value) = provider_answers.get(&question.id).cloned() else {
+                continue;
+            };
+            if value.is_null() || value == Value::String(String::new()) {
+                continue;
+            }
+            secret_paths.push((provider.provider_id.clone(), question.id.clone(), value));
+        }
+    }
+
+    if secret_paths.is_empty() {
+        return Ok(());
+    }
+
+    let resolved_key = match key {
+        Some(value) => value.to_string(),
+        None if interactive => answers_crypto::prompt_for_key("encrypting answers")?,
+        None => {
+            return Err(anyhow!(
+                "answer document includes secret values; rerun with --key or interactive input"
+            ));
+        }
+    };
+
+    for (provider_id, field_id, value) in secret_paths {
+        let encrypted = answers_crypto::encrypt_value(&value, &resolved_key)?;
+        if let Some(provider_answers) = setup_answers
+            .get_mut(&provider_id)
+            .and_then(Value::as_object_mut)
+        {
+            provider_answers.insert(field_id, encrypted);
+        }
+    }
+
+    Ok(())
+}
