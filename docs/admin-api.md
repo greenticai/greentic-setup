@@ -1,14 +1,22 @@
 # Admin API Reference
 
-The greentic-setup Admin API provides mTLS-secured endpoints for runtime bundle lifecycle management. These endpoints are served by greentic-operator on a separate admin port.
+`greentic-setup` defines the shared mTLS Admin API contract for runtime bundle lifecycle management.
+The runtime lifecycle owner is `greentic-start`. Other repos may proxy or orchestrate this API, but they do not own runtime `start`/`stop`.
 
 ## Overview
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/admin/status` | GET | Get bundle deployment status |
-| `/admin/deploy` | POST | Deploy or upgrade a bundle |
+| `/admin/list` | GET | List managed bundles |
+| `/admin/deploy` | POST | Deploy a new bundle |
+| `/admin/update` | POST | Update an existing bundle |
+| `/admin/start` | POST | Start runtime lifecycle for a bundle |
+| `/admin/stop` | POST | Stop runtime lifecycle for a bundle |
 | `/admin/remove` | POST | Remove bundle components |
+| `/admin/admins` | GET | List runtime admin client CN allowlist |
+| `/admin/admins/add` | POST | Add runtime admin client CN |
+| `/admin/admins/remove` | POST | Remove runtime admin client CN |
 | `/admin/qa/spec` | POST | Get QA FormSpec for a provider |
 | `/admin/qa/validate` | POST | Validate QA answers |
 | `/admin/qa/submit` | POST | Submit and persist QA answers |
@@ -62,8 +70,12 @@ curl --cert client.crt --key client.key --cacert ca.crt \
 ```
 
 **Status values:**
+- `inactive` - Bundle is known but not currently active
 - `active` - Bundle is running normally
 - `deploying` - Bundle deployment in progress
+- `updating` - Bundle update is in progress
+- `stopping` - Bundle shutdown is in progress
+- `stopped` - Bundle runtime has been stopped cleanly
 - `removing` - Bundle removal in progress
 - `error` - Bundle has errors
 
@@ -169,6 +181,53 @@ curl --cert client.crt --key client.key --cacert ca.crt \
   }
 }
 ```
+
+---
+
+### GET /admin/admins
+
+List the runtime admin client CN allowlist.
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "admins": [
+      { "client_cn": "local-admin" },
+      { "client_cn": "ops-admin" }
+    ]
+  }
+}
+```
+
+### POST /admin/admins/add
+
+Add a client CN to the runtime admin allowlist registry.
+
+**Request:**
+```json
+{
+  "bundle_path": "/path/to/bundle",
+  "client_cn": "ops-admin"
+}
+```
+
+### POST /admin/admins/remove
+
+Remove a client CN from the runtime admin allowlist registry.
+
+**Request:**
+```json
+{
+  "bundle_path": "/path/to/bundle",
+  "client_cn": "ops-admin"
+}
+```
+
+These endpoints are intended for runtime admin allowlist management. In
+`greentic-start`, the registry is persisted in `.greentic/admin/admins.json`
+and new connections observe the updated allowlist immediately.
 
 ---
 
