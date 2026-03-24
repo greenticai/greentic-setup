@@ -35,6 +35,60 @@ pub struct BundleDeployRequest {
     pub dry_run: bool,
 }
 
+/// Request to update an existing bundle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BundleUpdateRequest {
+    /// Target bundle path on the server.
+    pub bundle_path: PathBuf,
+    /// Optional display name for the bundle.
+    #[serde(default)]
+    pub bundle_name: Option<String>,
+    /// Pack references to resolve and install.
+    #[serde(default)]
+    pub pack_refs: Vec<String>,
+    /// Tenant selections with allow rules.
+    #[serde(default)]
+    pub tenants: Vec<TenantSelection>,
+    /// Pre-collected QA answers (provider_id → answers map).
+    #[serde(default)]
+    pub answers: Value,
+    /// If true, only plan without executing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Request to start a managed bundle runtime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BundleStartRequest {
+    /// Target bundle path.
+    pub bundle_path: PathBuf,
+}
+
+/// Request to stop a managed bundle runtime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BundleStopRequest {
+    /// Target bundle path.
+    pub bundle_path: PathBuf,
+}
+
+/// Request to add an admin client CN to the runtime allowlist.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminClientAddRequest {
+    /// Target bundle path.
+    pub bundle_path: PathBuf,
+    /// Client CN to allow.
+    pub client_cn: String,
+}
+
+/// Request to remove an admin client CN from the runtime allowlist.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminClientRemoveRequest {
+    /// Target bundle path.
+    pub bundle_path: PathBuf,
+    /// Client CN to remove.
+    pub client_cn: String,
+}
+
 /// Request to remove components from a bundle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BundleRemoveRequest {
@@ -138,12 +192,34 @@ pub struct BundleStatusResponse {
     pub provider_count: usize,
 }
 
+/// Bundle inventory listing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BundleListResponse {
+    pub bundles: Vec<BundleStatusResponse>,
+}
+
+/// One admin client entry in the runtime allowlist registry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminClientEntry {
+    pub client_cn: String,
+}
+
+/// Runtime admin allowlist inventory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminClientListResponse {
+    pub admins: Vec<AdminClientEntry>,
+}
+
 /// Bundle lifecycle status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BundleStatus {
+    Inactive,
     Active,
     Deploying,
+    Updating,
+    Stopping,
+    Stopped,
     Removing,
     Error,
 }
@@ -153,7 +229,12 @@ pub enum BundleStatus {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AdminRequest {
     Deploy(BundleDeployRequest),
+    Update(BundleUpdateRequest),
     Remove(BundleRemoveRequest),
+    Start(BundleStartRequest),
+    Stop(BundleStopRequest),
+    AddAdminClient(AdminClientAddRequest),
+    RemoveAdminClient(AdminClientRemoveRequest),
     QaSpec(QaSpecRequest),
     QaValidate(QaValidateRequest),
     QaSubmit(QaSubmitRequest),
@@ -201,6 +282,22 @@ mod tests {
     }
 
     #[test]
+    fn update_request_serde_roundtrip() {
+        let req = BundleUpdateRequest {
+            bundle_path: PathBuf::from("/tmp/bundle"),
+            bundle_name: Some("test".into()),
+            pack_refs: vec!["oci://test:latest".into()],
+            tenants: vec![],
+            answers: Value::Object(Default::default()),
+            dry_run: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: BundleUpdateRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.bundle_path, PathBuf::from("/tmp/bundle"));
+        assert!(parsed.dry_run);
+    }
+
+    #[test]
     fn admin_request_tagged_enum() {
         let json = r#"{"action":"list"}"#;
         let req: AdminRequest = serde_json::from_str(json).unwrap();
@@ -212,5 +309,12 @@ mod tests {
         let status = BundleStatus::Active;
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(json, "\"active\"");
+    }
+
+    #[test]
+    fn bundle_status_stopped_serde() {
+        let status = BundleStatus::Stopped;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"stopped\"");
     }
 }
