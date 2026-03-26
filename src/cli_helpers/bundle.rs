@@ -4,10 +4,11 @@
 //! and managing pack files.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use url::Url;
 
 use crate::cli_i18n::CliI18n;
 
@@ -76,6 +77,45 @@ pub fn resolve_bundle_source(path: &std::path::Path, i18n: &CliI18n) -> Result<P
             )
         );
     }
+}
+
+/// Persistent output target for simple setup flows.
+pub enum SetupOutputTarget {
+    Directory(PathBuf),
+    Archive(PathBuf),
+}
+
+/// Decide whether simple setup should materialize a configured local bundle.
+///
+/// - For remote `https://.../*.gtbundle`, write `./<file-name>.gtbundle` as a
+///   local bundle directory, matching the normal `gtc start ./demo.gtbundle`
+///   workspace flow.
+/// - For local archive paths, update that same archive in place.
+/// - For local bundle directories, keep working in the directory and do not emit
+///   a new artifact automatically.
+pub fn setup_output_target(source: &Path) -> Result<Option<SetupOutputTarget>> {
+    let source_str = source.to_string_lossy();
+
+    if source_str.starts_with("https://") || source_str.starts_with("http://") {
+        let parsed =
+            Url::parse(&source_str).with_context(|| format!("invalid bundle URL: {source_str}"))?;
+        let file_name = parsed
+            .path_segments()
+            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+            .filter(|segment| segment.ends_with(".gtbundle"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("remote bundle URL must point to a .gtbundle archive")
+            })?;
+        return Ok(Some(SetupOutputTarget::Directory(
+            std::env::current_dir()?.join(file_name),
+        )));
+    }
+
+    if source_str.ends_with(".gtbundle") {
+        return Ok(Some(SetupOutputTarget::Archive(source.to_path_buf())));
+    }
+
+    Ok(None)
 }
 
 /// Download and extract a remote bundle archive.
@@ -182,5 +222,57 @@ pub fn resolve_pack_source(source: &str) -> Result<PathBuf> {
         let path = parsed.resolve()?;
         println!("    Downloaded to cache: {}", path.display());
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SetupOutputTarget, setup_output_target};
+    use std::env;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    #[test]
+    fn setup_output_target_uses_cwd_file_name_directory_for_remote_bundle_urls() {
+        let cwd = env::current_dir().expect("cwd");
+        let dir = tempdir().expect("tempdir");
+        env::set_current_dir(dir.path()).expect("set cwd");
+
+        let output = setup_output_target(Path::new(
+            "https://github.com/greenticai/greentic-demo/releases/download/v0.1.9/cloud-deploy-demo.gtbundle",
+        ))
+        .expect("output target")
+        .expect("some output target");
+
+        match output {
+            SetupOutputTarget::Directory(path) => {
+                assert_eq!(path, dir.path().join("cloud-deploy-demo.gtbundle"));
+            }
+            SetupOutputTarget::Archive(path) => {
+                panic!("expected directory output, got archive {}", path.display());
+            }
+        }
+
+        env::set_current_dir(cwd).expect("restore cwd");
+    }
+
+    #[test]
+    fn setup_output_target_updates_local_archives_in_place() {
+        let archive = Path::new("/tmp/demo-bundle.gtbundle");
+        let output = setup_output_target(archive)
+            .expect("output target")
+            .expect("some output target");
+        match output {
+            SetupOutputTarget::Archive(path) => assert_eq!(path, archive),
+            SetupOutputTarget::Directory(path) => {
+                panic!("expected archive output, got directory {}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn setup_output_target_skips_local_bundle_directories() {
+        let output = setup_output_target(Path::new("./demo-bundle")).expect("output target");
+        assert!(output.is_none());
     }
 }

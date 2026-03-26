@@ -19,8 +19,8 @@ use crate::setup_to_formspec;
 
 // Re-export from submodules
 pub use bundle::{
-    copy_dir_recursive, detect_domain_from_filename, resolve_bundle_dir, resolve_bundle_source,
-    resolve_pack_source,
+    SetupOutputTarget, copy_dir_recursive, detect_domain_from_filename, resolve_bundle_dir,
+    resolve_bundle_source, resolve_pack_source, setup_output_target,
 };
 pub use env_vars::{
     EnvVarPlaceholder, apply_resolved_env_vars, collect_env_var_placeholders,
