@@ -22,18 +22,20 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::fs;
 
 use greentic_setup::cli_args::{BundleCommand, Cli, Command};
 use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
-    complete_loaded_answers_with_prompts, ensure_deployment_targets_present, prompt_setup_params,
-    resolve_bundle_source, run_interactive_wizard,
+    SetupOutputTarget, complete_loaded_answers_with_prompts, copy_dir_recursive,
+    ensure_deployment_targets_present, prompt_setup_params, resolve_bundle_source,
+    run_interactive_wizard, setup_output_target,
 };
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
 use greentic_setup::plan::TenantSelection;
 use greentic_setup::platform_setup::StaticRoutesPolicy;
-use greentic_setup::{SetupEngine, SetupMode, bundle};
+use greentic_setup::{SetupEngine, SetupMode, bundle, gtbundle};
 
 /// Global i18n instance (initialized once at startup).
 fn get_i18n() -> &'static CliI18n {
@@ -232,6 +234,38 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     engine
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
+
+    if let Some(output_target) = setup_output_target(&bundle_path)? {
+        match output_target {
+            SetupOutputTarget::Directory(output_bundle) => {
+                if output_bundle.exists() {
+                    if output_bundle.is_dir() {
+                        fs::remove_dir_all(&output_bundle).with_context(|| {
+                            format!(
+                                "failed to replace existing bundle directory {}",
+                                output_bundle.display()
+                            )
+                        })?;
+                    } else {
+                        fs::remove_file(&output_bundle).with_context(|| {
+                            format!(
+                                "failed to replace existing bundle file {}",
+                                output_bundle.display()
+                            )
+                        })?;
+                    }
+                }
+                copy_dir_recursive(&bundle_dir, &output_bundle, false)
+                    .context("failed to write configured local bundle directory")?;
+                println!("Configured bundle written to: {}", output_bundle.display());
+            }
+            SetupOutputTarget::Archive(output_bundle) => {
+                gtbundle::create_gtbundle(&bundle_dir, &output_bundle)
+                    .context("failed to write configured .gtbundle archive")?;
+                println!("Configured bundle written to: {}", output_bundle.display());
+            }
+        }
+    }
 
     println!(
         "\n{}",
