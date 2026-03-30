@@ -28,6 +28,9 @@ pub mod setup_input;
 pub mod setup_to_formspec;
 pub mod webhook;
 
+#[cfg(feature = "ui")]
+pub mod ui;
+
 pub mod qa {
     //! QA-driven configuration: FormSpec bridge, wizard prompts, answers
     //! persistence, and setup input loading.
