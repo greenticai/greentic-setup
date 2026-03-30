@@ -60,6 +60,12 @@ fn main() -> Result<()> {
     init_i18n(cli.locale.as_deref());
     let i18n = get_i18n();
 
+    // Launch web UI if --ui flag is set
+    #[cfg(feature = "ui")]
+    if cli.ui {
+        return run_ui_mode(&cli, i18n);
+    }
+
     match cli.command {
         Some(Command::Bundle(cmd)) => match cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
@@ -276,4 +282,28 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Launch the web-based setup UI.
+#[cfg(feature = "ui")]
+fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
+    let bundle_path = cli.bundle.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}\n\n{}",
+            i18n.t("cli.simple.bundle_required"),
+            i18n.t("cli.help.for_help")
+        )
+    })?;
+
+    let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
+    bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(greentic_setup::ui::launch(
+        &bundle_dir,
+        &cli.tenant,
+        cli.team.as_deref(),
+        &cli.env,
+        cli.advanced,
+    ))
 }

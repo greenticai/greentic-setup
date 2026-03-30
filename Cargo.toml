@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 license = "MIT"
 description = "End-to-end bundle setup engine for the Greentic platform — pack discovery, QA-driven configuration, secrets persistence, and bundle lifecycle management"
@@ -11,7 +11,8 @@ keywords = ["greentic", "setup", "bundle", "qa", "secrets"]
 categories = ["command-line-utilities", "config"]
 
 [features]
-default = ["oci", "squashfs"]
+default = ["oci", "squashfs", "ui"]
+ui = ["axum", "open"]
 oci = ["greentic-distributor-client"]
 squashfs = ["backhand"]
 
@@ -36,7 +37,9 @@ serde_cbor = "0.11"
 serde_json = "1"
 serde_yaml_bw = { package = "serde_yaml_gtc", version = "2.5.2" }
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+axum = { version = "0.8", optional = true }
+open = { version = "5", optional = true }
 tar = "0.4"
 ureq = { version = "3", features = ["json"] }
 tracing = "0.1"

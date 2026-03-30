@@ -5,11 +5,21 @@
 
 use serde_json::Value;
 
-/// Print post-setup instructions for providers that need manual intervention.
+/// A single provider's manual setup instructions.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderInstruction {
+    pub provider_name: String,
+    pub steps: Vec<String>,
+}
+
+/// Collect post-setup instructions for providers that need manual intervention.
 ///
-/// Some providers (e.g. Teams, WhatsApp) cannot be fully automated and require
-/// the user to complete additional steps in external portals.
-pub fn print_post_setup_instructions(providers: &[(String, Value)], tenant: &str, team: &str) {
+/// Returns structured data that can be displayed in terminal or UI.
+pub fn collect_post_setup_instructions(
+    providers: &[(String, Value)],
+    tenant: &str,
+    team: &str,
+) -> Vec<ProviderInstruction> {
     let mut instructions: Vec<(&str, Vec<String>)> = Vec::new();
 
     for (provider_id, config) in providers {
@@ -111,6 +121,22 @@ pub fn print_post_setup_instructions(providers: &[(String, Value)], tenant: &str
         }
     }
 
+    instructions
+        .into_iter()
+        .map(|(name, steps)| ProviderInstruction {
+            provider_name: name.to_string(),
+            steps,
+        })
+        .collect()
+}
+
+/// Print post-setup instructions for providers that need manual intervention.
+///
+/// Some providers (e.g. Teams, WhatsApp) cannot be fully automated and require
+/// the user to complete additional steps in external portals.
+pub fn print_post_setup_instructions(providers: &[(String, Value)], tenant: &str, team: &str) {
+    let instructions = collect_post_setup_instructions(providers, tenant, team);
+
     if instructions.is_empty() {
         return;
     }
@@ -119,10 +145,10 @@ pub fn print_post_setup_instructions(providers: &[(String, Value)], tenant: &str
     println!("──────────────────────────────────────────────────────────");
     println!("  Manual steps required:");
     println!("──────────────────────────────────────────────────────────");
-    for (provider_name, steps) in &instructions {
+    for instr in &instructions {
         println!();
-        println!("  [{provider_name}]");
-        for step in steps {
+        println!("  [{}]", instr.provider_name);
+        for step in &instr.steps {
             println!("    {step}");
         }
     }
