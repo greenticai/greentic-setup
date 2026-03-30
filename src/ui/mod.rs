@@ -91,6 +91,7 @@ struct ExecutionResult {
     success: bool,
     stdout: String,
     stderr: String,
+    manual_steps: Vec<crate::webhook::ProviderInstruction>,
 }
 
 // ── Public API ──
@@ -267,6 +268,7 @@ async fn post_execute(
         success: false,
         stdout: String::new(),
         stderr: format!("Task panicked: {e}"),
+        manual_steps: vec![],
     });
 
     *state.result.lock().unwrap() = Some(result.clone());
@@ -301,9 +303,19 @@ fn execute_setup(
                 success: false,
                 stdout: String::new(),
                 stderr: format!("Failed to normalize static routes: {e}"),
+                manual_steps: vec![],
             };
         }
     };
+
+    // Collect manual steps before moving answers into request
+    let provider_configs: Vec<(String, serde_json::Value)> = answers
+        .iter()
+        .map(|(id, val)| (id.clone(), val.clone()))
+        .collect();
+    let team_str = team.unwrap_or("default");
+    let manual_steps =
+        crate::webhook::collect_post_setup_instructions(&provider_configs, tenant, team_str);
 
     let request = SetupRequest {
         bundle: bundle_path.to_path_buf(),
@@ -327,6 +339,7 @@ fn execute_setup(
                 success: false,
                 stdout: String::new(),
                 stderr: format!("Failed to build plan: {e}"),
+                manual_steps: vec![],
             };
         }
     };
@@ -356,12 +369,14 @@ fn execute_setup(
                     plan.steps.len()
                 ),
                 stderr: String::new(),
+                manual_steps,
             }
         }
         Err(e) => ExecutionResult {
             success: false,
             stdout,
             stderr: format!("Execution failed: {e}"),
+            manual_steps: vec![],
         },
     }
 }

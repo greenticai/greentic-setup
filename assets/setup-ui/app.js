@@ -513,6 +513,21 @@
           '</div>' +
           '<div class="card-content">';
 
+    if (r && r.manual_steps && r.manual_steps.length > 0) {
+      html += '<div class="output-section"><h4 class="output-title" style="color:#f59e0b">Manual Steps Required</h4>';
+      r.manual_steps.forEach(function (instr) {
+        html += '<div style="margin-bottom:.75rem;padding:.75rem 1rem;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);border-radius:calc(var(--radius) - 2px)">';
+        html += '<div style="font-size:.8125rem;font-weight:600;color:#f59e0b;margin-bottom:.375rem">' + esc(instr.provider_name) + '</div>';
+        html += '<ol style="margin:0;padding-left:1.25rem;font-size:.8rem;color:#d4d4d8;line-height:1.7">';
+        instr.steps.forEach(function (step) {
+          var text = step.replace(/^\d+\.\s*/, '');
+          html += '<li>' + esc(text) + '</li>';
+        });
+        html += '</ol></div>';
+      });
+      html += '</div>';
+    }
+
     if (r && r.stdout) {
       html += '<div class="output-section"><h4 class="output-title">Output</h4><pre class="output-pre">' + esc(r.stdout) + '</pre></div>';
     }
