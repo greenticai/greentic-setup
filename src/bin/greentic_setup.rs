@@ -305,5 +305,6 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         cli.team.as_deref(),
         &cli.env,
         cli.advanced,
+        cli.locale.as_deref(),
     ))
 }

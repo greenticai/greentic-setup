@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use tokio::sync::broadcast;
 
+use crate::cli_i18n::CliI18n;
 use crate::engine::{SetupConfig, SetupRequest};
 use crate::plan::TenantSelection;
 use crate::platform_setup::StaticRoutesPolicy;
@@ -34,6 +35,7 @@ struct UiState {
     env: String,
     #[allow(dead_code)]
     advanced: bool,
+    locale: Option<String>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -103,6 +105,7 @@ pub async fn launch(
     team: Option<&str>,
     env: &str,
     advanced: bool,
+    locale: Option<&str>,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -112,6 +115,7 @@ pub async fn launch(
         team: team.map(String::from),
         env: env.to_string(),
         advanced,
+        locale: locale.map(String::from),
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -140,6 +144,7 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/", get(serve_index))
         .route("/app.js", get(serve_js))
         .route("/style.css", get(serve_css))
+        .route("/api/locales", get(get_locales))
         .route("/api/providers", get(get_providers))
         .route("/api/execute", post(post_execute))
         .route("/api/shutdown", post(post_shutdown))
@@ -174,8 +179,63 @@ async fn serve_css() -> impl IntoResponse {
 
 // ── API handlers ──
 
-async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Value> {
+/// Well-known locales with display labels.
+const LOCALE_OPTIONS: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("id", "Bahasa Indonesia"),
+    ("ja", "日本語"),
+    ("zh", "中文"),
+    ("ko", "한국어"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("pt", "Português"),
+    ("ru", "Русский"),
+    ("ar", "العربية"),
+    ("th", "ไทย"),
+    ("vi", "Tiếng Việt"),
+    ("tr", "Türkçe"),
+    ("it", "Italiano"),
+    ("nl", "Nederlands"),
+    ("pl", "Polski"),
+    ("sv", "Svenska"),
+    ("hi", "हिन्दी"),
+    ("ms", "Bahasa Melayu"),
+];
+
+async fn get_locales(State(state): State<std::sync::Arc<UiState>>) -> Json<Value> {
+    let current = state.locale.as_deref().unwrap_or("en");
+    let locales: Vec<Value> = LOCALE_OPTIONS
+        .iter()
+        .map(|(code, label)| {
+            serde_json::json!({
+                "code": code,
+                "label": label,
+                "selected": *code == current,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "locales": locales, "current": current }))
+}
+
+#[derive(Deserialize)]
+struct ProviderQuery {
+    locale: Option<String>,
+}
+
+async fn get_providers(
+    State(state): State<std::sync::Arc<UiState>>,
+    axum::extract::Query(query): axum::extract::Query<ProviderQuery>,
+) -> Json<Value> {
     let bundle_path = &state.bundle_path;
+
+    // Use query locale override, fall back to CLI locale
+    let locale = query.locale.as_deref().or(state.locale.as_deref());
+
+    // Load i18n strings for the UI
+    let i18n = CliI18n::from_request(locale)
+        .unwrap_or_else(|_| CliI18n::from_request(Some("en")).expect("en locale must exist"));
+    let ui_strings = i18n.keys_with_prefix("ui.");
 
     let discovered = match discovery::discover(bundle_path) {
         Ok(d) => d,
@@ -185,6 +245,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
                 "providers": [],
                 "provider_forms": [],
                 "shared_questions": [],
+                "i18n": ui_strings,
                 "error": e.to_string(),
             }));
         }
@@ -209,7 +270,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
         shared
             .shared_questions
             .iter()
-            .map(form_question_to_info)
+            .map(|q| form_question_to_info(q, Some(&i18n)))
             .collect::<Vec<_>>()
     } else {
         vec![]
@@ -237,7 +298,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
                 .form_spec
                 .questions
                 .iter()
-                .map(form_question_to_info)
+                .map(|q| form_question_to_info(q, Some(&i18n)))
                 .collect(),
         })
         .collect();
@@ -247,6 +308,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
         "providers": providers,
         "provider_forms": provider_forms,
         "shared_questions": shared_questions,
+        "i18n": ui_strings,
     }))
 }
 
@@ -383,7 +445,7 @@ fn execute_setup(
 
 // ── Helpers ──
 
-fn form_question_to_info(q: &qa_spec::QuestionSpec) -> QuestionInfo {
+fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> QuestionInfo {
     let visible_if = q.visible_if.as_ref().and_then(|v| match v {
         qa_spec::Expr::Eq { left, right } => {
             let field = match left.as_ref() {
@@ -405,14 +467,32 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec) -> QuestionInfo {
         _ => None,
     });
 
+    // Resolve title and help from i18n if available
+    let title_key = format!("ui.q.{}", q.id);
+    let help_key = format!("ui.q.{}.help", q.id);
+
+    let title = i18n
+        .and_then(|i| {
+            let t = i.t(&title_key);
+            if t != title_key { Some(t) } else { None }
+        })
+        .unwrap_or_else(|| q.title.clone());
+
+    let help = i18n
+        .and_then(|i| {
+            let t = i.t(&help_key);
+            if t != help_key { Some(t) } else { None }
+        })
+        .or_else(|| q.description.clone());
+
     QuestionInfo {
         id: q.id.clone(),
-        title: q.title.clone(),
+        title,
         kind: format!("{:?}", q.kind),
         required: q.required,
         secret: q.secret,
         default_value: q.default_value.clone(),
-        help: q.description.clone(),
+        help,
         choices: q.choices.clone(),
         visible_if,
     }
