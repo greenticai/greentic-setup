@@ -144,6 +144,7 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/", get(serve_index))
         .route("/app.js", get(serve_js))
         .route("/style.css", get(serve_css))
+        .route("/api/locales", get(get_locales))
         .route("/api/providers", get(get_providers))
         .route("/api/execute", post(post_execute))
         .route("/api/shutdown", post(post_shutdown))
@@ -178,11 +179,61 @@ async fn serve_css() -> impl IntoResponse {
 
 // ── API handlers ──
 
-async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Value> {
+/// Well-known locales with display labels.
+const LOCALE_OPTIONS: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("id", "Bahasa Indonesia"),
+    ("ja", "日本語"),
+    ("zh", "中文"),
+    ("ko", "한국어"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("pt", "Português"),
+    ("ru", "Русский"),
+    ("ar", "العربية"),
+    ("th", "ไทย"),
+    ("vi", "Tiếng Việt"),
+    ("tr", "Türkçe"),
+    ("it", "Italiano"),
+    ("nl", "Nederlands"),
+    ("pl", "Polski"),
+    ("sv", "Svenska"),
+    ("hi", "हिन्दी"),
+    ("ms", "Bahasa Melayu"),
+];
+
+async fn get_locales(State(state): State<std::sync::Arc<UiState>>) -> Json<Value> {
+    let current = state.locale.as_deref().unwrap_or("en");
+    let locales: Vec<Value> = LOCALE_OPTIONS
+        .iter()
+        .map(|(code, label)| {
+            serde_json::json!({
+                "code": code,
+                "label": label,
+                "selected": *code == current,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "locales": locales, "current": current }))
+}
+
+#[derive(Deserialize)]
+struct ProviderQuery {
+    locale: Option<String>,
+}
+
+async fn get_providers(
+    State(state): State<std::sync::Arc<UiState>>,
+    axum::extract::Query(query): axum::extract::Query<ProviderQuery>,
+) -> Json<Value> {
     let bundle_path = &state.bundle_path;
 
+    // Use query locale override, fall back to CLI locale
+    let locale = query.locale.as_deref().or(state.locale.as_deref());
+
     // Load i18n strings for the UI
-    let i18n = CliI18n::from_request(state.locale.as_deref())
+    let i18n = CliI18n::from_request(locale)
         .unwrap_or_else(|_| CliI18n::from_request(Some("en")).expect("en locale must exist"));
     let ui_strings = i18n.keys_with_prefix("ui.");
 

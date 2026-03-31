@@ -3,6 +3,8 @@
 
   var app = document.getElementById("app");
   var i18n = {};  // populated from /api/providers response
+  var currentLocale = "en";
+  var localeOptions = [];
 
   function t(key, args) {
     var text = i18n[key] || key.replace(/^ui\./, "");
@@ -12,6 +14,40 @@
       }
     }
     return text;
+  }
+
+  function renderLocalePicker() {
+    if (localeOptions.length === 0) return "";
+    var html = '<select id="locale-picker" class="locale-picker">';
+    localeOptions.forEach(function (loc) {
+      var sel = loc.code === currentLocale ? " selected" : "";
+      html += '<option value="' + esc(loc.code) + '"' + sel + '>' + esc(loc.label) + '</option>';
+    });
+    html += '</select>';
+    return html;
+  }
+
+  function setupLocalePicker() {
+    var picker = document.getElementById("locale-picker");
+    if (!picker) return;
+    picker.addEventListener("change", function () {
+      currentLocale = picker.value;
+      reloadWithLocale();
+    });
+  }
+
+  function reloadWithLocale() {
+    fetch("/api/providers?locale=" + encodeURIComponent(currentLocale))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.i18n) i18n = data.i18n;
+        state.providerForms = {};
+        (data.provider_forms || []).forEach(function (pf) {
+          state.providerForms[pf.provider_id] = pf;
+        });
+        state.sharedQuestions = data.shared_questions || [];
+        render();
+      });
   }
 
   var state = {
@@ -49,7 +85,14 @@
         '<p class="executing-sub">' + esc(t("ui.discovering_sub")) + '</p>' +
       '</div>';
 
-    fetch("/api/providers")
+    // Load locales first, then providers
+    fetch("/api/locales")
+      .then(function (r) { return r.json(); })
+      .then(function (locData) {
+        localeOptions = locData.locales || [];
+        currentLocale = locData.current || "en";
+        return fetch("/api/providers?locale=" + encodeURIComponent(currentLocale));
+      })
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (data.i18n) i18n = data.i18n;
@@ -102,6 +145,7 @@
           '</div>' +
           '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
           '<p class="brand-desc">' + esc(t("ui.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
+          renderLocalePicker() +
         '</div>' +
         '<div class="provider-list">';
 
@@ -135,6 +179,7 @@
     html += '<div style="text-align:center;margin-top:.75rem"><button class="btn btn-ghost" id="btn-close-providers">' + esc(t("ui.close")) + '</button></div></div>';
 
     app.innerHTML = html;
+    setupLocalePicker();
 
     var startBtn = document.getElementById("btn-start");
     if (startBtn) startBtn.addEventListener("click", function () {
