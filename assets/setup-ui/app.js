@@ -2,6 +2,18 @@
   "use strict";
 
   var app = document.getElementById("app");
+  var i18n = {};  // populated from /api/providers response
+
+  function t(key, args) {
+    var text = i18n[key] || key.replace(/^ui\./, "");
+    if (args) {
+      for (var i = 0; i < args.length; i++) {
+        text = text.replace("{}", args[i]);
+      }
+    }
+    return text;
+  }
+
   var state = {
     phase: "loading",        // loading | providers | shared | provider-form | review | executing | result
     providers: [],           // [{provider_id, domain, question_count}]
@@ -19,7 +31,7 @@
     switch (state.phase) {
       case "loading": renderLoading(); break;
       case "providers": renderProviders(); break;
-      case "shared": renderForm(state.sharedQuestions, "Shared Configuration", "These questions apply to all providers.", null, submitShared); break;
+      case "shared": renderForm(state.sharedQuestions, t("ui.shared.title"), t("ui.shared.description"), null, submitShared); break;
       case "provider-form": renderProviderForm(); break;
       case "review": renderReview(); break;
       case "executing": renderExecuting(); break;
@@ -33,13 +45,14 @@
     app.innerHTML =
       '<div class="fade-in center-msg">' +
         '<div class="spinner"></div>' +
-        '<p class="executing-text">Discovering providers...</p>' +
-        '<p class="executing-sub">Reading bundle configuration</p>' +
+        '<p class="executing-text">' + esc(t("ui.discovering")) + '</p>' +
+        '<p class="executing-sub">' + esc(t("ui.discovering_sub")) + '</p>' +
       '</div>';
 
     fetch("/api/providers")
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        if (data.i18n) i18n = data.i18n;
         state.bundlePath = data.bundle_path || "";
         state.providers = data.providers || [];
         state.providerForms = {};
@@ -56,9 +69,9 @@
         if (state.providers.length === 0) {
           app.innerHTML =
             '<div class="fade-in center-msg">' +
-              '<p class="executing-text">No providers found in bundle.</p>' +
-              '<p class="executing-sub">Nothing to configure.</p>' +
-              '<br><button class="btn btn-ghost" id="btn-close-empty">Close</button>' +
+              '<p class="executing-text">' + esc(t("ui.no_providers")) + '</p>' +
+              '<p class="executing-sub">' + esc(t("ui.nothing_to_configure")) + '</p>' +
+              '<br><button class="btn btn-ghost" id="btn-close-empty">' + esc(t("ui.close")) + '</button>' +
             '</div>';
           document.getElementById("btn-close-empty").addEventListener("click", shutdown);
           return;
@@ -87,8 +100,8 @@
           '<div class="brand-icon">' +
             '<svg width="32" height="32" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill="#25c39e"/><path d="M10 16.5L14 20.5L22 12.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
           '</div>' +
-          '<h1 class="brand-title">Greentic Setup</h1>' +
-          '<p class="brand-desc">Configure ' + state.providers.length + ' provider(s) in ' + esc(state.bundlePath) + '</p>' +
+          '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
+          '<p class="brand-desc">' + esc(t("ui.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
         '</div>' +
         '<div class="provider-list">';
 
@@ -103,22 +116,22 @@
             '<div class="prov-name">' + esc(p.provider_id) + '</div>' +
             '<div class="prov-domain">' + esc(p.domain) + ' &middot; ' + qCount + ' questions</div>' +
           '</div>' +
-          '<span class="prov-badge ' + (done ? 'done' : 'pending') + '">' + (done ? 'Done' : 'Pending') + '</span>' +
+          '<span class="prov-badge ' + (done ? 'done' : 'pending') + '">' + (done ? esc(t("ui.done")) : esc(t("ui.pending"))) + '</span>' +
         '</div>';
     });
 
     html += '</div>';
 
     if (state.sharedQuestions.length > 0 && !state.sharedAnswersDone) {
-      html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">Start Configuration</button>';
+      html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
     } else if (!allDone) {
       var nextIdx = state.providers.findIndex(function (p) { return !state.providersDone[p.provider_id]; });
-      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">Configure ' + esc(state.providers[nextIdx].provider_id) + '</button>';
+      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [state.providers[nextIdx].provider_id])) + '</button>';
     } else {
-      html += '<button class="btn btn-primary btn-lg" id="btn-review" style="width:100%">Review & Execute</button>';
+      html += '<button class="btn btn-primary btn-lg" id="btn-review" style="width:100%">' + esc(t("ui.review_execute")) + '</button>';
     }
 
-    html += '<div style="text-align:center;margin-top:.75rem"><button class="btn btn-ghost" id="btn-close-providers">Close</button></div></div>';
+    html += '<div style="text-align:center;margin-top:.75rem"><button class="btn btn-ghost" id="btn-close-providers">' + esc(t("ui.close")) + '</button></div></div>';
 
     app.innerHTML = html;
 
@@ -152,7 +165,7 @@
         '<div class="step-header">' +
           '<button class="btn btn-ghost btn-sm btn-back" id="btn-back">' +
             '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
-            ' Back' +
+            ' ' + esc(t("ui.back")) +
           '</button>' +
         '</div>' +
         '<div class="card">' +
@@ -171,7 +184,7 @@
             '</div>' +
           '</div>' +
           '<div class="card-footer">' +
-            '<button class="btn btn-primary" id="btn-submit">Continue</button>' +
+            '<button class="btn btn-primary" id="btn-submit">' + esc(t("ui.continue")) + '</button>' +
           '</div>' +
         '</div>' +
       '</div>';
@@ -326,7 +339,7 @@
       if (!el) return;
       var val = el.value.trim();
       if (q.required && !val && !q.default_value) {
-        showFieldError(el, q.title + " is required.");
+        showFieldError(el, t("ui.field.required", [q.title]));
         if (!firstErr) firstErr = el;
       }
     });
@@ -377,7 +390,7 @@
     renderForm(
       form.questions,
       form.title || p.provider_id,
-      "Configure " + p.provider_id,
+      t("ui.provider.configure", [p.provider_id]),
       "providers",
       function () {
         state.providersDone[p.provider_id] = true;
@@ -405,13 +418,13 @@
         '<div class="step-header">' +
           '<button class="btn btn-ghost btn-sm btn-back" id="btn-back-review">' +
             '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
-            ' Back' +
+            ' ' + esc(t("ui.back")) +
           '</button>' +
         '</div>' +
         '<div class="card">' +
           '<div class="card-header">' +
-            '<h2 class="card-title">Review & Execute</h2>' +
-            '<p class="card-desc">Review configuration before applying to bundle.</p>' +
+            '<h2 class="card-title">' + esc(t("ui.review.title")) + '</h2>' +
+            '<p class="card-desc">' + esc(t("ui.review.description")) + '</p>' +
           '</div>' +
           '<div class="card-content">';
 
@@ -427,9 +440,9 @@
         var isSecret = form && form.questions.some(function (q) { return q.id === k && q.secret; });
         var display;
         if (typeof val === "boolean") {
-          display = val ? "Yes" : "No";
+          display = val ? t("ui.review.yes") : t("ui.review.no");
         } else if (isSecret && val) {
-          display = "********";
+          display = t("ui.review.secret_mask");
         } else {
           display = String(val || "");
         }
@@ -448,7 +461,7 @@
           '<div class="card-footer">' +
             '<button class="btn btn-primary btn-lg" id="btn-execute">' +
               '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>' +
-              ' Execute Setup' +
+              ' ' + esc(t("ui.execute_setup")) +
             '</button>' +
           '</div>' +
         '</div>' +
@@ -489,8 +502,8 @@
     app.innerHTML =
       '<div class="fade-in center-msg">' +
         '<div class="spinner"></div>' +
-        '<p class="executing-text">Running setup...</p>' +
-        '<p class="executing-sub">Applying configuration to bundle</p>' +
+        '<p class="executing-text">' + esc(t("ui.executing.title")) + '</p>' +
+        '<p class="executing-sub">' + esc(t("ui.executing.sub")) + '</p>' +
       '</div>';
   }
 
@@ -508,13 +521,13 @@
                 '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>'
               ) +
             '</div>' +
-            '<h2 class="card-title">' + (ok ? "Setup Complete" : "Setup Failed") + '</h2>' +
-            '<p class="card-desc">' + (ok ? "Bundle configured successfully." : "Something went wrong during setup.") + '</p>' +
+            '<h2 class="card-title">' + (ok ? esc(t("ui.result.success.title")) : esc(t("ui.result.fail.title"))) + '</h2>' +
+            '<p class="card-desc">' + (ok ? esc(t("ui.result.success.description")) : esc(t("ui.result.fail.description"))) + '</p>' +
           '</div>' +
           '<div class="card-content">';
 
     if (r && r.manual_steps && r.manual_steps.length > 0) {
-      html += '<div class="output-section"><h4 class="output-title" style="color:#f59e0b">Manual Steps Required</h4>';
+      html += '<div class="output-section"><h4 class="output-title" style="color:#f59e0b">' + esc(t("ui.result.manual_steps")) + '</h4>';
       r.manual_steps.forEach(function (instr) {
         html += '<div style="margin-bottom:.75rem;padding:.75rem 1rem;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);border-radius:calc(var(--radius) - 2px)">';
         html += '<div style="font-size:.8125rem;font-weight:600;color:#f59e0b;margin-bottom:.375rem">' + esc(instr.provider_name) + '</div>';
@@ -529,17 +542,17 @@
     }
 
     if (r && r.stdout) {
-      html += '<div class="output-section"><h4 class="output-title">Output</h4><pre class="output-pre">' + esc(r.stdout) + '</pre></div>';
+      html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.output")) + '</h4><pre class="output-pre">' + esc(r.stdout) + '</pre></div>';
     }
     if (r && r.stderr) {
-      html += '<div class="output-section"><h4 class="output-title">Log</h4><pre class="output-pre stderr">' + esc(r.stderr) + '</pre></div>';
+      html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.log")) + '</h4><pre class="output-pre stderr">' + esc(r.stderr) + '</pre></div>';
     }
 
     html +=
           '</div>' +
           '<div class="card-footer card-footer-split">' +
-            '<button class="btn btn-secondary" id="btn-restart">New Setup</button>' +
-            '<button class="btn btn-ghost" id="btn-close">Close</button>' +
+            '<button class="btn btn-secondary" id="btn-restart">' + esc(t("ui.new_setup")) + '</button>' +
+            '<button class="btn btn-ghost" id="btn-close">' + esc(t("ui.close")) + '</button>' +
           '</div>' +
         '</div>' +
       '</div>';
@@ -558,7 +571,7 @@
 
   function shutdown() {
     fetch("/api/shutdown", { method: "POST" });
-    app.innerHTML = '<div class="fade-in center-msg"><p class="executing-text">Setup closed.</p><p class="executing-sub">You can close this tab.</p></div>';
+    app.innerHTML = '<div class="fade-in center-msg"><p class="executing-text">' + esc(t("ui.result.closed")) + '</p><p class="executing-sub">' + esc(t("ui.result.closed_sub")) + '</p></div>';
   }
 
   function esc(str) {

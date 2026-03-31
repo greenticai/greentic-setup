@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use tokio::sync::broadcast;
 
+use crate::cli_i18n::CliI18n;
 use crate::engine::{SetupConfig, SetupRequest};
 use crate::plan::TenantSelection;
 use crate::platform_setup::StaticRoutesPolicy;
@@ -34,6 +35,7 @@ struct UiState {
     env: String,
     #[allow(dead_code)]
     advanced: bool,
+    locale: Option<String>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -103,6 +105,7 @@ pub async fn launch(
     team: Option<&str>,
     env: &str,
     advanced: bool,
+    locale: Option<&str>,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -112,6 +115,7 @@ pub async fn launch(
         team: team.map(String::from),
         env: env.to_string(),
         advanced,
+        locale: locale.map(String::from),
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -177,6 +181,11 @@ async fn serve_css() -> impl IntoResponse {
 async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Value> {
     let bundle_path = &state.bundle_path;
 
+    // Load i18n strings for the UI
+    let i18n = CliI18n::from_request(state.locale.as_deref())
+        .unwrap_or_else(|_| CliI18n::from_request(Some("en")).expect("en locale must exist"));
+    let ui_strings = i18n.keys_with_prefix("ui.");
+
     let discovered = match discovery::discover(bundle_path) {
         Ok(d) => d,
         Err(e) => {
@@ -185,6 +194,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
                 "providers": [],
                 "provider_forms": [],
                 "shared_questions": [],
+                "i18n": ui_strings,
                 "error": e.to_string(),
             }));
         }
@@ -247,6 +257,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
         "providers": providers,
         "provider_forms": provider_forms,
         "shared_questions": shared_questions,
+        "i18n": ui_strings,
     }))
 }
 
