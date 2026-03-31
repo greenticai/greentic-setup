@@ -109,12 +109,13 @@
       var done = state.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
+      var displayName = formatProviderName(p.provider_id);
       html +=
         '<div class="provider-card">' +
-          '<div class="prov-icon">' + esc(p.domain.charAt(0).toUpperCase()) + '</div>' +
+          '<div class="prov-icon">' + esc(displayName.charAt(0)) + '</div>' +
           '<div>' +
-            '<div class="prov-name">' + esc(p.provider_id) + '</div>' +
-            '<div class="prov-domain">' + esc(p.domain) + ' &middot; ' + qCount + ' questions</div>' +
+            '<div class="prov-name">' + esc(displayName) + '</div>' +
+            '<div class="prov-domain">' + esc(p.domain) + ' &middot; ' + qCount + ' ' + esc(t("ui.questions")) + '</div>' +
           '</div>' +
           '<span class="prov-badge ' + (done ? 'done' : 'pending') + '">' + (done ? esc(t("ui.done")) : esc(t("ui.pending"))) + '</span>' +
         '</div>';
@@ -126,7 +127,7 @@
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
     } else if (!allDone) {
       var nextIdx = state.providers.findIndex(function (p) { return !state.providersDone[p.provider_id]; });
-      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [state.providers[nextIdx].provider_id])) + '</button>';
+      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[nextIdx].provider_id)])) + '</button>';
     } else {
       html += '<button class="btn btn-primary btn-lg" id="btn-review" style="width:100%">' + esc(t("ui.review_execute")) + '</button>';
     }
@@ -389,8 +390,8 @@
     }
     renderForm(
       form.questions,
-      form.title || p.provider_id,
-      t("ui.provider.configure", [p.provider_id]),
+      form.title || formatProviderName(p.provider_id),
+      t("ui.provider.configure", [formatProviderName(p.provider_id)]),
       "providers",
       function () {
         state.providersDone[p.provider_id] = true;
@@ -434,7 +435,7 @@
       var keys = Object.keys(answers);
       if (keys.length === 0) return;
 
-      html += '<div class="review-group"><h4 class="review-group-title">' + esc(p.provider_id) + '</h4>';
+      html += '<div class="review-group"><h4 class="review-group-title">' + esc(formatProviderName(p.provider_id)) + '</h4>';
       keys.forEach(function (k) {
         var val = answers[k];
         var isSecret = form && form.questions.some(function (q) { return q.id === k && q.secret; });
@@ -578,6 +579,15 @@
     var d = document.createElement("div");
     d.textContent = str || "";
     return d.innerHTML;
+  }
+
+  function formatProviderName(id) {
+    var name = id.replace(/^messaging-/, "").replace(/^events-/, "").replace(/^state-/, "");
+    return name.split("-").map(function (w) {
+      if (w === "gui") return "GUI";
+      if (w === "api") return "API";
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    }).join(" ");
   }
 
   render();
