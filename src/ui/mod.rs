@@ -219,7 +219,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
         shared
             .shared_questions
             .iter()
-            .map(form_question_to_info)
+            .map(|q| form_question_to_info(q, Some(&i18n)))
             .collect::<Vec<_>>()
     } else {
         vec![]
@@ -247,7 +247,7 @@ async fn get_providers(State(state): State<std::sync::Arc<UiState>>) -> Json<Val
                 .form_spec
                 .questions
                 .iter()
-                .map(form_question_to_info)
+                .map(|q| form_question_to_info(q, Some(&i18n)))
                 .collect(),
         })
         .collect();
@@ -394,7 +394,7 @@ fn execute_setup(
 
 // ── Helpers ──
 
-fn form_question_to_info(q: &qa_spec::QuestionSpec) -> QuestionInfo {
+fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> QuestionInfo {
     let visible_if = q.visible_if.as_ref().and_then(|v| match v {
         qa_spec::Expr::Eq { left, right } => {
             let field = match left.as_ref() {
@@ -416,14 +416,32 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec) -> QuestionInfo {
         _ => None,
     });
 
+    // Resolve title and help from i18n if available
+    let title_key = format!("ui.q.{}", q.id);
+    let help_key = format!("ui.q.{}.help", q.id);
+
+    let title = i18n
+        .and_then(|i| {
+            let t = i.t(&title_key);
+            if t != title_key { Some(t) } else { None }
+        })
+        .unwrap_or_else(|| q.title.clone());
+
+    let help = i18n
+        .and_then(|i| {
+            let t = i.t(&help_key);
+            if t != help_key { Some(t) } else { None }
+        })
+        .or_else(|| q.description.clone());
+
     QuestionInfo {
         id: q.id.clone(),
-        title: q.title.clone(),
+        title,
         kind: format!("{:?}", q.kind),
         required: q.required,
         secret: q.secret,
         default_value: q.default_value.clone(),
-        help: q.description.clone(),
+        help,
         choices: q.choices.clone(),
         visible_if,
     }
