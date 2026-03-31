@@ -36,7 +36,18 @@
     });
   }
 
+  var RTL_LOCALES = ["ar", "he", "fa", "ur"];
+
+  function isRtl(locale) {
+    return RTL_LOCALES.some(function (r) { return locale === r || locale.startsWith(r + "-"); });
+  }
+
+  function applyDirection() {
+    document.documentElement.dir = isRtl(currentLocale) ? "rtl" : "ltr";
+  }
+
   function reloadWithLocale() {
+    applyDirection();
     fetch("/api/providers?locale=" + encodeURIComponent(currentLocale))
       .then(function (r) { return r.json(); })
       .then(function (data) {
@@ -86,6 +97,7 @@
       '</div>';
 
     // Load locales first, then providers
+    applyDirection();
     fetch("/api/locales")
       .then(function (r) { return r.json(); })
       .then(function (locData) {
