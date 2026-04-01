@@ -93,10 +93,25 @@ body{font-family:var(--font);background:var(--bg);color:var(--fg);min-height:100
 
 /* ── Form fields ── */
 .form-fields{display:flex;flex-direction:column;gap:1.125rem}
+/* ── Form groups ── */
+.form-group{margin-bottom:.5rem}
+.form-group-title{
+  font-size:.6875rem;font-weight:600;color:var(--primary);
+  text-transform:uppercase;letter-spacing:.05em;
+  margin-bottom:.75rem;padding-bottom:.375rem;
+  border-bottom:1px solid var(--card-border);
+}
+
 .field{display:flex;flex-direction:column;gap:.375rem}
 .field-row{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
 .field-label{font-size:.8125rem;font-weight:500;color:var(--fg)}
-.field-help{font-size:.7rem;color:var(--muted);line-height:1.4}
+.field-meta{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}
+.field-help{font-size:.7rem;color:var(--muted);line-height:1.4;flex:1}
+.field-docs{
+  font-size:.7rem;color:var(--primary);text-decoration:none;
+  white-space:nowrap;flex-shrink:0;
+}
+.field-docs:hover{text-decoration:underline}
 .required{color:var(--primary);margin-left:.125rem}
 
 input[type="text"],input[type="password"],select{

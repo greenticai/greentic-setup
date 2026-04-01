@@ -610,6 +610,7 @@ setup_answers:
             secret: false,
             title: None,
             visible_if: None,
+            ..Default::default()
         };
         let result = infer_default_value(&question);
         assert_eq!(result, json!("https://explicit.com"));
@@ -628,6 +629,7 @@ setup_answers:
             secret: false,
             title: None,
             visible_if: None,
+            ..Default::default()
         };
         let result = infer_default_value(&question);
         assert_eq!(result, json!("https://slack.com/api"));
@@ -646,6 +648,7 @@ setup_answers:
             secret: true,
             title: None,
             visible_if: None,
+            ..Default::default()
         };
         let result = infer_default_value(&question);
         assert_eq!(result, json!(""));

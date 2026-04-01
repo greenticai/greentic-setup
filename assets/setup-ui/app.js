@@ -234,9 +234,19 @@
           '<div class="card-content">' +
             '<div id="form-area" class="form-fields">';
 
+    var currentGroup = null;
     questions.forEach(function (q) {
+      if (q.group && q.group !== currentGroup) {
+        if (currentGroup !== null) html += '</div>'; // close previous group
+        currentGroup = q.group;
+        html += '<div class="form-group"><h4 class="form-group-title">' + esc(q.group) + '</h4>';
+      } else if (!q.group && currentGroup !== null) {
+        html += '</div>';
+        currentGroup = null;
+      }
       html += renderQuestion(q);
     });
+    if (currentGroup !== null) html += '</div>';
 
     html +=
             '</div>' +
@@ -285,6 +295,7 @@
       if (q.required) html += '<span class="required">*</span>';
       html += '</label>';
 
+      var ph = q.placeholder || q.default_value || "";
       if (q.choices && q.choices.length > 0) {
         html += '<select id="f-' + esc(q.id) + '" name="' + esc(q.id) + '">';
         q.choices.forEach(function (c) {
@@ -293,15 +304,20 @@
         html += '</select>';
       } else if (q.secret) {
         html += '<input type="password" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '"';
-        if (q.default_value) html += ' placeholder="' + esc(q.default_value) + '"';
+        if (ph) html += ' placeholder="' + esc(ph) + '"';
         html += ' />';
       } else {
         html += '<input type="text" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '"';
-        if (q.default_value) html += ' placeholder="' + esc(q.default_value) + '"';
+        if (ph) html += ' placeholder="' + esc(ph) + '"';
         html += ' />';
       }
 
-      if (q.help) html += '<p class="field-help">' + esc(q.help) + '</p>';
+      if (q.help || q.docs_url) {
+        html += '<div class="field-meta">';
+        if (q.help) html += '<p class="field-help">' + esc(q.help) + '</p>';
+        if (q.docs_url) html += '<a class="field-docs" href="' + esc(q.docs_url) + '" target="_blank" rel="noopener">Setup Guide ↗</a>';
+        html += '</div>';
+      }
     }
 
     html += '</div>';

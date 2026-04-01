@@ -75,12 +75,22 @@ struct QuestionInfo {
     help: Option<String>,
     choices: Option<Vec<String>>,
     visible_if: Option<VisibleIfInfo>,
+    placeholder: Option<String>,
+    group: Option<String>,
+    docs_url: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
 struct VisibleIfInfo {
     field: String,
     eq: Option<String>,
+}
+
+/// Extra fields from setup.yaml not in FormSpec.
+struct SetupQuestionExtras {
+    placeholder: Option<String>,
+    group: Option<String>,
+    docs_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -289,17 +299,52 @@ async fn get_providers(
         })
         .collect();
 
+    // Build lookup maps for extra fields (placeholder, group, docs_url) from setup.yaml
+    let mut extras_by_provider: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, SetupQuestionExtras>,
+    > = std::collections::HashMap::new();
+    for provider in &discovered.providers {
+        if let Ok(Some(spec)) = crate::setup_input::load_setup_spec(&provider.pack_path) {
+            let mut map = std::collections::HashMap::new();
+            for q in &spec.questions {
+                map.insert(
+                    q.name.clone(),
+                    SetupQuestionExtras {
+                        placeholder: q.placeholder.clone(),
+                        group: q.group.clone(),
+                        docs_url: q.docs_url.clone(),
+                    },
+                );
+            }
+            extras_by_provider.insert(provider.provider_id.clone(), map);
+        }
+    }
+
     let provider_forms: Vec<ProviderForm> = provider_form_specs
         .iter()
-        .map(|pfs| ProviderForm {
-            provider_id: pfs.provider_id.clone(),
-            title: pfs.form_spec.title.clone(),
-            questions: pfs
-                .form_spec
-                .questions
-                .iter()
-                .map(|q| form_question_to_info(q, Some(&i18n)))
-                .collect(),
+        .map(|pfs| {
+            let extras = extras_by_provider.get(&pfs.provider_id);
+            ProviderForm {
+                provider_id: pfs.provider_id.clone(),
+                title: pfs.form_spec.title.clone(),
+                questions: pfs
+                    .form_spec
+                    .questions
+                    .iter()
+                    .map(|q| {
+                        let mut info = form_question_to_info(q, Some(&i18n));
+                        if let Some(ext) = extras.and_then(|m| m.get(&q.id)) {
+                            if info.placeholder.is_none() {
+                                info.placeholder = ext.placeholder.clone();
+                            }
+                            info.group = ext.group.clone();
+                            info.docs_url = ext.docs_url.clone();
+                        }
+                        info
+                    })
+                    .collect(),
+            }
         })
         .collect();
 
@@ -495,5 +540,8 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         help,
         choices: q.choices.clone(),
         visible_if,
+        placeholder: None,
+        group: None,
+        docs_url: None,
     }
 }
