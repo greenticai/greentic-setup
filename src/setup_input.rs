@@ -81,7 +81,7 @@ pub struct SetupSpec {
 }
 
 /// A single setup question definition.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SetupQuestion {
     #[serde(default)]
     pub name: String,
@@ -101,6 +101,15 @@ pub struct SetupQuestion {
     pub title: Option<String>,
     #[serde(default)]
     pub visible_if: Option<SetupVisibleIf>,
+    /// Example value shown as placeholder in the input field.
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    /// Group/section name for organizing questions in the UI.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// URL to external setup documentation.
+    #[serde(default)]
+    pub docs_url: Option<String>,
 }
 
 /// Conditional visibility for a setup question.

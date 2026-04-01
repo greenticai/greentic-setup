@@ -39,6 +39,7 @@ mod tests {
                     secret: false,
                     title: Some("Enable provider".to_string()),
                     visible_if: None,
+                    ..Default::default()
                 },
                 SetupQuestion {
                     name: "public_base_url".to_string(),
@@ -50,6 +51,7 @@ mod tests {
                     secret: false,
                     title: None,
                     visible_if: None,
+                    ..Default::default()
                 },
                 SetupQuestion {
                     name: "bot_token".to_string(),
@@ -61,6 +63,7 @@ mod tests {
                     secret: true,
                     title: Some("Bot Token".to_string()),
                     visible_if: None,
+                    ..Default::default()
                 },
                 SetupQuestion {
                     name: "log_level".to_string(),
@@ -72,6 +75,7 @@ mod tests {
                     secret: false,
                     title: Some("Log Level".to_string()),
                     visible_if: None,
+                    ..Default::default()
                 },
             ],
         }
@@ -271,6 +275,7 @@ mod tests {
                 secret: false,
                 title: Some("API base URL".to_string()),
                 visible_if: None,
+                ..Default::default()
             }],
         };
 
