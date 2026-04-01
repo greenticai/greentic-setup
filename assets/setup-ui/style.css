@@ -102,7 +102,8 @@ body{font-family:var(--font);background:var(--bg);color:var(--fg);min-height:100
   border-bottom:1px solid var(--card-border);
 }
 
-.field{display:flex;flex-direction:column;gap:.375rem}
+.field{display:flex;flex-direction:column;gap:.375rem;margin-top:1rem}
+.field:first-child{margin-top:0}
 .field-row{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
 .field-label{font-size:.8125rem;font-weight:500;color:var(--fg)}
 .field-meta{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}
