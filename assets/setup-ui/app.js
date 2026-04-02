@@ -352,14 +352,16 @@
       (state.answers[state.providers[state.currentProvider].provider_id] || {});
 
     questions.forEach(function (q) {
-      var group = document.getElementById("field-" + q.id);
-      if (group && group.style.display === "none") return; // skip hidden
-
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
+
+      var fieldDiv = document.getElementById("field-" + q.id);
+      var isHidden = fieldDiv && fieldDiv.style.display === "none";
+
       if (q.kind === "Boolean") {
-        store[q.id] = el.checked;
-      } else {
+        // Always collect booleans (even hidden ones keep their toggled state)
+        store[q.id] = el.checked ? "true" : "false";
+      } else if (!isHidden) {
         var val = el.value.trim();
         if (val) store[q.id] = val;
       }

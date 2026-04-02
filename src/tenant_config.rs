@@ -146,11 +146,11 @@ fn update_tenant_config(
             tenant,
         );
 
-        // Find existing provider entry or create new one
-        if let Some(existing) = providers_arr
-            .iter_mut()
-            .find(|p| p.get("id").and_then(Value::as_str) == Some(&provider_id))
-        {
+        // Find existing provider entry — match by exact ID or by suffix (e.g. "google", "microsoft")
+        if let Some(existing) = providers_arr.iter_mut().find(|p| {
+            let id = p.get("id").and_then(Value::as_str).unwrap_or("");
+            id == provider_id || id == def.id_suffix
+        }) {
             if let Some(obj) = existing.as_object_mut() {
                 obj.insert("enabled".to_string(), Value::Bool(enabled));
                 if !client_id.is_empty() {
