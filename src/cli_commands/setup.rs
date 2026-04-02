@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli_args::*;
 use crate::cli_helpers::{
     complete_loaded_answers_with_prompts, ensure_deployment_targets_present, resolve_bundle_dir,
-    run_interactive_wizard,
+    resolve_setup_scope, run_interactive_wizard,
 };
 use crate::cli_i18n::CliI18n;
 use crate::engine::{LoadedAnswers, SetupConfig, SetupRequest};
@@ -26,13 +26,28 @@ pub fn update(args: BundleSetupArgs, i18n: &CliI18n) -> Result<()> {
 /// Shared implementation for setup and update commands.
 fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Result<()> {
     let bundle_dir = resolve_bundle_dir(args.bundle)?;
+    let BundleSetupArgs {
+        provider_id,
+        bundle: _,
+        tenant: cli_tenant,
+        team: cli_team,
+        env: cli_env,
+        domain,
+        dry_run,
+        emit_answers,
+        answers,
+        key,
+        non_interactive,
+        advanced,
+        parallel,
+        backup,
+        skip_secrets_init,
+        best_effort,
+    } = args;
 
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
 
-    let provider_display = args
-        .provider_id
-        .clone()
-        .unwrap_or_else(|| "all".to_string());
+    let provider_display = provider_id.clone().unwrap_or_else(|| "all".to_string());
 
     let header_key = match mode {
         SetupMode::Update => "cli.bundle.update.updating",
@@ -50,103 +65,113 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
             &[&bundle_dir.display().to_string()]
         )
     );
-    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&args.tenant]));
-    println!(
-        "{}",
-        i18n.tf(
-            "cli.bundle.add.team",
-            &[args.team.as_deref().unwrap_or("default")]
-        )
-    );
-    println!("{}", i18n.tf("cli.bundle.add.env", &[&args.env]));
-    println!("{}", i18n.tf("cli.bundle.setup.domain", &[&args.domain]));
-
-    let config = SetupConfig {
-        tenant: args.tenant.clone(),
-        team: args.team.clone(),
-        env: args.env.clone(),
+    let loader_engine = SetupEngine::new(SetupConfig {
+        tenant: cli_tenant.clone(),
+        team: cli_team.clone(),
+        env: cli_env.clone(),
         offline: false,
         verbose: true,
-    };
-    let engine = SetupEngine::new(config);
+    });
 
-    let loaded_answers = if let Some(answers_path) = &args.answers {
-        engine
-            .load_answers(answers_path, args.key.as_deref(), !args.non_interactive)
+    let loaded_answers = if let Some(answers_path) = &answers {
+        loader_engine
+            .load_answers(answers_path, key.as_deref(), !non_interactive)
             .context(i18n.t("cli.error.failed_read_answers"))?
-    } else if args.emit_answers.is_some() {
+    } else if emit_answers.is_some() {
         LoadedAnswers::default()
-    } else if args.non_interactive {
+    } else if non_interactive {
         bail!("{}", i18n.t("cli.error.answers_required"));
     } else {
         println!("\n{}", i18n.t("cli.simple.interactive_mode"));
         println!();
         run_interactive_wizard(
             &bundle_dir,
-            &args.tenant,
-            args.team.as_deref(),
-            &args.env,
-            args.advanced,
+            &cli_tenant,
+            cli_team.as_deref(),
+            &cli_env,
+            advanced,
         )?
     };
-    let loaded_answers = if args.answers.is_some() && !args.non_interactive {
+    let (tenant, team, env) = if answers.is_some() {
+        resolve_setup_scope(cli_tenant, cli_team, cli_env, &loaded_answers)
+    } else {
+        (cli_tenant, cli_team, cli_env)
+    };
+
+    println!("{}", i18n.tf("cli.bundle.add.tenant", &[&tenant]));
+    println!(
+        "{}",
+        i18n.tf(
+            "cli.bundle.add.team",
+            &[team.as_deref().unwrap_or("default")]
+        )
+    );
+    println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
+    println!("{}", i18n.tf("cli.bundle.setup.domain", &[&domain]));
+
+    let loaded_answers = if answers.is_some() && !non_interactive {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
-            &args.tenant,
-            args.team.as_deref(),
-            &args.env,
-            args.advanced,
+            &tenant,
+            team.as_deref(),
+            &env,
+            advanced,
             loaded_answers,
         )?
     } else {
         loaded_answers
     };
-    if args.non_interactive {
+    if non_interactive {
         ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
     }
 
-    let providers = args
-        .provider_id
-        .clone()
-        .map_or_else(Vec::new, |id| vec![id]);
+    let providers = provider_id.clone().map_or_else(Vec::new, |id| vec![id]);
 
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
         providers,
         tenants: vec![TenantSelection {
-            tenant: args.tenant,
-            team: args.team,
+            tenant: tenant.clone(),
+            team: team.clone(),
             allow_paths: Vec::new(),
         }],
         static_routes: StaticRoutesPolicy::normalize(
             loaded_answers.platform_setup.static_routes.as_ref(),
-            &args.env,
+            &env,
         )
         .context(i18n.t("cli.error.failed_read_answers"))?,
         deployment_targets: loaded_answers.platform_setup.deployment_targets,
         setup_answers: loaded_answers.setup_answers,
-        domain_filter: if args.domain == "all" {
+        domain_filter: if domain == "all" {
             None
         } else {
-            Some(args.domain.clone())
+            Some(domain.clone())
         },
-        parallel: args.parallel,
-        backup: args.backup,
-        skip_secrets_init: args.skip_secrets_init,
-        best_effort: args.best_effort,
+        parallel,
+        backup,
+        skip_secrets_init,
+        best_effort,
         ..Default::default()
     };
 
+    let engine = SetupEngine::new(SetupConfig {
+        tenant,
+        team,
+        env,
+        offline: false,
+        verbose: true,
+    });
+
     let plan = engine
-        .plan(mode, &request, args.dry_run || args.emit_answers.is_some())
+        .plan(mode, &request, dry_run || emit_answers.is_some())
         .context(i18n.t("cli.error.failed_build_plan"))?;
 
     engine.print_plan(&plan);
 
-    if let Some(emit_path) = &args.emit_answers {
+    if let Some(emit_path) = &emit_answers {
         let emit_path_str = emit_path.display().to_string();
         engine
-            .emit_answers(&plan, emit_path, args.key.as_deref(), !args.non_interactive)
+            .emit_answers(&plan, emit_path, key.as_deref(), !non_interactive)
             .context(i18n.t("cli.error.failed_emit_answers"))?;
         println!(
             "\n{}",
@@ -160,7 +185,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         return Ok(());
     }
 
-    if args.dry_run {
+    if dry_run {
         let dry_key = match mode {
             SetupMode::Update => "cli.bundle.update.dry_run",
             _ => "cli.bundle.setup.dry_run",

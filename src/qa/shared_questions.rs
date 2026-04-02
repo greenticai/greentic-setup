@@ -7,7 +7,7 @@
 use anyhow::Result;
 use qa_spec::{FormSpec, QuestionSpec};
 use serde_json::{Map as JsonMap, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::qa::prompts::ask_form_spec_question;
 use crate::setup_to_formspec;
@@ -54,8 +54,10 @@ pub fn collect_shared_questions(providers: &[ProviderFormSpec]) -> SharedQuestio
         return SharedQuestionsResult::default();
     }
 
-    // Count occurrences of each question ID across providers
-    let mut question_count: HashMap<String, Vec<String>> = HashMap::new();
+    // Count occurrences of each question ID across providers.
+    // Store counts only (not provider IDs) to avoid excessive cloning/allocation
+    // for questions that are not ultimately shared.
+    let mut question_count: HashMap<String, usize> = HashMap::new();
     let mut first_question: HashMap<String, QuestionSpec> = HashMap::new();
 
     for provider in providers {
@@ -63,10 +65,7 @@ pub fn collect_shared_questions(providers: &[ProviderFormSpec]) -> SharedQuestio
             if question.id.is_empty() {
                 continue;
             }
-            question_count
-                .entry(question.id.clone())
-                .or_default()
-                .push(provider.provider_id.clone());
+            *question_count.entry(question.id.clone()).or_insert(0) += 1;
 
             // Keep the first occurrence of each question
             first_question
@@ -84,37 +83,53 @@ pub fn collect_shared_questions(providers: &[ProviderFormSpec]) -> SharedQuestio
     let mut shared_questions = Vec::new();
     let mut question_providers = HashMap::new();
 
-    // Questions that should NEVER be shared even if they appear in multiple providers
-    const NEVER_SHARE_IDS: &[&str] = &[
-        "api_base_url",   // Different API endpoints per provider
-        "bot_token",      // Provider-specific secrets
-        "access_token",   // Provider-specific secrets
-        "token",          // Provider-specific secrets
-        "app_id",         // Provider-specific IDs
-        "app_secret",     // Provider-specific secrets
-        "client_id",      // Provider-specific IDs
-        "client_secret",  // Provider-specific secrets
-        "webhook_secret", // Provider-specific secrets
-        "signing_secret", // Provider-specific secrets
-    ];
+    fn is_never_shared(question_id: &str) -> bool {
+        matches!(
+            question_id,
+            "api_base_url"
+                | "bot_token"
+                | "access_token"
+                | "token"
+                | "app_id"
+                | "app_secret"
+                | "client_id"
+                | "client_secret"
+                | "webhook_secret"
+                | "signing_secret"
+        )
+    }
 
-    for (question_id, provider_ids) in &question_count {
-        let appears_multiple = provider_ids.len() >= 2;
-
+    let mut shared_ids = HashSet::new();
+    for (question_id, count) in &question_count {
         // Only share questions that actually appear in 2+ providers
-        if appears_multiple && let Some(question) = first_question.get(question_id) {
+        if *count >= 2
+            && let Some(question) = first_question.get(question_id)
+        {
             // Skip secrets - they should never be shared across providers
             if question.secret {
                 continue;
             }
 
             // Skip provider-specific fields that happen to have the same ID
-            if NEVER_SHARE_IDS.contains(&question_id.as_str()) {
+            if is_never_shared(question_id) {
                 continue;
             }
 
             shared_questions.push(question.clone());
-            question_providers.insert(question_id.clone(), provider_ids.clone());
+            question_providers.insert(question_id.clone(), Vec::new());
+            shared_ids.insert(question_id.clone());
+        }
+    }
+
+    if !shared_ids.is_empty() {
+        for provider in providers {
+            for question in &provider.form_spec.questions {
+                if shared_ids.contains(&question.id)
+                    && let Some(provider_ids) = question_providers.get_mut(&question.id)
+                {
+                    provider_ids.push(provider.provider_id.clone());
+                }
+            }
         }
     }
 
