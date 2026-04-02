@@ -305,6 +305,8 @@ mod tests {
             &answers_path,
             r#"
 bundle_source: ./bundle
+tenant: acme
+team: core
 env: prod
 platform_setup:
   static_routes:
@@ -338,6 +340,9 @@ setup_answers:
                 .and_then(serde_json::Value::as_str),
             Some("abc")
         );
+        assert_eq!(loaded.tenant.as_deref(), Some("acme"));
+        assert_eq!(loaded.team.as_deref(), Some("core"));
+        assert_eq!(loaded.env.as_deref(), Some("prod"));
         assert_eq!(loaded.platform_setup.deployment_targets.len(), 1);
         assert_eq!(loaded.platform_setup.deployment_targets[0].target, "aws");
     }
