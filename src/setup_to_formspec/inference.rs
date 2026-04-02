@@ -74,7 +74,7 @@ pub fn capitalize(s: &str) -> String {
 /// Extract default value from help text.
 ///
 /// Matches patterns like:
-/// - "(default: https://slack.com/api)"
+/// - "(default: <https://slack.com/api>)"
 /// - "[default: true]"
 /// - "Default: some_value"
 pub fn extract_default_from_help(help: &str) -> Option<String> {

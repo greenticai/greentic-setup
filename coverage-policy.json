@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "global": { "line_coverage_min": 60.0 },
+  "defaults": { "per_file_line_coverage_min": 60.0 },
+  "exclusions": {
+    "files": [
+      "src/bin/greentic_setup.rs",
+      "src/ui/mod.rs",
+      "src/cli_commands/inspect.rs",
+      "src/cli_commands/lifecycle.rs",
+      "src/cli_commands/setup.rs",
+      "src/cli_helpers/bundle.rs",
+      "src/cli_helpers/env_vars.rs",
+      "src/cli_helpers/mod.rs",
+      "src/cli_helpers/prompts.rs",
+      "src/cli_i18n.rs",
+      "src/deployment_targets.rs",
+      "src/discovery.rs",
+      "src/engine/answers.rs",
+      "src/engine/executors.rs",
+      "src/engine/plan_builders.rs",
+      "src/platform_setup/prompts.rs",
+      "src/qa/prompts.rs",
+      "src/qa/shared_questions.rs",
+      "src/setup_input.rs",
+      "src/tenant_config.rs",
+      "src/webhook/instructions.rs",
+      "src/webhook/slack.rs",
+      "src/webhook/telegram.rs",
+      "src/webhook/webex.rs"
+    ]
+  },
+  "per_file": {
+    "src/qa/persist.rs": { "line_coverage_min": 85.0 },
+    "src/answers_crypto.rs": { "line_coverage_min": 85.0 },
+    "src/secrets.rs": { "line_coverage_min": 85.0 }
+  }
+}
