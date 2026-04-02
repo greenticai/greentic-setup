@@ -367,17 +367,6 @@ async fn post_execute(
     let env = state.env.clone();
     let answers = req.answers;
 
-    // Debug: print what frontend sent
-    eprintln!("[ui:execute] received answers:");
-    for (provider, vals) in &answers {
-        eprintln!("  {provider}:");
-        if let Some(obj) = vals.as_object() {
-            for (k, v) in obj {
-                eprintln!("    {k}: {v}");
-            }
-        }
-    }
-
     let result = tokio::task::spawn_blocking(move || {
         execute_setup(&bundle_path, &tenant, team.as_deref(), &env, answers)
     })
