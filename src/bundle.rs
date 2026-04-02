@@ -69,10 +69,11 @@ pub fn create_demo_bundle_structure(root: &Path, bundle_name: Option<&str>) -> a
     Ok(())
 }
 
-/// Embedded welcome pack bytes (built from `assets/default-welcome.gtpack`).
+/// Embedded quickstart pack bytes (built from `assets/default-welcome.gtpack`).
 ///
-/// This pack contains a single-node flow using the adaptive-card component
-/// that replies with a welcome/setup-instructions card to any incoming message.
+/// This pack contains an Adaptive Card menu flow (quickstart demo) using the
+/// adaptive-card component with text + button routing, i18n support, and
+/// Handlebars template rendering for dynamic card content.
 const EMBEDDED_WELCOME_PACK: &[u8] = include_bytes!("../assets/default-welcome.gtpack");
 
 /// Write the embedded welcome pack as `packs/default.gtpack` if not already present.
