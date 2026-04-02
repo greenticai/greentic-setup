@@ -283,8 +283,13 @@ fn value_to_text(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::open_dev_store;
+    use greentic_secrets_lib::SecretsStore;
     use qa_spec::{QuestionSpec, QuestionType};
     use serde_json::json;
+    use std::io::Write;
+    use std::path::Path;
+    use zip::write::SimpleFileOptions;
 
     fn make_form_spec(questions: Vec<QuestionSpec>) -> FormSpec {
         FormSpec {
@@ -359,5 +364,118 @@ mod tests {
             .map(|q| q.id.as_str())
             .collect();
         assert_eq!(secret_ids, vec!["bot_token", "api_secret"]);
+    }
+
+    fn write_pack_with_secret_requirements(path: &Path, req_json: &str) {
+        let file = std::fs::File::create(path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            SimpleFileOptions::default(),
+        )
+        .expect("start entry");
+        zip.write_all(req_json.as_bytes()).expect("write reqs");
+        zip.finish().expect("finish zip");
+    }
+
+    #[tokio::test]
+    async fn persist_qa_secrets_persists_visible_non_empty_values() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = open_dev_store(temp.path()).expect("open dev store");
+        let spec = make_form_spec(vec![question("token", true), question("enabled", false)]);
+        let config = json!({
+            "token": "abc123",
+            "enabled": true,
+            "ignored": "not-in-form",
+            "empty": ""
+        });
+
+        let saved = persist_qa_secrets(
+            &store,
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-telegram",
+            &config,
+            &spec,
+        )
+        .await
+        .expect("persist");
+        assert_eq!(saved, vec!["token".to_string(), "enabled".to_string()]);
+
+        let token_uri = crate::canonical_secret_uri(
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-telegram",
+            "token",
+        );
+        let enabled_uri = crate::canonical_secret_uri(
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-telegram",
+            "enabled",
+        );
+        let token_value =
+            String::from_utf8(store.get(&token_uri).await.expect("token")).expect("token utf8");
+        let enabled_value = String::from_utf8(store.get(&enabled_uri).await.expect("enabled"))
+            .expect("enabled utf8");
+        assert_eq!(token_value, "abc123");
+        assert_eq!(enabled_value, "true");
+    }
+
+    #[tokio::test]
+    async fn persist_all_config_as_secrets_seeds_aliases_from_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle_root = temp.path();
+        let pack = bundle_root.join("messaging-webex.gtpack");
+        write_pack_with_secret_requirements(&pack, r#"[{"key":"WEBEX_BOT_TOKEN"}]"#);
+
+        let config = json!({
+            "bot_token": "xyz"
+        });
+        let saved = persist_all_config_as_secrets(
+            bundle_root,
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-webex",
+            &config,
+            Some(&pack),
+        )
+        .await
+        .expect("persist all");
+        assert_eq!(saved, vec!["bot_token".to_string()]);
+
+        let store = open_dev_store(bundle_root).expect("open store");
+        let base_uri = crate::canonical_secret_uri(
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-webex",
+            "bot_token",
+        );
+        let alias_uri = crate::canonical_secret_uri(
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-webex",
+            "WEBEX_BOT_TOKEN",
+        );
+        let base_value =
+            String::from_utf8(store.get(&base_uri).await.expect("base")).expect("base utf8");
+        let alias_value =
+            String::from_utf8(store.get(&alias_uri).await.expect("alias")).expect("alias utf8");
+        assert_eq!(base_value, "xyz");
+        assert_eq!(alias_value, "xyz");
+    }
+
+    #[test]
+    fn oauth_authorize_stub_returns_none() {
+        assert!(
+            oauth_authorize_stub("messaging-slack", Some("https://auth.example.com")).is_none()
+        );
+        assert!(oauth_authorize_stub("messaging-slack", None).is_none());
     }
 }

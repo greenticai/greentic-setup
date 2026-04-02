@@ -16,6 +16,9 @@ use crate::platform_setup::{PlatformSetupAnswers, StaticRoutesPolicy};
 /// Loaded answers from a JSON/YAML file.
 #[derive(Clone, Debug, Default)]
 pub struct LoadedAnswers {
+    pub tenant: Option<String>,
+    pub team: Option<String>,
+    pub env: Option<String>,
     pub platform_setup: PlatformSetupAnswers,
     pub setup_answers: JsonMap<String, Value>,
 }

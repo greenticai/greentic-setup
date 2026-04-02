@@ -1,0 +1,32 @@
+name: Nightly Coverage
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    uses: greenticai/.github/.github/workflows/host-crate-ci.yml@main
+
+  coverage:
+    name: Coverage Policy
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+      - name: Install coverage toolchain binaries
+        run: cargo binstall --no-confirm greentic-dev cargo-llvm-cov cargo-nextest
+      - name: Run coverage policy
+        run: greentic-dev coverage

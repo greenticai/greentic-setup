@@ -140,6 +140,21 @@ pub fn load_answers(
     };
     match raw {
         Value::Object(map) => {
+            fn parse_optional_string(
+                map: &JsonMap<String, Value>,
+                key: &str,
+            ) -> anyhow::Result<Option<String>> {
+                match map.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(value)) => Ok(Some(value.clone())),
+                    Some(_) => Err(anyhow!("answers field '{key}' must be a string or null")),
+                }
+            }
+
+            let tenant = parse_optional_string(&map, "tenant")?;
+            let team = parse_optional_string(&map, "team")?;
+            let env = parse_optional_string(&map, "env")?;
+
             let platform_setup = map
                 .get("platform_setup")
                 .cloned()
@@ -150,6 +165,9 @@ pub fn load_answers(
 
             if let Some(Value::Object(setup_answers)) = map.get("setup_answers") {
                 Ok(LoadedAnswers {
+                    tenant,
+                    team,
+                    env,
                     platform_setup,
                     setup_answers: setup_answers.clone(),
                 })
@@ -160,11 +178,17 @@ pub fn load_answers(
                 || map.contains_key("platform_setup")
             {
                 Ok(LoadedAnswers {
+                    tenant,
+                    team,
+                    env,
                     platform_setup,
                     setup_answers: JsonMap::new(),
                 })
             } else {
                 Ok(LoadedAnswers {
+                    tenant,
+                    team,
+                    env,
                     platform_setup,
                     setup_answers: map,
                 })

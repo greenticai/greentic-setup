@@ -3,7 +3,7 @@ use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use rand::RngCore;
+use rand::Rng;
 use rpassword::prompt_password;
 use serde_json::{Map as JsonMap, Value};
 use sha2::{Digest, Sha256};
@@ -134,6 +134,57 @@ mod tests {
         assert_eq!(
             decrypted["setup_answers"]["provider"]["token"],
             json!("abc")
+        );
+    }
+
+    #[test]
+    fn has_encrypted_values_detects_arrays_and_nested_objects() {
+        let plain = json!({"list": [1, 2, 3]});
+        assert!(!has_encrypted_values(&plain));
+
+        let encrypted = encrypt_value(&json!("xyz"), "demo-key").expect("encrypt");
+        let wrapped = json!({"nested": [{"v": encrypted}]});
+        assert!(has_encrypted_values(&wrapped));
+    }
+
+    #[test]
+    fn decrypt_value_passthrough_for_plain_object() {
+        let value = json!({"k": "v"});
+        let out = decrypt_value(&value, "any-key").expect("passthrough");
+        assert_eq!(out, value);
+    }
+
+    #[test]
+    fn decrypt_value_rejects_missing_nonce() {
+        let encrypted = encrypt_value(&json!("secret"), "demo-key").expect("encrypt");
+        let mut map = encrypted.as_object().cloned().expect("object");
+        map.remove(NONCE_FIELD);
+        let err = decrypt_value(&Value::Object(map), "demo-key")
+            .expect_err("missing nonce should fail")
+            .to_string();
+        assert!(err.contains("missing nonce"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn decrypt_value_rejects_invalid_base64() {
+        let encrypted = encrypt_value(&json!("secret"), "demo-key").expect("encrypt");
+        let mut map = encrypted.as_object().cloned().expect("object");
+        map.insert(NONCE_FIELD.to_string(), Value::String("***".to_string()));
+        let err = decrypt_value(&Value::Object(map), "demo-key")
+            .expect_err("invalid nonce encoding should fail")
+            .to_string();
+        assert!(err.contains("decode nonce"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn decrypt_value_fails_with_wrong_key() {
+        let encrypted = encrypt_value(&json!({"token": "abc"}), "key-a").expect("encrypt");
+        let err = decrypt_value(&encrypted, "key-b")
+            .expect_err("wrong key should fail")
+            .to_string();
+        assert!(
+            err.contains("decrypt answer value"),
+            "unexpected error: {err}"
         );
     }
 }

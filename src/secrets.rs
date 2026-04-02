@@ -256,3 +256,153 @@ pub fn open_dev_store(bundle_root: &Path) -> Result<DevStore> {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn write_pack_with_secret_requirements(path: &Path, req_json: &str) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            SimpleFileOptions::default(),
+        )?;
+        zip.write_all(req_json.as_bytes())?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_path_creates_parent_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        let path = ensure_path(&bundle).expect("ensure path");
+        assert!(path.ends_with(".greentic/dev/.dev.secrets.env"));
+        assert!(path.parent().expect("parent").exists());
+    }
+
+    #[test]
+    fn find_existing_with_override_prefers_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        let override_file = temp.path().join("custom.env");
+        std::fs::write(&override_file, "KEY=value\n").expect("write override");
+
+        let found = find_existing_with_override(&bundle, Some(&override_file));
+        assert_eq!(found.as_deref(), Some(override_file.as_path()));
+    }
+
+    #[test]
+    fn find_existing_finds_default_locations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        let store_path = bundle.join(STORE_RELATIVE);
+        std::fs::create_dir_all(store_path.parent().expect("parent")).expect("create dirs");
+        std::fs::write(&store_path, "K=V\n").expect("write store");
+
+        let found = find_existing_with_override(&bundle, None).expect("found");
+        assert_eq!(found, store_path);
+    }
+
+    #[test]
+    fn load_secret_keys_from_pack_reads_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pack = temp.path().join("provider.gtpack");
+        write_pack_with_secret_requirements(&pack, r#"[{"key":"BOT_TOKEN"},{"key":"API_SECRET"}]"#)
+            .expect("write pack");
+
+        let keys = load_secret_keys_from_pack(&pack).expect("load keys");
+        assert_eq!(
+            keys,
+            vec!["BOT_TOKEN".to_string(), "API_SECRET".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_secret_keys_from_pack_returns_empty_without_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pack = temp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())
+            .expect("start entry");
+        zip.write_all(b"questions: []\n").expect("write setup");
+        zip.finish().expect("finish zip");
+
+        let keys = load_secret_keys_from_pack(&pack).expect("load keys");
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_seeds_placeholders_for_missing_keys() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        let pack = temp.path().join("provider.gtpack");
+        write_pack_with_secret_requirements(&pack, r#"[{"key":"BOT_TOKEN"}]"#).expect("pack");
+
+        let setup = SecretsSetup::new(&bundle, "dev", "tenant-a", Some("core")).expect("setup");
+        setup
+            .ensure_pack_secrets(&pack, "messaging-telegram")
+            .await
+            .expect("ensure secrets");
+
+        let uri = canonical_secret_uri(
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-telegram",
+            "BOT_TOKEN",
+        );
+        let value = setup.store().get(&uri).await.expect("seeded value");
+        let value = String::from_utf8(value).expect("utf8");
+        assert!(
+            value.contains("placeholder for secrets://"),
+            "unexpected placeholder value: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_uses_seed_values_when_available() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        let seed_uri = canonical_secret_uri(
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-telegram",
+            "BOT_TOKEN",
+        );
+        let seeds_yaml = serde_yaml_bw::to_string(&SeedDoc {
+            entries: vec![SeedEntry {
+                uri: seed_uri.clone(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "seeded-secret".to_string(),
+                },
+                description: Some("test seed".to_string()),
+            }],
+        })
+        .expect("serialize seeds");
+        std::fs::write(bundle.join("seeds.yaml"), seeds_yaml).expect("write seeds");
+
+        let pack = temp.path().join("provider.gtpack");
+        write_pack_with_secret_requirements(&pack, r#"[{"key":"BOT_TOKEN"}]"#).expect("pack");
+
+        let setup = SecretsSetup::new(&bundle, "dev", "tenant-a", Some("core")).expect("setup");
+        setup
+            .ensure_pack_secrets(&pack, "messaging-telegram")
+            .await
+            .expect("ensure secrets");
+
+        let value = setup.store().get(&seed_uri).await.expect("seeded value");
+        let value = String::from_utf8(value).expect("utf8");
+        assert_eq!(value, "seeded-secret");
+    }
+}

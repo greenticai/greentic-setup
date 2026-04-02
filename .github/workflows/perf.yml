@@ -1,0 +1,22 @@
+name: Perf (lightweight)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests (including perf guards)
+        run: cargo test --all --all-features
+      - name: Run benchmarks (smoke)
+        run: cargo bench --bench perf -- --sample-size 10
