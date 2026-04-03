@@ -95,6 +95,11 @@ pub fn apply_create(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
         "Validate bundle is loadable by internal demo pipeline",
         [("check", "resolved manifests present".to_string())],
     ));
+    steps.push(step(
+        SetupStepKind::BuildFlowIndex,
+        "Build fast2flow routing indexes and intents.md",
+        [("output", "state/indexes/".to_string())],
+    ));
 
     Ok(SetupPlan {
         mode: "create".to_string(),
@@ -254,6 +259,11 @@ pub fn apply_update(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
         SetupStepKind::ValidateBundle,
         "Validate bundle is loadable by internal demo pipeline",
         [("check", "resolved manifests present".to_string())],
+    ));
+    steps.push(step(
+        SetupStepKind::BuildFlowIndex,
+        "Rebuild fast2flow routing indexes after update",
+        [("output", "state/indexes/".to_string())],
     ));
 
     Ok(SetupPlan {

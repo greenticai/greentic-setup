@@ -1205,6 +1205,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast2flow-bundle"
+version = "0.4.6"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fast2flow-contracts",
+ "fast2flow-indexer",
+ "serde",
+ "serde_json",
+ "serde_yaml_gtc",
+ "walkdir",
+]
+
+[[package]]
+name = "fast2flow-contracts"
+version = "0.4.6"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "fast2flow-indexer"
+version = "0.4.6"
+dependencies = [
+ "anyhow",
+ "fast2flow-contracts",
+ "fast2flow-strategy",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fast2flow-strategy"
+version = "0.4.6"
+dependencies = [
+ "fast2flow-contracts",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1603,6 +1642,7 @@ dependencies = [
  "clap",
  "criterion",
  "dialoguer",
+ "fast2flow-bundle",
  "greentic-distributor-client",
  "greentic-i18n",
  "greentic-secrets-lib",
