@@ -60,7 +60,11 @@ pub fn has_webhook_url(answers: &Value) -> Option<&str> {
 
 /// Register a webhook for a provider based on its setup answers.
 ///
-/// Supports: Telegram, Slack, Webex.
+/// Dispatch chain:
+/// 1. Declared ops from config (`webhook_ops`) — purely declarative, no API calls
+/// 2. Provider-specific legacy fallback — will be removed once all provider packs
+///    implement the `webhook_register` operation in their WASM component
+///
 /// Returns `Some(result)` with status JSON, or `None` if the provider
 /// doesn't need webhook registration.
 pub fn register_webhook(
@@ -69,6 +73,7 @@ pub fn register_webhook(
     tenant: &str,
     team: Option<&str>,
 ) -> Option<Value> {
+    // Prefer declared ops from provider setup flow output
     if let Some(result) = registration_result_from_declared_ops(config) {
         return Some(result);
     }
@@ -80,6 +85,22 @@ pub fn register_webhook(
 
     let team = team.unwrap_or("default");
 
+    // Legacy fallback: provider-specific webhook registration.
+    // TODO: Remove once all provider packs implement `webhook_register` WASM operation.
+    // At that point, the operator will call invoke_provider_op("webhook_register", ...)
+    // and this match block becomes unnecessary.
+    legacy_register_webhook(provider_id, config, public_base_url, tenant, team)
+}
+
+/// Legacy provider-specific webhook registration. Kept as a transitional
+/// fallback until provider packs implement the `webhook_register` operation.
+fn legacy_register_webhook(
+    provider_id: &str,
+    config: &Value,
+    public_base_url: &str,
+    tenant: &str,
+    team: &str,
+) -> Option<Value> {
     let provider_short = provider_id
         .strip_prefix("messaging-")
         .unwrap_or(provider_id);
