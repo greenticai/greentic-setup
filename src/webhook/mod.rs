@@ -16,7 +16,9 @@ mod webex;
 use serde_json::{Value, json};
 
 // Re-export public functions from submodules
-pub use instructions::print_post_setup_instructions;
+pub use instructions::{
+    ProviderInstruction, collect_post_setup_instructions, print_post_setup_instructions,
+};
 pub use slack::update_manifest_urls as slack_update_manifest_urls;
 
 /// Extract registration result from declared ops in config.

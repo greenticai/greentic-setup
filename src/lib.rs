@@ -26,7 +26,11 @@ pub mod secret_name;
 pub mod secrets;
 pub mod setup_input;
 pub mod setup_to_formspec;
+pub mod tenant_config;
 pub mod webhook;
+
+#[cfg(feature = "ui")]
+pub mod ui;
 
 pub mod qa {
     //! QA-driven configuration: FormSpec bridge, wizard prompts, answers

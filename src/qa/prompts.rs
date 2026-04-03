@@ -84,6 +84,13 @@ pub fn answer_satisfies_question(question: &QuestionSpec, value: &Value) -> bool
         return false;
     }
 
+    // Empty or blank string is not satisfactory for any question
+    if let Some(s) = value.as_str()
+        && s.trim().is_empty()
+    {
+        return false;
+    }
+
     // Check for environment variable placeholder (e.g., "${PUBLIC_BASE_URL}")
     // These are considered valid values that will be resolved at runtime
     if let Some(s) = value.as_str()

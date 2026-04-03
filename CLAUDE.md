@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 greentic-setup is a Rust crate (v0.4.x) providing end-to-end bundle setup for the Greentic platform. It handles pack discovery, QA-driven configuration (via greentic-qa FormSpec), secrets persistence, admin API types, hot reload diffing, and bundle lifecycle management.
 
-Part of the greentic-ai mono-workspace (33 repos). greentic-operator is the primary consumer, delegating all setup logic here.
+Part of the greentic-ai mono-workspace (55+ repos). greentic-operator is the primary consumer, delegating all setup logic here.
 
 **Dual-mode:**
 - **Library** — core APIs for programmatic use by greentic-operator, runner, and other tools

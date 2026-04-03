@@ -19,14 +19,42 @@ use crate::setup_to_formspec;
 
 // Re-export from submodules
 pub use bundle::{
-    copy_dir_recursive, detect_domain_from_filename, resolve_bundle_dir, resolve_bundle_source,
-    resolve_pack_source,
+    SetupOutputTarget, copy_dir_recursive, detect_domain_from_filename, resolve_bundle_dir,
+    resolve_bundle_source, resolve_pack_source, setup_output_target,
 };
 pub use env_vars::{
     EnvVarPlaceholder, apply_resolved_env_vars, collect_env_var_placeholders,
     confirm_env_var_placeholders,
 };
 pub use prompts::{SetupParams, prompt_setup_params};
+
+/// Resolve tenant/team/env for setup.
+///
+/// When CLI values are still defaults (`demo`, unset team, `dev`) and an answers
+/// file includes tenant/team/env metadata, prefer metadata values.
+pub fn resolve_setup_scope(
+    tenant: String,
+    team: Option<String>,
+    env: String,
+    loaded: &LoadedAnswers,
+) -> (String, Option<String>, String) {
+    let tenant = if tenant == "demo" {
+        loaded.tenant.clone().unwrap_or(tenant)
+    } else {
+        tenant
+    };
+    let team = if team.is_none() {
+        loaded.team.clone()
+    } else {
+        team
+    };
+    let env = if env == "dev" {
+        loaded.env.clone().unwrap_or(env)
+    } else {
+        env
+    };
+    (tenant, team, env)
+}
 
 /// Run interactive wizard for all discovered packs in the bundle.
 pub fn run_interactive_wizard(
@@ -50,6 +78,9 @@ pub fn run_interactive_wizard(
     if discovered.providers.is_empty() {
         println!("No providers found in bundle. Nothing to configure.");
         return Ok(LoadedAnswers {
+            tenant: None,
+            team: None,
+            env: None,
             platform_setup: PlatformSetupAnswers {
                 static_routes: Some(static_routes.to_answers()),
                 deployment_targets,
@@ -128,6 +159,9 @@ pub fn run_interactive_wizard(
     }
 
     Ok(LoadedAnswers {
+        tenant: None,
+        team: None,
+        env: None,
         platform_setup: PlatformSetupAnswers {
             static_routes: Some(static_routes.to_answers()),
             deployment_targets,
@@ -295,4 +329,43 @@ pub fn ensure_deployment_targets_present(bundle_path: &Path, loaded: &LoadedAnsw
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_setup_scope;
+    use crate::engine::LoadedAnswers;
+
+    #[test]
+    fn resolve_setup_scope_prefers_answers_when_cli_is_default() {
+        let loaded = LoadedAnswers {
+            tenant: Some("acme".to_string()),
+            team: Some("core".to_string()),
+            env: Some("prod".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_setup_scope("demo".to_string(), None, "dev".to_string(), &loaded);
+        assert_eq!(resolved.0, "acme");
+        assert_eq!(resolved.1.as_deref(), Some("core"));
+        assert_eq!(resolved.2, "prod");
+    }
+
+    #[test]
+    fn resolve_setup_scope_keeps_explicit_cli_values() {
+        let loaded = LoadedAnswers {
+            tenant: Some("acme".to_string()),
+            team: Some("core".to_string()),
+            env: Some("prod".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_setup_scope(
+            "sandbox".to_string(),
+            Some("ops".to_string()),
+            "staging".to_string(),
+            &loaded,
+        );
+        assert_eq!(resolved.0, "sandbox");
+        assert_eq!(resolved.1.as_deref(), Some("ops"));
+        assert_eq!(resolved.2, "staging");
+    }
 }

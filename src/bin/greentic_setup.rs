@@ -22,18 +22,20 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::fs;
 
 use greentic_setup::cli_args::{BundleCommand, Cli, Command};
 use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
-    complete_loaded_answers_with_prompts, ensure_deployment_targets_present, prompt_setup_params,
-    resolve_bundle_source, run_interactive_wizard,
+    SetupOutputTarget, complete_loaded_answers_with_prompts, copy_dir_recursive,
+    ensure_deployment_targets_present, prompt_setup_params, resolve_bundle_source,
+    resolve_setup_scope, run_interactive_wizard, setup_output_target,
 };
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
 use greentic_setup::plan::TenantSelection;
 use greentic_setup::platform_setup::StaticRoutesPolicy;
-use greentic_setup::{SetupEngine, SetupMode, bundle};
+use greentic_setup::{SetupEngine, SetupMode, bundle, gtbundle};
 
 /// Global i18n instance (initialized once at startup).
 fn get_i18n() -> &'static CliI18n {
@@ -58,6 +60,12 @@ fn main() -> Result<()> {
     init_i18n(cli.locale.as_deref());
     let i18n = get_i18n();
 
+    // Launch web UI if --ui flag is set
+    #[cfg(feature = "ui")]
+    if cli.ui {
+        return run_ui_mode(&cli, i18n);
+    }
+
     match cli.command {
         Some(Command::Bundle(cmd)) => match cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
@@ -76,7 +84,7 @@ fn main() -> Result<()> {
 /// Run simple setup mode: greentic-setup [OPTIONS] <BUNDLE>
 fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     // If no bundle path given and no flags, run fully interactive mode
-    let (bundle_path, tenant, team, env, advanced) = if cli.bundle.is_none()
+    let (bundle_path, mut tenant, mut team, mut env, advanced) = if cli.bundle.is_none()
         && cli.answers.is_none()
         && cli.emit_answers.is_none()
         && !cli.dry_run
@@ -109,6 +117,36 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
 
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
+    let loader_engine = SetupEngine::new(SetupConfig {
+        tenant: tenant.clone(),
+        team: team.clone(),
+        env: env.clone(),
+        offline: false,
+        verbose: true,
+    });
+
+    let loaded_answers = if let Some(answers_path) = &cli.answers {
+        println!(
+            "{}",
+            i18n.tf(
+                "setup.answers.loaded",
+                &[&answers_path.display().to_string()]
+            )
+        );
+        loader_engine
+            .load_answers(answers_path, cli.key.as_deref(), true)
+            .context(i18n.t("cli.error.failed_read_answers"))?
+    } else if cli.emit_answers.is_some() || cli.dry_run {
+        LoadedAnswers::default()
+    } else {
+        println!("{}", i18n.t("cli.simple.interactive_mode"));
+        println!();
+        run_interactive_wizard(&bundle_dir, &tenant, team.as_deref(), &env, advanced)?
+    };
+
+    if cli.answers.is_some() {
+        (tenant, team, env) = resolve_setup_scope(tenant, team, env, &loaded_answers);
+    }
 
     println!("{}", i18n.t("cli.simple.header"));
     println!(
@@ -129,40 +167,12 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!();
 
-    let config = SetupConfig {
-        tenant: tenant.clone(),
-        team: team.clone(),
-        env: env.clone(),
-        offline: false,
-        verbose: true,
-    };
-    let engine = SetupEngine::new(config);
-
-    let loaded_answers = if let Some(answers_path) = &cli.answers {
-        println!(
-            "{}",
-            i18n.tf(
-                "setup.answers.loaded",
-                &[&answers_path.display().to_string()]
-            )
-        );
-        engine
-            .load_answers(answers_path, cli.key.as_deref(), true)
-            .context(i18n.t("cli.error.failed_read_answers"))?
-    } else if cli.emit_answers.is_some() || cli.dry_run {
-        LoadedAnswers::default()
-    } else {
-        println!("{}", i18n.t("cli.simple.interactive_mode"));
-        println!();
-        run_interactive_wizard(&bundle_dir, &tenant, team.as_deref(), &cli.env, advanced)?
-    };
-
     let loaded_answers = if cli.answers.is_some() {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
             &tenant,
             team.as_deref(),
-            &cli.env,
+            &env,
             advanced,
             loaded_answers,
         )?
@@ -182,13 +192,21 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         }],
         static_routes: StaticRoutesPolicy::normalize(
             loaded_answers.platform_setup.static_routes.as_ref(),
-            &cli.env,
+            &env,
         )
         .context(i18n.t("cli.error.failed_read_answers"))?,
         deployment_targets: loaded_answers.platform_setup.deployment_targets,
         setup_answers: loaded_answers.setup_answers,
         ..Default::default()
     };
+
+    let engine = SetupEngine::new(SetupConfig {
+        tenant: tenant.clone(),
+        team: team.clone(),
+        env: env.clone(),
+        offline: false,
+        verbose: true,
+    });
 
     let is_dry_run = cli.dry_run || cli.emit_answers.is_some();
     let plan = engine
@@ -233,6 +251,38 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
 
+    if let Some(output_target) = setup_output_target(&bundle_path)? {
+        match output_target {
+            SetupOutputTarget::Directory(output_bundle) => {
+                if output_bundle.exists() {
+                    if output_bundle.is_dir() {
+                        fs::remove_dir_all(&output_bundle).with_context(|| {
+                            format!(
+                                "failed to replace existing bundle directory {}",
+                                output_bundle.display()
+                            )
+                        })?;
+                    } else {
+                        fs::remove_file(&output_bundle).with_context(|| {
+                            format!(
+                                "failed to replace existing bundle file {}",
+                                output_bundle.display()
+                            )
+                        })?;
+                    }
+                }
+                copy_dir_recursive(&bundle_dir, &output_bundle, false)
+                    .context("failed to write configured local bundle directory")?;
+                println!("Configured bundle written to: {}", output_bundle.display());
+            }
+            SetupOutputTarget::Archive(output_bundle) => {
+                gtbundle::create_gtbundle(&bundle_dir, &output_bundle)
+                    .context("failed to write configured .gtbundle archive")?;
+                println!("Configured bundle written to: {}", output_bundle.display());
+            }
+        }
+    }
+
     println!(
         "\n{}",
         i18n.tf(
@@ -242,4 +292,29 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Launch the web-based setup UI.
+#[cfg(feature = "ui")]
+fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
+    let bundle_path = cli.bundle.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}\n\n{}",
+            i18n.t("cli.simple.bundle_required"),
+            i18n.t("cli.help.for_help")
+        )
+    })?;
+
+    let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
+    bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(greentic_setup::ui::launch(
+        &bundle_dir,
+        &cli.tenant,
+        cli.team.as_deref(),
+        &cli.env,
+        cli.advanced,
+        cli.locale.as_deref(),
+    ))
 }

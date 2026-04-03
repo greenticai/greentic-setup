@@ -67,6 +67,10 @@ pub struct Cli {
     #[arg(long = "advanced", global = true)]
     pub advanced: bool,
 
+    /// Launch web-based setup UI in browser
+    #[arg(long = "ui", global = true)]
+    pub ui: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

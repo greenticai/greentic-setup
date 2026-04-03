@@ -39,6 +39,25 @@ impl CliI18n {
     pub fn tf(&self, key: &str, args: &[&str]) -> String {
         format_template(&self.t(key), args)
     }
+
+    /// Export all keys matching a prefix as a flat map.
+    ///
+    /// Used by the web UI to send translated strings to the frontend.
+    pub fn keys_with_prefix(&self, prefix: &str) -> BTreeMap<String, String> {
+        let mut result = BTreeMap::new();
+        // Prefer catalog (current locale), fall back to fallback (en)
+        for (k, v) in &self.fallback {
+            if k.starts_with(prefix) {
+                result.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in &self.catalog {
+            if k.starts_with(prefix) {
+                result.insert(k.clone(), v.clone());
+            }
+        }
+        result
+    }
 }
 
 fn resolve_locale(requested: Option<&str>) -> String {
