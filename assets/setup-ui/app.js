@@ -165,7 +165,7 @@
       var done = state.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
-      var displayName = formatProviderName(p.provider_id);
+      var displayName = formatProviderName(p);
       html +=
         '<div class="provider-card">' +
           '<div class="prov-icon">' + esc(displayName.charAt(0)) + '</div>' +
@@ -183,7 +183,7 @@
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
     } else if (!allDone) {
       var nextIdx = state.providers.findIndex(function (p) { return !state.providersDone[p.provider_id]; });
-      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[nextIdx].provider_id)])) + '</button>';
+      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[nextIdx])])) + '</button>';
     } else {
       html += '<button class="btn btn-primary btn-lg" id="btn-review" style="width:100%">' + esc(t("ui.review_execute")) + '</button>';
     }
@@ -465,8 +465,8 @@
     }
     renderForm(
       form.questions,
-      form.title || formatProviderName(p.provider_id),
-      t("ui.provider.configure", [formatProviderName(p.provider_id)]),
+      form.title || formatProviderName(p),
+      t("ui.provider.configure", [formatProviderName(p)]),
       "providers",
       function () {
         state.providersDone[p.provider_id] = true;
@@ -510,7 +510,7 @@
       var keys = Object.keys(answers);
       if (keys.length === 0) return;
 
-      html += '<div class="review-group"><h4 class="review-group-title">' + esc(formatProviderName(p.provider_id)) + '</h4>';
+      html += '<div class="review-group"><h4 class="review-group-title">' + esc(formatProviderName(p)) + '</h4>';
       keys.forEach(function (k) {
         var val = answers[k];
         var isSecret = form && form.questions.some(function (q) { return q.id === k && q.secret; });
@@ -656,13 +656,9 @@
     return d.innerHTML;
   }
 
-  function formatProviderName(id) {
-    var name = id.replace(/^messaging-/, "").replace(/^events-/, "").replace(/^state-/, "");
-    return name.split("-").map(function (w) {
-      if (w === "gui") return "GUI";
-      if (w === "api") return "API";
-      return w.charAt(0).toUpperCase() + w.slice(1);
-    }).join(" ");
+  function formatProviderName(provider) {
+    if (typeof provider === "object" && provider.display_name) return provider.display_name;
+    return typeof provider === "object" ? provider.provider_id : provider;
   }
 
   render();

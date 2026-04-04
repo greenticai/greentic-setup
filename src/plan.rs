@@ -78,6 +78,7 @@ pub enum SetupStepKind {
     RunResolver,
     CopyResolvedManifest,
     ValidateBundle,
+    BuildFlowIndex,
 }
 
 /// Tenant + optional team + allow-list paths.

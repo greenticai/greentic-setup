@@ -20,9 +20,10 @@ use crate::platform_setup::persist_static_routes_artifact;
 pub use answers::{emit_answers, encrypt_secret_answers, load_answers, prompt_secret_answers};
 pub use executors::{
     auto_install_provider_packs, domain_from_provider_id, execute_add_packs_to_bundle,
-    execute_apply_pack_setup, execute_copy_resolved_manifests, execute_create_bundle,
-    execute_remove_provider_artifacts, execute_resolve_packs, execute_validate_bundle,
-    execute_write_gmap_rules, find_provider_pack_source, get_pack_target_dir,
+    execute_apply_pack_setup, execute_build_flow_index, execute_copy_resolved_manifests,
+    execute_create_bundle, execute_remove_provider_artifacts, execute_resolve_packs,
+    execute_validate_bundle, execute_write_gmap_rules, find_provider_pack_source,
+    get_pack_target_dir,
 };
 pub use plan_builders::{
     apply_create, apply_remove, apply_update, build_metadata, build_metadata_with_ops,
@@ -155,6 +156,12 @@ impl SetupEngine {
                 }
                 SetupStepKind::ValidateBundle => {
                     execute_validate_bundle(bundle)?;
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
+                    }
+                }
+                SetupStepKind::BuildFlowIndex => {
+                    execute_build_flow_index(bundle, &self.config)?;
                     if self.config.verbose {
                         println!("  [done] {}", step.description);
                     }

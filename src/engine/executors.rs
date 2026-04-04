@@ -461,3 +461,17 @@ pub fn execute_copy_resolved_manifests(
 pub fn execute_validate_bundle(bundle_path: &Path) -> anyhow::Result<()> {
     bundle::validate_bundle_exists(bundle_path)
 }
+
+/// Execute the BuildFlowIndex step.
+///
+/// Scans all flows in the bundle, builds a TF-IDF index and a routing-compatible
+/// index, and optionally generates intents.md documentation.
+/// Output is written to `bundle/state/indexes/`.
+///
+/// Requires the `fast2flow` feature AND the `fast2flow-bundle` crate wired as a
+/// dependency.  Until `fast2flow-bundle` is published or vendored, this is a
+/// no-op stub that logs a skip message.
+pub fn execute_build_flow_index(_bundle_path: &Path, _config: &SetupConfig) -> anyhow::Result<()> {
+    tracing::debug!("fast2flow indexing skipped (fast2flow-bundle not available)");
+    Ok(())
+}
