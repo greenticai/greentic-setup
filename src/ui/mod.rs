@@ -53,6 +53,8 @@ struct ProvidersResponse {
 #[derive(Serialize)]
 struct ProviderInfo {
     provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
     domain: String,
     question_count: usize,
 }
@@ -293,6 +295,7 @@ async fn get_providers(
             let form = setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id);
             ProviderInfo {
                 provider_id: p.provider_id.clone(),
+                display_name: p.display_name.clone(),
                 domain: p.domain.clone(),
                 question_count: form.as_ref().map(|f| f.questions.len()).unwrap_or(0),
             }

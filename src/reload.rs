@@ -193,6 +193,7 @@ mod tests {
     fn make_provider(id: &str, path: &str) -> DetectedProvider {
         DetectedProvider {
             provider_id: id.to_string(),
+            display_name: None,
             domain: "messaging".to_string(),
             pack_path: PathBuf::from(path),
             id_source: ProviderIdSource::Manifest,

@@ -28,6 +28,7 @@ pub struct DetectedDomains {
 #[derive(Clone, Debug, Serialize)]
 pub struct DetectedProvider {
     pub provider_id: String,
+    pub display_name: Option<String>,
     pub domain: String,
     pub pack_path: PathBuf,
     pub id_source: ProviderIdSource,
@@ -39,6 +40,12 @@ pub struct DetectedProvider {
 pub enum ProviderIdSource {
     Manifest,
     Filename,
+}
+
+/// Metadata extracted from a pack manifest.
+struct PackMeta {
+    pack_id: String,
+    display_name: Option<String>,
 }
 
 /// Options for discovery.
@@ -84,27 +91,28 @@ pub fn discover_with_options(
                 continue;
             }
 
-            let (provider_id, id_source) = if options.cbor_only {
-                match read_pack_id_cbor_only(&path)? {
-                    Some(id) => (id, ProviderIdSource::Manifest),
+            let (provider_id, display_name, id_source) = if options.cbor_only {
+                match read_pack_meta_cbor_only(&path)? {
+                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
                     None => return Err(missing_cbor_error(&path)),
                 }
             } else {
-                match read_pack_id_from_manifest(&path)? {
-                    Some(id) => (id, ProviderIdSource::Manifest),
+                match read_pack_meta_from_manifest(&path)? {
+                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
                     None => {
                         let stem = path
                             .file_stem()
                             .and_then(|v| v.to_str())
                             .unwrap_or_default()
                             .to_string();
-                        (stem, ProviderIdSource::Filename)
+                        (stem, None, ProviderIdSource::Filename)
                     }
                 }
             };
 
             providers.push(DetectedProvider {
                 provider_id,
+                display_name,
                 domain: domain.to_string(),
                 pack_path: path,
                 id_source,
@@ -147,27 +155,27 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
 
 // ── Manifest reading ────────────────────────────────────────────────────────
 
-fn read_pack_id_from_manifest(path: &Path) -> anyhow::Result<Option<String>> {
+fn read_pack_meta_from_manifest(path: &Path) -> anyhow::Result<Option<PackMeta>> {
     let file = std::fs::File::open(path)?;
     match zip::ZipArchive::new(file) {
         Ok(mut archive) => {
-            if let Some(id) = read_manifest_cbor(&mut archive)? {
-                return Ok(Some(id));
+            if let Some(meta) = read_manifest_cbor(&mut archive)? {
+                return Ok(Some(meta));
             }
-            if let Some(id) = read_manifest_json(&mut archive, "pack.manifest.json")? {
-                return Ok(Some(id));
+            if let Some(meta) = read_manifest_json(&mut archive, "pack.manifest.json")? {
+                return Ok(Some(meta));
             }
         }
         Err(_) => {
-            if let Some(id) = read_manifest_cbor_from_tar(path)? {
-                return Ok(Some(id));
+            if let Some(meta) = read_manifest_cbor_from_tar(path)? {
+                return Ok(Some(meta));
             }
         }
     }
     Ok(None)
 }
 
-fn read_pack_id_cbor_only(path: &Path) -> anyhow::Result<Option<String>> {
+fn read_pack_meta_cbor_only(path: &Path) -> anyhow::Result<Option<PackMeta>> {
     let file = std::fs::File::open(path)?;
     match zip::ZipArchive::new(file) {
         Ok(mut archive) => read_manifest_cbor(&mut archive),
@@ -177,7 +185,7 @@ fn read_pack_id_cbor_only(path: &Path) -> anyhow::Result<Option<String>> {
 
 fn read_manifest_cbor(
     archive: &mut zip::ZipArchive<std::fs::File>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<PackMeta>> {
     let mut file = match archive.by_name("manifest.cbor") {
         Ok(file) => file,
         Err(ZipError::FileNotFound) => return Ok(None),
@@ -186,13 +194,13 @@ fn read_manifest_cbor(
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)?;
     let value: CborValue = serde_cbor::from_slice(&bytes)?;
-    extract_pack_id_from_cbor(&value)
+    extract_pack_meta_from_cbor(&value)
 }
 
 fn read_manifest_json(
     archive: &mut zip::ZipArchive<std::fs::File>,
     name: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<PackMeta>> {
     let mut file = match archive.by_name(name) {
         Ok(file) => file,
         Err(ZipError::FileNotFound) => return Ok(None),
@@ -202,18 +210,34 @@ fn read_manifest_json(
     std::io::Read::read_to_string(&mut file, &mut contents)?;
     let parsed: serde_json::Value = serde_json::from_str(&contents)?;
 
+    let display_name = parsed
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     if let Some(id) = parsed.get("pack_id").and_then(|v| v.as_str()) {
-        return Ok(Some(id.to_string()));
+        return Ok(Some(PackMeta {
+            pack_id: id.to_string(),
+            display_name,
+        }));
     }
     if let Some(meta) = parsed.get("meta")
         && let Some(id) = meta.get("pack_id").and_then(|v| v.as_str())
     {
-        return Ok(Some(id.to_string()));
+        let dn = meta
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or(display_name);
+        return Ok(Some(PackMeta {
+            pack_id: id.to_string(),
+            display_name: dn,
+        }));
     }
     Ok(None)
 }
 
-fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<String>> {
+fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<PackMeta>> {
     let file = std::fs::File::open(path)?;
     let mut archive = tar::Archive::new(file);
     for entry in archive.entries()? {
@@ -224,12 +248,12 @@ fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<String>> {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut entry, &mut bytes)?;
         let value: CborValue = serde_cbor::from_slice(&bytes)?;
-        return extract_pack_id_from_cbor(&value);
+        return extract_pack_meta_from_cbor(&value);
     }
     Ok(None)
 }
 
-fn extract_pack_id_from_cbor(value: &CborValue) -> anyhow::Result<Option<String>> {
+fn extract_pack_meta_from_cbor(value: &CborValue) -> anyhow::Result<Option<PackMeta>> {
     let CborValue::Map(map) = value else {
         return Ok(None);
     };
@@ -238,17 +262,33 @@ fn extract_pack_id_from_cbor(value: &CborValue) -> anyhow::Result<Option<String>
         _ => None,
     };
 
+    let resolve_display_name =
+        |source_map: &std::collections::BTreeMap<CborValue, CborValue>| -> Option<String> {
+            map_get(source_map, "display_name").and_then(|v| match v {
+                CborValue::Text(text) => Some(text.clone()),
+                _ => resolve_string_symbol(v, symbols, "display_names")
+                    .ok()
+                    .flatten(),
+            })
+        };
+
     if let Some(pack_id) = map_get(map, "pack_id")
-        && let Some(value) = resolve_string_symbol(pack_id, symbols, "pack_ids")?
+        && let Some(id) = resolve_string_symbol(pack_id, symbols, "pack_ids")?
     {
-        return Ok(Some(value));
+        return Ok(Some(PackMeta {
+            pack_id: id,
+            display_name: resolve_display_name(map),
+        }));
     }
 
     if let Some(CborValue::Map(meta)) = map_get(map, "meta")
         && let Some(pack_id) = map_get(meta, "pack_id")
-        && let Some(value) = resolve_string_symbol(pack_id, symbols, "pack_ids")?
+        && let Some(id) = resolve_string_symbol(pack_id, symbols, "pack_ids")?
     {
-        return Ok(Some(value));
+        return Ok(Some(PackMeta {
+            pack_id: id,
+            display_name: resolve_display_name(meta).or_else(|| resolve_display_name(map)),
+        }));
     }
 
     Ok(None)
