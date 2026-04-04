@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "config"]
 
 [features]
 default = ["oci", "squashfs", "ui"]
+fast2flow = []
 ui = ["axum", "open"]
 oci = ["greentic-distributor-client"]
 squashfs = ["backhand"]
