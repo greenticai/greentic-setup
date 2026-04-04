@@ -658,13 +658,7 @@
 
   function formatProviderName(provider) {
     if (typeof provider === "object" && provider.display_name) return provider.display_name;
-    var id = typeof provider === "object" ? provider.provider_id : provider;
-    var name = id.replace(/^messaging-/, "").replace(/^events-/, "").replace(/^state-/, "");
-    return name.split("-").map(function (w) {
-      if (w === "gui") return "GUI";
-      if (w === "api") return "API";
-      return w.charAt(0).toUpperCase() + w.slice(1);
-    }).join(" ");
+    return typeof provider === "object" ? provider.provider_id : provider;
   }
 
   render();
