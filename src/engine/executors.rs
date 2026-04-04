@@ -467,26 +467,11 @@ pub fn execute_validate_bundle(bundle_path: &Path) -> anyhow::Result<()> {
 /// Scans all flows in the bundle, builds a TF-IDF index and a routing-compatible
 /// index, and optionally generates intents.md documentation.
 /// Output is written to `bundle/state/indexes/`.
-#[cfg(feature = "fast2flow")]
-pub fn execute_build_flow_index(bundle_path: &Path, config: &SetupConfig) -> anyhow::Result<()> {
-    let output_path = bundle_path.join("state").join("indexes");
-    let tenant = &config.tenant;
-    let team = config.team.as_deref().unwrap_or("default");
-
-    fast2flow_bundle::hooks::index_bundle_after_setup(
-        bundle_path,
-        &output_path,
-        tenant,
-        team,
-        true, // generate intents.md
-    )
-    .context("failed to build fast2flow routing index")?;
-
-    Ok(())
-}
-
-/// Stub when fast2flow feature is disabled — skips indexing.
-#[cfg(not(feature = "fast2flow"))]
+///
+/// Requires the `fast2flow` feature AND the `fast2flow-bundle` crate wired as a
+/// dependency.  Until `fast2flow-bundle` is published or vendored, this is a
+/// no-op stub that logs a skip message.
 pub fn execute_build_flow_index(_bundle_path: &Path, _config: &SetupConfig) -> anyhow::Result<()> {
+    tracing::debug!("fast2flow indexing skipped (fast2flow-bundle not available)");
     Ok(())
 }
