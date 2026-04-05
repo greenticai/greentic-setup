@@ -274,9 +274,7 @@ fn extract_pack_meta_from_cbor(value: &CborValue) -> anyhow::Result<Option<PackM
                 .or_else(|| {
                     map_get(source_map, "name").and_then(|v| match v {
                         CborValue::Text(text) => Some(text.clone()),
-                        _ => resolve_string_symbol(v, symbols, "names")
-                            .ok()
-                            .flatten(),
+                        _ => resolve_string_symbol(v, symbols, "names").ok().flatten(),
                     })
                 })
         };
