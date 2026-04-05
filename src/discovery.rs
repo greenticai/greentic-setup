@@ -210,10 +210,14 @@ fn read_manifest_json(
     std::io::Read::read_to_string(&mut file, &mut contents)?;
     let parsed: serde_json::Value = serde_json::from_str(&contents)?;
 
-    let display_name = parsed
-        .get("display_name")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let resolve_dn = |obj: &serde_json::Value| -> Option<String> {
+        obj.get("display_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("name").and_then(|v| v.as_str()))
+            .map(String::from)
+    };
+
+    let display_name = resolve_dn(&parsed);
 
     if let Some(id) = parsed.get("pack_id").and_then(|v| v.as_str()) {
         return Ok(Some(PackMeta {
@@ -224,11 +228,7 @@ fn read_manifest_json(
     if let Some(meta) = parsed.get("meta")
         && let Some(id) = meta.get("pack_id").and_then(|v| v.as_str())
     {
-        let dn = meta
-            .get("display_name")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or(display_name);
+        let dn = resolve_dn(meta).or(display_name);
         return Ok(Some(PackMeta {
             pack_id: id.to_string(),
             display_name: dn,
@@ -264,12 +264,19 @@ fn extract_pack_meta_from_cbor(value: &CborValue) -> anyhow::Result<Option<PackM
 
     let resolve_display_name =
         |source_map: &std::collections::BTreeMap<CborValue, CborValue>| -> Option<String> {
-            map_get(source_map, "display_name").and_then(|v| match v {
-                CborValue::Text(text) => Some(text.clone()),
-                _ => resolve_string_symbol(v, symbols, "display_names")
-                    .ok()
-                    .flatten(),
-            })
+            map_get(source_map, "display_name")
+                .and_then(|v| match v {
+                    CborValue::Text(text) => Some(text.clone()),
+                    _ => resolve_string_symbol(v, symbols, "display_names")
+                        .ok()
+                        .flatten(),
+                })
+                .or_else(|| {
+                    map_get(source_map, "name").and_then(|v| match v {
+                        CborValue::Text(text) => Some(text.clone()),
+                        _ => resolve_string_symbol(v, symbols, "names").ok().flatten(),
+                    })
+                })
         };
 
     if let Some(pack_id) = map_get(map, "pack_id")
