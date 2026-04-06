@@ -116,9 +116,17 @@
         });
         state.sharedQuestions = data.shared_questions || [];
 
-        // Initialize answer maps
+        // Initialize answer maps, pre-seeding from saved secrets
         state.providers.forEach(function (p) {
           if (!state.answers[p.provider_id]) state.answers[p.provider_id] = {};
+          var form = state.providerForms[p.provider_id];
+          if (form) {
+            form.questions.forEach(function (q) {
+              if (q.saved_value && !state.answers[p.provider_id][q.id]) {
+                state.answers[p.provider_id][q.id] = q.saved_value;
+              }
+            });
+          }
         });
 
         if (state.providers.length === 0) {
@@ -344,11 +352,13 @@
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
       var val = store[q.id];
-      if (val !== undefined) {
+      // Priority: user answer > saved secret > default value
+      var effective = val !== undefined ? val : (q.saved_value || undefined);
+      if (effective !== undefined) {
         if (q.kind === "Boolean") {
-          el.checked = val === true || val === "true";
+          el.checked = effective === true || effective === "true";
         } else {
-          el.value = val;
+          el.value = effective;
         }
       } else if (q.default_value && q.kind !== "Boolean") {
         el.value = q.default_value;

@@ -74,6 +74,8 @@ struct QuestionInfo {
     required: bool,
     secret: bool,
     default_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saved_value: Option<String>,
     help: Option<String>,
     choices: Option<Vec<String>>,
     visible_if: Option<VisibleIfInfo>,
@@ -324,10 +326,21 @@ async fn get_providers(
         }
     }
 
+    // Load saved secrets from dev store for auto-fill
+    let saved_secrets = load_saved_secrets(
+        bundle_path,
+        &state.env,
+        &state.tenant,
+        state.team.as_deref(),
+        &provider_form_specs,
+    )
+    .await;
+
     let provider_forms: Vec<ProviderForm> = provider_form_specs
         .iter()
         .map(|pfs| {
             let extras = extras_by_provider.get(&pfs.provider_id);
+            let saved = saved_secrets.get(&pfs.provider_id);
             ProviderForm {
                 provider_id: pfs.provider_id.clone(),
                 title: pfs.form_spec.title.clone(),
@@ -343,6 +356,9 @@ async fn get_providers(
                             }
                             info.group = ext.group.clone();
                             info.docs_url = ext.docs_url.clone();
+                        }
+                        if let Some(val) = saved.and_then(|m| m.get(&q.id)) {
+                            info.saved_value = Some(val.clone());
                         }
                         info
                     })
@@ -493,6 +509,40 @@ fn execute_setup(
 
 // ── Helpers ──
 
+/// Load previously saved secret values from the dev store for all providers.
+async fn load_saved_secrets(
+    bundle_path: &Path,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_form_specs: &[wizard::ProviderFormSpec],
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    use greentic_secrets_lib::SecretsStore;
+
+    let store = match crate::secrets::open_dev_store(bundle_path) {
+        Ok(s) => s,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    let mut result = std::collections::HashMap::new();
+    for pfs in provider_form_specs {
+        let mut values = std::collections::HashMap::new();
+        for q in &pfs.form_spec.questions {
+            let uri = crate::canonical_secret_uri(env, tenant, team, &pfs.provider_id, &q.id);
+            if let Ok(bytes) = store.get(&uri).await
+                && let Ok(text) = String::from_utf8(bytes)
+                && !text.is_empty()
+            {
+                values.insert(q.id.clone(), text);
+            }
+        }
+        if !values.is_empty() {
+            result.insert(pfs.provider_id.clone(), values);
+        }
+    }
+    result
+}
+
 fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> QuestionInfo {
     let visible_if = q.visible_if.as_ref().and_then(|v| match v {
         qa_spec::Expr::Eq { left, right } => {
@@ -540,6 +590,7 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         required: q.required,
         secret: q.secret,
         default_value: q.default_value.clone(),
+        saved_value: None,
         help,
         choices: q.choices.clone(),
         visible_if,
