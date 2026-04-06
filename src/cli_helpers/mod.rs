@@ -32,6 +32,8 @@ pub use prompts::{SetupParams, prompt_setup_params};
 ///
 /// When CLI values are still defaults (`demo`, unset team, `dev`) and an answers
 /// file includes tenant/team/env metadata, prefer metadata values.
+/// Also detects tenant from existing bundle `tenants/` directory when neither
+/// CLI nor answers provide a tenant.
 pub fn resolve_setup_scope(
     tenant: String,
     team: Option<String>,
@@ -54,6 +56,54 @@ pub fn resolve_setup_scope(
         env
     };
     (tenant, team, env)
+}
+
+/// Like [`resolve_setup_scope`] but also checks the bundle's `tenants/` directory
+/// for existing tenants when the CLI value is still the default.
+pub fn resolve_setup_scope_with_bundle(
+    tenant: String,
+    team: Option<String>,
+    env: String,
+    loaded: &LoadedAnswers,
+    bundle_dir: &std::path::Path,
+) -> (String, Option<String>, String) {
+    let (mut tenant, team, env) = resolve_setup_scope(tenant, team, env, loaded);
+
+    // If tenant is still the CLI default ("demo") and the bundle has a tenants/
+    // directory, detect the actual tenant from existing directories.
+    if tenant == "demo"
+        && let Some(detected) = detect_tenant_from_bundle(bundle_dir)
+    {
+        tenant = detected;
+    }
+
+    (tenant, team, env)
+}
+
+/// Detect tenant from the bundle's `tenants/` directory.
+/// Returns the single tenant if exactly one exists, or the first non-"demo"
+/// tenant if multiple exist.
+fn detect_tenant_from_bundle(bundle_dir: &std::path::Path) -> Option<String> {
+    let tenants_dir = bundle_dir.join("tenants");
+    let entries: Vec<String> = std::fs::read_dir(&tenants_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    match entries.len() {
+        0 => None,
+        1 => Some(entries[0].clone()),
+        _ => {
+            // Multiple tenants — prefer non-"demo" if exists
+            entries
+                .iter()
+                .find(|t| t.as_str() != "demo")
+                .cloned()
+                .or_else(|| entries.first().cloned())
+        }
+    }
 }
 
 /// Run interactive wizard for all discovered packs in the bundle.

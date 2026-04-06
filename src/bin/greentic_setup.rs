@@ -29,7 +29,7 @@ use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
     SetupOutputTarget, complete_loaded_answers_with_prompts, copy_dir_recursive,
     ensure_deployment_targets_present, prompt_setup_params, resolve_bundle_source,
-    resolve_setup_scope, run_interactive_wizard, setup_output_target,
+    resolve_setup_scope_with_bundle, run_interactive_wizard, setup_output_target,
 };
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
@@ -144,9 +144,8 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         run_interactive_wizard(&bundle_dir, &tenant, team.as_deref(), &env, advanced)?
     };
 
-    if cli.answers.is_some() {
-        (tenant, team, env) = resolve_setup_scope(tenant, team, env, &loaded_answers);
-    }
+    (tenant, team, env) =
+        resolve_setup_scope_with_bundle(tenant, team, env, &loaded_answers, &bundle_dir);
 
     println!("{}", i18n.t("cli.simple.header"));
     println!(
