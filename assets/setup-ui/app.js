@@ -251,7 +251,11 @@
     html +=
             '</div>' +
           '</div>' +
-          '<div class="card-footer">' +
+          '<div class="card-footer card-footer-split">' +
+            '<button class="btn btn-secondary" id="btn-prev">' +
+              '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+              ' ' + esc(t("ui.back")) +
+            '</button>' +
             '<button class="btn btn-primary" id="btn-submit">' + esc(t("ui.continue")) + '</button>' +
           '</div>' +
         '</div>' +
@@ -262,6 +266,13 @@
     setupVisibility(questions);
 
     document.getElementById("btn-back").addEventListener("click", function () {
+      collectFormValues(questions);
+      state.phase = backPhase || "providers";
+      render();
+    });
+
+    document.getElementById("btn-prev").addEventListener("click", function () {
+      collectFormValues(questions);
       state.phase = backPhase || "providers";
       render();
     });
