@@ -278,14 +278,11 @@ async fn get_providers(
         })
         .collect();
 
-    // Detect shared questions
-    let shared_questions = if provider_form_specs.len() > 1 {
-        let shared = wizard::collect_shared_questions(&provider_form_specs);
-        shared
+    // Detect shared questions (saved values injected after secrets are loaded below)
+    let shared_question_specs = if provider_form_specs.len() > 1 {
+        wizard::collect_shared_questions(&provider_form_specs)
             .shared_questions
-            .iter()
-            .map(|q| form_question_to_info(q, Some(&i18n)))
-            .collect::<Vec<_>>()
+            .clone()
     } else {
         vec![]
     };
@@ -335,6 +332,21 @@ async fn get_providers(
         &provider_form_specs,
     )
     .await;
+
+    // Inject saved values into shared questions (pick from first provider that has the value)
+    let shared_questions: Vec<QuestionInfo> = shared_question_specs
+        .iter()
+        .map(|q| {
+            let mut info = form_question_to_info(q, Some(&i18n));
+            for secrets in saved_secrets.values() {
+                if let Some(val) = secrets.get(&q.id) {
+                    info.saved_value = Some(val.clone());
+                    break;
+                }
+            }
+            info
+        })
+        .collect();
 
     let provider_forms: Vec<ProviderForm> = provider_form_specs
         .iter()

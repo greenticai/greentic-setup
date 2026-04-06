@@ -116,6 +116,13 @@
         });
         state.sharedQuestions = data.shared_questions || [];
 
+        // Pre-seed shared answers from saved secrets
+        state.sharedQuestions.forEach(function (q) {
+          if (q.saved_value && !state.sharedAnswers[q.id]) {
+            state.sharedAnswers[q.id] = q.saved_value;
+          }
+        });
+
         // Initialize answer maps, pre-seeding from saved secrets
         state.providers.forEach(function (p) {
           if (!state.answers[p.provider_id]) state.answers[p.provider_id] = {};
@@ -225,7 +232,7 @@
 
   // ── Form rendering (reusable for shared + per-provider) ──
 
-  function renderForm(questions, title, desc, backPhase, onSubmit) {
+  function renderForm(questions, title, desc, backPhase, onSubmit, backFn) {
     var html =
       '<div class="fade-in">' +
         '<div class="step-header">' +
@@ -273,16 +280,19 @@
     restoreFormValues(questions);
     setupVisibility(questions);
 
-    document.getElementById("btn-back").addEventListener("click", function () {
-      collectFormValues(questions);
+    var goBack = backFn || function () {
       state.phase = backPhase || "providers";
       render();
+    };
+
+    document.getElementById("btn-back").addEventListener("click", function () {
+      collectFormValues(questions);
+      goBack();
     });
 
     document.getElementById("btn-prev").addEventListener("click", function () {
       collectFormValues(questions);
-      state.phase = backPhase || "providers";
-      render();
+      goBack();
     });
 
     document.getElementById("btn-submit").addEventListener("click", function () {
@@ -484,15 +494,30 @@
       advanceProvider();
       return;
     }
+
+    // Back goes to previous provider, or shared questions, or provider list
+    var backFn = function () {
+      if (state.currentProvider > 0) {
+        state.currentProvider--;
+        state.phase = "provider-form";
+      } else if (state.sharedQuestions.length > 0) {
+        state.phase = "shared";
+      } else {
+        state.phase = "providers";
+      }
+      render();
+    };
+
     renderForm(
       form.questions,
       form.title || formatProviderName(p),
       t("ui.provider.configure", [formatProviderName(p)]),
-      "providers",
+      null,
       function () {
         state.providersDone[p.provider_id] = true;
         advanceProvider();
-      }
+      },
+      backFn
     );
   }
 
