@@ -116,9 +116,24 @@
         });
         state.sharedQuestions = data.shared_questions || [];
 
-        // Initialize answer maps
+        // Pre-seed shared answers from saved secrets
+        state.sharedQuestions.forEach(function (q) {
+          if (q.saved_value && !state.sharedAnswers[q.id]) {
+            state.sharedAnswers[q.id] = q.saved_value;
+          }
+        });
+
+        // Initialize answer maps, pre-seeding from saved secrets
         state.providers.forEach(function (p) {
           if (!state.answers[p.provider_id]) state.answers[p.provider_id] = {};
+          var form = state.providerForms[p.provider_id];
+          if (form) {
+            form.questions.forEach(function (q) {
+              if (q.saved_value && !state.answers[p.provider_id][q.id]) {
+                state.answers[p.provider_id][q.id] = q.saved_value;
+              }
+            });
+          }
         });
 
         if (state.providers.length === 0) {
@@ -217,7 +232,7 @@
 
   // ── Form rendering (reusable for shared + per-provider) ──
 
-  function renderForm(questions, title, desc, backPhase, onSubmit) {
+  function renderForm(questions, title, desc, backPhase, onSubmit, backFn) {
     var html =
       '<div class="fade-in">' +
         '<div class="step-header">' +
@@ -251,7 +266,11 @@
     html +=
             '</div>' +
           '</div>' +
-          '<div class="card-footer">' +
+          '<div class="card-footer card-footer-split">' +
+            '<button class="btn btn-secondary" id="btn-prev">' +
+              '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+              ' ' + esc(t("ui.back")) +
+            '</button>' +
             '<button class="btn btn-primary" id="btn-submit">' + esc(t("ui.continue")) + '</button>' +
           '</div>' +
         '</div>' +
@@ -261,9 +280,19 @@
     restoreFormValues(questions);
     setupVisibility(questions);
 
-    document.getElementById("btn-back").addEventListener("click", function () {
+    var goBack = backFn || function () {
       state.phase = backPhase || "providers";
       render();
+    };
+
+    document.getElementById("btn-back").addEventListener("click", function () {
+      collectFormValues(questions);
+      goBack();
+    });
+
+    document.getElementById("btn-prev").addEventListener("click", function () {
+      collectFormValues(questions);
+      goBack();
     });
 
     document.getElementById("btn-submit").addEventListener("click", function () {
@@ -333,11 +362,13 @@
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
       var val = store[q.id];
-      if (val !== undefined) {
+      // Priority: user answer > saved secret > default value
+      var effective = val !== undefined ? val : (q.saved_value || undefined);
+      if (effective !== undefined) {
         if (q.kind === "Boolean") {
-          el.checked = val === true || val === "true";
+          el.checked = effective === true || effective === "true";
         } else {
-          el.value = val;
+          el.value = effective;
         }
       } else if (q.default_value && q.kind !== "Boolean") {
         el.value = q.default_value;
@@ -463,15 +494,30 @@
       advanceProvider();
       return;
     }
+
+    // Back goes to previous provider, or shared questions, or provider list
+    var backFn = function () {
+      if (state.currentProvider > 0) {
+        state.currentProvider--;
+        state.phase = "provider-form";
+      } else if (state.sharedQuestions.length > 0) {
+        state.phase = "shared";
+      } else {
+        state.phase = "providers";
+      }
+      render();
+    };
+
     renderForm(
       form.questions,
       form.title || formatProviderName(p),
       t("ui.provider.configure", [formatProviderName(p)]),
-      "providers",
+      null,
       function () {
         state.providersDone[p.provider_id] = true;
         advanceProvider();
-      }
+      },
+      backFn
     );
   }
 
