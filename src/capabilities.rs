@@ -178,6 +178,176 @@ pub fn validate_and_upgrade_packs(bundle_path: &Path) -> anyhow::Result<UpgradeR
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// Dependency capability validation
+// ---------------------------------------------------------------------------
+
+/// Report of dependency capability validation across all packs in the bundle.
+pub struct DependencyReport {
+    pub satisfied: Vec<SatisfiedCapability>,
+    pub missing: Vec<MissingCapability>,
+}
+
+pub struct SatisfiedCapability {
+    pub capability: String,
+    pub required_by: String,
+    pub provided_by: String,
+}
+
+pub struct MissingCapability {
+    pub capability: String,
+    pub required_by: String,
+}
+
+/// Validate that all pack dependencies have their required_capabilities
+/// satisfied by other packs in the bundle.
+pub fn validate_dependency_capabilities(bundle_path: &Path) -> anyhow::Result<DependencyReport> {
+    let discovered = discovery::discover(bundle_path)
+        .context("failed to discover providers for dependency validation")?;
+
+    let mut report = DependencyReport {
+        satisfied: Vec::new(),
+        missing: Vec::new(),
+    };
+
+    // Build capability index: capability_name → provider_id.
+    let mut capability_providers: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for provider in &discovered.providers {
+        if let Ok(caps) = read_pack_capabilities(&provider.pack_path) {
+            for cap_name in caps {
+                capability_providers
+                    .entry(cap_name)
+                    .or_insert_with(|| provider.provider_id.clone());
+            }
+        }
+    }
+
+    // Check each pack's dependencies.
+    let mut pack_id_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for provider in &discovered.providers {
+        pack_id_set.insert(provider.provider_id.clone());
+    }
+
+    for provider in &discovered.providers {
+        let deps = match read_pack_dependencies(&provider.pack_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for (dep_pack_id, required_caps) in deps {
+            // Skip if dependency pack_id is present directly.
+            if pack_id_set.contains(&dep_pack_id) {
+                continue;
+            }
+            for cap in &required_caps {
+                if let Some(provided_by) = capability_providers.get(cap) {
+                    report.satisfied.push(SatisfiedCapability {
+                        capability: cap.clone(),
+                        required_by: provider.provider_id.clone(),
+                        provided_by: provided_by.clone(),
+                    });
+                } else {
+                    report.missing.push(MissingCapability {
+                        capability: cap.clone(),
+                        required_by: provider.provider_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Read capability names from a gtpack manifest.
+fn read_pack_capabilities(pack_path: &Path) -> anyhow::Result<Vec<String>> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut entry = archive.by_name("manifest.cbor")?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    let cbor: serde_cbor::Value = serde_cbor::from_slice(&bytes)?;
+
+    let mut caps = Vec::new();
+    if let serde_cbor::Value::Map(ref map) = cbor {
+        if let Some(serde_cbor::Value::Array(arr)) =
+            map.get(&serde_cbor::Value::Text("capabilities".to_string()))
+        {
+            for item in arr {
+                if let serde_cbor::Value::Map(cap_map) = item {
+                    if let Some(serde_cbor::Value::Text(name)) =
+                        cap_map.get(&serde_cbor::Value::Text("name".to_string()))
+                    {
+                        caps.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(caps)
+}
+
+/// Read dependencies from a gtpack manifest.
+/// Returns Vec of (pack_id, required_capabilities).
+fn read_pack_dependencies(
+    pack_path: &Path,
+) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut entry = archive.by_name("manifest.cbor")?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    let cbor: serde_cbor::Value = serde_cbor::from_slice(&bytes)?;
+
+    let mut deps = Vec::new();
+    if let serde_cbor::Value::Map(ref map) = cbor {
+        if let Some(serde_cbor::Value::Array(arr)) =
+            map.get(&serde_cbor::Value::Text("dependencies".to_string()))
+        {
+            for item in arr {
+                if let serde_cbor::Value::Map(dep_map) = item {
+                    let pack_id = dep_map
+                        .get(&serde_cbor::Value::Text("pack_id".to_string()))
+                        .and_then(|v| {
+                            if let serde_cbor::Value::Text(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    let req_caps: Vec<String> = dep_map
+                        .get(&serde_cbor::Value::Text(
+                            "required_capabilities".to_string(),
+                        ))
+                        .and_then(|v| {
+                            if let serde_cbor::Value::Array(arr) = v {
+                                Some(
+                                    arr.iter()
+                                        .filter_map(|item| {
+                                            if let serde_cbor::Value::Text(s) = item {
+                                                Some(s.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect(),
+                                )
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    if !pack_id.is_empty() && !req_caps.is_empty() {
+                        deps.push((pack_id, req_caps));
+                    }
+                }
+            }
+        }
+    }
+    Ok(deps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
