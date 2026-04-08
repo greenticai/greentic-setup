@@ -269,18 +269,16 @@ fn read_pack_capabilities(pack_path: &Path) -> anyhow::Result<Vec<String>> {
     let cbor: serde_cbor::Value = serde_cbor::from_slice(&bytes)?;
 
     let mut caps = Vec::new();
-    if let serde_cbor::Value::Map(ref map) = cbor {
-        if let Some(serde_cbor::Value::Array(arr)) =
+    if let serde_cbor::Value::Map(ref map) = cbor
+        && let Some(serde_cbor::Value::Array(arr)) =
             map.get(&serde_cbor::Value::Text("capabilities".to_string()))
-        {
-            for item in arr {
-                if let serde_cbor::Value::Map(cap_map) = item {
-                    if let Some(serde_cbor::Value::Text(name)) =
-                        cap_map.get(&serde_cbor::Value::Text("name".to_string()))
-                    {
-                        caps.push(name.clone());
-                    }
-                }
+    {
+        for item in arr {
+            if let serde_cbor::Value::Map(cap_map) = item
+                && let Some(serde_cbor::Value::Text(name)) =
+                    cap_map.get(&serde_cbor::Value::Text("name".to_string()))
+            {
+                caps.push(name.clone());
             }
         }
     }
@@ -289,9 +287,7 @@ fn read_pack_capabilities(pack_path: &Path) -> anyhow::Result<Vec<String>> {
 
 /// Read dependencies from a gtpack manifest.
 /// Returns Vec of (pack_id, required_capabilities).
-fn read_pack_dependencies(
-    pack_path: &Path,
-) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+fn read_pack_dependencies(pack_path: &Path) -> anyhow::Result<Vec<(String, Vec<String>)>> {
     let file = std::fs::File::open(pack_path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut entry = archive.by_name("manifest.cbor")?;
@@ -300,47 +296,46 @@ fn read_pack_dependencies(
     let cbor: serde_cbor::Value = serde_cbor::from_slice(&bytes)?;
 
     let mut deps = Vec::new();
-    if let serde_cbor::Value::Map(ref map) = cbor {
-        if let Some(serde_cbor::Value::Array(arr)) =
+    if let serde_cbor::Value::Map(ref map) = cbor
+        && let Some(serde_cbor::Value::Array(arr)) =
             map.get(&serde_cbor::Value::Text("dependencies".to_string()))
-        {
-            for item in arr {
-                if let serde_cbor::Value::Map(dep_map) = item {
-                    let pack_id = dep_map
-                        .get(&serde_cbor::Value::Text("pack_id".to_string()))
-                        .and_then(|v| {
-                            if let serde_cbor::Value::Text(s) = v {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
-                    let req_caps: Vec<String> = dep_map
-                        .get(&serde_cbor::Value::Text(
-                            "required_capabilities".to_string(),
-                        ))
-                        .and_then(|v| {
-                            if let serde_cbor::Value::Array(arr) = v {
-                                Some(
-                                    arr.iter()
-                                        .filter_map(|item| {
-                                            if let serde_cbor::Value::Text(s) = item {
-                                                Some(s.clone())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect(),
-                                )
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
-                    if !pack_id.is_empty() && !req_caps.is_empty() {
-                        deps.push((pack_id, req_caps));
-                    }
+    {
+        for item in arr {
+            if let serde_cbor::Value::Map(dep_map) = item {
+                let pack_id = dep_map
+                    .get(&serde_cbor::Value::Text("pack_id".to_string()))
+                    .and_then(|v| {
+                        if let serde_cbor::Value::Text(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let req_caps: Vec<String> = dep_map
+                    .get(&serde_cbor::Value::Text(
+                        "required_capabilities".to_string(),
+                    ))
+                    .and_then(|v| {
+                        if let serde_cbor::Value::Array(arr) = v {
+                            Some(
+                                arr.iter()
+                                    .filter_map(|item| {
+                                        if let serde_cbor::Value::Text(s) = item {
+                                            Some(s.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                if !pack_id.is_empty() && !req_caps.is_empty() {
+                    deps.push((pack_id, req_caps));
                 }
             }
         }
