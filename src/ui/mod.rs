@@ -262,9 +262,7 @@ struct ProviderQuery {
     locale: Option<String>,
 }
 
-async fn get_scope(
-    State(state): State<std::sync::Arc<UiState>>,
-) -> Json<ScopeResponse> {
+async fn get_scope(State(state): State<std::sync::Arc<UiState>>) -> Json<ScopeResponse> {
     let bundle_path = &state.bundle_path;
     let cli_tenant = &state.tenant;
     let cli_env = &state.env;
@@ -420,10 +418,11 @@ async fn get_providers(
             let mut found = false;
             if let Some(answers) = prefill {
                 for pfs in &provider_form_specs {
-                    if let Some(provider_answers) = answers
-                        .get(&pfs.provider_id)
-                        .and_then(|v| v.as_object())
-                        && let Some(val) = provider_answers.get(&q.id).and_then(value_as_nonempty_string)
+                    if let Some(provider_answers) =
+                        answers.get(&pfs.provider_id).and_then(|v| v.as_object())
+                        && let Some(val) = provider_answers
+                            .get(&q.id)
+                            .and_then(value_as_nonempty_string)
                     {
                         info.saved_value = Some(val);
                         found = true;
@@ -547,9 +546,7 @@ async fn post_export(
     let secret_fields: std::collections::HashSet<String> = discovered
         .iter()
         .flat_map(|d| d.providers.iter())
-        .filter_map(|p| {
-            setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id)
-        })
+        .filter_map(|p| setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id))
         .flat_map(|spec| spec.questions.into_iter())
         .filter(|q| q.secret)
         .map(|q| q.id)
@@ -565,8 +562,12 @@ async fn post_export(
                     if secret_fields.contains(field) && req.key.is_some() {
                         let key = req.key.as_deref().unwrap();
                         match crate::answers_crypto::encrypt_value(value, key) {
-                            Ok(enc) => { encrypted_answers.insert(field.clone(), enc); }
-                            Err(_) => { encrypted_answers.insert(field.clone(), value.clone()); }
+                            Ok(enc) => {
+                                encrypted_answers.insert(field.clone(), enc);
+                            }
+                            Err(_) => {
+                                encrypted_answers.insert(field.clone(), value.clone());
+                            }
                         }
                     } else {
                         encrypted_answers.insert(field.clone(), value.clone());
