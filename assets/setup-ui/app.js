@@ -160,19 +160,42 @@
           return;
         }
 
-        return fetch("/api/scope");
+        // Fetch existing scopes (previously configured) and scope defaults in parallel
+        return Promise.all([
+          fetch("/api/existing-scopes").then(function (r) { return r.json(); }),
+          fetch("/api/scope").then(function (r) { return r.json(); }),
+        ]);
       })
-      .then(function (r) { return r.json(); })
-      .then(function (scopeData) {
+      .then(function (results) {
+        var existingData = results[0];
+        var scopeData = results[1];
         state.detectedTenant = scopeData.detected_tenant || null;
-        // Create initial scope from detected values
-        if (state.scopes.length === 0) {
+
+        var existingScopes = existingData.scopes || [];
+        if (existingScopes.length > 0) {
+          // Restore previously configured scopes
+          state.scopes = existingScopes.map(function (es) {
+            var s = makeScope(es.tenant || "demo", es.env || "dev", es.team || "");
+            if (es.answers) {
+              Object.keys(es.answers).forEach(function (pid) {
+                if (typeof es.answers[pid] === "object") {
+                  s.answers[pid] = es.answers[pid];
+                }
+              });
+            }
+            if (es.providers_done) {
+              es.providers_done.forEach(function (pid) { s.providersDone[pid] = true; });
+            }
+            return s;
+          });
+          state.phase = "dashboard";
+        } else if (state.scopes.length === 0) {
+          // No existing config — create fresh scope and go to edit
           state.scopes.push(makeScope(
             scopeData.tenant || "demo",
             scopeData.env || "dev",
             scopeData.team || ""
           ));
-          // First time: go straight to scope edit
           state.currentScopeIdx = 0;
           state.currentProvider = 0;
           state.phase = "scope-edit";
