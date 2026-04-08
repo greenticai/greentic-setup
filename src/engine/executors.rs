@@ -178,6 +178,25 @@ pub fn execute_apply_pack_setup(
                 .map(|p| p.pack_path.as_path())
         });
         let env = crate::resolve_env(Some(&config.env));
+        if config.verbose {
+            let team_display = config.team.as_deref().unwrap_or("(none)");
+            println!(
+                "  [secrets] scope: env={env}, tenant={}, team={team_display}, provider={provider_id}",
+                config.tenant
+            );
+            let example_uri = crate::canonical_secret_uri(
+                &env,
+                &config.tenant,
+                config.team.as_deref(),
+                provider_id,
+                "_example_key",
+            );
+            println!("  [secrets] URI pattern: {example_uri}");
+            if let Some(config_map) = answers.as_object() {
+                let keys: Vec<&String> = config_map.keys().collect();
+                println!("  [secrets] answer keys: {keys:?}");
+            }
+        }
         let rt = tokio::runtime::Runtime::new()
             .context("failed to create tokio runtime for secrets persistence")?;
         let persisted = rt.block_on(crate::qa::persist::persist_all_config_as_secrets(
@@ -189,11 +208,18 @@ pub fn execute_apply_pack_setup(
             answers,
             pack_path,
         ))?;
-        if config.verbose && !persisted.is_empty() {
-            println!(
-                "  [secrets] persisted {} key(s) for {provider_id}",
-                persisted.len()
-            );
+        if config.verbose {
+            if persisted.is_empty() {
+                println!(
+                    "  [secrets] WARNING: 0 key(s) persisted for {provider_id} (all values empty?)"
+                );
+            } else {
+                println!(
+                    "  [secrets] persisted {} key(s) for {provider_id}: {:?}",
+                    persisted.len(),
+                    persisted
+                );
+            }
         }
 
         // Sync OAuth answers to tenant config JSON for webchat-gui providers

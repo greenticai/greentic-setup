@@ -2,7 +2,7 @@
   "use strict";
 
   var app = document.getElementById("app");
-  var i18n = {};  // populated from /api/providers response
+  var i18n = {};
   var currentLocale = "en";
   var localeOptions = [];
 
@@ -61,28 +61,62 @@
       });
   }
 
+  // ── State ──
+
+  function makeScope(tenant, env, team) {
+    var answers = {};
+    state.providers.forEach(function (p) {
+      answers[p.provider_id] = {};
+      var form = state.providerForms[p.provider_id];
+      if (form) {
+        form.questions.forEach(function (q) {
+          if (q.saved_value) answers[p.provider_id][q.id] = q.saved_value;
+        });
+      }
+    });
+    return {
+      tenant: tenant || "demo",
+      env: env || "dev",
+      team: team || "",
+      answers: answers,
+      sharedAnswers: {},
+      providersDone: {},
+      sharedAnswersDone: false,
+      executed: false,
+    };
+  }
+
   var state = {
-    phase: "loading",        // loading | providers | shared | provider-form | review | executing | result
-    providers: [],           // [{provider_id, domain, question_count}]
-    sharedQuestions: [],      // FormSpec questions
-    providerForms: {},        // {provider_id: {questions, title}}
-    currentProvider: 0,       // index into providers
-    answers: {},              // {provider_id: {field: value}}
-    sharedAnswers: {},        // {field: value}
-    providersDone: {},        // {provider_id: true}
-    result: null,
+    phase: "loading",
+    // global
+    providers: [],
+    sharedQuestions: [],
+    providerForms: {},
     bundlePath: "",
+    detectedTenant: null,
+    // multi-scope
+    scopes: [],
+    currentScopeIdx: -1,
+    // per-scope working state
+    currentProvider: 0,
+    result: null,
   };
+
+  /** Get the scope currently being edited. */
+  function cs() { return state.scopes[state.currentScopeIdx]; }
 
   function render() {
     switch (state.phase) {
       case "loading": renderLoading(); break;
+      case "dashboard": renderDashboard(); break;
+      case "scope-edit": renderScopeEdit(); break;
       case "providers": renderProviders(); break;
       case "shared": renderForm(state.sharedQuestions, t("ui.shared.title"), t("ui.shared.description"), null, submitShared); break;
       case "provider-form": renderProviderForm(); break;
       case "review": renderReview(); break;
       case "executing": renderExecuting(); break;
       case "result": renderResult(); break;
+      case "export": renderExport(); break;
     }
   }
 
@@ -96,7 +130,6 @@
         '<p class="executing-sub">' + esc(t("ui.discovering_sub")) + '</p>' +
       '</div>';
 
-    // Load locales first, then providers
     applyDirection();
     fetch("/api/locales")
       .then(function (r) { return r.json(); })
@@ -116,26 +149,6 @@
         });
         state.sharedQuestions = data.shared_questions || [];
 
-        // Pre-seed shared answers from saved secrets
-        state.sharedQuestions.forEach(function (q) {
-          if (q.saved_value && !state.sharedAnswers[q.id]) {
-            state.sharedAnswers[q.id] = q.saved_value;
-          }
-        });
-
-        // Initialize answer maps, pre-seeding from saved secrets
-        state.providers.forEach(function (p) {
-          if (!state.answers[p.provider_id]) state.answers[p.provider_id] = {};
-          var form = state.providerForms[p.provider_id];
-          if (form) {
-            form.questions.forEach(function (q) {
-              if (q.saved_value && !state.answers[p.provider_id][q.id]) {
-                state.answers[p.provider_id][q.id] = q.saved_value;
-              }
-            });
-          }
-        });
-
         if (state.providers.length === 0) {
           app.innerHTML =
             '<div class="fade-in center-msg">' +
@@ -147,7 +160,25 @@
           return;
         }
 
-        state.phase = "providers";
+        return fetch("/api/scope");
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (scopeData) {
+        state.detectedTenant = scopeData.detected_tenant || null;
+        // Create initial scope from detected values
+        if (state.scopes.length === 0) {
+          state.scopes.push(makeScope(
+            scopeData.tenant || "demo",
+            scopeData.env || "dev",
+            scopeData.team || ""
+          ));
+          // First time: go straight to scope edit
+          state.currentScopeIdx = 0;
+          state.currentProvider = 0;
+          state.phase = "scope-edit";
+        } else {
+          state.phase = "dashboard";
+        }
         render();
       })
       .catch(function (err) {
@@ -159,10 +190,300 @@
       });
   }
 
+  // ── Dashboard ──
+
+  function renderDashboard() {
+    var html =
+      '<div class="fade-in">' +
+        '<div class="brand">' +
+          '<div class="brand-icon">' +
+            '<svg width="32" height="32" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill="#25c39e"/><path d="M10 16.5L14 20.5L22 12.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+          '</div>' +
+          '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
+          '<p class="brand-desc">' + esc(t("ui.dashboard.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
+          renderLocalePicker() +
+        '</div>';
+
+    // Scope cards
+    html += '<div class="provider-list">';
+    state.scopes.forEach(function (scope, idx) {
+      var configured = Object.keys(scope.providersDone).length;
+      var total = state.providers.length;
+      var statusClass = scope.executed ? "done" : (configured === total && total > 0 ? "done" : "pending");
+      var statusText = scope.executed ? t("ui.dashboard.executed") : (configured + "/" + total + " " + t("ui.dashboard.configured"));
+      html +=
+        '<div class="provider-card scope-card" data-idx="' + idx + '">' +
+          '<div class="prov-icon" style="background:#6366f1">' + esc(scope.tenant.charAt(0).toUpperCase()) + '</div>' +
+          '<div style="flex:1">' +
+            '<div class="prov-name">' + esc(scope.tenant) + '</div>' +
+            '<div class="prov-domain">' + esc(scope.env) + (scope.team ? " / " + esc(scope.team) : "") + '</div>' +
+          '</div>' +
+          '<span class="prov-badge ' + statusClass + '">' + esc(statusText) + '</span>' +
+          '<button class="btn btn-ghost btn-sm scope-delete" data-idx="' + idx + '" title="' + esc(t("ui.dashboard.delete")) + '">' +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/></svg>' +
+          '</button>' +
+        '</div>';
+    });
+    html += '</div>';
+
+    // Import drop zone
+    html +=
+      '<div id="import-zone" class="import-zone">' +
+        '<input type="file" id="import-file" accept=".json,.yaml,.yml" style="display:none" />' +
+        '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
+        ' ' + esc(t("ui.import.dropzone")) +
+      '</div>';
+
+    // Action buttons
+    html +=
+      '<div style="display:flex;gap:.5rem;flex-wrap:wrap">' +
+        '<button class="btn btn-secondary" id="btn-add-scope" style="flex:1">' + esc(t("ui.dashboard.add_scope")) + '</button>' +
+        '<button class="btn btn-secondary" id="btn-export" style="flex:1">' + esc(t("ui.dashboard.export")) + '</button>' +
+      '</div>' +
+      '<div style="text-align:center;margin-top:.75rem"><button class="btn btn-ghost" id="btn-close-dash">' + esc(t("ui.close")) + '</button></div>' +
+    '</div>';
+
+    app.innerHTML = html;
+    setupLocalePicker();
+
+    // Scope card click → edit
+    app.querySelectorAll(".scope-card").forEach(function (card) {
+      card.addEventListener("click", function (e) {
+        if (e.target.closest(".scope-delete")) return;
+        var idx = parseInt(card.getAttribute("data-idx"), 10);
+        state.currentScopeIdx = idx;
+        state.currentProvider = 0;
+        state.phase = "scope-edit";
+        render();
+      });
+    });
+
+    // Delete buttons
+    app.querySelectorAll(".scope-delete").forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var idx = parseInt(btn.getAttribute("data-idx"), 10);
+        if (state.scopes.length <= 1) return; // keep at least one
+        state.scopes.splice(idx, 1);
+        render();
+      });
+    });
+
+    document.getElementById("btn-add-scope").addEventListener("click", function () {
+      var newScope = makeScope(
+        state.detectedTenant || "demo",
+        "dev",
+        ""
+      );
+      state.scopes.push(newScope);
+      state.currentScopeIdx = state.scopes.length - 1;
+      state.currentProvider = 0;
+      state.phase = "scope-edit";
+      render();
+    });
+
+    document.getElementById("btn-export").addEventListener("click", function () {
+      state.phase = "export";
+      render();
+    });
+
+    // Import: file picker
+    var importZone = document.getElementById("import-zone");
+    var importFile = document.getElementById("import-file");
+    importZone.addEventListener("click", function () { importFile.click(); });
+    importFile.addEventListener("change", function () {
+      if (importFile.files.length > 0) handleImportFile(importFile.files[0]);
+    });
+    // Import: drag & drop
+    importZone.addEventListener("dragover", function (e) { e.preventDefault(); importZone.classList.add("drag-over"); });
+    importZone.addEventListener("dragleave", function () { importZone.classList.remove("drag-over"); });
+    importZone.addEventListener("drop", function (e) {
+      e.preventDefault();
+      importZone.classList.remove("drag-over");
+      if (e.dataTransfer.files.length > 0) handleImportFile(e.dataTransfer.files[0]);
+    });
+
+    document.getElementById("btn-close-dash").addEventListener("click", shutdown);
+  }
+
+  // ── Import answers file ──
+
+  function handleImportFile(file) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var doc = JSON.parse(reader.result);
+        processImportedDoc(doc);
+      } catch (e) {
+        alert(t("ui.import.parse_error") + ": " + e.message);
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function processImportedDoc(doc) {
+    // Check if encrypted
+    if (docHasEncrypted(doc)) {
+      var key = prompt(t("ui.import.password_prompt"));
+      if (!key) return;
+      fetch("/api/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ doc: doc, key: key }),
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (res.ok) {
+          importScopesFromDoc(res.doc);
+        } else {
+          alert(t("ui.import.decrypt_failed") + ": " + (res.error || "unknown error"));
+        }
+      })
+      .catch(function (err) { alert(t("ui.import.decrypt_failed") + ": " + err.message); });
+    } else {
+      importScopesFromDoc(doc);
+    }
+  }
+
+  function docHasEncrypted(val) {
+    if (!val || typeof val !== "object") return false;
+    if (val.__greentic_encrypted__) return true;
+    var keys = Array.isArray(val) ? val : Object.values(val);
+    return keys.some(function (v) { return docHasEncrypted(v); });
+  }
+
+  function importScopesFromDoc(doc) {
+    var imported = [];
+
+    // Multi-scope format: { scopes: [...] }
+    if (doc.scopes && Array.isArray(doc.scopes)) {
+      doc.scopes.forEach(function (s) { imported.push(scopeFromAnswerDoc(s)); });
+    }
+    // Single scope format: { tenant, env, setup_answers: {...} }
+    else if (doc.setup_answers && typeof doc.setup_answers === "object") {
+      imported.push(scopeFromAnswerDoc(doc));
+    }
+    // Flat format: { "messaging-telegram": {...}, ... } (no metadata)
+    else if (typeof doc === "object" && !doc.greentic_setup_version) {
+      var s = makeScope("demo", "dev", "");
+      Object.keys(doc).forEach(function (k) {
+        if (typeof doc[k] === "object" && !Array.isArray(doc[k])) {
+          s.answers[k] = doc[k];
+        }
+      });
+      imported.push(s);
+    }
+
+    if (imported.length === 0) {
+      alert(t("ui.import.no_scopes"));
+      return;
+    }
+
+    // Replace existing scopes or append
+    state.scopes = imported;
+    state.phase = "dashboard";
+    render();
+  }
+
+  function scopeFromAnswerDoc(doc) {
+    var s = makeScope(
+      doc.tenant || "demo",
+      doc.env || "dev",
+      doc.team || ""
+    );
+    if (doc.setup_answers && typeof doc.setup_answers === "object") {
+      Object.keys(doc.setup_answers).forEach(function (pid) {
+        if (typeof doc.setup_answers[pid] === "object") {
+          s.answers[pid] = doc.setup_answers[pid];
+          // Mark provider as done if it has non-empty answers
+          var keys = Object.keys(doc.setup_answers[pid]);
+          if (keys.length > 0) s.providersDone[pid] = true;
+        }
+      });
+    }
+    return s;
+  }
+
+  // ── Scope edit ──
+
+  function renderScopeEdit() {
+    var scope = cs();
+    var html =
+      '<div class="fade-in">' +
+        '<div class="step-header">' +
+          '<button class="btn btn-ghost btn-sm btn-back" id="btn-back">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+            ' ' + esc(t("ui.back")) +
+          '</button>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="card-header">' +
+            '<h2 class="card-title">' + esc(t("ui.scope.title")) + '</h2>' +
+            '<p class="card-desc">' + esc(t("ui.scope.hint")) + '</p>' +
+          '</div>' +
+          '<div class="card-content"><div class="form-fields">';
+
+    html +=
+      '<div class="field">' +
+        '<label class="field-label" for="f-scope-tenant">' + esc(t("ui.scope.tenant")) + '<span class="required">*</span></label>' +
+        '<input type="text" id="f-scope-tenant" value="' + esc(scope.tenant) + '" />';
+    if (state.detectedTenant) {
+      html += '<p class="field-help">' + esc(t("ui.scope.detected_tenant", [state.detectedTenant])) + '</p>';
+    }
+    html += '</div>';
+
+    html +=
+      '<div class="field">' +
+        '<label class="field-label" for="f-scope-env">' + esc(t("ui.scope.env")) + '<span class="required">*</span></label>' +
+        '<select id="f-scope-env">' +
+          '<option value="dev"' + (scope.env === "dev" ? " selected" : "") + '>dev</option>' +
+          '<option value="local"' + (scope.env === "local" ? " selected" : "") + '>local</option>' +
+          '<option value="test"' + (scope.env === "test" ? " selected" : "") + '>test</option>' +
+          '<option value="staging"' + (scope.env === "staging" ? " selected" : "") + '>staging</option>' +
+          '<option value="prod"' + (scope.env === "prod" ? " selected" : "") + '>prod</option>' +
+        '</select>' +
+        '<p class="field-help">' + esc(t("ui.scope.env_help")) + '</p>' +
+      '</div>';
+
+    html +=
+      '<div class="field">' +
+        '<label class="field-label" for="f-scope-team">' + esc(t("ui.scope.team")) + '</label>' +
+        '<input type="text" id="f-scope-team" value="' + esc(scope.team) + '" placeholder="default" />' +
+        '<p class="field-help">' + esc(t("ui.scope.team_help")) + '</p>' +
+      '</div>';
+
+    html +=
+          '</div></div>' +
+          '<div class="card-footer">' +
+            '<button class="btn btn-primary btn-lg" id="btn-scope-continue" style="width:100%">' + esc(t("ui.continue")) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    app.innerHTML = html;
+
+    document.getElementById("btn-back").addEventListener("click", function () {
+      state.phase = "dashboard";
+      render();
+    });
+
+    document.getElementById("btn-scope-continue").addEventListener("click", function () {
+      var tenantEl = document.getElementById("f-scope-tenant");
+      var tenant = tenantEl.value.trim();
+      if (!tenant) { tenantEl.classList.add("input-error"); tenantEl.focus(); return; }
+      scope.tenant = tenant;
+      scope.env = document.getElementById("f-scope-env").value;
+      scope.team = document.getElementById("f-scope-team").value.trim();
+      state.phase = "providers";
+      render();
+    });
+  }
+
   // ── Provider list ──
 
   function renderProviders() {
-    var allDone = state.providers.every(function (p) { return state.providersDone[p.provider_id]; });
+    var scope = cs();
+    var allDone = state.providers.every(function (p) { return scope.providersDone[p.provider_id]; });
 
     var html =
       '<div class="fade-in">' +
@@ -172,12 +493,12 @@
           '</div>' +
           '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
           '<p class="brand-desc">' + esc(t("ui.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
-          renderLocalePicker() +
+          '<p class="brand-desc" style="font-size:.8rem;opacity:.7">tenant=' + esc(scope.tenant) + ' env=' + esc(scope.env) + (scope.team ? ' team=' + esc(scope.team) : '') + '</p>' +
         '</div>' +
         '<div class="provider-list">';
 
-    state.providers.forEach(function (p, idx) {
-      var done = state.providersDone[p.provider_id];
+    state.providers.forEach(function (p) {
+      var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
       var displayName = formatProviderName(p);
@@ -194,25 +515,25 @@
 
     html += '</div>';
 
-    if (state.sharedQuestions.length > 0 && !state.sharedAnswersDone) {
+    if (state.sharedQuestions.length > 0 && !scope.sharedAnswersDone) {
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
     } else if (!allDone) {
-      var nextIdx = state.providers.findIndex(function (p) { return !state.providersDone[p.provider_id]; });
+      var nextIdx = state.providers.findIndex(function (p) { return !scope.providersDone[p.provider_id]; });
       html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[nextIdx])])) + '</button>';
     } else {
       html += '<button class="btn btn-primary btn-lg" id="btn-review" style="width:100%">' + esc(t("ui.review_execute")) + '</button>';
     }
 
-    html += '<div style="text-align:center;margin-top:.75rem"><button class="btn btn-ghost" id="btn-close-providers">' + esc(t("ui.close")) + '</button></div></div>';
+    html +=
+      '<div style="text-align:center;margin-top:.75rem;display:flex;justify-content:center;gap:.5rem">' +
+        '<button class="btn btn-ghost" id="btn-back-scope">' + esc(t("ui.back")) + '</button>' +
+      '</div></div>';
 
     app.innerHTML = html;
     setupLocalePicker();
 
     var startBtn = document.getElementById("btn-start");
-    if (startBtn) startBtn.addEventListener("click", function () {
-      state.phase = "shared";
-      render();
-    });
+    if (startBtn) startBtn.addEventListener("click", function () { state.phase = "shared"; render(); });
 
     var nextBtn = document.getElementById("btn-next-prov");
     if (nextBtn) nextBtn.addEventListener("click", function () {
@@ -222,15 +543,15 @@
     });
 
     var reviewBtn = document.getElementById("btn-review");
-    if (reviewBtn) reviewBtn.addEventListener("click", function () {
-      state.phase = "review";
+    if (reviewBtn) reviewBtn.addEventListener("click", function () { state.phase = "review"; render(); });
+
+    document.getElementById("btn-back-scope").addEventListener("click", function () {
+      state.phase = "scope-edit";
       render();
     });
-
-    document.getElementById("btn-close-providers").addEventListener("click", shutdown);
   }
 
-  // ── Form rendering (reusable for shared + per-provider) ──
+  // ── Form rendering (reusable) ──
 
   function renderForm(questions, title, desc, backPhase, onSubmit, backFn) {
     var html =
@@ -246,13 +567,12 @@
             '<h2 class="card-title">' + esc(title) + '</h2>' +
             '<p class="card-desc">' + esc(desc) + '</p>' +
           '</div>' +
-          '<div class="card-content">' +
-            '<div id="form-area" class="form-fields">';
+          '<div class="card-content"><div id="form-area" class="form-fields">';
 
     var currentGroup = null;
     questions.forEach(function (q) {
       if (q.group && q.group !== currentGroup) {
-        if (currentGroup !== null) html += '</div>'; // close previous group
+        if (currentGroup !== null) html += '</div>';
         currentGroup = q.group;
         html += '<div class="form-group"><h4 class="form-group-title">' + esc(q.group) + '</h4>';
       } else if (!q.group && currentGroup !== null) {
@@ -264,8 +584,7 @@
     if (currentGroup !== null) html += '</div>';
 
     html +=
-            '</div>' +
-          '</div>' +
+          '</div></div>' +
           '<div class="card-footer card-footer-split">' +
             '<button class="btn btn-secondary" id="btn-prev">' +
               '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
@@ -280,21 +599,9 @@
     restoreFormValues(questions);
     setupVisibility(questions);
 
-    var goBack = backFn || function () {
-      state.phase = backPhase || "providers";
-      render();
-    };
-
-    document.getElementById("btn-back").addEventListener("click", function () {
-      collectFormValues(questions);
-      goBack();
-    });
-
-    document.getElementById("btn-prev").addEventListener("click", function () {
-      collectFormValues(questions);
-      goBack();
-    });
-
+    var goBack = backFn || function () { state.phase = backPhase || "providers"; render(); };
+    document.getElementById("btn-back").addEventListener("click", function () { collectFormValues(questions); goBack(); });
+    document.getElementById("btn-prev").addEventListener("click", function () { collectFormValues(questions); goBack(); });
     document.getElementById("btn-submit").addEventListener("click", function () {
       if (!validateForm(questions)) return;
       collectFormValues(questions);
@@ -307,40 +614,27 @@
     if (q.visible_if) {
       visAttr = ' data-vis-field="' + esc(q.visible_if.field) + '" data-vis-eq="' + esc(q.visible_if.eq || "") + '"';
     }
-
     var html = '<div class="field" id="field-' + esc(q.id) + '"' + visAttr + '>';
-
     if (q.kind === "Boolean") {
       html +=
         '<div class="field-row">' +
           '<label class="field-label" for="f-' + esc(q.id) + '">' + esc(q.title) + '</label>' +
-          '<label class="switch">' +
-            '<input type="checkbox" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '" />' +
-            '<span class="switch-slider"></span>' +
-          '</label>' +
+          '<label class="switch"><input type="checkbox" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '" /><span class="switch-slider"></span></label>' +
         '</div>';
     } else {
       html += '<label class="field-label" for="f-' + esc(q.id) + '">' + esc(q.title);
       if (q.required) html += '<span class="required">*</span>';
       html += '</label>';
-
       var ph = q.placeholder || q.default_value || "";
       if (q.choices && q.choices.length > 0) {
         html += '<select id="f-' + esc(q.id) + '" name="' + esc(q.id) + '">';
-        q.choices.forEach(function (c) {
-          html += '<option value="' + esc(c) + '">' + esc(c) + '</option>';
-        });
+        q.choices.forEach(function (c) { html += '<option value="' + esc(c) + '">' + esc(c) + '</option>'; });
         html += '</select>';
       } else if (q.secret) {
-        html += '<input type="password" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '"';
-        if (ph) html += ' placeholder="' + esc(ph) + '"';
-        html += ' />';
+        html += '<input type="password" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : '') + ' />';
       } else {
-        html += '<input type="text" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '"';
-        if (ph) html += ' placeholder="' + esc(ph) + '"';
-        html += ' />';
+        html += '<input type="text" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : '') + ' />';
       }
-
       if (q.help || q.docs_url) {
         html += '<div class="field-meta">';
         if (q.help) html += '<p class="field-help">' + esc(q.help) + '</p>';
@@ -348,79 +642,50 @@
         html += '</div>';
       }
     }
-
     html += '</div>';
     return html;
   }
 
   function restoreFormValues(questions) {
-    // Determine which answer store to use
-    var store = state.phase === "shared" ? state.sharedAnswers :
-      (state.answers[state.providers[state.currentProvider].provider_id] || {});
-
+    var scope = cs();
+    var store = state.phase === "shared" ? scope.sharedAnswers :
+      (scope.answers[state.providers[state.currentProvider].provider_id] || {});
     questions.forEach(function (q) {
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
       var val = store[q.id];
-      // Priority: user answer > saved secret > default value
       var effective = val !== undefined ? val : (q.saved_value || undefined);
       if (effective !== undefined) {
-        if (q.kind === "Boolean") {
-          el.checked = effective === true || effective === "true";
-        } else {
-          el.value = effective;
-        }
-      } else if (q.default_value && q.kind !== "Boolean") {
-        el.value = q.default_value;
-      } else if (q.kind === "Boolean" && q.default_value) {
-        el.checked = q.default_value === "true" || q.default_value === true;
-      }
+        if (q.kind === "Boolean") { el.checked = effective === true || effective === "true"; }
+        else { el.value = effective; }
+      } else if (q.default_value && q.kind !== "Boolean") { el.value = q.default_value; }
+      else if (q.kind === "Boolean" && q.default_value) { el.checked = q.default_value === "true" || q.default_value === true; }
     });
   }
 
   function collectFormValues(questions) {
-    var store = state.phase === "shared" ? state.sharedAnswers :
-      (state.answers[state.providers[state.currentProvider].provider_id] || {});
-
+    var scope = cs();
+    var store = state.phase === "shared" ? scope.sharedAnswers :
+      (scope.answers[state.providers[state.currentProvider].provider_id] || {});
     questions.forEach(function (q) {
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
-
       var fieldDiv = document.getElementById("field-" + q.id);
       var isHidden = fieldDiv && fieldDiv.style.display === "none";
-
-      if (q.kind === "Boolean") {
-        // Always collect booleans (even hidden ones keep their toggled state)
-        store[q.id] = el.checked ? "true" : "false";
-      } else if (!isHidden) {
-        var val = el.value.trim();
-        if (val) store[q.id] = val;
-      }
+      if (q.kind === "Boolean") { store[q.id] = el.checked ? "true" : "false"; }
+      else if (!isHidden) { var val = el.value.trim(); if (val) store[q.id] = val; }
     });
-
-    if (state.phase === "shared") {
-      state.sharedAnswers = store;
-    } else {
-      state.answers[state.providers[state.currentProvider].provider_id] = store;
-    }
+    if (state.phase === "shared") { scope.sharedAnswers = store; }
+    else { scope.answers[state.providers[state.currentProvider].provider_id] = store; }
   }
 
   function setupVisibility(questions) {
-    // Add change listeners on fields that other fields depend on
     var depFields = {};
-    questions.forEach(function (q) {
-      if (q.visible_if) depFields[q.visible_if.field] = true;
-    });
-
+    questions.forEach(function (q) { if (q.visible_if) depFields[q.visible_if.field] = true; });
     Object.keys(depFields).forEach(function (fid) {
       var el = document.getElementById("f-" + fid);
-      if (el) {
-        var handler = function () { evaluateVisibility(); };
-        el.addEventListener("change", handler);
-        el.addEventListener("input", handler);
-      }
+      if (el) { var h = function () { evaluateVisibility(); }; el.addEventListener("change", h); el.addEventListener("input", h); }
     });
-
     evaluateVisibility();
   }
 
@@ -444,8 +709,7 @@
       if (group && group.style.display === "none") return;
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
-      var val = el.value.trim();
-      if (q.required && !val && !q.default_value) {
+      if (q.required && !el.value.trim() && !q.default_value) {
         showFieldError(el, t("ui.field.required", [q.title]));
         if (!firstErr) firstErr = el;
       }
@@ -467,17 +731,17 @@
     el.parentElement.appendChild(err);
   }
 
-  // ── Shared questions submit ──
+  // ── Shared questions ──
 
   function submitShared() {
-    state.sharedAnswersDone = true;
-    // Apply shared answers to all providers
+    var scope = cs();
+    scope.sharedAnswersDone = true;
     state.providers.forEach(function (p) {
-      var store = state.answers[p.provider_id] || {};
-      Object.keys(state.sharedAnswers).forEach(function (k) {
-        if (!store[k]) store[k] = state.sharedAnswers[k];
+      var store = scope.answers[p.provider_id] || {};
+      Object.keys(scope.sharedAnswers).forEach(function (k) {
+        if (!store[k]) store[k] = scope.sharedAnswers[k];
       });
-      state.answers[p.provider_id] = store;
+      scope.answers[p.provider_id] = store;
     });
     state.currentProvider = 0;
     state.phase = "provider-form";
@@ -487,54 +751,38 @@
   // ── Per-provider form ──
 
   function renderProviderForm() {
+    var scope = cs();
     var p = state.providers[state.currentProvider];
     var form = state.providerForms[p.provider_id];
     if (!form || form.questions.length === 0) {
-      state.providersDone[p.provider_id] = true;
+      scope.providersDone[p.provider_id] = true;
       advanceProvider();
       return;
     }
-
-    // Back goes to previous provider, or shared questions, or provider list
     var backFn = function () {
-      if (state.currentProvider > 0) {
-        state.currentProvider--;
-        state.phase = "provider-form";
-      } else if (state.sharedQuestions.length > 0) {
-        state.phase = "shared";
-      } else {
-        state.phase = "providers";
-      }
+      if (state.currentProvider > 0) { state.currentProvider--; state.phase = "provider-form"; }
+      else if (state.sharedQuestions.length > 0) { state.phase = "shared"; }
+      else { state.phase = "providers"; }
       render();
     };
-
-    renderForm(
-      form.questions,
-      form.title || formatProviderName(p),
-      t("ui.provider.configure", [formatProviderName(p)]),
-      null,
-      function () {
-        state.providersDone[p.provider_id] = true;
-        advanceProvider();
-      },
-      backFn
-    );
+    renderForm(form.questions, form.title || formatProviderName(p), t("ui.provider.configure", [formatProviderName(p)]), null, function () {
+      scope.providersDone[p.provider_id] = true;
+      advanceProvider();
+    }, backFn);
   }
 
   function advanceProvider() {
-    var next = state.providers.findIndex(function (p) { return !state.providersDone[p.provider_id]; });
-    if (next >= 0) {
-      state.currentProvider = next;
-      state.phase = "provider-form";
-    } else {
-      state.phase = "review";
-    }
+    var scope = cs();
+    var next = state.providers.findIndex(function (p) { return !scope.providersDone[p.provider_id]; });
+    if (next >= 0) { state.currentProvider = next; state.phase = "provider-form"; }
+    else { state.phase = "review"; }
     render();
   }
 
   // ── Review ──
 
   function renderReview() {
+    var scope = cs();
     var html =
       '<div class="fade-in">' +
         '<div class="step-header">' +
@@ -550,30 +798,26 @@
           '</div>' +
           '<div class="card-content">';
 
+    // Scope summary
+    html +=
+      '<div class="review-group"><h4 class="review-group-title">' + esc(t("ui.scope.title")) + '</h4>' +
+        '<div class="review-item"><span class="review-key">tenant</span><span class="review-val">' + esc(scope.tenant) + '</span></div>' +
+        '<div class="review-item"><span class="review-key">env</span><span class="review-val">' + esc(scope.env) + '</span></div>' +
+        '<div class="review-item"><span class="review-key">team</span><span class="review-val">' + esc(scope.team || "default") + '</span></div>' +
+      '</div>';
+
     state.providers.forEach(function (p) {
-      var answers = state.answers[p.provider_id] || {};
+      var answers = scope.answers[p.provider_id] || {};
       var form = state.providerForms[p.provider_id];
       var keys = Object.keys(answers);
       if (keys.length === 0) return;
-
       html += '<div class="review-group"><h4 class="review-group-title">' + esc(formatProviderName(p)) + '</h4>';
       keys.forEach(function (k) {
         var val = answers[k];
         var isSecret = form && form.questions.some(function (q) { return q.id === k && q.secret; });
-        var display;
-        if (typeof val === "boolean") {
-          display = val ? t("ui.review.yes") : t("ui.review.no");
-        } else if (isSecret && val) {
-          display = t("ui.review.secret_mask");
-        } else {
-          display = String(val || "");
-        }
+        var display = typeof val === "boolean" ? (val ? t("ui.review.yes") : t("ui.review.no")) : (isSecret && val ? t("ui.review.secret_mask") : String(val || ""));
         if (!display) return;
-        html +=
-          '<div class="review-item">' +
-            '<span class="review-key">' + esc(k) + '</span>' +
-            '<span class="review-val' + (isSecret ? ' secret' : '') + '">' + esc(display) + '</span>' +
-          '</div>';
+        html += '<div class="review-item"><span class="review-key">' + esc(k) + '</span><span class="review-val' + (isSecret ? ' secret' : '') + '">' + esc(display) + '</span></div>';
       });
       html += '</div>';
     });
@@ -590,25 +834,30 @@
       '</div>';
 
     app.innerHTML = html;
-    document.getElementById("btn-back-review").addEventListener("click", function () {
-      state.phase = "providers";
-      render();
-    });
+    document.getElementById("btn-back-review").addEventListener("click", function () { state.phase = "providers"; render(); });
     document.getElementById("btn-execute").addEventListener("click", executeSetup);
   }
 
   // ── Execute ──
 
   function executeSetup() {
+    var scope = cs();
     state.phase = "executing";
     render();
+    var payload = {
+      answers: scope.answers,
+      tenant: scope.tenant,
+      env: scope.env,
+    };
+    if (scope.team) payload.team = scope.team;
     fetch("/api/execute", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ answers: state.answers }),
+      body: JSON.stringify(payload),
     })
     .then(function (r) { return r.json(); })
     .then(function (result) {
+      scope.executed = true;
       state.result = result;
       state.phase = "result";
       render();
@@ -632,21 +881,19 @@
   function renderResult() {
     var r = state.result;
     var ok = r && r.success;
-
     var html =
-      '<div class="fade-in">' +
-        '<div class="card">' +
-          '<div class="card-header center">' +
-            '<div class="result-icon ' + (ok ? "result-ok" : "result-err") + '">' +
-              (ok ?
-                '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>' :
-                '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>'
-              ) +
-            '</div>' +
-            '<h2 class="card-title">' + (ok ? esc(t("ui.result.success.title")) : esc(t("ui.result.fail.title"))) + '</h2>' +
-            '<p class="card-desc">' + (ok ? esc(t("ui.result.success.description")) : esc(t("ui.result.fail.description"))) + '</p>' +
+      '<div class="fade-in"><div class="card">' +
+        '<div class="card-header center">' +
+          '<div class="result-icon ' + (ok ? "result-ok" : "result-err") + '">' +
+            (ok ?
+              '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>' :
+              '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>'
+            ) +
           '</div>' +
-          '<div class="card-content">';
+          '<h2 class="card-title">' + (ok ? esc(t("ui.result.success.title")) : esc(t("ui.result.fail.title"))) + '</h2>' +
+          '<p class="card-desc">' + (ok ? esc(t("ui.result.success.description")) : esc(t("ui.result.fail.description"))) + '</p>' +
+        '</div>' +
+        '<div class="card-content">';
 
     if (r && r.manual_steps && r.manual_steps.length > 0) {
       html += '<div class="output-section"><h4 class="output-title" style="color:#f59e0b">' + esc(t("ui.result.manual_steps")) + '</h4>';
@@ -654,39 +901,81 @@
         html += '<div style="margin-bottom:.75rem;padding:.75rem 1rem;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);border-radius:calc(var(--radius) - 2px)">';
         html += '<div style="font-size:.8125rem;font-weight:600;color:#f59e0b;margin-bottom:.375rem">' + esc(instr.provider_name) + '</div>';
         html += '<ol style="margin:0;padding-left:1.25rem;font-size:.8rem;color:#d4d4d8;line-height:1.7">';
-        instr.steps.forEach(function (step) {
-          var text = step.replace(/^\d+\.\s*/, '');
-          html += '<li>' + esc(text) + '</li>';
-        });
+        instr.steps.forEach(function (step) { html += '<li>' + esc(step.replace(/^\d+\.\s*/, '')) + '</li>'; });
         html += '</ol></div>';
       });
       html += '</div>';
     }
-
-    if (r && r.stdout) {
-      html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.output")) + '</h4><pre class="output-pre">' + esc(r.stdout) + '</pre></div>';
-    }
-    if (r && r.stderr) {
-      html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.log")) + '</h4><pre class="output-pre stderr">' + esc(r.stderr) + '</pre></div>';
-    }
+    if (r && r.stdout) html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.output")) + '</h4><pre class="output-pre">' + esc(r.stdout) + '</pre></div>';
+    if (r && r.stderr) html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.log")) + '</h4><pre class="output-pre stderr">' + esc(r.stderr) + '</pre></div>';
 
     html +=
+        '</div>' +
+        '<div class="card-footer card-footer-split">' +
+          '<button class="btn btn-secondary" id="btn-back-dash">' + esc(t("ui.dashboard.back")) + '</button>' +
+          '<button class="btn btn-ghost" id="btn-close">' + esc(t("ui.close")) + '</button>' +
+        '</div>' +
+      '</div></div>';
+
+    app.innerHTML = html;
+    document.getElementById("btn-back-dash").addEventListener("click", function () { state.phase = "dashboard"; render(); });
+    document.getElementById("btn-close").addEventListener("click", shutdown);
+  }
+
+  // ── Export ──
+
+  function renderExport() {
+    var html =
+      '<div class="fade-in">' +
+        '<div class="step-header">' +
+          '<button class="btn btn-ghost btn-sm btn-back" id="btn-back-export">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+            ' ' + esc(t("ui.back")) +
+          '</button>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="card-header">' +
+            '<h2 class="card-title">' + esc(t("ui.export.title")) + '</h2>' +
+            '<p class="card-desc">' + esc(t("ui.export.description")) + '</p>' +
           '</div>' +
-          '<div class="card-footer card-footer-split">' +
-            '<button class="btn btn-secondary" id="btn-restart">' + esc(t("ui.new_setup")) + '</button>' +
-            '<button class="btn btn-ghost" id="btn-close">' + esc(t("ui.close")) + '</button>' +
+          '<div class="card-content"><div class="form-fields">' +
+            '<div class="field">' +
+              '<label class="field-label" for="f-export-key">' + esc(t("ui.export.password")) + '</label>' +
+              '<input type="password" id="f-export-key" placeholder="' + esc(t("ui.export.password_hint")) + '" />' +
+              '<p class="field-help">' + esc(t("ui.export.password_help")) + '</p>' +
+            '</div>' +
+          '</div></div>' +
+          '<div class="card-footer">' +
+            '<button class="btn btn-primary btn-lg" id="btn-do-export" style="width:100%">' + esc(t("ui.export.download")) + '</button>' +
           '</div>' +
         '</div>' +
       '</div>';
 
     app.innerHTML = html;
-    document.getElementById("btn-restart").addEventListener("click", function () {
-      state.phase = "loading";
-      state.providersDone = {};
-      state.sharedAnswersDone = false;
-      render();
+
+    document.getElementById("btn-back-export").addEventListener("click", function () { state.phase = "dashboard"; render(); });
+
+    document.getElementById("btn-do-export").addEventListener("click", function () {
+      var key = document.getElementById("f-export-key").value.trim() || null;
+      var scopes = state.scopes.map(function (s) {
+        return { tenant: s.tenant, team: s.team || null, env: s.env, answers: s.answers };
+      });
+      fetch("/api/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scopes: scopes, key: key }),
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (doc) {
+        var blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" });
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "setup-answers.json";
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(function (err) { alert("Export failed: " + err.message); });
     });
-    document.getElementById("btn-close").addEventListener("click", shutdown);
   }
 
   // ── Helpers ──
