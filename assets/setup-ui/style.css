@@ -203,6 +203,18 @@ select{cursor:pointer;appearance:none;
 }
 .output-pre.stderr{color:#fca5a5}
 
+/* ── Import drop zone ── */
+.import-zone{
+  display:flex;align-items:center;justify-content:center;gap:.5rem;
+  padding:1rem;margin-bottom:.75rem;
+  border:2px dashed var(--card-border);border-radius:var(--radius);
+  color:var(--muted);font-size:.8125rem;cursor:pointer;
+  transition:border-color .15s,background .15s,color .15s;
+}
+.import-zone:hover,.import-zone.drag-over{
+  border-color:var(--primary);background:var(--primary-muted);color:var(--fg);
+}
+
 /* ── Spinner ── */
 .spinner{
   width:1.75rem;height:1.75rem;

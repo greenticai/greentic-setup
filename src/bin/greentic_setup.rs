@@ -307,6 +307,30 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
 
+    // Load answers from --answers file for UI pre-fill
+    let prefill_answers = if let Some(answers_path) = &cli.answers {
+        println!(
+            "{}",
+            i18n.tf(
+                "setup.answers.loaded",
+                &[&answers_path.display().to_string()]
+            )
+        );
+        let loader_engine = SetupEngine::new(SetupConfig {
+            tenant: cli.tenant.clone(),
+            team: cli.team.clone(),
+            env: cli.env.clone(),
+            offline: false,
+            verbose: false,
+        });
+        let loaded = loader_engine
+            .load_answers(answers_path, cli.key.as_deref(), true)
+            .context(i18n.t("cli.error.failed_read_answers"))?;
+        Some(loaded.setup_answers)
+    } else {
+        None
+    };
+
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(greentic_setup::ui::launch(
         &bundle_dir,
@@ -315,5 +339,6 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         &cli.env,
         cli.advanced,
         cli.locale.as_deref(),
+        prefill_answers,
     ))
 }

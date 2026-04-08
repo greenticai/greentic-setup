@@ -36,6 +36,8 @@ struct UiState {
     #[allow(dead_code)]
     advanced: bool,
     locale: Option<String>,
+    /// Pre-loaded answers from `--answers` file, keyed by provider_id.
+    prefill_answers: Option<JsonMap<String, Value>>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -100,6 +102,20 @@ struct SetupQuestionExtras {
 #[derive(Deserialize)]
 struct ExecuteRequest {
     answers: JsonMap<String, Value>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ScopeResponse {
+    tenant: String,
+    team: Option<String>,
+    env: String,
+    detected_tenant: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -113,6 +129,10 @@ struct ExecutionResult {
 // ── Public API ──
 
 /// Launch the setup UI server and open in browser.
+///
+/// When `prefill_answers` is provided (from `--answers` file), the values are
+/// injected into the UI as pre-filled form values so the user can review and
+/// edit before executing.
 pub async fn launch(
     bundle_path: &Path,
     tenant: &str,
@@ -120,6 +140,7 @@ pub async fn launch(
     env: &str,
     advanced: bool,
     locale: Option<&str>,
+    prefill_answers: Option<JsonMap<String, Value>>,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -130,6 +151,7 @@ pub async fn launch(
         env: env.to_string(),
         advanced,
         locale: locale.map(String::from),
+        prefill_answers,
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -159,8 +181,11 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/app.js", get(serve_js))
         .route("/style.css", get(serve_css))
         .route("/api/locales", get(get_locales))
+        .route("/api/scope", get(get_scope))
         .route("/api/providers", get(get_providers))
         .route("/api/execute", post(post_execute))
+        .route("/api/export", post(post_export))
+        .route("/api/decrypt", post(post_decrypt))
         .route("/api/shutdown", post(post_shutdown))
         .with_state(state)
 }
@@ -235,6 +260,55 @@ async fn get_locales(State(state): State<std::sync::Arc<UiState>>) -> Json<Value
 #[derive(Deserialize)]
 struct ProviderQuery {
     locale: Option<String>,
+}
+
+async fn get_scope(
+    State(state): State<std::sync::Arc<UiState>>,
+) -> Json<ScopeResponse> {
+    let bundle_path = &state.bundle_path;
+    let cli_tenant = &state.tenant;
+    let cli_env = &state.env;
+
+    // Detect tenant from the bundle's tenants/ directory, same as --answers mode
+    let detected_tenant = detect_tenant_from_bundle(bundle_path);
+
+    // Apply same resolution logic as resolve_setup_scope_with_bundle:
+    // if CLI tenant is the default "demo" and we detect a tenant from the bundle, use it.
+    let effective_tenant = if cli_tenant == "demo" {
+        detected_tenant
+            .clone()
+            .unwrap_or_else(|| cli_tenant.clone())
+    } else {
+        cli_tenant.clone()
+    };
+
+    Json(ScopeResponse {
+        tenant: effective_tenant,
+        team: state.team.clone(),
+        env: cli_env.clone(),
+        detected_tenant,
+    })
+}
+
+/// Detect tenant from the bundle's `tenants/` directory.
+fn detect_tenant_from_bundle(bundle_dir: &Path) -> Option<String> {
+    let tenants_dir = bundle_dir.join("tenants");
+    let entries: Vec<String> = std::fs::read_dir(&tenants_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    match entries.len() {
+        0 => None,
+        1 => Some(entries[0].clone()),
+        _ => entries
+            .iter()
+            .find(|t| t.as_str() != "demo")
+            .cloned()
+            .or_else(|| entries.first().cloned()),
+    }
 }
 
 async fn get_providers(
@@ -333,15 +407,37 @@ async fn get_providers(
     )
     .await;
 
+    // Build per-provider prefill map from --answers file (overrides saved secrets)
+    let prefill = &state.prefill_answers;
+
     // Inject saved values into shared questions (pick from first provider that has the value)
+    // Answers from --answers file take priority over saved secrets.
     let shared_questions: Vec<QuestionInfo> = shared_question_specs
         .iter()
         .map(|q| {
             let mut info = form_question_to_info(q, Some(&i18n));
-            for secrets in saved_secrets.values() {
-                if let Some(val) = secrets.get(&q.id) {
-                    info.saved_value = Some(val.clone());
-                    break;
+            // First try --answers prefill (check all providers for the shared question)
+            let mut found = false;
+            if let Some(answers) = prefill {
+                for pfs in &provider_form_specs {
+                    if let Some(provider_answers) = answers
+                        .get(&pfs.provider_id)
+                        .and_then(|v| v.as_object())
+                        && let Some(val) = provider_answers.get(&q.id).and_then(value_as_nonempty_string)
+                    {
+                        info.saved_value = Some(val);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            // Fall back to saved secrets
+            if !found {
+                for secrets in saved_secrets.values() {
+                    if let Some(val) = secrets.get(&q.id) {
+                        info.saved_value = Some(val.clone());
+                        break;
+                    }
                 }
             }
             info
@@ -353,6 +449,10 @@ async fn get_providers(
         .map(|pfs| {
             let extras = extras_by_provider.get(&pfs.provider_id);
             let saved = saved_secrets.get(&pfs.provider_id);
+            let answers = prefill
+                .as_ref()
+                .and_then(|a| a.get(&pfs.provider_id))
+                .and_then(|v| v.as_object());
             ProviderForm {
                 provider_id: pfs.provider_id.clone(),
                 title: pfs.form_spec.title.clone(),
@@ -369,7 +469,13 @@ async fn get_providers(
                             info.group = ext.group.clone();
                             info.docs_url = ext.docs_url.clone();
                         }
-                        if let Some(val) = saved.and_then(|m| m.get(&q.id)) {
+                        // --answers prefill takes priority over saved secrets
+                        if let Some(val) = answers
+                            .and_then(|m| m.get(&q.id))
+                            .and_then(value_as_nonempty_string)
+                        {
+                            info.saved_value = Some(val);
+                        } else if let Some(val) = saved.and_then(|m| m.get(&q.id)) {
                             info.saved_value = Some(val.clone());
                         }
                         info
@@ -393,9 +499,10 @@ async fn post_execute(
     Json(req): Json<ExecuteRequest>,
 ) -> Json<ExecutionResult> {
     let bundle_path = state.bundle_path.clone();
-    let tenant = state.tenant.clone();
-    let team = state.team.clone();
-    let env = state.env.clone();
+    // Use scope from UI request if provided, otherwise fall back to CLI defaults
+    let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
+    let team = req.team.or_else(|| state.team.clone());
+    let env = req.env.unwrap_or_else(|| state.env.clone());
     let answers = req.answers;
 
     let result = tokio::task::spawn_blocking(move || {
@@ -411,6 +518,108 @@ async fn post_execute(
 
     *state.result.lock().unwrap() = Some(result.clone());
     Json(result)
+}
+
+#[derive(Deserialize)]
+struct ExportRequest {
+    scopes: Vec<ExportScope>,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExportScope {
+    tenant: String,
+    #[serde(default)]
+    team: Option<String>,
+    env: String,
+    answers: JsonMap<String, Value>,
+}
+
+async fn post_export(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<ExportRequest>,
+) -> Json<Value> {
+    let bundle_path = state.bundle_path.clone();
+
+    // Discover packs to identify secret fields for encryption
+    let discovered = discovery::discover(&bundle_path).ok();
+    let secret_fields: std::collections::HashSet<String> = discovered
+        .iter()
+        .flat_map(|d| d.providers.iter())
+        .filter_map(|p| {
+            setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id)
+        })
+        .flat_map(|spec| spec.questions.into_iter())
+        .filter(|q| q.secret)
+        .map(|q| q.id)
+        .collect();
+
+    let mut scopes_json = Vec::new();
+    for scope in &req.scopes {
+        let mut setup_answers = JsonMap::new();
+        for (provider_id, provider_answers) in &scope.answers {
+            let mut encrypted_answers = JsonMap::new();
+            if let Some(obj) = provider_answers.as_object() {
+                for (field, value) in obj {
+                    if secret_fields.contains(field) && req.key.is_some() {
+                        let key = req.key.as_deref().unwrap();
+                        match crate::answers_crypto::encrypt_value(value, key) {
+                            Ok(enc) => { encrypted_answers.insert(field.clone(), enc); }
+                            Err(_) => { encrypted_answers.insert(field.clone(), value.clone()); }
+                        }
+                    } else {
+                        encrypted_answers.insert(field.clone(), value.clone());
+                    }
+                }
+            }
+            setup_answers.insert(provider_id.clone(), Value::Object(encrypted_answers));
+        }
+        scopes_json.push(serde_json::json!({
+            "tenant": scope.tenant,
+            "team": scope.team,
+            "env": scope.env,
+            "setup_answers": setup_answers,
+        }));
+    }
+
+    // Single scope → flat format (compatible with --answers)
+    // Multiple scopes → array format
+    let doc = if scopes_json.len() == 1 {
+        let mut single = scopes_json.into_iter().next().unwrap();
+        if let Some(obj) = single.as_object_mut() {
+            obj.insert(
+                "greentic_setup_version".to_string(),
+                Value::String("1.0.0".to_string()),
+            );
+            obj.insert(
+                "bundle_source".to_string(),
+                Value::String(bundle_path.display().to_string()),
+            );
+        }
+        single
+    } else {
+        serde_json::json!({
+            "greentic_setup_version": "1.0.0",
+            "bundle_source": bundle_path.display().to_string(),
+            "scopes": scopes_json,
+        })
+    };
+
+    Json(doc)
+}
+
+#[derive(Deserialize)]
+struct DecryptRequest {
+    doc: Value,
+    key: String,
+}
+
+async fn post_decrypt(Json(req): Json<DecryptRequest>) -> Json<Value> {
+    match crate::answers_crypto::decrypt_tree(&req.doc, &req.key) {
+        Ok(decrypted) => Json(serde_json::json!({ "ok": true, "doc": decrypted })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 async fn post_shutdown(State(state): State<std::sync::Arc<UiState>>) {
@@ -553,6 +762,16 @@ async fn load_saved_secrets(
         }
     }
     result
+}
+
+/// Extract a non-empty string from a JSON value (handles String, Number, Bool).
+fn value_as_nonempty_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> QuestionInfo {
