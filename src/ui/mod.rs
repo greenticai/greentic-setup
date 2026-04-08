@@ -182,6 +182,7 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/style.css", get(serve_css))
         .route("/api/locales", get(get_locales))
         .route("/api/scope", get(get_scope))
+        .route("/api/existing-scopes", get(get_existing_scopes))
         .route("/api/providers", get(get_providers))
         .route("/api/execute", post(post_execute))
         .route("/api/export", post(post_export))
@@ -307,6 +308,110 @@ fn detect_tenant_from_bundle(bundle_dir: &Path) -> Option<String> {
             .cloned()
             .or_else(|| entries.first().cloned()),
     }
+}
+
+/// Scan the bundle for previously configured scopes.
+///
+/// Reads `state/config/*/setup-answers.json` for provider answers and
+/// probes the dev secrets store with detected tenants to reconstruct
+/// existing scope configurations.
+async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Json<Value> {
+    let bundle_path = &state.bundle_path;
+
+    // 1. Detect tenants from tenants/ directory
+    let tenants = {
+        let mut t = Vec::new();
+        let tenants_dir = bundle_path.join("tenants");
+        if let Ok(entries) = std::fs::read_dir(&tenants_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir()
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    t.push(name.to_string());
+                }
+            }
+        }
+        if t.is_empty() {
+            t.push(state.tenant.clone());
+        }
+        t.sort();
+        t
+    };
+
+    // 2. Read provider answers from state/config/*/setup-answers.json
+    let config_dir = bundle_path.join("state").join("config");
+    let mut provider_answers: JsonMap<String, Value> = JsonMap::new();
+    if let Ok(entries) = std::fs::read_dir(&config_dir) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let provider_id = entry.file_name().to_string_lossy().to_string();
+            let answers_file = entry.path().join("setup-answers.json");
+            if let Ok(content) = std::fs::read_to_string(&answers_file)
+                && let Ok(parsed) = serde_json::from_str::<Value>(&content)
+            {
+                provider_answers.insert(provider_id, parsed);
+            }
+        }
+    }
+
+    // 3. For each tenant, probe secrets store to see if secrets exist
+    let discovered = discovery::discover(bundle_path).ok();
+    let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
+        .iter()
+        .flat_map(|d| d.providers.iter())
+        .filter_map(|p| {
+            setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id).map(|fs| {
+                wizard::ProviderFormSpec {
+                    provider_id: p.provider_id.clone(),
+                    form_spec: fs,
+                }
+            })
+        })
+        .collect();
+
+    let envs_to_probe = ["dev", "local"];
+    let mut scopes = Vec::new();
+
+    for tenant in &tenants {
+        for env in &envs_to_probe {
+            let saved =
+                load_saved_secrets(bundle_path, env, tenant, None, &provider_form_specs).await;
+
+            if saved.is_empty() {
+                continue;
+            }
+
+            // Merge saved secrets with file-based answers
+            let mut merged_answers = JsonMap::new();
+            for (pid, file_ans) in &provider_answers {
+                merged_answers.insert(pid.clone(), file_ans.clone());
+            }
+            // Overlay saved secrets into answers
+            for (pid, secrets) in &saved {
+                let entry = merged_answers
+                    .entry(pid.clone())
+                    .or_insert_with(|| Value::Object(JsonMap::new()));
+                if let Some(obj) = entry.as_object_mut() {
+                    for (k, v) in secrets {
+                        obj.insert(k.clone(), Value::String(v.clone()));
+                    }
+                }
+            }
+
+            scopes.push(serde_json::json!({
+                "tenant": tenant,
+                "env": env,
+                "team": null,
+                "answers": merged_answers,
+                "providers_done": saved.keys().collect::<Vec<_>>(),
+            }));
+            break; // found secrets for this tenant, skip other envs
+        }
+    }
+
+    Json(serde_json::json!({ "scopes": scopes }))
 }
 
 async fn get_providers(
