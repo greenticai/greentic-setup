@@ -63,10 +63,32 @@ pub fn create_demo_bundle_structure(root: &Path, bundle_name: Option<&str>) -> a
         "_ = forbidden\n",
     )?;
 
-    // Write embedded welcome default.gtpack so the operator has a flow to execute.
-    write_default_pack_if_missing(root);
+    // Write embedded welcome default.gtpack only when the bundle does not already
+    // declare its own app packs (e.g. via wizard --answers).  When app_packs is
+    // present in bundle.yaml the user has an explicit pack reference and the
+    // generic welcome pack would just shadow it.
+    if !bundle_has_app_packs(root) {
+        write_default_pack_if_missing(root);
+    }
 
     Ok(())
+}
+
+/// Return `true` when `bundle.yaml` already declares at least one app pack.
+fn bundle_has_app_packs(bundle_root: &Path) -> bool {
+    let workspace = bundle_root.join(BUNDLE_WORKSPACE_MARKER);
+    let Ok(contents) = std::fs::read_to_string(&workspace) else {
+        return false;
+    };
+    // Simple check: look for a non-empty `app_packs:` list.
+    // A full YAML parse is avoided here to keep the dependency footprint minimal.
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("- packs/") || trimmed.starts_with("- ./packs/") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Embedded quickstart pack bytes (built from `assets/default-welcome.gtpack`).
@@ -271,6 +293,24 @@ mod tests {
         assert_eq!(
             contents, b"custom",
             "existing pack should not be overwritten"
+        );
+    }
+
+    #[test]
+    fn default_pack_skipped_when_bundle_has_app_packs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("custom-bundle");
+        std::fs::create_dir_all(root.join("packs")).unwrap();
+        // Write a bundle.yaml that declares an app pack
+        std::fs::write(
+            root.join(BUNDLE_WORKSPACE_MARKER),
+            "schema_version: 1\napp_packs:\n  - packs/my-flow.pack\n",
+        )
+        .unwrap();
+        create_demo_bundle_structure(&root, Some("test")).unwrap();
+        assert!(
+            !root.join("packs").join("default.gtpack").exists(),
+            "default.gtpack should NOT be created when app_packs are declared"
         );
     }
 
