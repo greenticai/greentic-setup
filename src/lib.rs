@@ -14,6 +14,7 @@ pub mod cli_commands;
 pub mod cli_helpers;
 pub mod cli_i18n;
 pub mod config_envelope;
+pub mod deploy_inputs;
 pub mod deployment_targets;
 pub mod discovery;
 pub mod engine;

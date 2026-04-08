@@ -241,6 +241,10 @@ pub fn execute_apply_pack_setup(
         bundle_path,
         &metadata.deployment_targets,
     );
+    let _ = crate::deploy_inputs::persist_setup_deploy_inputs(
+        bundle_path,
+        &metadata.deployment_targets,
+    );
 
     // Print post-setup instructions for providers needing manual steps
     let provider_configs: Vec<(String, Value)> = metadata
