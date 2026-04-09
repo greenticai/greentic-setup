@@ -10,6 +10,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
+use crate::platform_setup::load_effective_static_routes_defaults;
+
 /// Well-known OIDC provider definitions.
 struct OidcProviderDef {
     id_suffix: &'static str,
@@ -82,12 +84,24 @@ pub fn sync_oauth_to_tenant_config(
         // Try default.json as fallback
         let default_path = bundle_path.join("assets/webchat-gui/config/tenants/default.json");
         if default_path.exists() {
-            return update_tenant_config(&default_path, tenant, oauth_enabled, answers_obj);
+            return update_tenant_config(
+                &default_path,
+                tenant,
+                oauth_enabled,
+                answers_obj,
+                resolve_public_base_url(bundle_path, tenant, answers_obj)?,
+            );
         }
         return Ok(false);
     }
 
-    update_tenant_config(&config_path, tenant, oauth_enabled, answers_obj)
+    update_tenant_config(
+        &config_path,
+        tenant,
+        oauth_enabled,
+        answers_obj,
+        resolve_public_base_url(bundle_path, tenant, answers_obj)?,
+    )
 }
 
 fn update_tenant_config(
@@ -95,6 +109,7 @@ fn update_tenant_config(
     tenant: &str,
     oauth_enabled: bool,
     answers: &Map<String, Value>,
+    public_base_url: Option<String>,
 ) -> Result<bool> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("read tenant config {}", config_path.display()))?;
@@ -119,11 +134,6 @@ fn update_tenant_config(
         return Ok(false);
     };
 
-    let public_base_url = answers
-        .get("public_base_url")
-        .and_then(Value::as_str)
-        .unwrap_or("http://localhost:8080");
-
     let mut changed = false;
 
     for def in OIDC_PROVIDERS {
@@ -140,11 +150,13 @@ fn update_tenant_config(
             .to_string();
 
         let provider_id = format!("{tenant}-{}", def.id_suffix);
-        let redirect_uri = format!(
-            "{}/v1/web/webchat/{}/",
-            public_base_url.trim_end_matches('/'),
-            tenant,
-        );
+        let redirect_uri = public_base_url.as_deref().map(|public_base_url| {
+            format!(
+                "{}/v1/web/webchat/{}/",
+                public_base_url.trim_end_matches('/'),
+                tenant,
+            )
+        });
 
         // Find existing provider entry — match by exact ID or by suffix (e.g. "google", "microsoft")
         if let Some(existing) = providers_arr.iter_mut().find(|p| {
@@ -156,7 +168,12 @@ fn update_tenant_config(
                 if !client_id.is_empty() {
                     obj.insert("clientId".to_string(), Value::String(client_id));
                 }
-                obj.insert("redirectUri".to_string(), Value::String(redirect_uri));
+                if let Some(redirect_uri) = redirect_uri.as_ref() {
+                    obj.insert(
+                        "redirectUri".to_string(),
+                        Value::String(redirect_uri.clone()),
+                    );
+                }
                 changed = true;
             }
         } else if enabled {
@@ -173,7 +190,12 @@ fn update_tenant_config(
             if !client_id.is_empty() {
                 entry.insert("clientId".to_string(), Value::String(client_id));
             }
-            entry.insert("redirectUri".to_string(), Value::String(redirect_uri));
+            if let Some(redirect_uri) = redirect_uri.as_ref() {
+                entry.insert(
+                    "redirectUri".to_string(),
+                    Value::String(redirect_uri.clone()),
+                );
+            }
             entry.insert("scope".to_string(), Value::String(def.scope.to_string()));
             entry.insert(
                 "responseType".to_string(),
@@ -213,11 +235,13 @@ fn update_tenant_config(
             .and_then(Value::as_str)
             .unwrap_or("openid profile email")
             .to_string();
-        let redirect_uri = format!(
-            "{}/v1/web/webchat/{}/",
-            public_base_url.trim_end_matches('/'),
-            tenant,
-        );
+        let redirect_uri = public_base_url.as_deref().map(|public_base_url| {
+            format!(
+                "{}/v1/web/webchat/{}/",
+                public_base_url.trim_end_matches('/'),
+                tenant,
+            )
+        });
 
         if let Some(existing) = providers_arr
             .iter_mut()
@@ -232,7 +256,12 @@ fn update_tenant_config(
                 if !client_id.is_empty() {
                     obj.insert("clientId".to_string(), Value::String(client_id));
                 }
-                obj.insert("redirectUri".to_string(), Value::String(redirect_uri));
+                if let Some(redirect_uri) = redirect_uri.as_ref() {
+                    obj.insert(
+                        "redirectUri".to_string(),
+                        Value::String(redirect_uri.clone()),
+                    );
+                }
                 obj.insert("scope".to_string(), Value::String(scopes));
                 changed = true;
             }
@@ -248,7 +277,12 @@ fn update_tenant_config(
             if !client_id.is_empty() {
                 entry.insert("clientId".to_string(), Value::String(client_id));
             }
-            entry.insert("redirectUri".to_string(), Value::String(redirect_uri));
+            if let Some(redirect_uri) = redirect_uri.as_ref() {
+                entry.insert(
+                    "redirectUri".to_string(),
+                    Value::String(redirect_uri.clone()),
+                );
+            }
             entry.insert("scope".to_string(), Value::String(scopes));
             entry.insert(
                 "responseType".to_string(),
@@ -266,4 +300,111 @@ fn update_tenant_config(
     }
 
     Ok(changed)
+}
+
+fn resolve_public_base_url(
+    bundle_path: &Path,
+    tenant: &str,
+    answers: &Map<String, Value>,
+) -> Result<Option<String>> {
+    if let Some(value) = answers
+        .get("public_base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| !is_placeholder_public_base_url(value))
+    {
+        return Ok(Some(value.to_string()));
+    }
+
+    let from_policy = load_effective_static_routes_defaults(bundle_path, tenant, Some("default"))?
+        .and_then(|policy| policy.public_base_url)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| !is_placeholder_public_base_url(value));
+
+    Ok(from_policy)
+}
+
+fn is_placeholder_public_base_url(value: &str) -> bool {
+    let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalized.is_empty()
+        || normalized.contains("example.com")
+        || normalized.contains("localhost")
+        || normalized.contains("127.0.0.1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_placeholder_public_base_url, resolve_public_base_url, update_tenant_config};
+    use serde_json::{Map, Value, json};
+
+    #[test]
+    fn resolve_public_base_url_ignores_placeholder_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers = json!({
+            "public_base_url": "https://example.com"
+        });
+        let resolved =
+            resolve_public_base_url(temp.path(), "demo", answers.as_object().unwrap()).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_public_base_url_prefers_non_placeholder_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers = json!({
+            "public_base_url": "https://demo.example.net"
+        });
+        let resolved =
+            resolve_public_base_url(temp.path(), "demo", answers.as_object().unwrap()).unwrap();
+        assert_eq!(resolved.as_deref(), Some("https://demo.example.net"));
+    }
+
+    #[test]
+    fn update_tenant_config_preserves_existing_redirect_when_public_base_url_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("demo.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "auth": {
+                    "providers": [
+                        {
+                            "id": "demo-google",
+                            "enabled": true,
+                            "redirectUri": "https://existing.example.net/v1/web/webchat/demo/"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut answers = Map::new();
+        answers.insert("oauth_enabled".into(), Value::Bool(true));
+        answers.insert("oauth_enable_google".into(), Value::Bool(true));
+        answers.insert(
+            "oauth_google_client_id".into(),
+            Value::String("client-id".into()),
+        );
+
+        update_tenant_config(&config_path, "demo", true, &answers, None).unwrap();
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["auth"]["providers"][0]["redirectUri"].as_str(),
+            Some("https://existing.example.net/v1/web/webchat/demo/")
+        );
+    }
+
+    #[test]
+    fn placeholder_detection_catches_local_and_example_urls() {
+        assert!(is_placeholder_public_base_url("https://example.com"));
+        assert!(is_placeholder_public_base_url("http://localhost:8080"));
+        assert!(is_placeholder_public_base_url("http://127.0.0.1:8080"));
+        assert!(!is_placeholder_public_base_url("https://demo.example.net"));
+    }
 }
