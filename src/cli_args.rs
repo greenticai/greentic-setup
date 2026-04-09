@@ -67,9 +67,14 @@ pub struct Cli {
     #[arg(long = "advanced", global = true)]
     pub advanced: bool,
 
-    /// Launch web-based setup UI in browser
-    #[arg(long = "ui", global = true)]
+    /// Launch web-based setup UI in browser (enabled by default).
+    /// Use --no-ui for plain-text mode (SSH or headless deployments).
+    #[arg(long = "ui", global = true, default_value_t = true)]
     pub ui: bool,
+
+    /// Force plain-text mode (for SSH or headless deployments)
+    #[arg(long = "no-ui", global = true)]
+    pub no_ui: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,

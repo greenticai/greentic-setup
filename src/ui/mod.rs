@@ -38,6 +38,9 @@ struct UiState {
     locale: Option<String>,
     /// Pre-loaded answers from `--answers` file, keyed by provider_id.
     prefill_answers: Option<JsonMap<String, Value>>,
+    /// When true the tenant/env came from an answers file and should not be
+    /// overridden by bundle auto-detection.
+    scope_from_answers: bool,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -133,6 +136,7 @@ struct ExecutionResult {
 /// When `prefill_answers` is provided (from `--answers` file), the values are
 /// injected into the UI as pre-filled form values so the user can review and
 /// edit before executing.
+#[allow(clippy::too_many_arguments)]
 pub async fn launch(
     bundle_path: &Path,
     tenant: &str,
@@ -141,6 +145,7 @@ pub async fn launch(
     advanced: bool,
     locale: Option<&str>,
     prefill_answers: Option<JsonMap<String, Value>>,
+    scope_from_answers: bool,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -152,6 +157,7 @@ pub async fn launch(
         advanced,
         locale: locale.map(String::from),
         prefill_answers,
+        scope_from_answers,
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -268,12 +274,17 @@ async fn get_scope(State(state): State<std::sync::Arc<UiState>>) -> Json<ScopeRe
     let cli_tenant = &state.tenant;
     let cli_env = &state.env;
 
-    // Detect tenant from the bundle's tenants/ directory, same as --answers mode
+    // Detect tenant from the bundle's tenants/ directory for informational display.
     let detected_tenant = detect_tenant_from_bundle(bundle_path);
 
-    // Apply same resolution logic as resolve_setup_scope_with_bundle:
-    // if CLI tenant is the default "demo" and we detect a tenant from the bundle, use it.
-    let effective_tenant = if cli_tenant == "demo" {
+    // When the scope was explicitly provided via --answers, use it as-is
+    // without overriding with bundle detection.
+    let effective_tenant = if state.scope_from_answers {
+        cli_tenant.clone()
+    } else if cli_tenant == "demo" {
+        // Apply same resolution logic as resolve_setup_scope_with_bundle:
+        // if CLI tenant is the default "demo" and we detect a tenant from
+        // the bundle, use it.
         detected_tenant
             .clone()
             .unwrap_or_else(|| cli_tenant.clone())
