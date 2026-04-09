@@ -60,9 +60,9 @@ fn main() -> Result<()> {
     init_i18n(cli.locale.as_deref());
     let i18n = get_i18n();
 
-    // Launch web UI if --ui flag is set
+    // Launch web UI by default unless --no-ui is set.
     #[cfg(feature = "ui")]
-    if cli.ui {
+    if cli.ui && !cli.no_ui {
         return run_ui_mode(&cli, i18n);
     }
 
@@ -307,38 +307,53 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
 
-    // Load answers from --answers file for UI pre-fill
-    let prefill_answers = if let Some(answers_path) = &cli.answers {
-        println!(
-            "{}",
-            i18n.tf(
-                "setup.answers.loaded",
-                &[&answers_path.display().to_string()]
+    // Load answers from --answers file for UI pre-fill (values + scope).
+    let (prefill_answers, answers_tenant, answers_team, answers_env) =
+        if let Some(answers_path) = &cli.answers {
+            println!(
+                "{}",
+                i18n.tf(
+                    "setup.answers.loaded",
+                    &[&answers_path.display().to_string()],
+                ),
+            );
+            let loader_engine = SetupEngine::new(SetupConfig {
+                tenant: cli.tenant.clone(),
+                team: cli.team.clone(),
+                env: cli.env.clone(),
+                offline: false,
+                verbose: false,
+            });
+            let loaded = loader_engine
+                .load_answers(answers_path, cli.key.as_deref(), true)
+                .context(i18n.t("cli.error.failed_read_answers"))?;
+            (
+                Some(loaded.setup_answers),
+                loaded.tenant,
+                loaded.team,
+                loaded.env,
             )
-        );
-        let loader_engine = SetupEngine::new(SetupConfig {
-            tenant: cli.tenant.clone(),
-            team: cli.team.clone(),
-            env: cli.env.clone(),
-            offline: false,
-            verbose: false,
-        });
-        let loaded = loader_engine
-            .load_answers(answers_path, cli.key.as_deref(), true)
-            .context(i18n.t("cli.error.failed_read_answers"))?;
-        Some(loaded.setup_answers)
-    } else {
-        None
-    };
+        } else {
+            (None, None, None, None)
+        };
+
+    // Use scope from answers file when available, fall back to CLI args.
+    // Track whether scope came from answers so the UI skips bundle detection.
+    let scope_from_answers =
+        answers_tenant.is_some() || answers_team.is_some() || answers_env.is_some();
+    let tenant = answers_tenant.unwrap_or_else(|| cli.tenant.clone());
+    let team = answers_team.or_else(|| cli.team.clone());
+    let env = answers_env.unwrap_or_else(|| cli.env.clone());
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(greentic_setup::ui::launch(
         &bundle_dir,
-        &cli.tenant,
-        cli.team.as_deref(),
-        &cli.env,
+        &tenant,
+        team.as_deref(),
+        &env,
         cli.advanced,
         cli.locale.as_deref(),
         prefill_answers,
+        scope_from_answers,
     ))
 }
