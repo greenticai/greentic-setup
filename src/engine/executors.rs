@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::plan::{ResolvedPackInfo, SetupPlanMetadata};
-use crate::{bundle, discovery};
+use crate::{bundle, bundle_source::BundleSource, discovery};
 
 use super::plan_builders::compute_simple_hash;
 use super::types::SetupConfig;
@@ -28,54 +29,44 @@ pub fn execute_resolve_packs(
     metadata: &SetupPlanMetadata,
 ) -> anyhow::Result<Vec<ResolvedPackInfo>> {
     let mut resolved = Vec::new();
+    let mut failures = Vec::new();
 
     for pack_ref in &metadata.pack_refs {
-        // For now, we only support local pack refs (file paths)
-        // OCI resolution requires async and the distributor client
-        let path = PathBuf::from(pack_ref);
-
-        // Try to canonicalize the path to handle relative paths correctly
-        let resolved_path = if path.is_absolute() {
-            path.clone()
-        } else {
-            std::env::current_dir()
-                .ok()
-                .map(|cwd| cwd.join(&path))
-                .unwrap_or_else(|| path.clone())
-        };
-
-        if resolved_path.exists() {
-            let canonical = resolved_path
-                .canonicalize()
-                .unwrap_or(resolved_path.clone());
-            resolved.push(ResolvedPackInfo {
-                source_ref: pack_ref.clone(),
-                mapped_ref: canonical.display().to_string(),
-                resolved_digest: format!("sha256:{}", compute_simple_hash(pack_ref)),
-                pack_id: canonical
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-                entry_flows: Vec::new(),
-                cached_path: canonical.clone(),
-                output_path: canonical,
-            });
-        } else if pack_ref.starts_with("oci://")
-            || pack_ref.starts_with("repo://")
-            || pack_ref.starts_with("store://")
-        {
-            // Remote packs need async resolution via distributor-client
-            // For now, we'll skip and let the caller handle this
-            tracing::warn!("remote pack ref requires async resolution: {}", pack_ref);
-        } else {
-            // Log warning for unresolved local paths
-            tracing::warn!(
-                "pack ref not found: {} (resolved to: {})",
-                pack_ref,
-                resolved_path.display()
-            );
+        match resolve_pack_ref(pack_ref) {
+            Ok(resolved_path) => {
+                let canonical = resolved_path
+                    .canonicalize()
+                    .unwrap_or(resolved_path.clone());
+                let pack_meta = discovery::read_pack_meta(&canonical)?;
+                resolved.push(ResolvedPackInfo {
+                    source_ref: pack_ref.clone(),
+                    mapped_ref: canonical.display().to_string(),
+                    resolved_digest: compute_file_digest(&canonical)
+                        .unwrap_or_else(|_| format!("sha256:{}", compute_simple_hash(pack_ref))),
+                    pack_id: pack_meta.map(|meta| meta.pack_id).unwrap_or_else(|| {
+                        canonical
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    }),
+                    entry_flows: Vec::new(),
+                    cached_path: canonical.clone(),
+                    output_path: canonical,
+                });
+            }
+            Err(err) => {
+                failures.push(format!("{pack_ref}: {err}"));
+            }
         }
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "failed to resolve {} pack ref(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     Ok(resolved)
@@ -86,6 +77,8 @@ pub fn execute_add_packs_to_bundle(
     bundle_path: &Path,
     resolved_packs: &[ResolvedPackInfo],
 ) -> anyhow::Result<()> {
+    let mut metadata_entries = Vec::new();
+
     for pack in resolved_packs {
         // Determine target directory based on pack ID domain prefix
         let target_dir = get_pack_target_dir(bundle_path, &pack.pack_id);
@@ -101,7 +94,25 @@ pub fn execute_add_packs_to_bundle(
                 )
             })?;
         }
+
+        let reference = target_path
+            .strip_prefix(bundle_path)
+            .unwrap_or(&target_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let kind = if reference.starts_with("providers/") {
+            bundle::BundleReferenceKind::ExtensionProvider
+        } else {
+            bundle::BundleReferenceKind::AppPack
+        };
+        metadata_entries.push(bundle::BundleReference {
+            kind,
+            reference,
+            digest: Some(pack.resolved_digest.clone()),
+        });
     }
+
+    bundle::register_bundle_references(bundle_path, &metadata_entries, None)?;
     Ok(())
 }
 
@@ -172,9 +183,7 @@ pub fn execute_apply_pack_setup(
         // Persist all answer values to the dev secrets store so that
         // WASM components can read them via the secrets API at runtime.
         let pack_path = discovered.as_ref().and_then(|d| {
-            d.providers
-                .iter()
-                .find(|p| p.provider_id == *provider_id)
+            d.find_setup_target(provider_id)
                 .map(|p| p.pack_path.as_path())
         });
         let env = crate::resolve_env(Some(&config.env));
@@ -278,6 +287,67 @@ pub fn execute_apply_pack_setup(
     crate::webhook::print_post_setup_instructions(&provider_configs, &config.tenant, team);
 
     Ok(count)
+}
+
+fn compute_file_digest(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let digest = Sha256::digest(bytes);
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{encoded}"))
+}
+
+fn resolve_pack_ref(pack_ref: &str) -> anyhow::Result<PathBuf> {
+    let source = BundleSource::parse(pack_ref)?;
+    let resolved = source.resolve()?;
+
+    if resolved.extension().and_then(|ext| ext.to_str()) != Some("gtpack") {
+        anyhow::bail!(
+            "resolved pack ref is not a .gtpack file: {}",
+            resolved.display()
+        );
+    }
+
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform_setup::StaticRoutesPolicy;
+    use std::collections::BTreeSet;
+
+    fn empty_metadata(pack_refs: Vec<String>) -> SetupPlanMetadata {
+        SetupPlanMetadata {
+            bundle_name: None,
+            pack_refs,
+            tenants: Vec::new(),
+            default_assignments: Vec::new(),
+            providers: Vec::new(),
+            update_ops: BTreeSet::new(),
+            remove_targets: BTreeSet::new(),
+            packs_remove: Vec::new(),
+            providers_remove: Vec::new(),
+            tenants_remove: Vec::new(),
+            access_changes: Vec::new(),
+            static_routes: StaticRoutesPolicy::default(),
+            deployment_targets: Vec::new(),
+            setup_answers: serde_json::Map::new(),
+            tunnel: None,
+        }
+    }
+
+    #[test]
+    fn resolve_packs_errors_when_any_pack_ref_fails() {
+        let metadata = empty_metadata(vec!["/definitely/missing/example.gtpack".to_string()]);
+        let err = execute_resolve_packs(Path::new("."), &metadata).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("failed to resolve 1 pack ref"));
+        assert!(message.contains("/definitely/missing/example.gtpack"));
+    }
 }
 
 /// Remove provider artifacts and config directories.

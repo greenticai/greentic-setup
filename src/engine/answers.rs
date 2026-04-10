@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
+use qa_spec::QuestionType;
 use serde_json::{Map as JsonMap, Value};
 
 use crate::plan::SetupPlan;
@@ -67,28 +68,27 @@ pub fn emit_answers(
     // questions from setup.yaml so the user sees what needs to be filled.
     if bundle.exists() {
         let discovered = discovery::discover(bundle)?;
-        for provider in discovered.providers {
+        for provider in discovered.setup_targets() {
             let provider_id = provider.provider_id.clone();
             let existing_is_empty = setup_answers
                 .get(&provider_id)
                 .and_then(|v| v.as_object())
                 .is_some_and(|m| m.is_empty());
             if !setup_answers.contains_key(&provider_id) || existing_is_empty {
-                // Load the setup spec from the pack and create template
-                let template =
-                    if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
-                        // Pack has setup.yaml - extract questions
-                        let mut entries = JsonMap::new();
-                        for question in &spec.questions {
-                            let default_value = infer_default_value(question);
-                            entries.insert(question.name.clone(), default_value);
-                        }
-                        entries
-                    } else {
-                        // Pack uses flow-based setup or has no questions
-                        // Add empty entry so user knows pack exists
-                        JsonMap::new()
-                    };
+                let template = if let Some(form_spec) =
+                    crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider_id)
+                {
+                    template_from_form_spec(&form_spec)
+                } else if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
+                    let mut entries = JsonMap::new();
+                    for question in &spec.questions {
+                        let default_value = infer_default_value(question);
+                        entries.insert(question.name.clone(), default_value);
+                    }
+                    entries
+                } else {
+                    JsonMap::new()
+                };
                 setup_answers.insert(provider_id, Value::Object(template));
             }
         }
@@ -220,7 +220,7 @@ pub fn prompt_secret_answers(bundle: &Path, answers_doc: &mut Value) -> anyhow::
     // Collect all secret questions that need prompting
     let mut secret_questions: Vec<(String, String, String, bool)> = Vec::new(); // (provider_id, field_id, title, required)
 
-    for provider in &discovered.providers {
+    for provider in discovered.setup_targets() {
         let Some(form_spec) =
             crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id)
         else {
@@ -310,7 +310,7 @@ pub fn encrypt_secret_answers(
     };
 
     let mut secret_paths = Vec::new();
-    for provider in discovered.providers {
+    for provider in discovered.setup_targets() {
         let Some(form_spec) =
             crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id)
         else {
@@ -361,4 +361,101 @@ pub fn encrypt_secret_answers(
     }
 
     Ok(())
+}
+
+fn template_from_form_spec(form_spec: &qa_spec::FormSpec) -> JsonMap<String, Value> {
+    let mut entries = JsonMap::new();
+    for question in &form_spec.questions {
+        let value = question
+            .default_value
+            .as_ref()
+            .map(|default| crate::qa::prompts::parse_typed_value(question.kind, default))
+            .unwrap_or_else(|| empty_value_for_question(question.kind));
+        entries.insert(question.id.clone(), value);
+    }
+    entries
+}
+
+fn empty_value_for_question(kind: QuestionType) -> Value {
+    match kind {
+        QuestionType::Boolean => Value::String(String::new()),
+        QuestionType::Number => Value::String(String::new()),
+        _ => Value::String(String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{SetupConfig, SetupEngine, SetupRequest};
+    use crate::plan::TenantSelection;
+    use crate::platform_setup::StaticRoutesPolicy;
+    use std::collections::BTreeSet;
+    use std::io::Write;
+    use zip::write::{FileOptions, ZipWriter};
+
+    fn write_app_pack(path: &Path, pack_id: &str, secret_key: &str) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options)?;
+        writer.write_all(
+            serde_json::json!({
+                "pack_id": pack_id,
+                "display_name": pack_id,
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        writer.start_file("assets/secret-requirements.json", options)?;
+        writer.write_all(
+            serde_json::json!([{ "key": secret_key }])
+                .to_string()
+                .as_bytes(),
+        )?;
+        writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn emit_answers_includes_app_pack_secret_questions() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle_root = temp.path().join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_root, Some("weather-demo"))?;
+
+        let pack_path = bundle_root.join("packs").join("weather-app.gtpack");
+        write_app_pack(&pack_path, "weather-app", "WEATHER_API_KEY")?;
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".to_string(),
+            team: None,
+            env: "dev".to_string(),
+            offline: false,
+            verbose: false,
+        });
+        let request = SetupRequest {
+            bundle: bundle_root.clone(),
+            tenants: vec![TenantSelection {
+                tenant: "demo".to_string(),
+                team: None,
+                allow_paths: Vec::new(),
+            }],
+            update_ops: BTreeSet::new(),
+            static_routes: StaticRoutesPolicy::default(),
+            ..Default::default()
+        };
+        let plan = engine.plan(crate::SetupMode::Create, &request, true)?;
+
+        let answers_path = temp.path().join("answers.json");
+        emit_answers(engine.config(), &plan, &answers_path, None, false)?;
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&answers_path)?)?;
+        assert_eq!(
+            doc.pointer("/setup_answers/weather-app/weather_api_key"),
+            Some(&Value::String(String::new()))
+        );
+        Ok(())
+    }
 }

@@ -375,7 +375,7 @@ async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Js
     let discovered = discovery::discover(bundle_path).ok();
     let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
         .iter()
-        .flat_map(|d| d.providers.iter())
+        .flat_map(|d| d.setup_targets())
         .filter_map(|p| {
             setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id).map(|fs| {
                 wizard::ProviderFormSpec {
@@ -457,8 +457,9 @@ async fn get_providers(
         }
     };
 
-    let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
-        .providers
+    let setup_targets = discovered.setup_targets();
+
+    let provider_form_specs: Vec<wizard::ProviderFormSpec> = setup_targets
         .iter()
         .filter_map(|provider| {
             setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
@@ -479,8 +480,7 @@ async fn get_providers(
         vec![]
     };
 
-    let providers: Vec<ProviderInfo> = discovered
-        .providers
+    let providers: Vec<ProviderInfo> = setup_targets
         .iter()
         .map(|p| {
             let form = setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id);
@@ -498,7 +498,7 @@ async fn get_providers(
         String,
         std::collections::HashMap<String, SetupQuestionExtras>,
     > = std::collections::HashMap::new();
-    for provider in &discovered.providers {
+    for provider in &setup_targets {
         if let Ok(Some(spec)) = crate::setup_input::load_setup_spec(&provider.pack_path) {
             let mut map = std::collections::HashMap::new();
             for q in &spec.questions {
@@ -676,7 +676,7 @@ async fn post_export(
     let discovered = discovery::discover(&bundle_path).ok();
     let secret_fields: std::collections::HashSet<String> = discovered
         .iter()
-        .flat_map(|d| d.providers.iter())
+        .flat_map(|d| d.setup_targets())
         .filter_map(|p| setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id))
         .flat_map(|spec| spec.questions.into_iter())
         .filter(|q| q.secret)

@@ -260,17 +260,10 @@ fn seed_secret_requirement_aliases(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct SecretRequirement {
-    key: String,
-}
-
-fn read_secret_requirements(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
-    let file = std::fs::File::open(pack_path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    let entry = archive.by_name("assets/secret-requirements.json")?;
-    let reqs: Vec<SecretRequirement> = serde_json::from_reader(entry)?;
-    Ok(reqs)
+fn read_secret_requirements(
+    pack_path: &Path,
+) -> Result<Vec<crate::secrets::PackSecretRequirement>> {
+    crate::secrets::load_secret_requirements_from_pack(pack_path)
 }
 
 fn value_to_text(value: &Value) -> String {

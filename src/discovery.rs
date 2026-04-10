@@ -12,6 +12,7 @@ use zip::result::ZipError;
 pub struct DiscoveryResult {
     pub domains: DetectedDomains,
     pub providers: Vec<DetectedProvider>,
+    pub app_packs: Vec<DetectedProvider>,
 }
 
 /// Flags indicating which domains are present in the bundle.
@@ -32,6 +33,15 @@ pub struct DetectedProvider {
     pub domain: String,
     pub pack_path: PathBuf,
     pub id_source: ProviderIdSource,
+    pub kind: DetectedPackKind,
+}
+
+/// The broad role this pack plays inside the bundle.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectedPackKind {
+    Provider,
+    App,
 }
 
 /// How the provider ID was determined.
@@ -46,6 +56,13 @@ pub enum ProviderIdSource {
 struct PackMeta {
     pack_id: String,
     display_name: Option<String>,
+}
+
+/// Public manifest metadata helper returned by [`read_pack_meta`].
+#[derive(Clone, Debug)]
+pub struct DiscoveredPackMeta {
+    pub pack_id: String,
+    pub display_name: Option<String>,
 }
 
 /// Options for discovery.
@@ -116,11 +133,56 @@ pub fn discover_with_options(
                 domain: domain.to_string(),
                 pack_path: path,
                 id_source,
+                kind: DetectedPackKind::Provider,
+            });
+        }
+    }
+
+    let mut app_packs = Vec::new();
+    let packs_dir = root.join("packs");
+    if packs_dir.exists() {
+        for entry in std::fs::read_dir(&packs_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("gtpack") {
+                continue;
+            }
+
+            let (provider_id, display_name, id_source) = if options.cbor_only {
+                match read_pack_meta_cbor_only(&path)? {
+                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
+                    None => return Err(missing_cbor_error(&path)),
+                }
+            } else {
+                match read_pack_meta_from_manifest(&path)? {
+                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
+                    None => {
+                        let stem = path
+                            .file_stem()
+                            .and_then(|v| v.to_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        (stem, None, ProviderIdSource::Filename)
+                    }
+                }
+            };
+
+            app_packs.push(DetectedProvider {
+                provider_id,
+                display_name,
+                domain: "app".to_string(),
+                pack_path: path,
+                id_source,
+                kind: DetectedPackKind::App,
             });
         }
     }
 
     providers.sort_by(|a, b| a.pack_path.cmp(&b.pack_path));
+    app_packs.sort_by(|a, b| a.pack_path.cmp(&b.pack_path));
 
     let domains = DetectedDomains {
         messaging: providers.iter().any(|p| p.domain == "messaging"),
@@ -130,7 +192,11 @@ pub fn discover_with_options(
         secrets: providers.iter().any(|p| p.domain == "secrets"),
     };
 
-    Ok(DiscoveryResult { domains, providers })
+    Ok(DiscoveryResult {
+        domains,
+        providers,
+        app_packs,
+    })
 }
 
 /// Persist discovery results to JSON files in the bundle's runtime state directory.
@@ -139,9 +205,36 @@ pub fn persist(root: &Path, tenant: &str, discovery: &DiscoveryResult) -> anyhow
     std::fs::create_dir_all(&runtime_root)?;
     let domains_path = runtime_root.join("detected_domains.json");
     let providers_path = runtime_root.join("detected_providers.json");
+    let app_packs_path = runtime_root.join("detected_app_packs.json");
     write_json(&domains_path, &discovery.domains)?;
     write_json(&providers_path, &discovery.providers)?;
+    write_json(&app_packs_path, &discovery.app_packs)?;
     Ok(())
+}
+
+impl DiscoveryResult {
+    /// Return every discovered pack that can participate in setup.
+    pub fn setup_targets(&self) -> Vec<&DetectedProvider> {
+        self.providers.iter().chain(self.app_packs.iter()).collect()
+    }
+
+    /// Find a discovered setup target by pack/provider ID.
+    pub fn find_setup_target(&self, provider_id: &str) -> Option<&DetectedProvider> {
+        self.providers
+            .iter()
+            .chain(self.app_packs.iter())
+            .find(|pack| pack.provider_id == provider_id)
+    }
+}
+
+/// Read the pack ID and display name from a `.gtpack` manifest when available.
+pub fn read_pack_meta(path: &Path) -> anyhow::Result<Option<DiscoveredPackMeta>> {
+    read_pack_meta_from_manifest(path).map(|meta| {
+        meta.map(|meta| DiscoveredPackMeta {
+            pack_id: meta.pack_id,
+            display_name: meta.display_name,
+        })
+    })
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
@@ -343,4 +436,60 @@ fn missing_cbor_error(path: &Path) -> anyhow::Error {
          Rebuild the pack with greentic-pack build (do not use --dev). Missing in {}",
         path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::{FileOptions, ZipWriter};
+
+    fn write_test_pack(path: &Path, pack_id: &str, display_name: &str) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options)?;
+        writer.write_all(
+            serde_json::json!({
+                "pack_id": pack_id,
+                "display_name": display_name,
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn discover_includes_app_packs_in_setup_targets() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("providers/messaging"))?;
+        std::fs::create_dir_all(root.join("packs"))?;
+
+        write_test_pack(
+            &root
+                .join("providers")
+                .join("messaging")
+                .join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+            "Telegram",
+        )?;
+        write_test_pack(
+            &root.join("packs").join("weather-app.gtpack"),
+            "weather-app",
+            "Weather App",
+        )?;
+
+        let discovered = discover(root)?;
+        assert_eq!(discovered.providers.len(), 1);
+        assert_eq!(discovered.app_packs.len(), 1);
+        assert_eq!(discovered.setup_targets().len(), 2);
+        assert_eq!(discovered.app_packs[0].provider_id, "weather-app");
+        assert_eq!(discovered.app_packs[0].domain, "app");
+        assert_eq!(discovered.app_packs[0].kind, DetectedPackKind::App);
+        Ok(())
+    }
 }
