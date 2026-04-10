@@ -62,7 +62,7 @@ fn main() -> Result<()> {
 
     // Launch web UI by default unless --no-ui is set.
     #[cfg(feature = "ui")]
-    if cli.ui && !cli.no_ui {
+    if cli.ui && !cli.no_ui && cli.command.is_none() {
         return run_ui_mode(&cli, i18n);
     }
 
@@ -356,4 +356,34 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         prefill_answers,
         scope_from_answers,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn bundle_build_parses_as_subcommand_even_with_default_ui_enabled() {
+        let cli = Cli::parse_from([
+            "greentic-setup",
+            "bundle",
+            "build",
+            "--bundle",
+            "./demo-bundle",
+            "--out",
+            "/tmp/demo.gtbundle",
+        ]);
+
+        match cli.command {
+            Some(Command::Bundle(BundleCommand::Build(args))) => {
+                assert_eq!(
+                    args.bundle.as_deref(),
+                    Some(std::path::Path::new("./demo-bundle"))
+                );
+                assert_eq!(args.out, std::path::PathBuf::from("/tmp/demo.gtbundle"));
+            }
+            other => panic!("expected bundle build subcommand, got {other:?}"),
+        }
+    }
 }
