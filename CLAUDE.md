@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 greentic-setup is a Rust crate (v0.4.x) providing end-to-end bundle setup for the Greentic platform. It handles pack discovery, QA-driven configuration (via greentic-qa FormSpec), secrets persistence, admin API types, hot reload diffing, and bundle lifecycle management.
 
-Part of the greentic-ai mono-workspace (55+ repos). greentic-operator is the primary consumer, delegating all setup logic here.
+Part of the greentic-ai mono-workspace (60+ repos). greentic-operator is the primary consumer, delegating all setup logic here.
 
 **Dual-mode:**
 - **Library** — core APIs for programmatic use by greentic-operator, runner, and other tools
@@ -16,7 +16,7 @@ Part of the greentic-ai mono-workspace (55+ repos). greentic-operator is the pri
 
 ```bash
 cargo build                     # Build
-cargo test                      # Test (69 tests)
+cargo test                      # Test
 cargo clippy -- -D warnings     # Lint
 cargo fmt --all --check         # Format check
 bash ci/local_check.sh          # Full CI (fmt + clippy + test + build + doc + package)
@@ -73,7 +73,7 @@ src/
 - **Library + CLI** — exports library APIs and `greentic-setup` CLI binary
 - **Reuse-first**: uses greentic-types, greentic-secrets-lib, qa-spec, greentic-distributor-client
 - All user-facing strings via greentic-i18n (keys in `i18n/en.json`)
-- Follow `.codex/global_rules.md` for PR workflow (repo overview + CI check)
+- Run `ci/local_check.sh` before PRs (fmt + clippy + test + build + doc + package)
 
 ## CLI Commands
 
