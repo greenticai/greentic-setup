@@ -27,6 +27,12 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
       - name: Install coverage toolchain binaries
-        run: cargo binstall --no-confirm greentic-dev cargo-llvm-cov cargo-nextest
+        run: cargo binstall --no-confirm --force greentic-dev cargo-llvm-cov cargo-nextest
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+      - name: Verify coverage toolchain
+        run: |
+          cargo llvm-cov --version
+          cargo nextest --version
       - name: Run coverage policy
         run: greentic-dev coverage
