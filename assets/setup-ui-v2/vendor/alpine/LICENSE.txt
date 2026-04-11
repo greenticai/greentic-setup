@@ -1,0 +1,3 @@
+Alpine.js is licensed under the MIT License.
+Copyright (c) 2019-present Caleb Porzio and contributors.
+Full license: https://github.com/alpinejs/alpine/blob/main/LICENSE.md
