@@ -6,6 +6,10 @@ document.addEventListener('alpine:init', () => {
     port: 0,
     availableLocales: ['en'],
     scopeFromCli: false,
+    // Show the first-run onboarding banner until the user dismisses it.
+    // Kept in-memory only (no localStorage per security rule) so a new
+    // `greentic-setup` invocation re-shows it.
+    onboardingDismissed: false,
 
     init() {
       // Read initial state injected by the server.
@@ -85,6 +89,10 @@ document.addEventListener('alpine:init', () => {
 
     toggleAdvanced() {
       this.advancedMode = !this.advancedMode;
+    },
+
+    dismissOnboarding() {
+      this.onboardingDismissed = true;
     },
   });
 });

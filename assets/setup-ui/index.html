@@ -46,7 +46,11 @@
          zero-custom-dropdown-logic. Styled via .scope-select to match
          the sidebar aesthetic. -->
     <div class="sidebar-scope">
-      <div class="sidebar-scope-label" x-text="t('ui.sidebar.scope_label')">Scope</div>
+      <div class="sidebar-scope-label">
+        <span x-text="t('ui.sidebar.scope_label')">Scope</span>
+        <span class="info-icon" :title="t('ui.sidebar.scope_tooltip')" aria-label="Scope information">&#9432;</span>
+      </div>
+      <div class="sidebar-scope-subtitle" x-text="t('ui.sidebar.scope_subtitle')">Active context for all operations</div>
 
       <label class="scope-dropdown active">
         <span class="hint" x-text="t('ui.scope.tenant_label')">tenant</span>
@@ -199,6 +203,34 @@
 
     <!-- ==================== WIZARD VIEW ==================== -->
     <div class="content" x-show="$store.ui.currentView === 'wizard'" x-cloak>
+
+      <!-- First-run onboarding banner. Visible when the wizard is reached
+           without a prior scope being set up, unless the user dismissed it
+           during this session. The dismiss state is kept in-memory only so
+           it resurfaces on the next dashboard invocation. -->
+      <div
+        class="onboarding-banner"
+        x-show="!$store.ui.onboardingDismissed && $store.ui.currentView === 'wizard'"
+        x-cloak
+      >
+        <div class="onboarding-banner-icon" aria-hidden="true">&#9433;</div>
+        <div class="onboarding-banner-body">
+          <div class="onboarding-banner-title" x-text="t('ui.onboarding.scope_banner_title')">Welcome</div>
+          <p
+            class="onboarding-banner-text"
+            x-text="t('ui.onboarding.scope_banner_body', {
+              tenant: $store.scope.tenant,
+              env: $store.scope.env,
+              team: $store.scope.team
+            })"
+          ></p>
+        </div>
+        <button
+          class="btn btn--ghost onboarding-banner-dismiss"
+          @click="$store.ui.dismissOnboarding()"
+          x-text="t('ui.onboarding.scope_banner_dismiss')"
+        >Got it</button>
+      </div>
 
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
         <button class="btn btn--ghost" @click="$store.ui.currentView = 'overview'">

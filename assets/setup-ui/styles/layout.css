@@ -27,7 +27,33 @@
 
 .sidebar-scope { padding: var(--space-1) var(--space-4) var(--space-4); }
 .sidebar-scope-label {
-  font-size: 10px; color: var(--fg-dim); margin: 0 var(--space-1) var(--space-2);
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin: 0 var(--space-1) 2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+}
+.sidebar-scope-label .info-icon {
+  font-size: 11px;
+  color: var(--fg-dim);
+  cursor: help;
+  opacity: 0.7;
+  transition: opacity var(--ease-base), color var(--ease-base);
+}
+.sidebar-scope-label .info-icon:hover {
+  opacity: 1;
+  color: var(--brand);
+}
+.sidebar-scope-subtitle {
+  font-size: 10.5px;
+  color: var(--fg-muted);
+  margin: 0 var(--space-1) var(--space-3);
+  line-height: 1.4;
+  font-style: italic;
 }
 .sidebar-nav { padding: var(--space-2) var(--space-3); flex: 1; overflow-y: auto; }
 .sidebar-nav-label {

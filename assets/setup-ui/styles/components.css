@@ -238,3 +238,50 @@
   color: var(--fg-muted);
   font-size: 13px;
 }
+
+/* Onboarding banner — shown on first-run in the wizard view.
+ * Explains what scope is and that the user can switch it in the sidebar. */
+.onboarding-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  background: var(--brand-bg);
+  border: 1px solid var(--brand-border);
+  border-radius: var(--r-lg);
+  padding: var(--space-4) var(--space-6);
+  margin-bottom: var(--space-6);
+}
+.onboarding-banner-icon {
+  font-size: 22px;
+  color: var(--brand);
+  line-height: 1;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.onboarding-banner-body {
+  flex: 1;
+  min-width: 0;
+}
+.onboarding-banner-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: var(--space-1);
+}
+.onboarding-banner-text {
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  line-height: 1.5;
+  margin: 0;
+}
+.onboarding-banner-dismiss {
+  flex-shrink: 0;
+  align-self: flex-start;
+  color: var(--brand);
+  border-color: var(--brand-border);
+  font-size: 12px;
+}
+.onboarding-banner-dismiss:hover {
+  background: hsl(166 70% 45% / 0.15);
+  border-color: var(--brand);
+}
