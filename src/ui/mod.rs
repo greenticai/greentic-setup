@@ -17,6 +17,6 @@ mod server;
 mod routes;
 pub mod state;
 mod sse;
-mod api;
+pub mod api;
 
 pub use legacy::launch;
