@@ -8,20 +8,11 @@ use greentic_setup::ui::state::{AppState, BundleMeta};
 use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
-use uuid::Uuid;
 
 const TOKEN: &str = "integration-test-token";
 
 fn state() -> Arc<AppState> {
-    Arc::new(AppState {
-        bundle: BundleMeta::test_fixture(),
-        port: 52341,
-        bearer_token: zeroize::Zeroizing::new(TOKEN.to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
-        launch_options: Default::default(),
-        provider_forms: vec![],
-    })
+    AppState::test_with(BundleMeta::test_fixture(), 52341, TOKEN, vec![])
 }
 
 fn authed_request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {

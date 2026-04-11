@@ -8,15 +8,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 fn state_with_token(token: &str) -> Arc<AppState> {
-    Arc::new(AppState {
-        bundle: BundleMeta::test_fixture(),
-        port: 52341,
-        bearer_token: zeroize::Zeroizing::new(token.to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
-        launch_options: Default::default(),
-        provider_forms: vec![],
-    })
+    AppState::test_with(BundleMeta::test_fixture(), 52341, token, vec![])
 }
 
 #[tokio::test]

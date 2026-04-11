@@ -8,12 +8,18 @@ use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::ui::api::bundle::get_bundle;
+use crate::ui::api::capabilities::{get_capabilities, put_toggle_capability};
 use crate::ui::api::locale::{get_locale, post_shutdown};
 use crate::ui::api::overview::get_overview;
+use crate::ui::api::providers::{delete_provider, get_providers, post_provider};
+use crate::ui::api::rebuild::{get_rebuild_pending, post_rebuild};
+use crate::ui::api::secrets::{
+    delete_secret, get_secrets, post_reveal_secret, post_secret, put_secret,
+};
 use crate::ui::api::wizard::{wizard_execute, wizard_next, wizard_session, wizard_start};
 use crate::ui::assets;
 use crate::ui::auth::{AuthError, verify_auth};
@@ -34,6 +40,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/bundle", get(get_bundle))
         .route("/overview", get(get_overview))
+        // Secrets CRUD
+        .route("/secrets", get(get_secrets))
+        .route("/secrets", put(put_secret))
+        .route("/secrets", post(post_secret))
+        .route("/secrets", delete(delete_secret))
+        .route("/secrets/reveal", post(post_reveal_secret))
+        // Provider management
+        .route("/providers", get(get_providers))
+        .route("/providers", post(post_provider))
+        .route("/providers", delete(delete_provider))
+        // Capability toggles
+        .route("/capabilities", get(get_capabilities))
+        .route("/capabilities/toggle", put(put_toggle_capability))
+        // Rebuild
+        .route("/rebuild", post(post_rebuild))
+        .route("/rebuild/pending", get(get_rebuild_pending))
+        // Wizard
         .route("/wizard/start", get(wizard_start))
         .route("/wizard/next", post(wizard_next))
         .route("/wizard/execute", post(wizard_execute))

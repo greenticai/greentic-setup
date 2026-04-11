@@ -157,6 +157,36 @@ pub fn validate_scope(scope: &ScopeKey, bundle: &BundleMeta) -> Result<(), Valid
     Ok(())
 }
 
+/// Test-only constructor helper to build an `AppState` without the new atomic
+/// fields requiring explicit initialization in every test.
+#[cfg(any(test, feature = "test-helpers"))]
+impl AppState {
+    /// Build a minimal `AppState` suitable for unit tests.
+    ///
+    /// Sets `pending_mutations`, `reveal_count`, `reveal_window_start` to
+    /// safe zero values. Production code must initialize them explicitly via
+    /// `Arc::new(AppState { ..., pending_mutations: AtomicBool::new(false), ... })`.
+    pub fn test_with(
+        bundle: BundleMeta,
+        port: u16,
+        bearer_token: &str,
+        provider_forms: Vec<ProviderFormData>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            bundle,
+            port,
+            bearer_token: zeroize::Zeroizing::new(bearer_token.to_string()),
+            wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
+            launch_options: Default::default(),
+            provider_forms,
+            pending_mutations: std::sync::atomic::AtomicBool::new(false),
+            reveal_count: std::sync::atomic::AtomicU32::new(0),
+            reveal_window_start: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
 /// A `HashMap<String, String>` that zeroizes all values on drop.
 ///
 /// `zeroize::Zeroizing` requires its inner type to implement `Zeroize`, which
@@ -201,6 +231,18 @@ pub struct ProviderFormData {
     pub form_spec: qa_spec::FormSpec,
 }
 
+/// A single secret entry returned by `GET /api/secrets`.
+///
+/// Values are always masked — raw secret data is never included in list responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretEntry {
+    pub provider_id: String,
+    pub key: String,
+    pub uri: String,
+    pub masked_value: String,
+    pub has_value: bool,
+}
+
 /// Top-level app state shared across Axum handlers.
 #[derive(Debug)]
 pub struct AppState {
@@ -212,6 +254,13 @@ pub struct AppState {
     pub launch_options: crate::ui::server::LaunchOptions,
     /// FormSpecs loaded from discovered provider packs at startup.
     pub provider_forms: Vec<ProviderFormData>,
+    /// Set to `true` when any mutation (secrets/providers/capabilities) occurs
+    /// since the last successful rebuild. Cleared on `POST /api/rebuild`.
+    pub pending_mutations: std::sync::atomic::AtomicBool,
+    /// Rate-limit counter for the reveal endpoint (requests per minute window).
+    pub reveal_count: std::sync::atomic::AtomicU32,
+    /// Timestamp of the start of the current rate-limit window (Unix seconds).
+    pub reveal_window_start: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
@@ -222,6 +271,45 @@ impl AppState {
     /// they want and we should jump straight into the form).
     pub fn should_start_in_wizard(&self) -> bool {
         self.bundle.scopes.is_empty() || self.launch_options.prefill_answers.is_some()
+    }
+
+    /// Mark that a mutation has occurred and a rebuild is pending.
+    pub fn mark_pending(&self) {
+        self.pending_mutations
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clear the pending-mutations flag after a successful rebuild.
+    pub fn clear_pending(&self) {
+        self.pending_mutations
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check whether any mutations are pending.
+    pub fn is_pending(&self) -> bool {
+        self.pending_mutations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Attempt to consume a reveal quota slot (max 10 per minute).
+    ///
+    /// Returns `true` if the request is within rate limits, `false` if it
+    /// should be rejected. Thread-safe via atomics.
+    pub fn consume_reveal_quota(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window_start = self.reveal_window_start.load(Relaxed);
+        // If we're in a new minute window, reset counter.
+        if now_secs.saturating_sub(window_start) >= 60 {
+            self.reveal_window_start.store(now_secs, Relaxed);
+            self.reveal_count.store(1, Relaxed);
+            return true;
+        }
+        let prev = self.reveal_count.fetch_add(1, Relaxed);
+        prev < 10
     }
 }
 

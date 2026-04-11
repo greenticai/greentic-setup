@@ -104,10 +104,11 @@ src/
 │   ├── inference.rs            Field type inference from setup.yaml shape
 │   └── pack.rs                 Per-pack FormSpec assembly
 │
-├── ui/                         Phase 1a dashboard (Alpine.js SPA, Axum server)
+├── ui/                         Phase 1a/1b dashboard (Alpine.js SPA, Axum server)
 │   ├── mod.rs                  UI module entry and feature-gated re-exports
 │   ├── assets.rs               Embedded static assets (include_bytes! manifest)
 │   ├── auth.rs                 Bearer token + Origin check middleware
+│   ├── bundle_yaml.rs          Load/save bundle.yaml for provider+capability mutations
 │   ├── routes.rs               Axum router wiring (API + asset routes)
 │   ├── server.rs               Server bind (127.0.0.1:random), browser open, shutdown
 │   ├── sse.rs                  Server-Sent Events stream for live reload notifications
@@ -115,9 +116,14 @@ src/
 │   └── api/
 │       ├── mod.rs              API handler re-exports
 │       ├── bundle.rs           GET /api/bundle — bundle metadata response
+│       ├── capabilities.rs     GET /api/capabilities, PUT /api/capabilities/toggle
 │       ├── error.rs            Unified JSON error envelope (ApiError)
 │       ├── locale.rs           GET /api/locale + POST /api/shutdown
 │       ├── overview.rs         GET /api/overview — provider status summary
+│       ├── providers.rs        GET/POST/DELETE /api/providers
+│       ├── rebuild.rs          POST /api/rebuild, GET /api/rebuild/pending
+│       ├── secrets.rs          GET/PUT/POST/DELETE /api/secrets, POST /api/secrets/reveal
+│       ├── secrets_store.rs    Secret list/reveal/write/delete helpers (zeroize + masking)
 │       └── wizard.rs           GET /api/wizard/start|session/:id, POST /api/wizard/next|execute
 │
 └── webhook/
@@ -178,8 +184,9 @@ This binary is invoked via `gtc setup ...` passthrough in the greentic repo.
 | Phase 6 | CLI binary | Done (bundle init/add/setup/update/remove/build/list/status) |
 | Phase 7 | gtc passthrough | TODO — add `gtc setup` → `greentic-setup` delegation in greentic repo |
 | Phase 1a Dashboard | Rebuilt web UI (Alpine SPA + scope switcher + embedded wizard) | Done |
+| Phase 1b Dashboard | Secrets CRUD, provider management, capability toggles, rebuild trigger | Done |
 
-## Phase 1a Dashboard
+## Phase 1a/1b Dashboard
 
 ### Spec and Plan
 
@@ -188,7 +195,7 @@ This binary is invoked via `gtc setup ...` passthrough in the greentic repo.
 
 ### Architecture
 
-The Phase 1a dashboard is a single-page application served by an Axum HTTP server bound exclusively to `127.0.0.1` on a randomly chosen available port. The server is started by `greentic-setup <bundle>` and a browser tab is opened automatically with the bearer token embedded in the URL.
+The dashboard is a single-page application served by an Axum HTTP server bound exclusively to `127.0.0.1` on a randomly chosen available port. The server is started by `greentic-setup <bundle>` and a browser tab is opened automatically with the bearer token embedded in the URL.
 
 **Frontend stack:**
 - Alpine.js v3 (vendored, no build step) for reactive UI
@@ -208,19 +215,38 @@ The Phase 1a dashboard is a single-page application served by an Axum HTTP serve
 - `GET /api/overview` — provider status summary for active scope
 - `GET /api/locale` — locale string map for the UI
 - `POST /api/shutdown` — graceful server shutdown
-- `GET /api/wizard/start` — start a new wizard session (stub)
-- `GET /api/wizard/session/:id` — fetch session state (stub)
-- `POST /api/wizard/next` — advance wizard step (stub)
-- `POST /api/wizard/execute` — apply wizard answers (stub)
+- `GET /api/wizard/start` — start a new wizard session
+- `GET /api/wizard/session/:id` — fetch session state
+- `POST /api/wizard/next` — advance wizard step
+- `POST /api/wizard/execute` — apply wizard answers
 
-### Phase 1b (Planned)
+**API surface (Phase 1b):**
+- `GET /api/secrets` — list secrets (values always masked)
+- `POST /api/secrets/reveal` — reveal a single secret value (requires `confirmed:true`; rate-limited 10/min)
+- `PUT /api/secrets` — update an existing secret value
+- `POST /api/secrets` — add an ad-hoc secret
+- `DELETE /api/secrets` — delete a secret
+- `GET /api/providers` — list extension providers from `bundle.yaml`
+- `POST /api/providers` — add an OCI extension provider reference
+- `DELETE /api/providers` — remove an extension provider
+- `GET /api/capabilities` — list capabilities from `bundle.yaml`
+- `PUT /api/capabilities/toggle` — enable or disable a capability
+- `POST /api/rebuild` — trigger a bundle rebuild (runs `SetupEngine::plan(Update)+execute` per scope)
+- `GET /api/rebuild/pending` — poll whether unsaved mutations exist
 
-Phase 1b will add:
-- Real FormSpec wiring: replace stub wizard engine with live `SetupEngine` calls
-- Secrets CRUD UI: read/write/delete individual secrets from the dashboard
-- Provider extension management: add/remove packs from a running bundle
-- Capability toggles: enable/disable provider capabilities without re-running setup
-- Rebuild trigger: one-click `.gtbundle` rebuild from the dashboard
+**Key Phase 1b modules:**
+- `src/ui/bundle_yaml.rs` — load/save `bundle.yaml` for provider + capability mutations (preserves unknown fields)
+- `src/ui/api/secrets.rs` — HTTP handlers for secrets CRUD
+- `src/ui/api/secrets_store.rs` — secret list/reveal/write/delete helpers (zeroize, masking, audit log)
+- `src/ui/api/providers.rs` — HTTP handlers for extension provider management
+- `src/ui/api/capabilities.rs` — HTTP handlers for capability toggles
+- `src/ui/api/rebuild.rs` — HTTP handlers for rebuild trigger and pending-mutation poll
+
+**Security (Phase 1b):**
+- Secret values held in `Zeroizing<String>` — scrubbed from memory on drop
+- Reveal endpoint requires `confirmed: true` body field + enforces 10 reveals/min rate limit via atomics
+- No secret values ever written to logs, error messages, or JSON error envelopes
+- `delete_from_env_file` edits the `.env` persistence file directly (base64 JSON) — `DevStore` has no native delete
 
 ## Release
 

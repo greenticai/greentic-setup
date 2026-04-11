@@ -129,6 +129,21 @@ pub const ASSETS: &[Asset] = &[
         mime: "application/javascript; charset=utf-8",
         body: include_bytes!("../../assets/setup-ui/js/stores/ui.js"),
     },
+    Asset {
+        path: "/js/stores/secrets.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui/js/stores/secrets.js"),
+    },
+    Asset {
+        path: "/js/stores/providers.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui/js/stores/providers.js"),
+    },
+    Asset {
+        path: "/js/stores/capabilities.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui/js/stores/capabilities.js"),
+    },
 ];
 
 /// Look up an embedded asset by its request path.

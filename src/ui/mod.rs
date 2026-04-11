@@ -8,6 +8,7 @@
 
 mod assets;
 pub mod auth;
+pub mod bundle_yaml;
 mod locales;
 pub mod routes;
 pub mod server;

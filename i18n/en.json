@@ -265,5 +265,50 @@
   "ui.onboarding.scope_banner_title": "Welcome — let's set up your first scope",
   "ui.onboarding.scope_banner_body": "Greentic isolates configuration by scope: a (tenant, environment, team) triple. You're about to configure {tenant} / {env} / {team}. You can change the active scope in the sidebar before running the wizard.",
   "ui.onboarding.scope_banner_dismiss": "Got it, continue",
-  "ui.onboarding.scope_banner_learn_more": "Learn more"
+  "ui.onboarding.scope_banner_learn_more": "Learn more",
+
+  "ui.sidebar.nav.providers_active": "Providers",
+  "ui.sidebar.nav.secrets_active": "Secrets",
+  "ui.sidebar.nav.capabilities_active": "Capabilities",
+
+  "ui.secrets.title": "Secrets",
+  "ui.secrets.subtitle": "Manage secrets for the active scope",
+  "ui.secrets.filter_label": "Filter by provider",
+  "ui.secrets.reveal": "Reveal",
+  "ui.secrets.hide": "Hide",
+  "ui.secrets.edit": "Edit",
+  "ui.secrets.delete": "Delete",
+  "ui.secrets.add": "Add secret",
+  "ui.secrets.save": "Save",
+  "ui.secrets.cancel": "Cancel",
+  "ui.secrets.reveal_confirm": "Reveal this secret value?",
+  "ui.secrets.delete_confirm": "Permanently delete this secret?",
+  "ui.secrets.reveal_countdown": "Hides in {seconds}s",
+  "ui.secrets.empty": "No secrets configured for this scope yet.",
+
+  "ui.providers.title": "Provider extensions",
+  "ui.providers.subtitle": "OCI pack references installed in this bundle",
+  "ui.providers.add": "Add provider",
+  "ui.providers.remove": "Remove",
+  "ui.providers.add_placeholder": "oci://ghcr.io/greenticai/packs/...",
+  "ui.providers.remove_confirm": "Remove this provider? The bundle will need to be rebuilt.",
+  "ui.providers.empty": "No extension providers in this bundle.",
+
+  "ui.capabilities.title": "Capabilities",
+  "ui.capabilities.subtitle": "Bundle feature flags",
+  "ui.capabilities.empty": "No capabilities declared in this bundle.",
+
+  "ui.topbar.apply_changes": "Apply changes",
+  "ui.topbar.rebuild_pending": "{count} unsaved changes — apply to rebuild",
+  "ui.topbar.rebuild_success": "Rebuild successful",
+  "ui.topbar.rebuild_failed": "Rebuild failed — see details",
+
+  "ui.error.secrets_list_failed": "Failed to load secrets for this scope.",
+  "ui.error.secrets_reveal_failed": "Failed to reveal secret.",
+  "ui.error.secrets_update_failed": "Failed to update secret.",
+  "ui.error.secrets_delete_failed": "Failed to delete secret.",
+  "ui.error.rate_limit_exceeded": "Too many requests. Please slow down.",
+  "ui.error.bundle_yaml_read_failed": "Failed to read bundle.yaml.",
+  "ui.error.bundle_yaml_write_failed": "Failed to update bundle.yaml.",
+  "ui.error.rebuild_failed": "Rebuild failed: {reason}"
 }

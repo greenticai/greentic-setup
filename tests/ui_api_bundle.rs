@@ -7,19 +7,10 @@ use axum::routing::get;
 use greentic_setup::ui::api::bundle::get_bundle;
 use greentic_setup::ui::state::{AppState, BundleMeta};
 use serde_json::Value;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    let state = Arc::new(AppState {
-        bundle: BundleMeta::test_fixture(),
-        port: 12345,
-        bearer_token: zeroize::Zeroizing::new("test-token".to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
-        launch_options: Default::default(),
-        provider_forms: vec![],
-    });
+    let state = AppState::test_with(BundleMeta::test_fixture(), 12345, "test-token", vec![]);
     Router::new()
         .route("/api/bundle", get(get_bundle))
         .with_state(state)

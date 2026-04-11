@@ -11,16 +11,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 fn app() -> (Router, Arc<AppState>) {
-    let (tx, _) = tokio::sync::broadcast::channel::<()>(1);
-    let state = Arc::new(AppState {
-        bundle: BundleMeta::test_fixture(),
-        port: 12345,
-        bearer_token: zeroize::Zeroizing::new("tok".to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tx,
-        launch_options: Default::default(),
-        provider_forms: vec![],
-    });
+    let state = AppState::test_with(BundleMeta::test_fixture(), 12345, "tok", vec![]);
     let router = Router::new()
         .route("/api/locale/{code}", get(get_locale))
         .route("/api/shutdown", post(post_shutdown))

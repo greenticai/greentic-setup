@@ -10,6 +10,8 @@ document.addEventListener('alpine:init', () => {
     // Kept in-memory only (no localStorage per security rule) so a new
     // `greentic-setup` invocation re-shows it.
     onboardingDismissed: false,
+    // Whether any mutation has occurred since the last successful rebuild.
+    pendingMutations: false,
 
     init() {
       // Read initial state injected by the server.
@@ -85,6 +87,18 @@ document.addEventListener('alpine:init', () => {
           Alpine.store('overview').refresh();
         });
       }
+
+      // Poll pending state from server.
+      Promise.resolve().then(() => this._pollPending());
+    },
+
+    async _pollPending() {
+      try {
+        const data = await window.api.get('/api/rebuild/pending');
+        this.pendingMutations = !!data.pending;
+      } catch (_) {
+        // Non-fatal: pending badge stays in last-known state.
+      }
     },
 
     toggleAdvanced() {
@@ -93,6 +107,44 @@ document.addEventListener('alpine:init', () => {
 
     dismissOnboarding() {
       this.onboardingDismissed = true;
+    },
+
+    navigate(view) {
+      this.currentView = view;
+      // Lazy-load the relevant store data.
+      const storeMap = {
+        overview: 'overview',
+        providers: 'providers',
+        secrets: 'secrets',
+        capabilities: 'capabilities',
+      };
+      const storeName = storeMap[view];
+      if (storeName && Alpine.store(storeName) && Alpine.store(storeName).refresh) {
+        Alpine.store(storeName).refresh();
+      }
+    },
+
+    async triggerRebuild() {
+      if (!this.pendingMutations) return;
+      try {
+        const data = await window.api.post('/api/rebuild', {});
+        this.pendingMutations = false;
+        if (Alpine.store('overview')) {
+          Alpine.store('overview').refresh();
+        }
+        // Brief toast — we use a simple alert for Phase 1b; a proper toast
+        // component is planned for Phase 2.
+        const msg = Alpine.store('locale')
+          ? Alpine.store('locale').t('ui.topbar.rebuild_success')
+          : 'Rebuild successful';
+        console.info(msg, data);
+      } catch (err) {
+        const msg = Alpine.store('locale')
+          ? Alpine.store('locale').t('ui.topbar.rebuild_failed')
+          : 'Rebuild failed';
+        console.error(msg, err);
+        alert(msg);
+      }
     },
   });
 });

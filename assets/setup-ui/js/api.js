@@ -48,5 +48,7 @@
     boot,
     get: (url) => request('GET', url),
     post: (url, body) => request('POST', url, body),
+    put: (url, body) => request('PUT', url, body),
+    delete: (url, body) => request('DELETE', url, body),
   };
 })();

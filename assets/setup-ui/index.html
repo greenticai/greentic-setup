@@ -87,27 +87,24 @@
     <nav class="sidebar-nav">
       <div class="sidebar-nav-label" x-text="t('ui.sidebar.nav.manage_label')">Manage</div>
 
-      <div class="nav-item active" @click="$store.ui.currentView = 'overview'">
+      <div class="nav-item" :class="$store.ui.currentView === 'overview' ? 'active' : ''" @click="$store.ui.navigate('overview')">
         <span class="ico"></span>
         <span x-text="t('ui.sidebar.nav.overview')">Overview</span>
       </div>
 
-      <div class="nav-item disabled" :title="t('ui.nav.coming_in_phase_1b')">
+      <div class="nav-item" :class="$store.ui.currentView === 'providers' ? 'active' : ''" @click="$store.ui.navigate('providers')">
         <span class="ico"></span>
-        <span x-text="t('ui.sidebar.nav.providers')">Providers</span>
-        <span class="phase-tag">1b</span>
+        <span x-text="t('ui.sidebar.nav.providers_active')">Providers</span>
       </div>
 
-      <div class="nav-item disabled" :title="t('ui.nav.coming_in_phase_1b')">
+      <div class="nav-item" :class="$store.ui.currentView === 'secrets' ? 'active' : ''" @click="$store.ui.navigate('secrets')">
         <span class="ico"></span>
-        <span x-text="t('ui.sidebar.nav.secrets')">Secrets</span>
-        <span class="phase-tag">1b</span>
+        <span x-text="t('ui.sidebar.nav.secrets_active')">Secrets</span>
       </div>
 
-      <div class="nav-item disabled" :title="t('ui.nav.coming_in_phase_1b')">
+      <div class="nav-item" :class="$store.ui.currentView === 'capabilities' ? 'active' : ''" @click="$store.ui.navigate('capabilities')">
         <span class="ico"></span>
-        <span x-text="t('ui.sidebar.nav.capabilities')">Capabilities</span>
-        <span class="phase-tag">1b</span>
+        <span x-text="t('ui.sidebar.nav.capabilities_active')">Capabilities</span>
       </div>
     </nav>
 
@@ -132,7 +129,7 @@
         </select>
       </label>
       <button class="btn btn--ghost" @click="$store.ui.toggleAdvanced()" :class="$store.ui.advancedMode ? 'btn--primary' : ''" x-text="t('ui.topbar.advanced_mode')">Advanced</button>
-      <button class="btn" disabled x-text="t('ui.topbar.no_pending_changes')">No pending changes</button>
+      <button class="btn" :class="$store.ui.pendingMutations ? 'btn--primary' : ''" :disabled="!$store.ui.pendingMutations" @click="$store.ui.triggerRebuild()" x-text="$store.ui.pendingMutations ? t('ui.topbar.apply_changes') : t('ui.topbar.no_pending_changes')">No pending changes</button>
     </div>
 
     <!-- ==================== OVERVIEW VIEW ==================== -->
@@ -304,6 +301,160 @@
       <div class="empty-row" x-show="$store.wizard.error" x-text="$store.wizard.error ? t($store.wizard.error.key || 'ui.error.unknown') : ''"></div>
     </div>
 
+    <!-- ==================== PROVIDERS VIEW ==================== -->
+    <div class="content" x-show="$store.ui.currentView === 'providers'" x-cloak>
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:24px">
+        <div>
+          <h2 style="font-size:24px;font-weight:600" x-text="t('ui.providers.title')">Provider extensions</h2>
+          <p style="color:var(--fg-muted);margin-top:4px" x-text="t('ui.providers.subtitle')"></p>
+        </div>
+        <button class="btn btn--primary" @click="$store.providers.showAddModal = true">
+          <span>+</span>
+          <span x-text="t('ui.providers.add')">Add provider</span>
+        </button>
+      </div>
+
+      <!-- Provider list -->
+      <template x-if="$store.providers.items.length === 0 && !$store.providers.loading">
+        <div class="empty-row" x-text="t('ui.providers.empty')">No extension providers in this bundle.</div>
+      </template>
+
+      <template x-for="(p, i) in $store.providers.items" :key="i">
+        <div class="scope-card" style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div style="font-weight:600;font-size:13px" x-text="p.display_name"></div>
+            <div style="color:var(--fg-muted);font-size:11px;margin-top:2px;word-break:break-all" x-text="p.oci_ref"></div>
+          </div>
+          <button class="btn" style="flex-shrink:0;margin-left:16px" @click="$store.providers.remove(p.oci_ref)" x-text="t('ui.providers.remove')">Remove</button>
+        </div>
+      </template>
+
+      <div class="empty-row" x-show="$store.providers.loading">Loading...</div>
+      <div class="empty-row" x-show="$store.providers.error" x-text="$store.providers.error ? t($store.providers.error.key || 'ui.error.unknown') : ''"></div>
+
+      <!-- Add provider modal -->
+      <div x-show="$store.providers.showAddModal" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
+        <div style="background:var(--surface);border-radius:10px;padding:28px;min-width:420px;max-width:560px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+          <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.providers.add')">Add provider</h3>
+          <div class="field">
+            <label class="field-label" x-text="t('ui.providers.add_placeholder')"></label>
+            <input class="field-input" type="text" x-model="$store.providers.newRef" :placeholder="t('ui.providers.add_placeholder')">
+          </div>
+          <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
+            <button class="btn btn--ghost" @click="$store.providers.showAddModal = false; $store.providers.newRef = ''" x-text="t('ui.secrets.cancel')">Cancel</button>
+            <button class="btn btn--primary" @click="$store.providers.add()" :disabled="!$store.providers.newRef.trim()" x-text="t('ui.providers.add')">Add</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== SECRETS VIEW ==================== -->
+    <div class="content" x-show="$store.ui.currentView === 'secrets'" x-cloak>
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:24px">
+        <div>
+          <h2 style="font-size:24px;font-weight:600" x-text="t('ui.secrets.title')">Secrets</h2>
+          <p style="color:var(--fg-muted);margin-top:4px" x-text="t('ui.secrets.subtitle')"></p>
+        </div>
+        <button class="btn btn--primary" @click="$store.secrets.showAddModal = true">
+          <span>+</span>
+          <span x-text="t('ui.secrets.add')">Add secret</span>
+        </button>
+      </div>
+
+      <!-- Secrets table -->
+      <template x-if="$store.secrets.items.length === 0 && !$store.secrets.loading">
+        <div class="empty-row" x-text="t('ui.secrets.empty')">No secrets configured for this scope yet.</div>
+      </template>
+
+      <template x-for="(s, i) in $store.secrets.items" :key="i">
+        <div class="scope-card" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:11px;color:var(--fg-muted);font-weight:500" x-text="s.provider_id"></div>
+            <div style="font-weight:600;font-size:13px" x-text="s.key"></div>
+            <div style="font-size:12px;color:var(--fg-muted);font-family:monospace">
+              <span x-show="!$store.secrets.revealed[s.uri]" x-text="s.masked_value"></span>
+              <span x-show="$store.secrets.revealed[s.uri]" x-text="$store.secrets.revealed[s.uri]?.value"></span>
+              <span x-show="$store.secrets.revealed[s.uri]" style="margin-left:6px;color:var(--warning);font-size:11px" x-text="t('ui.secrets.reveal_countdown', { seconds: $store.secrets.revealed[s.uri]?.remaining })"></span>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0">
+            <button class="btn btn--ghost" style="font-size:11px;padding:4px 10px" @click="$store.secrets.toggleReveal(s)" x-text="$store.secrets.revealed[s.uri] ? t('ui.secrets.hide') : t('ui.secrets.reveal')">Reveal</button>
+            <button class="btn btn--ghost" style="font-size:11px;padding:4px 10px" @click="$store.secrets.beginEdit(s)" x-text="t('ui.secrets.edit')">Edit</button>
+            <button class="btn btn--ghost" style="font-size:11px;padding:4px 10px;color:var(--warning)" @click="$store.secrets.deleteSecret(s)" x-text="t('ui.secrets.delete')">Delete</button>
+          </div>
+        </div>
+      </template>
+
+      <div class="empty-row" x-show="$store.secrets.loading">Loading...</div>
+      <div class="empty-row" x-show="$store.secrets.error" x-text="$store.secrets.error ? t($store.secrets.error.key || 'ui.error.unknown') : ''"></div>
+
+      <!-- Edit secret inline modal -->
+      <div x-show="$store.secrets.editingSecret" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
+        <div style="background:var(--surface);border-radius:10px;padding:28px;min-width:420px;max-width:560px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+          <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.secrets.edit') + ': ' + ($store.secrets.editingSecret?.key || '')"></h3>
+          <div class="field">
+            <label class="field-label">New value</label>
+            <input class="field-input" type="password" autocomplete="off" spellcheck="false" x-model="$store.secrets.editValue">
+          </div>
+          <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
+            <button class="btn btn--ghost" @click="$store.secrets.cancelEdit()" x-text="t('ui.secrets.cancel')">Cancel</button>
+            <button class="btn btn--primary" @click="$store.secrets.saveEdit()" :disabled="!$store.secrets.editValue" x-text="t('ui.secrets.save')">Save</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Add secret modal -->
+      <div x-show="$store.secrets.showAddModal" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
+        <div style="background:var(--surface);border-radius:10px;padding:28px;min-width:420px;max-width:560px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+          <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.secrets.add')">Add secret</h3>
+          <div class="field">
+            <label class="field-label">Provider ID</label>
+            <input class="field-input" type="text" x-model="$store.secrets.newEntry.provider_id">
+          </div>
+          <div class="field">
+            <label class="field-label">Key</label>
+            <input class="field-input" type="text" x-model="$store.secrets.newEntry.key">
+          </div>
+          <div class="field">
+            <label class="field-label">Value</label>
+            <input class="field-input" type="password" autocomplete="off" spellcheck="false" x-model="$store.secrets.newEntry.value">
+          </div>
+          <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
+            <button class="btn btn--ghost" @click="$store.secrets.cancelAdd()" x-text="t('ui.secrets.cancel')">Cancel</button>
+            <button class="btn btn--primary" @click="$store.secrets.addSecret()" :disabled="!$store.secrets.newEntry.key || !$store.secrets.newEntry.value" x-text="t('ui.secrets.save')">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== CAPABILITIES VIEW ==================== -->
+    <div class="content" x-show="$store.ui.currentView === 'capabilities'" x-cloak>
+      <div style="margin-bottom:24px">
+        <h2 style="font-size:24px;font-weight:600" x-text="t('ui.capabilities.title')">Capabilities</h2>
+        <p style="color:var(--fg-muted);margin-top:4px" x-text="t('ui.capabilities.subtitle')"></p>
+      </div>
+
+      <template x-if="$store.capabilities.items.length === 0 && !$store.capabilities.loading">
+        <div class="empty-row" x-text="t('ui.capabilities.empty')">No capabilities declared in this bundle.</div>
+      </template>
+
+      <template x-for="(c, i) in $store.capabilities.items" :key="i">
+        <div class="scope-card" style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div style="font-weight:600;font-size:13px" x-text="c.id"></div>
+            <div style="color:var(--fg-muted);font-size:12px;margin-top:2px" x-text="c.description"></div>
+          </div>
+          <label style="display:inline-flex;align-items:center;gap:8px;flex-shrink:0;margin-left:16px;cursor:pointer">
+            <input type="checkbox" :checked="c.enabled" @change="$store.capabilities.toggle(c.id, $event.target.checked)">
+            <span style="font-size:12px;color:var(--fg-muted)" x-text="c.enabled ? 'Enabled' : 'Disabled'"></span>
+          </label>
+        </div>
+      </template>
+
+      <div class="empty-row" x-show="$store.capabilities.loading">Loading...</div>
+      <div class="empty-row" x-show="$store.capabilities.error" x-text="$store.capabilities.error ? t($store.capabilities.error.key || 'ui.error.unknown') : ''"></div>
+    </div>
+
   </main>
 </div>
 
@@ -320,6 +471,9 @@
 <script src="/js/stores/scope.js"></script>
 <script src="/js/stores/overview.js"></script>
 <script src="/js/stores/wizard.js"></script>
+<script src="/js/stores/secrets.js"></script>
+<script src="/js/stores/providers.js"></script>
+<script src="/js/stores/capabilities.js"></script>
 <script src="/js/stores/ui.js"></script>
 <script src="/js/app.js"></script>
 <script src="/vendor/alpine/alpine.min.js" defer></script>

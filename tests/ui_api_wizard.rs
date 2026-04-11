@@ -53,32 +53,21 @@ fn minimal_form_spec(provider_id: &str) -> FormSpec {
 
 /// `AppState` with one provider loaded.
 fn state_with_one_provider() -> Arc<AppState> {
-    Arc::new(AppState {
-        bundle: BundleMeta::test_fixture(),
-        port: 12345,
-        bearer_token: zeroize::Zeroizing::new("tok".to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
-        launch_options: Default::default(),
-        provider_forms: vec![ProviderFormData {
+    AppState::test_with(
+        BundleMeta::test_fixture(),
+        12345,
+        "tok",
+        vec![ProviderFormData {
             provider_id: "messaging-telegram".to_string(),
             display_name: "Telegram".to_string(),
             form_spec: minimal_form_spec("messaging-telegram"),
         }],
-    })
+    )
 }
 
 /// `AppState` with no providers — used to test the empty-bundle error path.
 fn state_empty() -> Arc<AppState> {
-    Arc::new(AppState {
-        bundle: BundleMeta::test_fixture(),
-        port: 12345,
-        bearer_token: zeroize::Zeroizing::new("tok".to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
-        launch_options: Default::default(),
-        provider_forms: vec![],
-    })
+    AppState::test_with(BundleMeta::test_fixture(), 12345, "tok", vec![])
 }
 
 fn app_with_one_provider() -> Router {

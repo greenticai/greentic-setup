@@ -13,15 +13,7 @@ use tower::ServiceExt;
 const TOKEN: &str = "security-test-token";
 
 fn state() -> Arc<AppState> {
-    Arc::new(AppState {
-        bundle: BundleMeta::test_fixture(),
-        port: 52341,
-        bearer_token: zeroize::Zeroizing::new(TOKEN.to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
-        launch_options: Default::default(),
-        provider_forms: vec![],
-    })
+    AppState::test_with(BundleMeta::test_fixture(), 52341, TOKEN, vec![])
 }
 
 #[tokio::test]

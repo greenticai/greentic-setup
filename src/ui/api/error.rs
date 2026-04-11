@@ -92,6 +92,10 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, code, key)
     }
 
+    pub fn new_too_many(code: &str, key: &str) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, code, key)
+    }
+
     pub fn with_params(mut self, params: Value) -> Self {
         self.params = params;
         self

@@ -283,6 +283,9 @@ where
         shutdown_tx: shutdown_tx.clone(),
         launch_options: options,
         provider_forms,
+        pending_mutations: std::sync::atomic::AtomicBool::new(false),
+        reveal_count: std::sync::atomic::AtomicU32::new(0),
+        reveal_window_start: std::sync::atomic::AtomicU64::new(0),
     });
 
     let router = build_router(state.clone());

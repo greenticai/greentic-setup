@@ -9,7 +9,6 @@ use greentic_setup::ui::state::{
     AppState, BundleMeta, ProviderStatus, ScopeKey, ScopeStatus, ScopeSummary,
 };
 use serde_json::Value;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 fn fixture_bundle_with_scopes() -> BundleMeta {
@@ -65,15 +64,7 @@ fn fixture_bundle_with_scopes() -> BundleMeta {
 }
 
 fn app() -> Router {
-    let state = Arc::new(AppState {
-        bundle: fixture_bundle_with_scopes(),
-        port: 12345,
-        bearer_token: zeroize::Zeroizing::new("tok".to_string()),
-        wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
-        launch_options: Default::default(),
-        provider_forms: vec![],
-    });
+    let state = AppState::test_with(fixture_bundle_with_scopes(), 12345, "tok", vec![]);
     Router::new()
         .route("/api/overview", get(get_overview))
         .with_state(state)
