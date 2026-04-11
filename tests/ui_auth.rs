@@ -142,3 +142,32 @@ fn verify_auth_origin_takes_precedence_over_referer() {
     );
     assert_eq!(verify_auth(&h, TOKEN, PORT), Err(AuthError::InvalidOrigin));
 }
+
+#[test]
+fn verify_auth_accepts_csrf_custom_header() {
+    // The dashboard SPA always sends `X-Requested-With: GreenticSetupDashboard`.
+    // Cross-origin scripts cannot set this header without CORS preflight.
+    let mut h = HeaderMap::new();
+    h.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap(),
+    );
+    h.insert(
+        "x-requested-with",
+        HeaderValue::from_static("GreenticSetupDashboard"),
+    );
+    assert_eq!(verify_auth(&h, TOKEN, PORT), Ok(()));
+}
+
+#[test]
+fn verify_auth_rejects_wrong_csrf_header_value() {
+    // A different value does not pass — must be exact.
+    let mut h = HeaderMap::new();
+    h.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap(),
+    );
+    h.insert("x-requested-with", HeaderValue::from_static("XMLHttpRequest"));
+    // Falls through to Origin/Referer check, both absent → reject.
+    assert_eq!(verify_auth(&h, TOKEN, PORT), Err(AuthError::InvalidOrigin));
+}

@@ -80,6 +80,24 @@ async fn auth_middleware(
 /// round-trip.
 async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
     const TEMPLATE: &str = include_str!("../../assets/setup-ui/index.html");
+    // Embed only the `ui.*` subset of the i18n catalog so `t('ui.*')`
+    // calls resolve on the very first render — no async gap, no flash of
+    // raw keys. `cli.*` keys are for the terminal flow and would bloat
+    // the payload (plus their values may contain the hyphenated crate
+    // name `greentic-setup` which must not appear in dashboard copy).
+    const EN_CATALOG_JSON: &str = include_str!("../../i18n/en.json");
+    let full_catalog: serde_json::Value =
+        serde_json::from_str(EN_CATALOG_JSON).unwrap_or(serde_json::json!({}));
+    let ui_strings = full_catalog
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(k, _)| k.starts_with("ui."))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        })
+        .unwrap_or_default();
+
     let initial_state = serde_json::json!({
         "bearer_token": state.bearer_token.as_str(),
         "port": state.port,
@@ -91,6 +109,7 @@ async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
             "available_teams": state.bundle.available_teams,
         },
         "locale": "en",
+        "strings": serde_json::Value::Object(ui_strings),
     });
     let html = TEMPLATE.replacen("{{INITIAL_STATE}}", &initial_state.to_string(), 1);
     (
@@ -133,9 +152,14 @@ async fn serve_static_asset(method: Method, uri: Uri) -> Response {
 ///   of sensitive UI pages or API responses
 /// - `Pragma: no-cache` — legacy HTTP/1.0 cache hint
 /// - `X-Content-Type-Options: nosniff` — block MIME sniffing attacks
-/// - `X-Frame-Options: DENY` — disallow embedding in iframes
-/// - `Referrer-Policy: no-referrer` — do not leak the dashboard URL to any
-///   external site the user navigates to
+/// - `X-Frame-Options: DENY` — disallow embedding in iframes (covers the
+///   same ground as CSP `frame-ancestors 'none'`, which cannot be delivered
+///   via `<meta>`)
+/// - `Referrer-Policy: same-origin` — browsers still send the `Referer`
+///   header on same-origin requests (our auth middleware needs it as a
+///   fallback when the browser omits `Origin` on same-origin GET fetches)
+///   but never leak the dashboard URL to any external site the user
+///   navigates to afterwards
 ///
 /// Apply via `.layer(layers.0).layer(layers.1)...` on the Axum Router, or
 /// collect into a `ServiceBuilder`.
@@ -159,7 +183,7 @@ pub fn security_headers() -> [SetResponseHeaderLayer<HeaderValue>; 5] {
         ),
         SetResponseHeaderLayer::overriding(
             HeaderName::from_static("referrer-policy"),
-            HeaderValue::from_static("no-referrer"),
+            HeaderValue::from_static("same-origin"),
         ),
     ]
 }

@@ -11,6 +11,11 @@
   async function request(method, url, body) {
     const headers = {
       'accept': 'application/json',
+      // Custom header that cross-origin scripts cannot set without a CORS
+      // preflight. The server rejects any /api/* request that lacks it,
+      // giving us CSRF protection that is independent of Origin/Referer
+      // header behavior (which varies by browser and request mode).
+      'x-requested-with': 'GreenticSetupDashboard',
     };
     if (bearerToken) {
       headers['authorization'] = 'Bearer ' + bearerToken;

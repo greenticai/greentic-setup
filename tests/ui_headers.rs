@@ -77,7 +77,11 @@ async fn sets_x_frame_options_deny() {
 }
 
 #[tokio::test]
-async fn sets_referrer_policy_no_referrer() {
+async fn sets_referrer_policy_same_origin() {
+    // `same-origin` (not `no-referrer`) so browsers still send the
+    // `Referer` header on same-origin API requests — the auth middleware
+    // uses that as a fallback when `Origin` is omitted on same-origin GET
+    // fetches. Cross-origin navigations still get no Referer leaked.
     let resp = get_response().await;
     assert_eq!(
         resp.headers()
@@ -85,6 +89,6 @@ async fn sets_referrer_policy_no_referrer() {
             .unwrap()
             .to_str()
             .unwrap(),
-        "no-referrer"
+        "same-origin"
     );
 }
