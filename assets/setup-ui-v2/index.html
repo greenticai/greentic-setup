@@ -27,13 +27,13 @@
 </head>
 <body x-data x-init="$store.ui.init()">
 
-<!-- Initial state injected by the server — includes bearer_token, port,
-     bundle_id, initial locale catalog. Scripts read from here on boot. -->
 <script id="initial-state" type="application/json">{{INITIAL_STATE}}</script>
 
-<!-- App shell — full component templates land in Tasks 26-29. -->
 <div class="shell">
+
+  <!-- ==================== SIDEBAR ==================== -->
   <aside class="sidebar">
+
     <div class="sidebar-brand">
       <img src="/icons/greentic-mascot.png" alt="">
       <div>
@@ -42,15 +42,55 @@
       </div>
     </div>
 
-    <!-- Scope switcher + nav will be populated by components in Tasks 26-27 -->
+    <!-- Scope switcher: 3 dropdowns (tenant / env / team) -->
     <div class="sidebar-scope">
       <div class="sidebar-scope-label" x-text="t('ui.sidebar.scope_label')">Scope</div>
-      <!-- Tasks 26-27 replace this with real template -->
+
+      <div class="scope-dropdown active">
+        <span class="hint" x-text="t('ui.scope.tenant_label')">tenant</span>
+        <span class="value" x-text="$store.scope.tenant"></span>
+        <span class="caret">&#9662;</span>
+      </div>
+
+      <div class="scope-dropdown">
+        <span class="hint" x-text="t('ui.scope.env_label')">env</span>
+        <span class="value" x-text="$store.scope.env"></span>
+        <span class="caret">&#9662;</span>
+      </div>
+
+      <div class="scope-dropdown">
+        <span class="hint" x-text="t('ui.scope.team_label')">team</span>
+        <span class="value" x-text="$store.scope.team"></span>
+        <span class="caret">&#9662;</span>
+      </div>
     </div>
 
+    <!-- Nav -->
     <nav class="sidebar-nav">
       <div class="sidebar-nav-label" x-text="t('ui.sidebar.nav.manage_label')">Manage</div>
-      <!-- Tasks 26-27 add nav items -->
+
+      <div class="nav-item active" @click="$store.ui.currentView = 'overview'">
+        <span class="ico"></span>
+        <span x-text="t('ui.sidebar.nav.overview')">Overview</span>
+      </div>
+
+      <div class="nav-item disabled" :title="t('ui.nav.coming_in_phase_1b')">
+        <span class="ico"></span>
+        <span x-text="t('ui.sidebar.nav.providers')">Providers</span>
+        <span class="phase-tag">1b</span>
+      </div>
+
+      <div class="nav-item disabled" :title="t('ui.nav.coming_in_phase_1b')">
+        <span class="ico"></span>
+        <span x-text="t('ui.sidebar.nav.secrets')">Secrets</span>
+        <span class="phase-tag">1b</span>
+      </div>
+
+      <div class="nav-item disabled" :title="t('ui.nav.coming_in_phase_1b')">
+        <span class="ico"></span>
+        <span x-text="t('ui.sidebar.nav.capabilities')">Capabilities</span>
+        <span class="phase-tag">1b</span>
+      </div>
     </nav>
 
     <div class="sidebar-footer">
@@ -59,18 +99,156 @@
     </div>
   </aside>
 
+  <!-- ==================== MAIN ==================== -->
   <main class="main">
+
+    <!-- Topbar -->
     <div class="topbar">
       <div class="topbar-breadcrumb" x-text="$store.ui.breadcrumb"></div>
+      <button class="btn btn--ghost" @click="$store.locale.code === 'en' ? $store.locale.switch('id') : $store.locale.switch('en')" x-text="$store.locale.code.toUpperCase()"></button>
+      <button class="btn btn--ghost" @click="$store.ui.toggleAdvanced()" x-text="t('ui.topbar.advanced_mode')">Advanced</button>
+      <button class="btn" disabled x-text="t('ui.topbar.no_pending_changes')">No pending changes</button>
     </div>
-    <div class="content">
-      <p class="fade-in" x-text="t('ui.overview.welcome_title')">Welcome back</p>
-      <p class="fade-in" style="color: var(--fg-muted); margin-top: 8px;">Phase 1a dashboard shell — components arrive in Tasks 26-29.</p>
+
+    <!-- ==================== OVERVIEW VIEW ==================== -->
+    <div class="content" x-show="$store.ui.currentView === 'overview'" x-cloak>
+
+      <div class="overview-head" style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:24px">
+        <div>
+          <h2 style="font-size:24px;font-weight:600" x-text="t('ui.overview.welcome_title')">Welcome back</h2>
+          <p style="color:var(--fg-muted);margin-top:4px" x-text="t('ui.overview.welcome_summary', { count: $store.overview.stats.scopes_count, warnings: $store.overview.stats.warnings_count })">&#8212;</p>
+        </div>
+        <button class="btn btn--primary" @click="$store.ui.currentView = 'wizard'; $store.wizard.start($store.scope.tenant, $store.scope.env, $store.scope.team, null)">
+          <span>+</span>
+          <span x-text="t('ui.overview.add_scope_btn')">Add tenant</span>
+        </button>
+      </div>
+
+      <!-- Stats row -->
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-val" x-text="$store.overview.stats.scopes_count">0</div>
+          <div class="stat-label" x-text="t('ui.overview.stats.scopes')">Scopes</div>
+        </div>
+        <div class="stat">
+          <div class="stat-val" x-text="$store.overview.stats.providers_count">0</div>
+          <div class="stat-label" x-text="t('ui.overview.stats.providers')">Providers</div>
+        </div>
+        <div class="stat">
+          <div class="stat-val" x-text="$store.overview.stats.secrets_count">0</div>
+          <div class="stat-label" x-text="t('ui.overview.stats.secrets')">Secrets</div>
+        </div>
+        <div class="stat">
+          <div class="stat-val" :style="$store.overview.stats.warnings_count > 0 ? 'color: var(--warning)' : ''" x-text="$store.overview.stats.warnings_count">0</div>
+          <div class="stat-label" x-text="t('ui.overview.stats.warnings')">Warnings</div>
+        </div>
+      </div>
+
+      <!-- Configured scopes list -->
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px">
+        <span style="font-size:14px;font-weight:600" x-text="t('ui.overview.list.title')">Configured scopes</span>
+        <span style="font-size:11.5px;color:var(--fg-muted)" x-text="t('ui.overview.list.count', { current: $store.overview.scopes.length, total: $store.overview.scopes.length })"></span>
+      </div>
+
+      <template x-for="(s, i) in $store.overview.scopes" :key="i">
+        <div class="scope-card" :class="i === 0 ? 'active' : ''">
+          <div class="scope-card-head">
+            <span class="scope-card-title" x-text="s.scope.tenant + ' / ' + s.scope.env"></span>
+            <span x-show="i === 0" style="color:var(--brand);font-size:10px" x-text="'&#8212; ' + t('ui.overview.scope_card.active_label')"></span>
+            <span class="scope-card-path" x-text="'team=' + s.scope.team"></span>
+          </div>
+          <div>
+            <template x-for="(p, pi) in s.providers" :key="pi">
+              <span class="provider-chip" :class="p.configured ? 'ok' : 'warn'" x-text="p.display_name"></span>
+            </template>
+            <span class="provider-chip add" x-text="t('ui.overview.scope_card.add_provider')">+ Add provider</span>
+          </div>
+        </div>
+      </template>
+
+      <!-- Loading / empty / error states -->
+      <template x-if="$store.overview.scopes.length === 0 && !$store.overview.loading">
+        <div class="empty-row" x-text="t('ui.overview.empty_state.no_scopes')">No scopes configured yet</div>
+      </template>
+
+      <div class="empty-row" x-show="$store.overview.loading" x-text="t('ui.overview.loading')">Loading...</div>
+
+      <div class="empty-row" x-show="$store.overview.error" x-text="$store.overview.error ? t($store.overview.error.key || 'ui.error.unknown') : ''"></div>
     </div>
+
+    <!-- ==================== WIZARD VIEW ==================== -->
+    <div class="content" x-show="$store.ui.currentView === 'wizard'" x-cloak>
+
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+        <button class="btn btn--ghost" @click="$store.ui.currentView = 'overview'">
+          <span x-text="t('ui.wizard.back_to_overview')">&#8592; Back to Overview</span>
+        </button>
+        <span style="color:var(--fg-muted);font-size:11px" x-text="t('ui.wizard.step_label', { current: $store.wizard.currentStep, total: $store.wizard.totalSteps })"></span>
+      </div>
+
+      <!-- Wizard step -->
+      <div x-show="$store.wizard.step" x-cloak>
+        <h2 style="font-size:22px;font-weight:600;margin-bottom:8px" x-text="$store.wizard.step ? t($store.wizard.step.title_key) : ''"></h2>
+        <p style="color:var(--fg-muted);margin-bottom:20px" x-text="$store.wizard.step && $store.wizard.step.description_key ? t($store.wizard.step.description_key) : ''"></p>
+
+        <!-- Field renderer -->
+        <template x-for="(field, fi) in ($store.wizard.step ? $store.wizard.step.fields : [])" :key="fi">
+          <div class="field">
+            <label class="field-label" :data-required="field.required ? '' : null" x-text="t(field.label_key)"></label>
+
+            <!-- Text / Password -->
+            <template x-if="field.field_type === 'text' || field.field_type === 'password'">
+              <input class="field-input" :type="field.field_type" x-model="$store.wizard.answers[field.name]" :placeholder="field.placeholder_key ? t(field.placeholder_key) : ''" :autocomplete="field.field_type === 'password' ? 'off' : 'on'" :spellcheck="field.field_type === 'password' ? 'false' : 'true'">
+            </template>
+
+            <!-- Textarea -->
+            <template x-if="field.field_type === 'textarea'">
+              <textarea class="field-input" rows="3" x-model="$store.wizard.answers[field.name]" :placeholder="field.placeholder_key ? t(field.placeholder_key) : ''"></textarea>
+            </template>
+
+            <!-- Select -->
+            <template x-if="field.field_type === 'select'">
+              <select class="field-input" x-model="$store.wizard.answers[field.name]">
+                <template x-for="opt in field.options" :key="opt.value">
+                  <option :value="opt.value" x-text="t(opt.label_key)"></option>
+                </template>
+              </select>
+            </template>
+
+            <!-- Switch (boolean) -->
+            <template x-if="field.field_type === 'switch'">
+              <label style="display:inline-flex;align-items:center;gap:8px">
+                <input type="checkbox" x-model="$store.wizard.answers[field.name]">
+                <span x-text="t('ui.field.switch.enabled')">Enabled</span>
+              </label>
+            </template>
+
+            <div class="field-help" x-show="field.help_key" x-text="field.help_key ? t(field.help_key) : ''"></div>
+          </div>
+        </template>
+
+        <!-- Wizard actions -->
+        <div style="display:flex;gap:10px;margin-top:24px;padding-top:20px;border-top:1px solid var(--border);justify-content:space-between">
+          <button class="btn" @click="$store.ui.currentView = 'overview'" x-text="t('ui.wizard.btn.back')">&#8592; Back</button>
+          <button class="btn btn--primary" @click="$store.wizard.currentStep >= $store.wizard.totalSteps ? $store.wizard.execute().then(() => $store.ui.currentView = 'overview') : $store.wizard.next($store.wizard.answers)" x-text="$store.wizard.currentStep >= $store.wizard.totalSteps ? t('ui.wizard.btn.finish') : t('ui.wizard.btn.continue')"></button>
+        </div>
+      </div>
+
+      <!-- Done state -->
+      <div class="empty-row" x-show="!$store.wizard.step && !$store.wizard.loading" x-text="t('ui.wizard.done')">Wizard complete.</div>
+
+      <!-- Error state -->
+      <div class="empty-row" x-show="$store.wizard.error" x-text="$store.wizard.error ? t($store.wizard.error.key || 'ui.error.unknown') : ''"></div>
+    </div>
+
   </main>
 </div>
 
-<!-- JS layer loaded in dependency order. -->
+<style>
+  [x-cloak] { display: none !important; }
+</style>
+
+<!-- JS layer — loaded in dependency order. -->
 <script src="/js/formatters.js"></script>
 <script src="/js/api.js"></script>
 <script src="/js/router.js"></script>
