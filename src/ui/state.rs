@@ -114,7 +114,10 @@ pub struct ValidationError {
 
 impl ValidationError {
     pub fn new(code: &str, key: &str) -> Self {
-        Self { code: code.into(), key: key.into() }
+        Self {
+            code: code.into(),
+            key: key.into(),
+        }
     }
 }
 
@@ -196,8 +199,7 @@ pub struct AppState {
     pub bundle: BundleMeta,
     pub port: u16,
     pub bearer_token: zeroize::Zeroizing<String>,
-    pub wizard_sessions:
-        std::sync::Mutex<std::collections::HashMap<Uuid, WizardSession>>,
+    pub wizard_sessions: std::sync::Mutex<std::collections::HashMap<Uuid, WizardSession>>,
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 

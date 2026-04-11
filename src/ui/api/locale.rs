@@ -24,9 +24,8 @@ pub async fn get_locale(
 ) -> Result<impl IntoResponse, ApiError> {
     // TODO(task-34): Resolve the actual locale from `greentic-i18n` instead
     // of always returning the embedded English catalog.
-    let catalog: Value = serde_json::from_str(EN_CATALOG_JSON).map_err(|_| {
-        ApiError::internal("locale.catalog_parse_failed", "ui.error.internal")
-    })?;
+    let catalog: Value = serde_json::from_str(EN_CATALOG_JSON)
+        .map_err(|_| ApiError::internal("locale.catalog_parse_failed", "ui.error.internal"))?;
     Ok(Json(catalog))
 }
 

@@ -4,9 +4,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::routing::{get, post};
-use greentic_setup::ui::api::wizard::{
-    wizard_execute, wizard_next, wizard_session, wizard_start,
-};
+use greentic_setup::ui::api::wizard::{wizard_execute, wizard_next, wizard_session, wizard_start};
 use greentic_setup::ui::state::{AppState, BundleMeta};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -28,12 +26,7 @@ fn app() -> Router {
         .with_state(state)
 }
 
-async fn send(
-    app: &Router,
-    method: Method,
-    uri: &str,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
+async fn send(app: &Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
     let mut req = Request::builder().method(method).uri(uri);
     let body = if let Some(b) = body {
         req = req.header("content-type", "application/json");
@@ -43,7 +36,9 @@ async fn send(
     };
     let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, value)
 }

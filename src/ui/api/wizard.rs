@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crate::ui::api::error::ApiError;
 use crate::ui::state::{
-    AppState, FieldOption, FieldType, ScopeKey, WizardField, WizardSession,
-    WizardSessionView, WizardStep, validate_scope,
+    AppState, FieldOption, FieldType, ScopeKey, WizardField, WizardSession, WizardSessionView,
+    WizardStep, validate_scope,
 };
 
 #[derive(Debug, Deserialize)]
@@ -66,16 +66,20 @@ pub async fn wizard_start(
     State(state): State<Arc<AppState>>,
     Query(q): Query<StartQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let scope = ScopeKey { tenant: q.tenant, env: q.env, team: q.team };
-    validate_scope(&scope, &state.bundle)
-        .map_err(|e| ApiError::validation(&e.code, &e.key))?;
+    let scope = ScopeKey {
+        tenant: q.tenant,
+        env: q.env,
+        team: q.team,
+    };
+    validate_scope(&scope, &state.bundle).map_err(|e| ApiError::validation(&e.code, &e.key))?;
 
     let session = WizardSession::new(scope.clone(), q.provider.clone(), STUB_TOTAL_STEPS);
     let id = session.id;
 
-    let mut sessions = state.wizard_sessions.lock().map_err(|_| {
-        ApiError::internal("wizard.lock_poisoned", "ui.error.internal")
-    })?;
+    let mut sessions = state
+        .wizard_sessions
+        .lock()
+        .map_err(|_| ApiError::internal("wizard.lock_poisoned", "ui.error.internal"))?;
     sessions.insert(id, session);
 
     Ok(Json(WizardSessionView {
@@ -93,9 +97,10 @@ pub async fn wizard_next(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<NextPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut sessions = state.wizard_sessions.lock().map_err(|_| {
-        ApiError::internal("wizard.lock_poisoned", "ui.error.internal")
-    })?;
+    let mut sessions = state
+        .wizard_sessions
+        .lock()
+        .map_err(|_| ApiError::internal("wizard.lock_poisoned", "ui.error.internal"))?;
 
     let session = sessions.get_mut(&payload.session_id).ok_or_else(|| {
         ApiError::not_found("wizard.session_not_found", "ui.error.session_not_found")
@@ -121,12 +126,20 @@ pub async fn wizard_next(
     session.last_activity = std::time::Instant::now();
 
     let done = session.current_step > session.total_steps;
-    let step = if done { None } else { Some(stub_step(session.current_step)) };
+    let step = if done {
+        None
+    } else {
+        Some(stub_step(session.current_step))
+    };
     let view = WizardSessionView {
         id: session.id,
         scope: session.scope.clone(),
         provider: session.provider.clone(),
-        current_step: if done { session.total_steps } else { session.current_step },
+        current_step: if done {
+            session.total_steps
+        } else {
+            session.current_step
+        },
         total_steps: session.total_steps,
         step,
         answers_so_far: json!({}), // Secrets never leak back to client.
@@ -139,9 +152,10 @@ pub async fn wizard_execute(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ExecutePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut sessions = state.wizard_sessions.lock().map_err(|_| {
-        ApiError::internal("wizard.lock_poisoned", "ui.error.internal")
-    })?;
+    let mut sessions = state
+        .wizard_sessions
+        .lock()
+        .map_err(|_| ApiError::internal("wizard.lock_poisoned", "ui.error.internal"))?;
 
     let session = sessions.remove(&payload.session_id).ok_or_else(|| {
         ApiError::not_found("wizard.session_not_found", "ui.error.session_not_found")
@@ -162,9 +176,10 @@ pub async fn wizard_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let sessions = state.wizard_sessions.lock().map_err(|_| {
-        ApiError::internal("wizard.lock_poisoned", "ui.error.internal")
-    })?;
+    let sessions = state
+        .wizard_sessions
+        .lock()
+        .map_err(|_| ApiError::internal("wizard.lock_poisoned", "ui.error.internal"))?;
 
     let session = sessions.get(&id).ok_or_else(|| {
         ApiError::not_found("wizard.session_not_found", "ui.error.session_not_found")
@@ -178,7 +193,11 @@ pub async fn wizard_session(
     }
 
     let done = session.current_step > session.total_steps;
-    let step = if done { None } else { Some(stub_step(session.current_step)) };
+    let step = if done {
+        None
+    } else {
+        Some(stub_step(session.current_step))
+    };
     Ok(Json(WizardSessionView {
         id: session.id,
         scope: session.scope.clone(),

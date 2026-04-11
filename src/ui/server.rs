@@ -59,8 +59,8 @@ pub async fn launch_v2<F>(bundle_path: &Path, build_router: F) -> Result<()>
 where
     F: FnOnce(Arc<AppState>) -> axum::Router,
 {
-    let bundle = discover_bundle_stub(bundle_path)
-        .context("failed to discover bundle for dashboard")?;
+    let bundle =
+        discover_bundle_stub(bundle_path).context("failed to discover bundle for dashboard")?;
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -137,27 +137,24 @@ mod tests {
         // a short timeout.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_path_buf();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async move {
-                let (tx, _) = tokio::sync::broadcast::channel::<()>(1);
-                let tx_clone = tx.clone();
-                let handle = tokio::spawn(async move {
-                    launch_v2(&path, |_state| {
-                        // Empty router — just needs to be a valid tower service.
-                        Router::new()
-                    })
-                    .await
-                });
-                // Give the server 50ms to bind, then fire the internal shutdown.
-                // NOTE: launch_v2 owns its own broadcast channel, so we can't
-                // trigger it from outside. This test instead exits via timeout.
-                // A better test requires exposing a shutdown handle — future work.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                handle.abort();
-                let _ = tx_clone; // prevent unused warning
-            },
-        )
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let (tx, _) = tokio::sync::broadcast::channel::<()>(1);
+            let tx_clone = tx.clone();
+            let handle = tokio::spawn(async move {
+                launch_v2(&path, |_state| {
+                    // Empty router — just needs to be a valid tower service.
+                    Router::new()
+                })
+                .await
+            });
+            // Give the server 50ms to bind, then fire the internal shutdown.
+            // NOTE: launch_v2 owns its own broadcast channel, so we can't
+            // trigger it from outside. This test instead exits via timeout.
+            // A better test requires exposing a shutdown handle — future work.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            handle.abort();
+            let _ = tx_clone; // prevent unused warning
+        })
         .await;
         assert!(result.is_ok(), "server did not shut down within 5s");
     }

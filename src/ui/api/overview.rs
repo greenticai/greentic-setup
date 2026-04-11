@@ -11,9 +11,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 
 use crate::ui::api::error::ApiError;
-use crate::ui::state::{
-    AppState, OverviewResponse, OverviewStats, ScopeKey, validate_scope,
-};
+use crate::ui::state::{AppState, OverviewResponse, OverviewStats, ScopeKey, validate_scope};
 
 #[derive(Debug, Deserialize)]
 pub struct OverviewQuery {
@@ -34,17 +32,12 @@ pub async fn get_overview(
     };
 
     // Validate against bundle allow-list + path traversal.
-    validate_scope(&scope, &state.bundle).map_err(|e| {
-        ApiError::validation(&e.code, &e.key)
-    })?;
+    validate_scope(&scope, &state.bundle).map_err(|e| ApiError::validation(&e.code, &e.key))?;
 
     // Aggregate stats across all configured scopes.
     let scopes = state.bundle.scopes.clone();
     let scopes_count = scopes.len() as u32;
-    let providers_count: u32 = scopes
-        .iter()
-        .map(|s| s.providers.len() as u32)
-        .sum();
+    let providers_count: u32 = scopes.iter().map(|s| s.providers.len() as u32).sum();
     let secrets_count: u32 = scopes
         .iter()
         .flat_map(|s| s.providers.iter().map(|p| p.secrets_count))
@@ -53,7 +46,10 @@ pub async fn get_overview(
         .iter()
         .map(|s| {
             s.warnings.len() as u32
-                + s.providers.iter().map(|p| p.warnings.len() as u32).sum::<u32>()
+                + s.providers
+                    .iter()
+                    .map(|p| p.warnings.len() as u32)
+                    .sum::<u32>()
         })
         .sum();
 

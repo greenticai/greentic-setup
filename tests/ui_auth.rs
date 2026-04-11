@@ -1,7 +1,7 @@
 //! Auth middleware tests — bearer token + Origin check.
 
 use axum::http::{HeaderMap, HeaderValue};
-use greentic_setup::ui::auth::{generate_bearer_token, verify_auth, AuthError};
+use greentic_setup::ui::auth::{AuthError, generate_bearer_token, verify_auth};
 
 const TOKEN: &str = "secret-token-abc-123";
 const PORT: u16 = 52341;

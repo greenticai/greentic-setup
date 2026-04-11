@@ -44,10 +44,7 @@ pub fn verify_auth(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or(AuthError::MissingBearer)?;
 
-    if !constant_time_eq::constant_time_eq(
-        provided.as_bytes(),
-        expected_token.as_bytes(),
-    ) {
+    if !constant_time_eq::constant_time_eq(provided.as_bytes(), expected_token.as_bytes()) {
         return Err(AuthError::InvalidBearer);
     }
 

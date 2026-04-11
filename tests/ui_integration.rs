@@ -39,7 +39,9 @@ fn authed_request(method: Method, uri: &str, body: Option<Value>) -> Request<Bod
 async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
 }
@@ -52,9 +54,18 @@ async fn full_flow_bundle_overview_wizard_execute() {
     let (s1, bundle_body) = send(&app, authed_request(Method::GET, "/api/bundle", None)).await;
     assert_eq!(s1, StatusCode::OK);
     assert_eq!(bundle_body["id"], "demo");
-    let tenant = bundle_body["available_tenants"][0].as_str().unwrap().to_string();
-    let env = bundle_body["available_envs"][0].as_str().unwrap().to_string();
-    let team = bundle_body["available_teams"][0].as_str().unwrap().to_string();
+    let tenant = bundle_body["available_tenants"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let env = bundle_body["available_envs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let team = bundle_body["available_teams"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Step 2: Fetch overview.
     let uri = format!("/api/overview?tenant={tenant}&env={env}&team={team}");
@@ -113,11 +124,7 @@ async fn full_flow_bundle_overview_wizard_execute() {
 #[tokio::test]
 async fn locale_endpoint_serves_catalog_for_english() {
     let app = build_router(state());
-    let (s, body) = send(
-        &app,
-        authed_request(Method::GET, "/api/locale/en", None),
-    )
-    .await;
+    let (s, body) = send(&app, authed_request(Method::GET, "/api/locale/en", None)).await;
     assert_eq!(s, StatusCode::OK);
     // Must contain at least the Phase 1a ui.* keys.
     assert!(body["ui.overview.welcome_title"].is_string());
@@ -132,11 +139,7 @@ async fn shutdown_endpoint_triggers_broadcast() {
     let (s, body) = send(&app, authed_request(Method::POST, "/api/shutdown", None)).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["shutdown"], true);
-    let recv = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        rx.recv(),
-    )
-    .await;
+    let recv = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
     assert!(recv.is_ok(), "shutdown signal not received");
 }
 
@@ -147,7 +150,9 @@ async fn index_page_uses_friendly_brand_name_not_hyphenated() {
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let html = String::from_utf8(bytes.to_vec()).unwrap();
     // The inline placeholder index in routes.rs uses the friendly name
     // directly. The full SPA index.html uses i18n keys and will not contain
@@ -155,5 +160,8 @@ async fn index_page_uses_friendly_brand_name_not_hyphenated() {
     // call, which our integration test pass because routes.rs currently serves
     // its inline placeholder. This test guards against regressing to `greentic-setup`
     // hyphenated literal.
-    assert!(!html.contains("greentic-setup"), "hyphenated name must not appear in UI copy");
+    assert!(
+        !html.contains("greentic-setup"),
+        "hyphenated name must not appear in UI copy"
+    );
 }

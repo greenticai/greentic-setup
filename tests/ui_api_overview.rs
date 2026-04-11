@@ -83,22 +83,22 @@ async fn get_body(uri: &str) -> (StatusCode, Value) {
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
 }
 
 #[tokio::test]
 async fn returns_200_for_allowed_scope() {
-    let (status, _) =
-        get_body("/api/overview?tenant=demo&env=dev&team=default").await;
+    let (status, _) = get_body("/api/overview?tenant=demo&env=dev&team=default").await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn response_includes_stats() {
-    let (_, body) =
-        get_body("/api/overview?tenant=demo&env=dev&team=default").await;
+    let (_, body) = get_body("/api/overview?tenant=demo&env=dev&team=default").await;
     // 2 scopes fixture, 3 total providers (2 + 1), 4 total secrets (2 + 1 + 1), 1 warning
     assert_eq!(body["stats"]["scopes_count"], 2);
     assert_eq!(body["stats"]["providers_count"], 3);
@@ -108,8 +108,7 @@ async fn response_includes_stats() {
 
 #[tokio::test]
 async fn response_includes_scopes_list() {
-    let (_, body) =
-        get_body("/api/overview?tenant=demo&env=dev&team=default").await;
+    let (_, body) = get_body("/api/overview?tenant=demo&env=dev&team=default").await;
     assert!(body["scopes"].is_array());
     assert_eq!(body["scopes"].as_array().unwrap().len(), 2);
     assert_eq!(body["scopes"][0]["scope"]["tenant"], "demo");
@@ -119,8 +118,7 @@ async fn response_includes_scopes_list() {
 
 #[tokio::test]
 async fn response_echoes_requested_scope() {
-    let (_, body) =
-        get_body("/api/overview?tenant=demo&env=dev&team=default").await;
+    let (_, body) = get_body("/api/overview?tenant=demo&env=dev&team=default").await;
     assert_eq!(body["scope"]["tenant"], "demo");
     assert_eq!(body["scope"]["env"], "dev");
     assert_eq!(body["scope"]["team"], "default");
@@ -128,16 +126,14 @@ async fn response_echoes_requested_scope() {
 
 #[tokio::test]
 async fn rejects_unknown_tenant_400() {
-    let (status, body) =
-        get_body("/api/overview?tenant=evil&env=dev&team=default").await;
+    let (status, body) = get_body("/api/overview?tenant=evil&env=dev&team=default").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "scope.invalid_tenant");
 }
 
 #[tokio::test]
 async fn rejects_path_traversal_in_env_400() {
-    let (status, body) =
-        get_body("/api/overview?tenant=demo&env=../etc&team=default").await;
+    let (status, body) = get_body("/api/overview?tenant=demo&env=../etc&team=default").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "scope.path_traversal");
 }

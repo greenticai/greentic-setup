@@ -26,11 +26,7 @@ fn app() -> (Router, Arc<AppState>) {
     (router, state)
 }
 
-async fn send(
-    app: Router,
-    method: Method,
-    uri: &str,
-) -> (StatusCode, Value) {
+async fn send(app: Router, method: Method, uri: &str) -> (StatusCode, Value) {
     let resp = app
         .oneshot(
             Request::builder()
@@ -42,7 +38,9 @@ async fn send(
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
 }
@@ -54,10 +52,7 @@ async fn get_locale_returns_catalog() {
     assert_eq!(status, StatusCode::OK);
     // Must be a JSON object with at least one key-value pair from the catalog.
     assert!(body.is_object());
-    assert!(
-        body.as_object().unwrap().len() > 0,
-        "catalog empty"
-    );
+    assert!(!body.as_object().unwrap().is_empty(), "catalog empty");
 }
 
 #[tokio::test]
@@ -78,11 +73,8 @@ async fn post_shutdown_fires_broadcast() {
     assert_eq!(body["shutdown"], true);
     // The broadcast should deliver (`tokio::time::timeout` makes it
     // hermetic even if send didn't fire).
-    let recv = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        rx.recv(),
-    )
-    .await
-    .expect("shutdown signal not received within 100ms");
+    let recv = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+        .await
+        .expect("shutdown signal not received within 100ms");
     assert!(recv.is_ok());
 }

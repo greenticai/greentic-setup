@@ -24,7 +24,9 @@ fn app() -> Router {
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -45,7 +47,12 @@ async fn returns_bundle_metadata_200() {
 #[tokio::test]
 async fn response_has_expected_bundle_shape() {
     let resp = app()
-        .oneshot(Request::builder().uri("/api/bundle").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/bundle")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let body = body_json(resp).await;
@@ -61,9 +68,19 @@ async fn response_has_expected_bundle_shape() {
 #[tokio::test]
 async fn response_is_json_content_type() {
     let resp = app()
-        .oneshot(Request::builder().uri("/api/bundle").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/bundle")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.contains("application/json"));
 }

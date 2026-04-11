@@ -5,7 +5,7 @@
 set -euo pipefail
 
 EN_JSON="${EN_JSON:-i18n/en.json}"
-FRONTEND_DIR="${FRONTEND_DIR:-assets/setup-ui-v2}"
+FRONTEND_DIR="${FRONTEND_DIR:-assets/setup-ui}"
 
 if [ ! -f "$EN_JSON" ]; then
   echo "missing $EN_JSON" >&2

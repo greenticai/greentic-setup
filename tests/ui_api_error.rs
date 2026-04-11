@@ -3,7 +3,7 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use greentic_setup::ui::api::error::{ApiError, FieldError};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 async fn body_json(resp: axum::response::Response) -> Value {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -22,7 +22,10 @@ async fn not_found_error_has_correct_shape() {
     assert_eq!(body["error"]["code"], "bundle.not_found");
     assert_eq!(body["error"]["key"], "ui.error.bundle_not_found");
     assert_eq!(body["error"]["params"]["path"], "/tmp/missing");
-    assert!(body["error"]["fields"].is_null() || !body["error"].as_object().unwrap().contains_key("fields"));
+    assert!(
+        body["error"]["fields"].is_null()
+            || !body["error"].as_object().unwrap().contains_key("fields")
+    );
 }
 
 #[tokio::test]
@@ -37,8 +40,14 @@ async fn validation_error_has_fields() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
     assert_eq!(body["error"]["code"], "wizard.validation_failed");
-    assert_eq!(body["error"]["fields"]["slack_token"]["key"], "ui.error.invalid_token_format");
-    assert_eq!(body["error"]["fields"]["slack_token"]["params"]["pattern"], "xoxb-*");
+    assert_eq!(
+        body["error"]["fields"]["slack_token"]["key"],
+        "ui.error.invalid_token_format"
+    );
+    assert_eq!(
+        body["error"]["fields"]["slack_token"]["params"]["pattern"],
+        "xoxb-*"
+    );
 }
 
 #[tokio::test]

@@ -1,23 +1,44 @@
-//! Greentic Setup web dashboard.
+//! Greentic Setup web dashboard — Phase 1a.
 //!
-//! During Phase 1a migration this module re-exports the legacy `launch`
-//! function so the CLI binary keeps working while the new dashboard is built
-//! out piece by piece in sibling modules. The legacy module will be removed
-//! in the cutover task at the end of Phase 1a.
+//! Serves an Alpine.js SPA from an Axum server bound to 127.0.0.1, with
+//! bearer-token + origin authentication, security headers, and an embedded
+//! static asset manifest.
 
-#![allow(dead_code)] // skeleton modules may have unused items during migration
+#![allow(dead_code)]
 
 mod assets;
-mod assets_v2;
-mod legacy;
-
-// New modules — currently empty stubs, filled in by subsequent tasks.
-// Each stays private until the cutover task rewires `launch`.
 pub mod auth;
-pub mod server;
 pub mod routes;
-pub mod state;
+mod server;
 mod sse;
-pub mod api;
 
-pub use legacy::launch;
+pub mod api;
+pub mod state;
+
+// Re-export server pieces that integration tests exercise directly.
+pub use routes::build_router;
+
+use std::path::Path;
+
+use anyhow::Result;
+use serde_json::{Map, Value};
+
+/// Public launch entry point used by `src/bin/greentic_setup.rs`.
+///
+/// Signature preserved from the legacy module so the CLI binary compiles
+/// unchanged. The extra arguments (tenant, team, env, advanced, locale,
+/// prefill_answers, scope_from_answers) are currently unused in Phase 1a
+/// — they'll be passed through to the wizard context in Phase 1b.
+#[allow(clippy::too_many_arguments)]
+pub async fn launch(
+    bundle_path: &Path,
+    _tenant: &str,
+    _team: Option<&str>,
+    _env: &str,
+    _advanced: bool,
+    _locale: Option<&str>,
+    _prefill_answers: Option<Map<String, Value>>,
+    _scope_from_answers: bool,
+) -> Result<()> {
+    server::launch_v2(bundle_path, routes::build_router).await
+}

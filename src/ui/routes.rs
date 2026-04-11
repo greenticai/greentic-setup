@@ -15,7 +15,7 @@ use crate::ui::api::bundle::get_bundle;
 use crate::ui::api::locale::{get_locale, post_shutdown};
 use crate::ui::api::overview::get_overview;
 use crate::ui::api::wizard::{wizard_execute, wizard_next, wizard_session, wizard_start};
-use crate::ui::assets_v2;
+use crate::ui::assets;
 use crate::ui::auth::{AuthError, verify_auth};
 use crate::ui::state::AppState;
 
@@ -40,7 +40,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/wizard/session/{id}", get(wizard_session))
         .route("/locale/{code}", get(get_locale))
         .route("/shutdown", post(post_shutdown))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     let mut app = Router::new()
         .nest("/api", api)
@@ -64,59 +67,32 @@ async fn auth_middleware(
     let headers = req.headers();
     match verify_auth(headers, &state.bearer_token, state.port) {
         Ok(()) => Ok(next.run(req).await),
-        Err(AuthError::MissingBearer | AuthError::InvalidBearer) => {
-            Err(StatusCode::UNAUTHORIZED)
-        }
+        Err(AuthError::MissingBearer | AuthError::InvalidBearer) => Err(StatusCode::UNAUTHORIZED),
         Err(AuthError::InvalidOrigin) => Err(StatusCode::FORBIDDEN),
     }
 }
 
-/// Phase 1a placeholder index. Task 22 replaces this with a real
-/// `include_str!` of `assets/setup-ui-v2/index.html`.
+/// Serve the Phase 1a SPA index.html with the real initial state injected.
+///
+/// Reads the embedded `index.html` at compile time and substitutes
+/// `{{INITIAL_STATE}}` with a JSON object containing the bearer token, port,
+/// and bundle metadata so the Alpine.js SPA can bootstrap without an extra
+/// round-trip.
 async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html lang="en" dir="ltr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer">
-<title>Greentic Setup</title>
-<link rel="stylesheet" href="/styles/tokens.css">
-<link rel="stylesheet" href="/styles/base.css">
-<link rel="stylesheet" href="/styles/layout.css">
-<link rel="stylesheet" href="/styles/components.css">
-<link rel="stylesheet" href="/styles/animations.css">
-</head>
-<body>
-<div class="shell">
-<aside class="sidebar">
-<div class="sidebar-brand">
-<img src="/icons/greentic-mascot.png" alt="Greentic Setup">
-<div>
-<div class="sidebar-brand-text">Greentic Setup</div>
-<div class="sidebar-brand-sub">{bundle}</div>
-</div>
-</div>
-</aside>
-<main class="main">
-<div class="topbar"><div class="topbar-breadcrumb">Overview</div></div>
-<div class="content">
-<p>Phase 1a dashboard shell — full SPA lands in Tasks 22-29.</p>
-</div>
-</main>
-</div>
-<script id="initial-state" type="application/json">{state_json}</script>
-<script src="/vendor/alpine/alpine.min.js" defer></script>
-</body>
-</html>"#,
-        bundle = state.bundle.display_name,
-        state_json = serde_json::json!({
-            "bearer_token": state.bearer_token.as_str(),
-            "port": state.port,
-            "bundle_id": state.bundle.id,
-        })
-    );
+    const TEMPLATE: &str = include_str!("../../assets/setup-ui/index.html");
+    let initial_state = serde_json::json!({
+        "bearer_token": state.bearer_token.as_str(),
+        "port": state.port,
+        "bundle": {
+            "id": state.bundle.id,
+            "display_name": state.bundle.display_name,
+            "available_tenants": state.bundle.available_tenants,
+            "available_envs": state.bundle.available_envs,
+            "available_teams": state.bundle.available_teams,
+        },
+        "locale": "en",
+    });
+    let html = TEMPLATE.replacen("{{INITIAL_STATE}}", &initial_state.to_string(), 1);
     (
         [(
             HeaderName::from_static("content-type"),
@@ -127,14 +103,14 @@ async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// Fallback handler for static assets from `assets_v2::ASSETS`.
+/// Fallback handler for static assets from `assets::ASSETS`.
 ///
 /// Only accepts GET. Any other method returns 405.
 async fn serve_static_asset(method: Method, uri: Uri) -> Response {
     if method != Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    match assets_v2::find(uri.path()) {
+    match assets::find(uri.path()) {
         Some(asset) => (
             [(
                 HeaderName::from_static("content-type"),

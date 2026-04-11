@@ -88,7 +88,9 @@ async fn api_responses_never_contain_secret_field_names() {
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = String::from_utf8_lossy(&bytes).to_string();
         for forbidden in [
             "\"secret_value\"",

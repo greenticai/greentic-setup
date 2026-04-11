@@ -23,14 +23,22 @@ fn scope_status_serializes_snake_case() {
 #[test]
 fn validate_scope_accepts_allowed_tenant() {
     let bundle = BundleMeta::test_fixture();
-    let scope = ScopeKey { tenant: "demo".into(), env: "dev".into(), team: "default".into() };
+    let scope = ScopeKey {
+        tenant: "demo".into(),
+        env: "dev".into(),
+        team: "default".into(),
+    };
     assert!(validate_scope(&scope, &bundle).is_ok());
 }
 
 #[test]
 fn validate_scope_rejects_unknown_tenant() {
     let bundle = BundleMeta::test_fixture();
-    let scope = ScopeKey { tenant: "evil".into(), env: "dev".into(), team: "default".into() };
+    let scope = ScopeKey {
+        tenant: "evil".into(),
+        env: "dev".into(),
+        team: "default".into(),
+    };
     let err = validate_scope(&scope, &bundle).unwrap_err();
     assert_eq!(err.code, "scope.invalid_tenant");
 }
