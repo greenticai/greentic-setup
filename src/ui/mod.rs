@@ -12,7 +12,7 @@ mod legacy;
 
 // New modules — currently empty stubs, filled in by subsequent tasks.
 // Each stays private until the cutover task rewires `launch`.
-mod auth;
+pub mod auth;
 mod server;
 mod routes;
 pub mod state;
