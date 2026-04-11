@@ -17,6 +17,17 @@ fn headers(auth: Option<&str>, origin: Option<&str>) -> HeaderMap {
     h
 }
 
+fn headers_with_referer(auth: Option<&str>, referer: Option<&str>) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    if let Some(a) = auth {
+        h.insert("authorization", HeaderValue::from_str(a).unwrap());
+    }
+    if let Some(r) = referer {
+        h.insert("referer", HeaderValue::from_str(r).unwrap());
+    }
+    h
+}
+
 #[test]
 fn generate_bearer_token_is_exactly_43_chars() {
     // 32 random bytes → base64-url no-pad → exactly 43 characters.
@@ -73,7 +84,61 @@ fn verify_auth_rejects_wrong_origin() {
 }
 
 #[test]
-fn verify_auth_rejects_missing_origin() {
+fn verify_auth_rejects_missing_origin_and_referer() {
     let h = headers(Some(&format!("Bearer {TOKEN}")), None);
+    assert_eq!(verify_auth(&h, TOKEN, PORT), Err(AuthError::InvalidOrigin));
+}
+
+#[test]
+fn verify_auth_accepts_referer_fallback_when_origin_absent() {
+    // Browsers omit Origin on same-origin GET fetches — fall back to Referer.
+    let h = headers_with_referer(
+        Some(&format!("Bearer {TOKEN}")),
+        Some("http://127.0.0.1:52341/"),
+    );
+    assert_eq!(verify_auth(&h, TOKEN, PORT), Ok(()));
+}
+
+#[test]
+fn verify_auth_accepts_referer_fallback_with_localhost() {
+    let h = headers_with_referer(
+        Some(&format!("Bearer {TOKEN}")),
+        Some("http://localhost:52341/#/wizard"),
+    );
+    assert_eq!(verify_auth(&h, TOKEN, PORT), Ok(()));
+}
+
+#[test]
+fn verify_auth_rejects_evil_referer_subdomain() {
+    // Guards against crafted Referer like http://127.0.0.1:52341.evil.com/
+    let h = headers_with_referer(
+        Some(&format!("Bearer {TOKEN}")),
+        Some("http://127.0.0.1:52341.evil.com/"),
+    );
+    assert_eq!(verify_auth(&h, TOKEN, PORT), Err(AuthError::InvalidOrigin));
+}
+
+#[test]
+fn verify_auth_rejects_referer_without_trailing_slash_or_path() {
+    // Bare host-port Referer (no path, no query) is still accepted by the
+    // strict-equality branch — this test locks in that behavior.
+    let h = headers_with_referer(
+        Some(&format!("Bearer {TOKEN}")),
+        Some("http://127.0.0.1:52341"),
+    );
+    assert_eq!(verify_auth(&h, TOKEN, PORT), Ok(()));
+}
+
+#[test]
+fn verify_auth_origin_takes_precedence_over_referer() {
+    // If Origin is present and wrong, Referer is irrelevant — still reject.
+    let mut h = headers(
+        Some(&format!("Bearer {TOKEN}")),
+        Some("http://evil.example.com"),
+    );
+    h.insert(
+        "referer",
+        HeaderValue::from_static("http://127.0.0.1:52341/"),
+    );
     assert_eq!(verify_auth(&h, TOKEN, PORT), Err(AuthError::InvalidOrigin));
 }

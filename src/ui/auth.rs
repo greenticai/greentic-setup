@@ -23,13 +23,17 @@ pub fn generate_bearer_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Verify bearer token (constant-time compare) and Origin header.
+/// Verify bearer token (constant-time compare) and Origin / Referer header.
 ///
 /// - Returns `MissingBearer` if the `Authorization` header is absent or
 ///   doesn't start with `Bearer `.
 /// - Returns `InvalidBearer` if the token does not match (timing-safe).
-/// - Returns `InvalidOrigin` if the `Origin` header is absent or does not
-///   match `http://127.0.0.1:{port}` or `http://localhost:{port}`.
+/// - Returns `InvalidOrigin` if neither a valid `Origin` nor `Referer`
+///   header points at `http://127.0.0.1:{port}` or `http://localhost:{port}`.
+///
+/// Browsers do not always send `Origin` on same-origin GET fetches — in
+/// that case we fall back to the `Referer` header per the OWASP CSRF
+/// prevention cheat sheet. Requests with neither header are rejected.
 pub fn verify_auth(
     headers: &HeaderMap,
     expected_token: &str,
@@ -48,16 +52,33 @@ pub fn verify_auth(
         return Err(AuthError::InvalidBearer);
     }
 
-    let origin = headers
-        .get("origin")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(AuthError::InvalidOrigin)?;
-
     let ok_127 = format!("http://127.0.0.1:{expected_port}");
     let ok_local = format!("http://localhost:{expected_port}");
-    if origin != ok_127 && origin != ok_local {
+
+    // Prefer `Origin` (present on POST and cross-origin fetches).
+    if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
+        if origin == ok_127 || origin == ok_local {
+            return Ok(());
+        }
         return Err(AuthError::InvalidOrigin);
     }
 
-    Ok(())
+    // Fall back to `Referer` (browsers omit `Origin` on many same-origin
+    // GETs). A valid Referer must start with our expected origin followed
+    // by `/` or end-of-string so that `http://127.0.0.1:PORT.evil.com`
+    // does not pass the check.
+    if let Some(referer) = headers.get("referer").and_then(|h| h.to_str().ok()) {
+        for base in [&ok_127, &ok_local] {
+            if referer == *base
+                || referer.starts_with(&format!("{base}/"))
+                || referer.starts_with(&format!("{base}?"))
+                || referer.starts_with(&format!("{base}#"))
+            {
+                return Ok(());
+            }
+        }
+        return Err(AuthError::InvalidOrigin);
+    }
+
+    Err(AuthError::InvalidOrigin)
 }
