@@ -77,6 +77,62 @@ pub const ASSETS: &[Asset] = &[
         mime: "image/png",
         body: include_bytes!("../../assets/setup-ui-v2/icons/greentic-mascot.png"),
     },
+    // Phase 1a SPA shell + JS
+    Asset {
+        path: "/index.html",
+        mime: "text/html; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/index.html"),
+    },
+    Asset {
+        path: "/js/app.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/app.js"),
+    },
+    Asset {
+        path: "/js/api.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/api.js"),
+    },
+    Asset {
+        path: "/js/router.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/router.js"),
+    },
+    Asset {
+        path: "/js/formatters.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/formatters.js"),
+    },
+    Asset {
+        path: "/js/stores/bundle.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/stores/bundle.js"),
+    },
+    Asset {
+        path: "/js/stores/scope.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/stores/scope.js"),
+    },
+    Asset {
+        path: "/js/stores/overview.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/stores/overview.js"),
+    },
+    Asset {
+        path: "/js/stores/wizard.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/stores/wizard.js"),
+    },
+    Asset {
+        path: "/js/stores/locale.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/stores/locale.js"),
+    },
+    Asset {
+        path: "/js/stores/ui.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui-v2/js/stores/ui.js"),
+    },
 ];
 
 /// Look up an embedded asset by its request path.
