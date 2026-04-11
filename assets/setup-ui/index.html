@@ -41,27 +41,42 @@
       </div>
     </div>
 
-    <!-- Scope switcher: 3 dropdowns (tenant / env / team) -->
+    <!-- Scope switcher: 3 native selects (tenant / env / team).
+         Native <select> is used for keyboard accessibility and
+         zero-custom-dropdown-logic. Styled via .scope-select to match
+         the sidebar aesthetic. -->
     <div class="sidebar-scope">
       <div class="sidebar-scope-label" x-text="t('ui.sidebar.scope_label')">Scope</div>
 
-      <div class="scope-dropdown active">
+      <label class="scope-dropdown active">
         <span class="hint" x-text="t('ui.scope.tenant_label')">tenant</span>
-        <span class="value" x-text="$store.scope.tenant"></span>
-        <span class="caret">&#9662;</span>
-      </div>
+        <select class="scope-select" :value="$store.scope.tenant" @change="$store.scope.set($event.target.value, $store.scope.env, $store.scope.team)">
+          <template x-for="t in $store.bundle.availableTenants" :key="t">
+            <option :value="t" :selected="t === $store.scope.tenant" x-text="t"></option>
+          </template>
+        </select>
+        <span class="caret" aria-hidden="true">&#9662;</span>
+      </label>
 
-      <div class="scope-dropdown">
+      <label class="scope-dropdown">
         <span class="hint" x-text="t('ui.scope.env_label')">env</span>
-        <span class="value" x-text="$store.scope.env"></span>
-        <span class="caret">&#9662;</span>
-      </div>
+        <select class="scope-select" :value="$store.scope.env" @change="$store.scope.set($store.scope.tenant, $event.target.value, $store.scope.team)">
+          <template x-for="e in $store.bundle.availableEnvs" :key="e">
+            <option :value="e" :selected="e === $store.scope.env" x-text="e"></option>
+          </template>
+        </select>
+        <span class="caret" aria-hidden="true">&#9662;</span>
+      </label>
 
-      <div class="scope-dropdown">
+      <label class="scope-dropdown">
         <span class="hint" x-text="t('ui.scope.team_label')">team</span>
-        <span class="value" x-text="$store.scope.team"></span>
-        <span class="caret">&#9662;</span>
-      </div>
+        <select class="scope-select" :value="$store.scope.team" @change="$store.scope.set($store.scope.tenant, $store.scope.env, $event.target.value)">
+          <template x-for="tm in $store.bundle.availableTeams" :key="tm">
+            <option :value="tm" :selected="tm === $store.scope.team" x-text="tm"></option>
+          </template>
+        </select>
+        <span class="caret" aria-hidden="true">&#9662;</span>
+      </label>
     </div>
 
     <!-- Nav -->
