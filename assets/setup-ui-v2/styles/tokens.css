@@ -1,0 +1,69 @@
+/* Greentic design tokens — derived from https://greentic.ai CSS custom
+ * properties (shadcn/ui HSL format). Dark mode only in Phase 1a.
+ * Spec: docs/superpowers/specs/2026-04-11-greentic-setup-dashboard-phase-1a-design.md
+ */
+
+:root {
+  /* Brand */
+  --brand: hsl(166 70% 45%);
+  --brand-hover: hsl(166 70% 55%);
+  --brand-muted: hsl(166 50% 40%);
+  --brand-bg: hsl(166 70% 45% / 0.10);
+  --brand-border: hsl(166 70% 45% / 0.30);
+  --brand-ink: hsl(220 20% 8%);
+  --accent: hsl(186 70% 50%);
+
+  /* Surfaces (dark) */
+  --bg: hsl(220 20% 8%);
+  --surface: hsl(220 20% 11%);
+  --surface-2: hsl(220 20% 13%);
+  --border: hsl(220 15% 18%);
+  --border-subtle: hsl(220 15% 14%);
+
+  /* Text */
+  --fg: hsl(0 0% 98%);
+  --fg-muted: hsl(220 15% 62%);
+  --fg-dim: hsl(220 10% 46%);
+
+  /* Semantic */
+  --success: hsl(142 60% 55%);
+  --warning: hsl(42 80% 62%);
+  --danger: hsl(0 70% 60%);
+  --info: hsl(210 80% 60%);
+
+  /* Typography */
+  --font-sans: 'Poppins', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+
+  /* Spacing (4px grid) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* Radius */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-full: 9999px;
+
+  /* Elevation — one subtle shadow, used sparingly */
+  --shadow-subtle: 0 1px 2px hsl(0 0% 0% / 0.2);
+
+  /* Motion */
+  --ease-fast: 120ms cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-base: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-smooth: 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --ease-fast: 0.01ms linear;
+    --ease-base: 0.01ms linear;
+    --ease-smooth: 0.01ms linear;
+  }
+}
