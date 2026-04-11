@@ -3,6 +3,9 @@
 # OS
 .DS_Store
 
+# Superpowers brainstorm working cache (mockups, state — not for commit)
+.superpowers/
+
 # CI workflow artifacts (codex-security-fix, dependency-review, codex-semver-fix)
 all-dependabot-alerts.json
 all-code-scanning-alerts.json
