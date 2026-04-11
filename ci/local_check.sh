@@ -25,7 +25,7 @@ cargo build --all-features
 step "5/6  cargo doc"
 cargo doc --no-deps --all-features
 
-step "6/6  cargo package (dry-run)"
+step "6/7  cargo package (dry-run)"
 # Find publishable crates and run package + publish dry-run
 for toml in $(find . -name Cargo.toml -not -path '*/target/*'); do
   if grep -q 'publish\s*=\s*false' "$toml" 2>/dev/null; then
@@ -39,6 +39,9 @@ for toml in $(find . -name Cargo.toml -not -path '*/target/*'); do
   cargo package -p "$crate_name" --allow-dirty
   cargo publish -p "$crate_name" --dry-run --allow-dirty
 done
+
+step "7/7  i18n coverage check"
+bash scripts/check_i18n_coverage.sh
 
 echo ""
 echo "==> All checks passed."
