@@ -80,23 +80,33 @@ async fn auth_middleware(
 /// round-trip.
 async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
     const TEMPLATE: &str = include_str!("../../assets/setup-ui/index.html");
-    // Embed only the `ui.*` subset of the i18n catalog so `t('ui.*')`
-    // calls resolve on the very first render — no async gap, no flash of
-    // raw keys. `cli.*` keys are for the terminal flow and would bloat
-    // the payload (plus their values may contain the hyphenated crate
-    // name `greentic-setup` which must not appear in dashboard copy).
-    const EN_CATALOG_JSON: &str = include_str!("../../i18n/en.json");
-    let full_catalog: serde_json::Value =
-        serde_json::from_str(EN_CATALOG_JSON).unwrap_or(serde_json::json!({}));
-    let ui_strings = full_catalog
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter(|(k, _)| k.starts_with("ui."))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<serde_json::Map<String, serde_json::Value>>()
-        })
-        .unwrap_or_default();
+
+    // Resolve the initial locale: CLI flag wins, fallback to "en".
+    let initial_locale_code = state
+        .launch_options
+        .initial_locale
+        .clone()
+        .unwrap_or_else(|| "en".to_string());
+    let catalog = crate::ui::locales::catalog_for(&initial_locale_code)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // List of every embedded locale code — the topbar locale picker renders
+    // this. Falling back through the list guarantees the picker always has
+    // at least one option.
+    let available_locales: Vec<&'static str> = crate::ui::locales::available_codes();
+
+    let initial_view = if state.should_start_in_wizard() {
+        "wizard"
+    } else {
+        "overview"
+    };
+
+    let prefill_answers = state
+        .launch_options
+        .prefill_answers
+        .clone()
+        .map(serde_json::Value::Object)
+        .unwrap_or(serde_json::Value::Null);
 
     let initial_state = serde_json::json!({
         "bearer_token": state.bearer_token.as_str(),
@@ -108,8 +118,21 @@ async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
             "available_envs": state.bundle.available_envs,
             "available_teams": state.bundle.available_teams,
         },
-        "locale": "en",
-        "strings": serde_json::Value::Object(ui_strings),
+        "locale": initial_locale_code,
+        "available_locales": available_locales,
+        "strings": catalog,
+        "view": initial_view,
+        "scope_from_cli": state.launch_options.scope_from_answers
+            || state.launch_options.prefill_answers.is_some(),
+        "initial_scope": {
+            "tenant": state.launch_options.initial_tenant,
+            "env": state.launch_options.initial_env,
+            "team": state.launch_options.initial_team
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        },
+        "prefill_answers": prefill_answers,
+        "advanced": state.launch_options.advanced,
     });
     let html = TEMPLATE.replacen("{{INITIAL_STATE}}", &initial_state.to_string(), 1);
     (

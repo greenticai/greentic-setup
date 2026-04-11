@@ -14,6 +14,7 @@ fn state_with_token(token: &str) -> Arc<AppState> {
         bearer_token: zeroize::Zeroizing::new(token.to_string()),
         wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
+        launch_options: Default::default(),
     })
 }
 

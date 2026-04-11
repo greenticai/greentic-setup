@@ -201,6 +201,18 @@ pub struct AppState {
     pub bearer_token: zeroize::Zeroizing<String>,
     pub wizard_sessions: std::sync::Mutex<std::collections::HashMap<Uuid, WizardSession>>,
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    pub launch_options: crate::ui::server::LaunchOptions,
+}
+
+impl AppState {
+    /// Whether the first view shown to the user should be the wizard.
+    ///
+    /// Returns true when no scopes are configured yet OR when the user
+    /// provided a `--answers` file (in which case they already know what
+    /// they want and we should jump straight into the form).
+    pub fn should_start_in_wizard(&self) -> bool {
+        self.bundle.scopes.is_empty() || self.launch_options.prefill_answers.is_some()
+    }
 }
 
 #[derive(Debug)]

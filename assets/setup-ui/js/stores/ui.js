@@ -4,6 +4,8 @@ document.addEventListener('alpine:init', () => {
     currentView: 'overview',
     breadcrumb: 'Overview',
     port: 0,
+    availableLocales: ['en'],
+    scopeFromCli: false,
 
     init() {
       // Read initial state injected by the server.
@@ -18,24 +20,29 @@ document.addEventListener('alpine:init', () => {
       }
 
       this.port = initial.port || 0;
+      this.availableLocales = initial.available_locales || ['en'];
+      this.scopeFromCli = !!initial.scope_from_cli;
+      this.advancedMode = !!initial.advanced;
 
       // Boot the API client with the bearer token.
       if (window.api && initial.bearer_token) {
         window.api.boot(initial.bearer_token);
       }
 
-      // Initialize the locale catalog.
+      // Initialize the locale catalog (server already filtered to ui.*).
       if (Alpine.store('locale')) {
         Alpine.store('locale').init(initial.locale || 'en', initial.strings || {});
       }
 
-      // Initialize scope to first available.
+      // Initialize scope. Prefer the CLI-provided initial scope, then the
+      // first value in each allow-list as fallback.
       const bundle = initial.bundle || {};
-      if (Alpine.store('scope') && bundle.available_tenants) {
+      const initialScope = initial.initial_scope || {};
+      if (Alpine.store('scope')) {
         Alpine.store('scope').init(
-          bundle.available_tenants[0] || '',
-          bundle.available_envs?.[0] || '',
-          bundle.available_teams?.[0] || ''
+          initialScope.tenant || bundle.available_tenants?.[0] || '',
+          initialScope.env || bundle.available_envs?.[0] || '',
+          initialScope.team || bundle.available_teams?.[0] || ''
         );
       }
 
@@ -46,6 +53,33 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('bundle').availableTenants = bundle.available_tenants || [];
         Alpine.store('bundle').availableEnvs = bundle.available_envs || [];
         Alpine.store('bundle').availableTeams = bundle.available_teams || [];
+      }
+
+      // Initial view is chosen by the server: "wizard" when no scopes are
+      // configured or when --answers was provided, else "overview".
+      this.currentView = initial.view === 'wizard' ? 'wizard' : 'overview';
+      this.breadcrumb = this.currentView === 'wizard' ? 'Configure scope' : 'Overview';
+
+      // If we're booting into the wizard, kick off a session immediately
+      // with the CLI-seeded scope and any prefill answers.
+      if (this.currentView === 'wizard' && Alpine.store('wizard')) {
+        const scope = Alpine.store('scope');
+        const prefill = initial.prefill_answers || null;
+        // Run on next tick so Alpine has finished registering stores.
+        Promise.resolve().then(() => {
+          Alpine.store('wizard').start(
+            scope.tenant,
+            scope.env,
+            scope.team,
+            null,
+            prefill
+          );
+        });
+      } else if (Alpine.store('overview')) {
+        // On overview, refresh the stats immediately.
+        Promise.resolve().then(() => {
+          Alpine.store('overview').refresh();
+        });
       }
     },
 

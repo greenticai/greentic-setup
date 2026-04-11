@@ -18,6 +18,7 @@ fn app() -> (Router, Arc<AppState>) {
         bearer_token: zeroize::Zeroizing::new("tok".to_string()),
         wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         shutdown_tx: tx,
+        launch_options: Default::default(),
     });
     let router = Router::new()
         .route("/api/locale/{code}", get(get_locale))

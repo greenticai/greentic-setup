@@ -104,8 +104,15 @@
     <!-- Topbar -->
     <div class="topbar">
       <div class="topbar-breadcrumb" x-text="$store.ui.breadcrumb"></div>
-      <button class="btn btn--ghost" @click="$store.locale.code === 'en' ? $store.locale.switch('id') : $store.locale.switch('en')" x-text="$store.locale.code.toUpperCase()"></button>
-      <button class="btn btn--ghost" @click="$store.ui.toggleAdvanced()" x-text="t('ui.topbar.advanced_mode')">Advanced</button>
+      <label style="display:inline-flex;align-items:center;gap:6px">
+        <span class="field-label" style="margin:0;color:var(--fg-muted);font-size:11px" x-text="t('ui.topbar.locale_label')">Language</span>
+        <select class="field-input" style="max-width:120px;padding:6px 10px;font-size:12px" :value="$store.locale.code" @change="$store.locale.switch($event.target.value)">
+          <template x-for="code in $store.ui.availableLocales" :key="code">
+            <option :value="code" :selected="code === $store.locale.code" x-text="code.toUpperCase()"></option>
+          </template>
+        </select>
+      </label>
+      <button class="btn btn--ghost" @click="$store.ui.toggleAdvanced()" :class="$store.ui.advancedMode ? 'btn--primary' : ''" x-text="t('ui.topbar.advanced_mode')">Advanced</button>
       <button class="btn" disabled x-text="t('ui.topbar.no_pending_changes')">No pending changes</button>
     </div>
 
@@ -229,7 +236,17 @@
         <!-- Wizard actions -->
         <div style="display:flex;gap:10px;margin-top:24px;padding-top:20px;border-top:1px solid var(--border);justify-content:space-between">
           <button class="btn" @click="$store.ui.currentView = 'overview'" x-text="t('ui.wizard.btn.back')">&#8592; Back</button>
-          <button class="btn btn--primary" @click="$store.wizard.currentStep >= $store.wizard.totalSteps ? $store.wizard.execute().then(() => $store.ui.currentView = 'overview') : $store.wizard.next($store.wizard.answers)" x-text="$store.wizard.currentStep >= $store.wizard.totalSteps ? t('ui.wizard.btn.finish') : t('ui.wizard.btn.continue')"></button>
+          <button
+            class="btn btn--primary"
+            :disabled="!$store.wizard.canContinue() || $store.wizard.loading"
+            :style="(!$store.wizard.canContinue() || $store.wizard.loading) ? 'opacity:0.5;cursor:not-allowed' : ''"
+            @click="$store.wizard.currentStep >= $store.wizard.totalSteps ? $store.wizard.execute().then(() => $store.ui.currentView = 'overview') : $store.wizard.next($store.wizard.answers)"
+            x-text="$store.wizard.currentStep >= $store.wizard.totalSteps ? t('ui.wizard.btn.finish') : t('ui.wizard.btn.continue')">
+          </button>
+        </div>
+        <!-- Per-field missing indicator -->
+        <div x-show="!$store.wizard.canContinue() && !$store.wizard.loading" style="margin-top:10px;font-size:11px;color:var(--warning)" x-text="t('ui.wizard.required_hint')">
+          Fill in the required fields to continue.
         </div>
       </div>
 

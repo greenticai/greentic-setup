@@ -71,6 +71,7 @@ fn app() -> Router {
         bearer_token: zeroize::Zeroizing::new("tok".to_string()),
         wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
+        launch_options: Default::default(),
     });
     Router::new()
         .route("/api/overview", get(get_overview))

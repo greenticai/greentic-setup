@@ -8,8 +8,9 @@
 
 mod assets;
 pub mod auth;
+mod locales;
 pub mod routes;
-mod server;
+pub mod server;
 mod sse;
 
 pub mod api;
@@ -26,19 +27,30 @@ use serde_json::{Map, Value};
 /// Public launch entry point used by `src/bin/greentic_setup.rs`.
 ///
 /// Signature preserved from the legacy module so the CLI binary compiles
-/// unchanged. The extra arguments (tenant, team, env, advanced, locale,
-/// prefill_answers, scope_from_answers) are currently unused in Phase 1a
-/// — they'll be passed through to the wizard context in Phase 1b.
+/// unchanged. `tenant`, `team`, `env`, and `locale` seed the initial scope
+/// selection shown in the dashboard. `prefill_answers` populates the
+/// wizard form when the user provided a `--answers` file, and
+/// `scope_from_answers` tells the UI to lock the scope dropdowns to the
+/// pre-selected values.
 #[allow(clippy::too_many_arguments)]
 pub async fn launch(
     bundle_path: &Path,
-    _tenant: &str,
-    _team: Option<&str>,
-    _env: &str,
-    _advanced: bool,
-    _locale: Option<&str>,
-    _prefill_answers: Option<Map<String, Value>>,
-    _scope_from_answers: bool,
+    tenant: &str,
+    team: Option<&str>,
+    env: &str,
+    advanced: bool,
+    locale: Option<&str>,
+    prefill_answers: Option<Map<String, Value>>,
+    scope_from_answers: bool,
 ) -> Result<()> {
-    server::launch_v2(bundle_path, routes::build_router).await
+    let options = server::LaunchOptions {
+        initial_tenant: tenant.to_string(),
+        initial_team: team.map(String::from),
+        initial_env: env.to_string(),
+        advanced,
+        initial_locale: locale.map(String::from),
+        prefill_answers,
+        scope_from_answers,
+    };
+    server::launch_v2(bundle_path, options, routes::build_router).await
 }
