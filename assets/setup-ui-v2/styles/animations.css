@@ -1,0 +1,17 @@
+/* Micro-animations. Collapse to 0ms under prefers-reduced-motion via tokens.css. */
+
+.fade-in {
+  animation: fade-in var(--ease-base) both;
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.slide-up {
+  animation: slide-up var(--ease-base) both;
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
