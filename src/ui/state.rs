@@ -73,6 +73,7 @@ pub struct BundleMeta {
     pub extension_providers: Vec<ProviderRef>,
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
 impl BundleMeta {
     /// Fixture used by unit tests — do not use in production code.
     pub fn test_fixture() -> Self {
@@ -194,7 +195,7 @@ impl Drop for ZeroizingAnswers {
 pub struct AppState {
     pub bundle: BundleMeta,
     pub port: u16,
-    pub bearer_token: String,
+    pub bearer_token: zeroize::Zeroizing<String>,
     pub wizard_sessions:
         std::sync::Mutex<std::collections::HashMap<Uuid, WizardSession>>,
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,

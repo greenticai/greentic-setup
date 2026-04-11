@@ -15,6 +15,7 @@ default = ["oci", "squashfs", "ui"]
 ui = ["axum", "axum-extra", "open", "tower-http"]
 oci = ["greentic-distributor-client"]
 squashfs = ["backhand"]
+test-helpers = []
 
 [dependencies]
 aes-gcm-siv = "0.11"

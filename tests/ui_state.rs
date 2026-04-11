@@ -40,16 +40,11 @@ fn validate_scope_rejects_path_traversal_in_env() {
     let bundle = BundleMeta::test_fixture();
     let scope = ScopeKey {
         tenant: "demo".into(),
-        env: "..".into(),
+        env: "../etc".into(),
         team: "default".into(),
     };
     let err = validate_scope(&scope, &bundle).unwrap_err();
-    // env ".." is both unknown-env AND path-traversal. Whichever comes first is fine —
-    // test tolerates both outcomes.
-    assert!(
-        err.code == "scope.invalid_env" || err.code == "scope.path_traversal",
-        "unexpected code: {}", err.code
-    );
+    assert_eq!(err.code, "scope.path_traversal");
 }
 
 #[test]
