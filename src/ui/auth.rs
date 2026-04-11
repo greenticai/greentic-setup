@@ -38,6 +38,9 @@ pub fn verify_auth(
     let provided = headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
+        // Case-sensitive `Bearer ` prefix is intentional: this is a closed
+        // local-only dashboard API, not a general-purpose HTTP service.
+        // Strict matching avoids double-space / mixed-case bypass classes.
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or(AuthError::MissingBearer)?;
 

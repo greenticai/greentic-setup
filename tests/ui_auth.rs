@@ -18,9 +18,12 @@ fn headers(auth: Option<&str>, origin: Option<&str>) -> HeaderMap {
 }
 
 #[test]
-fn generate_bearer_token_is_at_least_32_chars() {
+fn generate_bearer_token_is_exactly_43_chars() {
+    // 32 random bytes → base64-url no-pad → exactly 43 characters.
+    // Locking the length catches accidental encoding changes that would
+    // silently reduce entropy or switch to padded / hex encoding.
     let t = generate_bearer_token();
-    assert!(t.len() >= 32, "token too short: {}", t.len());
+    assert_eq!(t.len(), 43, "token wrong length: {}", t.len());
 }
 
 #[test]
