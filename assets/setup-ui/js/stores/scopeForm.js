@@ -1,0 +1,101 @@
+document.addEventListener('alpine:init', () => {
+  Alpine.store('scopeForm', {
+    loading: false,
+    saving: false,
+    error: null,
+    saveError: null,
+    providers: [],      // [{ id, display_name, form_spec, current_values }]
+    answers: {},        // { provider_id: { field_key: value } }
+    fieldErrors: {},    // { provider_id: { field_key: error_key } }
+
+    async refresh() {
+      this.loading = true;
+      this.error = null;
+      const scope = Alpine.store('scope');
+      try {
+        const data = await window.api.get(
+          '/api/scope/form?tenant=' + encodeURIComponent(scope.tenant) +
+          '&env=' + encodeURIComponent(scope.env) +
+          '&team=' + encodeURIComponent(scope.team)
+        );
+        this.providers = data.providers || [];
+        // Initialize answers from current_values for each provider.
+        const init = {};
+        for (const p of this.providers) {
+          init[p.id] = { ...(p.current_values || {}) };
+        }
+        this.answers = init;
+        this.fieldErrors = {};
+      } catch (err) {
+        this.error = err;
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    fieldValue(providerId, fieldKey) {
+      return (this.answers[providerId] || {})[fieldKey] || '';
+    },
+
+    setFieldValue(providerId, fieldKey, value) {
+      if (!this.answers[providerId]) this.answers[providerId] = {};
+      this.answers[providerId][fieldKey] = value;
+      // Clear field-level error on edit.
+      if (this.fieldErrors[providerId] && this.fieldErrors[providerId][fieldKey]) {
+        delete this.fieldErrors[providerId][fieldKey];
+      }
+    },
+
+    async save() {
+      this.saving = true;
+      this.saveError = null;
+      this.fieldErrors = {};
+      const scope = Alpine.store('scope');
+      try {
+        const data = await window.api.post('/api/scope/form', {
+          scope: { tenant: scope.tenant, env: scope.env, team: scope.team },
+          by_provider: this.answers,
+        });
+        // Refresh overview to reflect new state.
+        if (Alpine.store('overview')) {
+          await Alpine.store('overview').refresh();
+        }
+        // Success — toast component is planned for a later phase.
+        console.info('[scopeForm] saved', data);
+      } catch (err) {
+        this.saveError = err;
+        // If err.fields is populated, distribute to fieldErrors by provider.
+        if (err && err.fields && typeof err.fields === 'object') {
+          for (const k of Object.keys(err.fields)) {
+            // Field keys are formatted as "provider_id.field_key".
+            const dotIdx = k.indexOf('.');
+            if (dotIdx > -1) {
+              const pid = k.substring(0, dotIdx);
+              const fk = k.substring(dotIdx + 1);
+              if (!this.fieldErrors[pid]) this.fieldErrors[pid] = {};
+              this.fieldErrors[pid][fk] = err.fields[k];
+            }
+          }
+        }
+      } finally {
+        this.saving = false;
+      }
+    },
+
+    // Whether all required fields across all providers have non-empty values.
+    canSave() {
+      for (const provider of this.providers) {
+        const pa = this.answers[provider.id] || {};
+        const questions = (provider.form_spec && provider.form_spec.questions) || [];
+        for (const q of questions) {
+          if (q.required) {
+            const v = pa[q.id];
+            if (v === undefined || v === null) return false;
+            if (typeof v === 'string' && v.trim() === '') return false;
+          }
+        }
+      }
+      return true;
+    },
+  });
+});

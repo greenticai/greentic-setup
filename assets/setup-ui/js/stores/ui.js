@@ -61,25 +61,17 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('bundle').availableTeams = bundle.available_teams || [];
       }
 
-      // Initial view is chosen by the server: "wizard" when no scopes are
-      // configured or when --answers was provided, else "overview".
-      this.currentView = initial.view === 'wizard' ? 'wizard' : 'overview';
-      this.breadcrumb = this.currentView === 'wizard' ? 'Configure scope' : 'Overview';
+      // Initial view is chosen by the server:
+      // - "configure" when no scopes are configured or when --answers was provided
+      // - "overview" otherwise
+      // The wizard view has been replaced by the unified Configure view.
+      this.currentView = initial.view === 'configure' ? 'configure' : 'overview';
+      this.breadcrumb = this.currentView === 'configure' ? 'Configure' : 'Overview';
 
-      // If we're booting into the wizard, kick off a session immediately
-      // with the CLI-seeded scope and any prefill answers.
-      if (this.currentView === 'wizard' && Alpine.store('wizard')) {
-        const scope = Alpine.store('scope');
-        const prefill = initial.prefill_answers || null;
-        // Run on next tick so Alpine has finished registering stores.
+      if (this.currentView === 'configure' && Alpine.store('scopeForm')) {
+        // Boot into the Configure view — load FormSpec + current values.
         Promise.resolve().then(() => {
-          Alpine.store('wizard').start(
-            scope.tenant,
-            scope.env,
-            scope.team,
-            null,
-            prefill
-          );
+          Alpine.store('scopeForm').refresh();
         });
       } else if (Alpine.store('overview')) {
         // On overview, refresh the stats immediately.
@@ -112,10 +104,11 @@ document.addEventListener('alpine:init', () => {
     navigate(view) {
       this.currentView = view;
       // Lazy-load the relevant store data.
+      // "secrets" is removed from the SPA nav (merged into "configure").
       const storeMap = {
         overview: 'overview',
+        configure: 'scopeForm',
         providers: 'providers',
-        secrets: 'secrets',
         capabilities: 'capabilities',
       };
       const storeName = storeMap[view];

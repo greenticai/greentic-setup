@@ -267,9 +267,17 @@
   "ui.onboarding.scope_banner_dismiss": "Got it, continue",
   "ui.onboarding.scope_banner_learn_more": "Learn more",
 
+  "ui.sidebar.nav.configure": "Configure",
   "ui.sidebar.nav.providers_active": "Providers",
   "ui.sidebar.nav.secrets_active": "Secrets",
   "ui.sidebar.nav.capabilities_active": "Capabilities",
+
+  "ui.configure.title": "Configure scope",
+  "ui.configure.subtitle": "Editing secrets for",
+  "ui.configure.save_all": "Save",
+  "ui.configure.saving": "Saving...",
+  "ui.configure.loading": "Loading providers...",
+  "ui.configure.no_providers": "No providers found in this bundle. Add provider packs first.",
 
   "ui.secrets.title": "Secrets",
   "ui.secrets.subtitle": "Manage secrets for the active scope",

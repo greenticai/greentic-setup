@@ -7,6 +7,7 @@ pub mod locale;
 pub mod overview;
 pub mod providers;
 pub mod rebuild;
+pub mod scope_form;
 pub mod secrets;
 pub mod secrets_store;
 pub mod wizard;

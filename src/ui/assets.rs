@@ -115,6 +115,11 @@ pub const ASSETS: &[Asset] = &[
         body: include_bytes!("../../assets/setup-ui/js/stores/overview.js"),
     },
     Asset {
+        path: "/js/stores/scopeForm.js",
+        mime: "application/javascript; charset=utf-8",
+        body: include_bytes!("../../assets/setup-ui/js/stores/scopeForm.js"),
+    },
+    Asset {
         path: "/js/stores/wizard.js",
         mime: "application/javascript; charset=utf-8",
         body: include_bytes!("../../assets/setup-ui/js/stores/wizard.js"),

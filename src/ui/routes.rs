@@ -17,6 +17,7 @@ use crate::ui::api::locale::{get_locale, post_shutdown};
 use crate::ui::api::overview::get_overview;
 use crate::ui::api::providers::{delete_provider, get_providers, post_provider};
 use crate::ui::api::rebuild::{get_rebuild_pending, post_rebuild};
+use crate::ui::api::scope_form::{get_scope_form, post_scope_form};
 use crate::ui::api::secrets::{
     delete_secret, get_secrets, post_reveal_secret, post_secret, put_secret,
 };
@@ -56,7 +57,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Rebuild
         .route("/rebuild", post(post_rebuild))
         .route("/rebuild/pending", get(get_rebuild_pending))
-        // Wizard
+        // Unified scope form (Configure view)
+        .route("/scope/form", get(get_scope_form))
+        .route("/scope/form", post(post_scope_form))
+        // Wizard (kept for tests + diagnostic use; not exposed in SPA UI)
         .route("/wizard/start", get(wizard_start))
         .route("/wizard/next", post(wizard_next))
         .route("/wizard/execute", post(wizard_execute))
@@ -118,8 +122,10 @@ async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
     // at least one option.
     let available_locales: Vec<&'static str> = crate::ui::locales::available_codes();
 
+    // First-run (no scopes configured) or pre-filled answers → go directly to Configure.
+    // The wizard view is removed from the SPA; the Configure view serves the same purpose.
     let initial_view = if state.should_start_in_wizard() {
-        "wizard"
+        "configure"
     } else {
         "overview"
     };
