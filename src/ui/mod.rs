@@ -8,6 +8,7 @@
 #![allow(dead_code)] // skeleton modules may have unused items during migration
 
 mod assets;
+mod assets_v2;
 mod legacy;
 
 // New modules — currently empty stubs, filled in by subsequent tasks.
