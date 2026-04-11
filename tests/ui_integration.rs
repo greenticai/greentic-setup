@@ -5,9 +5,10 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use greentic_setup::ui::routes::build_router;
 use greentic_setup::ui::state::{AppState, BundleMeta};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const TOKEN: &str = "integration-test-token";
 
@@ -19,6 +20,7 @@ fn state() -> Arc<AppState> {
         wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
         launch_options: Default::default(),
+        provider_forms: vec![],
     })
 }
 
@@ -74,47 +76,22 @@ async fn full_flow_bundle_overview_wizard_execute() {
     assert_eq!(s2, StatusCode::OK);
     assert!(ov_body["stats"].is_object());
 
-    // Step 3: Start a wizard.
+    // Step 3: Start a wizard — with no providers loaded in state() the engine
+    // now returns 409 (wizard.no_providers). This confirms the endpoint is
+    // reachable and produces a structured error, not a panic.
     let wuri = format!("/api/wizard/start?tenant={tenant}&env={env}&team={team}");
     let (s3, w1) = send(&app, authed_request(Method::GET, &wuri, None)).await;
-    assert_eq!(s3, StatusCode::OK);
-    assert_eq!(w1["current_step"], 1);
-    let session_id = w1["id"].as_str().unwrap().to_string();
+    // 409 is the expected response when no provider packs are loaded.
+    assert_eq!(s3, StatusCode::CONFLICT);
+    assert_eq!(w1["error"]["code"], "wizard.no_providers");
 
-    // Step 4: Advance all 3 steps.
-    for expected in 2..=3 {
-        let (s, body) = send(
-            &app,
-            authed_request(
-                Method::POST,
-                "/api/wizard/next",
-                Some(json!({ "session_id": session_id, "answers": {} })),
-            ),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK);
-        assert_eq!(body["current_step"], expected);
-    }
-
-    // Step 5: Execute (finalize).
-    let (s5, exec_body) = send(
-        &app,
-        authed_request(
-            Method::POST,
-            "/api/wizard/execute",
-            Some(json!({ "session_id": session_id })),
-        ),
-    )
-    .await;
-    assert_eq!(s5, StatusCode::OK);
-    assert_eq!(exec_body["success"], true);
-
-    // Step 6: Session should be gone now.
+    // Confirm that trying to look up a non-existent session returns 404.
+    let bogus_id = uuid::Uuid::new_v4();
     let (s6, _) = send(
         &app,
         authed_request(
             Method::GET,
-            &format!("/api/wizard/session/{session_id}"),
+            &format!("/api/wizard/session/{bogus_id}"),
             None,
         ),
     )

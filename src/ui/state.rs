@@ -193,6 +193,14 @@ impl Drop for ZeroizingAnswers {
     }
 }
 
+/// Provider form data loaded from a discovered pack.
+#[derive(Debug, Clone)]
+pub struct ProviderFormData {
+    pub provider_id: String,
+    pub display_name: String,
+    pub form_spec: qa_spec::FormSpec,
+}
+
 /// Top-level app state shared across Axum handlers.
 #[derive(Debug)]
 pub struct AppState {
@@ -202,6 +210,8 @@ pub struct AppState {
     pub wizard_sessions: std::sync::Mutex<std::collections::HashMap<Uuid, WizardSession>>,
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
     pub launch_options: crate::ui::server::LaunchOptions,
+    /// FormSpecs loaded from discovered provider packs at startup.
+    pub provider_forms: Vec<ProviderFormData>,
 }
 
 impl AppState {
@@ -225,6 +235,11 @@ pub struct WizardSession {
     pub created_at: std::time::Instant,
     pub last_activity: std::time::Instant,
     pub answers: ZeroizingAnswers,
+    /// Ordered list of provider IDs this session covers.
+    /// Length equals `total_steps` (or 1 for single-provider sessions).
+    pub provider_sequence: Vec<String>,
+    /// Answers collected per provider, keyed by provider_id.
+    pub answers_by_provider: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl WizardSession {
@@ -241,6 +256,8 @@ impl WizardSession {
             created_at: now,
             last_activity: now,
             answers: ZeroizingAnswers::default(),
+            provider_sequence: Vec::new(),
+            answers_by_provider: std::collections::HashMap::new(),
         }
     }
 
@@ -262,6 +279,10 @@ pub struct WizardField {
     pub name: String,
     pub field_type: FieldType,
     pub label_key: String,
+    /// Raw label text from FormSpec. When set, the SPA uses this directly
+    /// instead of calling `t(label_key)`, so real question titles come through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_text: Option<String>,
     pub help_key: Option<String>,
     pub placeholder_key: Option<String>,
     pub required: bool,

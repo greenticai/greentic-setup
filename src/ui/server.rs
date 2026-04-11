@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 
 use crate::ui::auth::generate_bearer_token;
-use crate::ui::state::{AppState, BundleMeta};
+use crate::ui::state::{AppState, BundleMeta, ProviderFormData, ProviderRef, ScopeKey, ScopeStatus, ScopeSummary};
 
 /// Options plumbed from the CLI binary through `ui::launch` into the
 /// dashboard server. These seed the initial state injected into the SPA.
@@ -27,21 +27,9 @@ pub struct LaunchOptions {
     pub scope_from_answers: bool,
 }
 
-/// Stub bundle discovery. Replaced by a later task with real pack + scope
-/// loading.
-///
-/// Produces a minimal `BundleMeta` so the server can start. Real scopes,
-/// providers, and secrets integration happens during post-Phase-1a polish.
-/// The initial tenant/env/team values from `LaunchOptions` are seeded into
-/// the allow-lists so the wizard can validate them immediately.
-fn discover_bundle_stub(bundle_path: &Path, options: &LaunchOptions) -> Result<BundleMeta> {
-    let id = bundle_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("bundle")
-        .to_string();
-    let display_name = id
-        .split('-')
+/// Derive a title-cased display name from a kebab-case bundle id.
+fn title_case_id(id: &str) -> String {
+    id.split('-')
         .map(|w| {
             let mut chars = w.chars();
             match chars.next() {
@@ -50,35 +38,226 @@ fn discover_bundle_stub(bundle_path: &Path, options: &LaunchOptions) -> Result<B
             }
         })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
 
-    // Seed allow-lists with the CLI-supplied scope so validate_scope accepts
-    // the initial wizard submission. Defaults are added as well so the
-    // scope switcher has something to show in the empty-bundle case.
-    let mut tenants = vec![options.initial_tenant.clone()];
-    if !tenants.iter().any(|t| t == "default") {
-        tenants.push("default".into());
+/// Scan configured scopes by probing the secrets store for any secrets.
+///
+/// For each (tenant, env, team) triple, if any secret exists in the store
+/// for that scope, the scope is marked `Configured`, otherwise `NotConfigured`.
+fn scan_configured_scopes(
+    bundle_path: &Path,
+    tenants: &[String],
+    envs: &[String],
+    teams: &[String],
+    providers: &[crate::discovery::DetectedProvider],
+    form_specs: &[ProviderFormData],
+) -> Vec<ScopeSummary> {
+    use greentic_secrets_lib::SecretsStore;
+
+    // Open the dev store — if it doesn't exist yet, return empty scopes (not configured).
+    let store = match crate::secrets::open_dev_store(bundle_path) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return vec![],
+    };
+
+    let mut summaries = Vec::new();
+
+    for tenant in tenants {
+        for env in envs {
+            for team in teams {
+                // Check if any secret exists for this scope.
+                let has_any_secret = form_specs.iter().any(|pf| {
+                    pf.form_spec.questions.iter().any(|q| {
+                        let uri = crate::canonical_secret_uri(
+                            env,
+                            tenant,
+                            Some(team.as_str()),
+                            &pf.provider_id,
+                            &q.id,
+                        );
+                        rt.block_on(store.get(&uri))
+                            .map(|b| !b.is_empty())
+                            .unwrap_or(false)
+                    })
+                });
+
+                let status = if has_any_secret {
+                    ScopeStatus::Configured
+                } else {
+                    ScopeStatus::NotConfigured
+                };
+
+                // Build provider status list from discovered providers.
+                let provider_statuses = providers
+                    .iter()
+                    .filter_map(|p| {
+                        form_specs
+                            .iter()
+                            .find(|pf| pf.provider_id == p.provider_id)
+                            .map(|pf| {
+                                let secrets_count = pf
+                                    .form_spec
+                                    .questions
+                                    .iter()
+                                    .filter(|q| {
+                                        let uri = crate::canonical_secret_uri(
+                                            env,
+                                            tenant,
+                                            Some(team.as_str()),
+                                            &p.provider_id,
+                                            &q.id,
+                                        );
+                                        rt.block_on(store.get(&uri))
+                                            .map(|b| !b.is_empty())
+                                            .unwrap_or(false)
+                                    })
+                                    .count() as u32;
+                                let configured = secrets_count > 0;
+                                crate::ui::state::ProviderStatus {
+                                    id: p.provider_id.clone(),
+                                    display_name: pf.display_name.clone(),
+                                    configured,
+                                    secrets_count,
+                                    warnings: vec![],
+                                }
+                            })
+                    })
+                    .collect();
+
+                summaries.push(ScopeSummary {
+                    scope: ScopeKey {
+                        tenant: tenant.clone(),
+                        env: env.clone(),
+                        team: team.clone(),
+                    },
+                    status,
+                    providers: provider_statuses,
+                    warnings: vec![],
+                });
+            }
+        }
     }
+
+    // Keep only scopes that are actually configured or have providers.
+    summaries
+        .into_iter()
+        .filter(|s| !matches!(s.status, ScopeStatus::NotConfigured))
+        .collect()
+}
+
+/// Discover the bundle at `bundle_path`, returning a `BundleMeta` and the
+/// list of provider FormSpecs.
+///
+/// On discovery failure (missing/malformed bundle), returns a minimal
+/// `BundleMeta` with empty scopes and providers so the UI can still render.
+pub fn discover_bundle(
+    bundle_path: &Path,
+    options: &LaunchOptions,
+) -> Result<(BundleMeta, Vec<ProviderFormData>)> {
+    let id = bundle_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("bundle")
+        .to_string();
+    let display_name = title_case_id(&id);
+
+    // Discover tenants from the bundle's tenants/ directory.
+    let discovered_tenants = crate::bundle::discover_tenants(bundle_path, None).unwrap_or_default();
+    let tenants: Vec<String> = {
+        let mut t = if discovered_tenants.is_empty() {
+            vec![options.initial_tenant.clone()]
+        } else {
+            discovered_tenants
+        };
+        // Always include the CLI-supplied initial tenant so validate_scope accepts it.
+        if !t.contains(&options.initial_tenant) {
+            t.push(options.initial_tenant.clone());
+        }
+        if !t.contains(&"default".to_string()) {
+            t.push("default".into());
+        }
+        t.sort();
+        t.dedup();
+        t
+    };
+
+    // Envs: CLI-supplied + well-known defaults, deduped.
     let mut envs = vec![options.initial_env.clone()];
-    if !envs.iter().any(|e| e == "dev") {
-        envs.push("dev".into());
+    for e in &["dev", "staging", "prod"] {
+        let s = e.to_string();
+        if !envs.contains(&s) {
+            envs.push(s);
+        }
     }
-    let team = options.initial_team.clone().unwrap_or_else(|| "default".into());
-    let mut teams = vec![team];
-    if !teams.iter().any(|t| t == "default") {
+
+    // Teams: CLI-supplied team or "default".
+    let initial_team = options.initial_team.clone().unwrap_or_else(|| "default".into());
+    let mut teams = vec![initial_team];
+    if !teams.contains(&"default".to_string()) {
         teams.push("default".into());
     }
 
-    Ok(BundleMeta {
+    // Discover providers. On failure, continue with empty list.
+    let (detected_providers, form_specs) =
+        match crate::discovery::discover(bundle_path) {
+            Ok(discovery) => {
+                let forms: Vec<ProviderFormData> = discovery
+                    .providers
+                    .iter()
+                    .filter_map(|p| {
+                        crate::setup_to_formspec::pack_to_form_spec(
+                            &p.pack_path,
+                            &p.provider_id,
+                        )
+                        .map(|form_spec| ProviderFormData {
+                            provider_id: p.provider_id.clone(),
+                            display_name: p
+                                .display_name
+                                .clone()
+                                .unwrap_or_else(|| title_case_id(&p.provider_id)),
+                            form_spec,
+                        })
+                    })
+                    .collect();
+                (discovery.providers, forms)
+            }
+            Err(_) => (vec![], vec![]),
+        };
+
+    let extension_providers: Vec<ProviderRef> = detected_providers
+        .iter()
+        .map(|p| ProviderRef {
+            oci: format!("local:{}", p.provider_id),
+        })
+        .collect();
+
+    let scopes = scan_configured_scopes(
+        bundle_path,
+        &tenants,
+        &envs,
+        &teams,
+        &detected_providers,
+        &form_specs,
+    );
+
+    let meta = BundleMeta {
         id,
         display_name,
         path: bundle_path.to_path_buf(),
-        scopes: vec![],
+        scopes,
         available_tenants: tenants,
         available_envs: envs,
         available_teams: teams,
-        extension_providers: vec![],
-    })
+        extension_providers,
+    };
+
+    Ok((meta, form_specs))
 }
 
 /// Launch the Phase 1a dashboard server.
@@ -97,7 +276,7 @@ pub async fn launch_v2<F>(
 where
     F: FnOnce(Arc<AppState>) -> axum::Router,
 {
-    let bundle = discover_bundle_stub(bundle_path, &options)
+    let (bundle, provider_forms) = discover_bundle(bundle_path, &options)
         .context("failed to discover bundle for dashboard")?;
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -118,6 +297,7 @@ where
         wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         shutdown_tx: shutdown_tx.clone(),
         launch_options: options,
+        provider_forms,
     });
 
     let router = build_router(state.clone());
@@ -154,28 +334,30 @@ mod tests {
     }
 
     #[test]
-    fn discover_bundle_stub_produces_title_case_display_name() {
+    fn discover_bundle_produces_title_case_display_name() {
         let path = PathBuf::from("/tmp/my-bundle-name");
-        let bundle = discover_bundle_stub(&path, &default_options()).unwrap();
+        // Non-existent path → discovery falls back gracefully with empty providers.
+        let (bundle, forms) = discover_bundle(&path, &default_options()).unwrap();
         assert_eq!(bundle.id, "my-bundle-name");
         assert_eq!(bundle.display_name, "My Bundle Name");
+        assert!(forms.is_empty());
     }
 
     #[test]
-    fn discover_bundle_stub_handles_single_word_name() {
+    fn discover_bundle_handles_single_word_name() {
         let path = PathBuf::from("/tmp/demo");
-        let bundle = discover_bundle_stub(&path, &default_options()).unwrap();
+        let (bundle, _) = discover_bundle(&path, &default_options()).unwrap();
         assert_eq!(bundle.display_name, "Demo");
     }
 
     #[test]
-    fn discover_bundle_stub_seeds_cli_scope_into_allow_list() {
+    fn discover_bundle_seeds_cli_scope_into_allow_list() {
         let path = PathBuf::from("/tmp/demo");
         let mut opts = default_options();
         opts.initial_tenant = "acme-corp".into();
         opts.initial_env = "prod".into();
         opts.initial_team = Some("platform".into());
-        let bundle = discover_bundle_stub(&path, &opts).unwrap();
+        let (bundle, _) = discover_bundle(&path, &opts).unwrap();
         assert!(bundle.available_tenants.contains(&"acme-corp".to_string()));
         assert!(bundle.available_tenants.contains(&"default".to_string()));
         assert!(bundle.available_envs.contains(&"prod".to_string()));

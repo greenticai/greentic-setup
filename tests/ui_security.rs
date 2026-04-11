@@ -20,6 +20,7 @@ fn state() -> Arc<AppState> {
         wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
         launch_options: Default::default(),
+        provider_forms: vec![],
     })
 }
 

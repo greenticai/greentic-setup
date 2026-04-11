@@ -19,6 +19,7 @@ fn app() -> (Router, Arc<AppState>) {
         wizard_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         shutdown_tx: tx,
         launch_options: Default::default(),
+        provider_forms: vec![],
     });
     let router = Router::new()
         .route("/api/locale/{code}", get(get_locale))

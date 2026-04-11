@@ -200,7 +200,7 @@
         <!-- Field renderer -->
         <template x-for="(field, fi) in ($store.wizard.step ? $store.wizard.step.fields : [])" :key="fi">
           <div class="field">
-            <label class="field-label" :data-required="field.required ? '' : null" x-text="t(field.label_key)"></label>
+            <label class="field-label" :data-required="field.required ? '' : null" x-text="field.label_text || t(field.label_key)"></label>
 
             <!-- Text / Password -->
             <template x-if="field.field_type === 'text' || field.field_type === 'password'">

@@ -255,5 +255,9 @@
   "ui.error.locale_not_found": "Locale catalog not found.",
   "ui.error.required_fields_missing": "Please fill in the required fields.",
   "ui.topbar.locale_label": "Language",
-  "ui.wizard.required_hint": "Fill in the required fields to continue."
+  "ui.wizard.required_hint": "Fill in the required fields to continue.",
+  "ui.error.no_providers": "No providers found in this bundle. Add provider packs before running setup.",
+  "ui.error.provider_not_found": "The requested provider was not found in this bundle.",
+  "ui.error.validation_failed": "Some fields are invalid. Please check your answers.",
+  "ui.error.execute_failed": "Setup execution failed. Check the error details and try again."
 }
