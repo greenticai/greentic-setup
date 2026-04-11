@@ -14,7 +14,7 @@ mod legacy;
 // Each stays private until the cutover task rewires `launch`.
 pub mod auth;
 mod server;
-mod routes;
+pub mod routes;
 pub mod state;
 mod sse;
 pub mod api;
