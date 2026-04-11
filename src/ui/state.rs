@@ -234,3 +234,54 @@ impl WizardSession {
         self.last_activity.elapsed() > Self::TTL
     }
 }
+
+/// Wizard step rendered to the SPA. All labels are i18n keys.
+#[derive(Debug, Clone, Serialize)]
+pub struct WizardStep {
+    pub title_key: String,
+    pub description_key: Option<String>,
+    pub fields: Vec<WizardField>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WizardField {
+    pub name: String,
+    pub field_type: FieldType,
+    pub label_key: String,
+    pub help_key: Option<String>,
+    pub placeholder_key: Option<String>,
+    pub required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_if: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<FieldOption>,
+    pub default_value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldType {
+    Text,
+    Password,
+    Select,
+    Switch,
+    Textarea,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldOption {
+    pub value: String,
+    pub label_key: String,
+}
+
+/// View DTO for `GET /api/wizard/session/:id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WizardSessionView {
+    pub id: uuid::Uuid,
+    pub scope: ScopeKey,
+    pub provider: Option<String>,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub step: Option<WizardStep>, // None if done
+    pub answers_so_far: serde_json::Value,
+}
