@@ -193,7 +193,8 @@
             <span class="scope-card-path" x-text="$store.scopeForm.currentProvider() ? $store.scopeForm.currentProvider().id : ''"></span>
           </div>
 
-          <!-- Current provider's form fields -->
+          <!-- Current provider's form fields (2-column grid on wide screens) -->
+          <div class="form-grid">
           <template x-for="question in ($store.scopeForm.currentProvider() ? $store.scopeForm.currentProvider().form_spec.questions : [])" :key="question.id">
             <div class="field">
               <label class="field-label" :data-required="question.required ? '' : null" x-text="question.title"></label>
@@ -245,6 +246,7 @@
               ></div>
             </div>
           </template>
+          </div><!-- /.form-grid -->
         </div>
       </template>
 
