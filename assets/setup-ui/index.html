@@ -41,48 +41,6 @@
       </div>
     </div>
 
-    <!-- Scope switcher: 3 native selects (tenant / env / team).
-         Native <select> is used for keyboard accessibility and
-         zero-custom-dropdown-logic. Styled via .scope-select to match
-         the sidebar aesthetic. -->
-    <div class="sidebar-scope">
-      <div class="sidebar-scope-label">
-        <span x-text="t('ui.sidebar.scope_label')">Scope</span>
-        <span class="info-icon" :title="t('ui.sidebar.scope_tooltip')" aria-label="Scope information">&#9432;</span>
-      </div>
-      <div class="sidebar-scope-subtitle" x-text="t('ui.sidebar.scope_subtitle')">Active context for all operations</div>
-
-      <label class="scope-dropdown active">
-        <span class="hint" x-text="t('ui.scope.tenant_label')">tenant</span>
-        <select class="scope-select" :value="$store.scope.tenant" @change="$store.scope.set($event.target.value, $store.scope.env, $store.scope.team)">
-          <template x-for="t in $store.bundle.availableTenants" :key="t">
-            <option :value="t" :selected="t === $store.scope.tenant" x-text="t"></option>
-          </template>
-        </select>
-        <span class="caret" aria-hidden="true">&#9662;</span>
-      </label>
-
-      <label class="scope-dropdown">
-        <span class="hint" x-text="t('ui.scope.env_label')">env</span>
-        <select class="scope-select" :value="$store.scope.env" @change="$store.scope.set($store.scope.tenant, $event.target.value, $store.scope.team)">
-          <template x-for="e in $store.bundle.availableEnvs" :key="e">
-            <option :value="e" :selected="e === $store.scope.env" x-text="e"></option>
-          </template>
-        </select>
-        <span class="caret" aria-hidden="true">&#9662;</span>
-      </label>
-
-      <label class="scope-dropdown">
-        <span class="hint" x-text="t('ui.scope.team_label')">team</span>
-        <select class="scope-select" :value="$store.scope.team" @change="$store.scope.set($store.scope.tenant, $store.scope.env, $event.target.value)">
-          <template x-for="tm in $store.bundle.availableTeams" :key="tm">
-            <option :value="tm" :selected="tm === $store.scope.team" x-text="tm"></option>
-          </template>
-        </select>
-        <span class="caret" aria-hidden="true">&#9662;</span>
-      </label>
-    </div>
-
     <!-- Nav -->
     <nav class="sidebar-nav">
       <div class="sidebar-nav-label" x-text="t('ui.sidebar.nav.manage_label')">Manage</div>
@@ -90,11 +48,6 @@
       <div class="nav-item" :class="$store.ui.currentView === 'overview' ? 'active' : ''" @click="$store.ui.navigate('overview')">
         <span class="ico"></span>
         <span x-text="t('ui.sidebar.nav.overview')">Overview</span>
-      </div>
-
-      <div class="nav-item" :class="$store.ui.currentView === 'configure' ? 'active' : ''" @click="$store.ui.navigate('configure')">
-        <span class="ico"></span>
-        <span x-text="t('ui.sidebar.nav.configure')">Configure</span>
       </div>
 
       <div class="nav-item" :class="$store.ui.currentView === 'providers' ? 'active' : ''" @click="$store.ui.navigate('providers')">
@@ -140,9 +93,9 @@
           <h2 style="font-size:24px;font-weight:600" x-text="t('ui.overview.welcome_title')">Welcome back</h2>
           <p style="color:var(--fg-muted);margin-top:4px" x-text="t('ui.overview.welcome_summary', { count: $store.overview.stats.scopes_count, warnings: $store.overview.stats.warnings_count })">&#8212;</p>
         </div>
-        <button class="btn btn--primary" @click="$store.ui.navigate('configure')">
+        <button class="btn btn--primary" @click="$store.ui.showAddScopeModal = true">
           <span>+</span>
-          <span x-text="t('ui.overview.add_scope_btn')">Add tenant</span>
+          <span x-text="t('ui.overview.add_scope_btn')">Add new scope</span>
         </button>
       </div>
 
@@ -173,13 +126,14 @@
       </div>
 
       <template x-for="(s, i) in $store.overview.scopes" :key="i">
-        <div class="scope-card" :class="i === 0 ? 'active' : ''">
+        <div class="scope-card" :class="i === 0 ? 'active' : ''" style="cursor:pointer" @click="$store.ui.openConfigure(s.scope)">
           <div class="scope-card-head">
             <span class="scope-card-title" x-text="s.scope.tenant + ' / ' + s.scope.env"></span>
             <span x-show="i === 0" style="color:var(--brand);font-size:10px" x-text="'&#8212; ' + t('ui.overview.scope_card.active_label')"></span>
             <span class="scope-card-path" x-text="'team=' + s.scope.team"></span>
+            <span style="margin-inline-start:auto;color:var(--fg-dim);font-size:10px" x-text="t('ui.configure.click_to_edit')"></span>
           </div>
-          <div>
+          <div @click.stop>
             <template x-for="(p, pi) in s.providers" :key="pi">
               <span class="provider-chip" :class="p.configured ? 'ok' : 'warn'" x-text="p.display_name"></span>
             </template>
@@ -201,22 +155,24 @@
     <!-- ==================== CONFIGURE VIEW ==================== -->
     <div class="content" x-show="$store.ui.currentView === 'configure'" x-cloak>
 
-      <!-- Header: scope reminder + Save button -->
-      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:24px">
-        <div>
-          <h2 style="font-size:24px;font-weight:600" x-text="t('ui.configure.title')">Configure scope</h2>
-          <p style="color:var(--fg-muted);margin-top:4px">
-            <span x-text="t('ui.configure.subtitle')">Editing secrets for</span>
-            <strong x-text="$store.scope.tenant + ' / ' + $store.scope.env + ' / ' + $store.scope.team"></strong>
-          </p>
+      <!-- Top bar: back link + step label + scope reminder -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+        <div style="display:flex;align-items:center;gap:12px">
+          <button class="btn btn--ghost" @click="$store.ui.currentView = 'overview'">
+            <span x-text="t('ui.configure.back_to_overview')">← Back to Overview</span>
+          </button>
+          <span style="color:var(--fg-muted);font-size:11px" x-text="t('ui.configure.step_label', { current: $store.scopeForm.currentStep + 1, total: $store.scopeForm.totalSteps })"></span>
         </div>
-        <button
-          class="btn btn--primary"
-          :disabled="$store.scopeForm.saving || !$store.scopeForm.canSave()"
-          :style="($store.scopeForm.saving || !$store.scopeForm.canSave()) ? 'opacity:0.5;cursor:not-allowed' : ''"
-          @click="$store.scopeForm.save()"
-          x-text="$store.scopeForm.saving ? t('ui.configure.saving') : t('ui.configure.save_all')"
-        >Save</button>
+        <div style="color:var(--fg-muted);font-size:11px">
+          <span x-text="$store.scope.tenant + ' / ' + $store.scope.env + ' / ' + $store.scope.team"></span>
+        </div>
+      </div>
+
+      <!-- Step progress bar -->
+      <div style="display:flex;gap:6px;margin-bottom:24px">
+        <template x-for="i in $store.scopeForm.totalSteps" :key="i">
+          <div :style="'flex:1;height:3px;border-radius:999px;background:' + (i - 1 <= $store.scopeForm.currentStep ? 'var(--brand)' : 'var(--border)')"></div>
+        </template>
       </div>
 
       <!-- Loading state -->
@@ -228,15 +184,17 @@
       <!-- Empty state -->
       <div x-show="!$store.scopeForm.loading && !$store.scopeForm.error && $store.scopeForm.providers.length === 0" class="empty-row" x-text="t('ui.configure.no_providers')">No providers found in this bundle.</div>
 
-      <!-- Per-provider sections -->
-      <template x-for="provider in $store.scopeForm.providers" :key="provider.id">
-        <div class="scope-card" style="margin-bottom:16px">
-          <div class="scope-card-head" style="margin-bottom:14px">
-            <span class="scope-card-title" x-text="provider.display_name"></span>
-            <span class="scope-card-path" x-text="provider.id"></span>
+      <!-- Current provider step -->
+      <template x-if="!$store.scopeForm.loading && !$store.scopeForm.isReviewStep()">
+        <div>
+          <!-- Current provider header -->
+          <div class="scope-card-head" style="margin-bottom:16px">
+            <span class="scope-card-title" style="font-size:18px" x-text="$store.scopeForm.currentProvider() ? $store.scopeForm.currentProvider().display_name : ''"></span>
+            <span class="scope-card-path" x-text="$store.scopeForm.currentProvider() ? $store.scopeForm.currentProvider().id : ''"></span>
           </div>
 
-          <template x-for="question in (provider.form_spec.questions || [])" :key="question.id">
+          <!-- Current provider's form fields -->
+          <template x-for="question in ($store.scopeForm.currentProvider() ? $store.scopeForm.currentProvider().form_spec.questions : [])" :key="question.id">
             <div class="field">
               <label class="field-label" :data-required="question.required ? '' : null" x-text="question.title"></label>
               <p x-show="question.description" style="color:var(--fg-muted);font-size:11px;margin-bottom:6px" x-text="question.description || ''"></p>
@@ -246,8 +204,8 @@
                 <input
                   class="field-input"
                   :type="question.secret ? 'password' : 'text'"
-                  :value="$store.scopeForm.fieldValue(provider.id, question.id)"
-                  @input="$store.scopeForm.setFieldValue(provider.id, question.id, $event.target.value)"
+                  :value="$store.scopeForm.fieldValue($store.scopeForm.currentProvider().id, question.id)"
+                  @input="$store.scopeForm.setFieldValue($store.scopeForm.currentProvider().id, question.id, $event.target.value)"
                   :autocomplete="question.secret ? 'off' : 'on'"
                   :spellcheck="question.secret ? 'false' : 'true'"
                 >
@@ -257,8 +215,8 @@
               <template x-if="question.choices && question.choices.length > 0">
                 <select
                   class="field-input"
-                  :value="$store.scopeForm.fieldValue(provider.id, question.id)"
-                  @change="$store.scopeForm.setFieldValue(provider.id, question.id, $event.target.value)"
+                  :value="$store.scopeForm.fieldValue($store.scopeForm.currentProvider().id, question.id)"
+                  @change="$store.scopeForm.setFieldValue($store.scopeForm.currentProvider().id, question.id, $event.target.value)"
                 >
                   <option value="">--</option>
                   <template x-for="choice in question.choices" :key="choice">
@@ -272,8 +230,8 @@
                 <label style="display:inline-flex;align-items:center;gap:8px">
                   <input
                     type="checkbox"
-                    :checked="$store.scopeForm.fieldValue(provider.id, question.id) === 'true' || $store.scopeForm.fieldValue(provider.id, question.id) === true"
-                    @change="$store.scopeForm.setFieldValue(provider.id, question.id, $event.target.checked)"
+                    :checked="$store.scopeForm.fieldValue($store.scopeForm.currentProvider().id, question.id) === 'true' || $store.scopeForm.fieldValue($store.scopeForm.currentProvider().id, question.id) === true"
+                    @change="$store.scopeForm.setFieldValue($store.scopeForm.currentProvider().id, question.id, $event.target.checked)"
                   >
                   <span x-text="t('ui.field.switch.enabled')">Enabled</span>
                 </label>
@@ -281,17 +239,85 @@
 
               <!-- Field error -->
               <div
-                x-show="$store.scopeForm.fieldErrors[provider.id] && $store.scopeForm.fieldErrors[provider.id][question.id]"
+                x-show="$store.scopeForm.fieldErrors[$store.scopeForm.currentProvider().id] && $store.scopeForm.fieldErrors[$store.scopeForm.currentProvider().id][question.id]"
                 style="color:var(--danger);font-size:11px;margin-top:6px"
-                x-text="$store.scopeForm.fieldErrors[provider.id] && $store.scopeForm.fieldErrors[provider.id][question.id] ? t($store.scopeForm.fieldErrors[provider.id][question.id].key || 'ui.error.unknown') : ''"
+                x-text="$store.scopeForm.fieldErrors[$store.scopeForm.currentProvider().id] && $store.scopeForm.fieldErrors[$store.scopeForm.currentProvider().id][question.id] ? t($store.scopeForm.fieldErrors[$store.scopeForm.currentProvider().id][question.id].key || 'ui.error.unknown') : ''"
               ></div>
             </div>
           </template>
         </div>
       </template>
 
+      <!-- Review step -->
+      <template x-if="!$store.scopeForm.loading && $store.scopeForm.isReviewStep()">
+        <div>
+          <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.configure.review_title')">Review your configuration</h3>
+          <p style="color:var(--fg-muted);margin-bottom:20px" x-text="t('ui.configure.review_subtitle')">Review the values you've entered before saving.</p>
+
+          <template x-for="provider in $store.scopeForm.providers" :key="provider.id">
+            <div class="scope-card" style="margin-bottom:12px">
+              <div class="scope-card-head">
+                <span class="scope-card-title" x-text="provider.display_name"></span>
+              </div>
+              <template x-for="question in (provider.form_spec.questions || [])" :key="question.id">
+                <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-subtle);font-size:12px">
+                  <span style="color:var(--fg-muted)" x-text="question.title"></span>
+                  <span style="font-family:var(--font-mono);color:var(--fg)" x-text="$store.scopeForm.displayValue(provider.id, question.id, question.secret)"></span>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <!-- Navigation buttons -->
+      <div x-show="!$store.scopeForm.loading && $store.scopeForm.providers.length > 0" style="display:flex;gap:10px;margin-top:24px;padding-top:20px;border-top:1px solid var(--border);justify-content:space-between">
+        <button
+          class="btn"
+          :disabled="$store.scopeForm.currentStep === 0"
+          :style="$store.scopeForm.currentStep === 0 ? 'opacity:0.5;cursor:not-allowed' : ''"
+          @click="$store.scopeForm.prevStep()"
+          x-text="t('ui.configure.btn.back')">← Back</button>
+        <button
+          class="btn btn--primary"
+          :disabled="!$store.scopeForm.canAdvance() || $store.scopeForm.saving"
+          :style="(!$store.scopeForm.canAdvance() || $store.scopeForm.saving) ? 'opacity:0.5;cursor:not-allowed' : ''"
+          @click="$store.scopeForm.isReviewStep() ? $store.scopeForm.save().then(() => { if (!$store.scopeForm.saveError) $store.ui.currentView = 'overview' }) : $store.scopeForm.nextStep()"
+          x-text="$store.scopeForm.isReviewStep() ? ($store.scopeForm.saving ? t('ui.configure.saving') : t('ui.configure.save_all')) : t('ui.configure.btn.continue')">Continue →</button>
+      </div>
+
       <!-- Save error -->
       <div x-show="$store.scopeForm.saveError" class="empty-row" style="color:var(--danger);margin-top:12px" x-text="$store.scopeForm.saveError ? t($store.scopeForm.saveError.key || 'ui.error.unknown') : ''"></div>
+    </div>
+
+    <!-- ==================== ADD SCOPE MODAL ==================== -->
+    <div x-show="$store.ui.showAddScopeModal" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
+      <div style="background:var(--surface);border-radius:10px;padding:28px;min-width:460px;max-width:560px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+        <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.configure.add_scope_title')">Add new scope</h3>
+        <p style="color:var(--fg-muted);font-size:12px;margin-bottom:16px" x-text="t('ui.configure.add_scope_subtitle')">Enter the tenant, environment, and team for the new scope.</p>
+
+        <div class="field">
+          <label class="field-label" data-required="" x-text="t('ui.scope.tenant_label')">tenant</label>
+          <input class="field-input" type="text" x-model="$store.ui.newScope.tenant" placeholder="e.g. acme-corp">
+        </div>
+        <div class="field">
+          <label class="field-label" data-required="" x-text="t('ui.scope.env_label')">env</label>
+          <input class="field-input" type="text" x-model="$store.ui.newScope.env" placeholder="e.g. prod">
+        </div>
+        <div class="field">
+          <label class="field-label" data-required="" x-text="t('ui.scope.team_label')">team</label>
+          <input class="field-input" type="text" x-model="$store.ui.newScope.team" placeholder="e.g. default">
+        </div>
+
+        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
+          <button class="btn btn--ghost" @click="$store.ui.showAddScopeModal = false; $store.ui.newScope = { tenant: '', env: '', team: '' }" x-text="t('ui.secrets.cancel')">Cancel</button>
+          <button
+            class="btn btn--primary"
+            :disabled="!$store.ui.newScope.tenant.trim() || !$store.ui.newScope.env.trim() || !$store.ui.newScope.team.trim()"
+            @click="$store.ui.confirmAddScope()"
+            x-text="t('ui.configure.btn.continue')">Continue →</button>
+        </div>
+      </div>
     </div>
 
     <!-- ==================== PROVIDERS VIEW ==================== -->

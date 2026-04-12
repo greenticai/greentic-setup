@@ -121,38 +121,49 @@ impl ValidationError {
     }
 }
 
-/// Validate a `ScopeKey` against the bundle's allow-list.
+/// Validate a `ScopeKey` for well-formedness.
 ///
-/// Rejects unknown tenant/env/team names and any component containing
-/// path-traversal characters (`..`, `/`, `\`).
-pub fn validate_scope(scope: &ScopeKey, bundle: &BundleMeta) -> Result<(), ValidationError> {
-    // Path traversal check runs first so malicious inputs that happen to match
-    // the allow-list (e.g. a team literally named "a/b") are still rejected.
-    for part in [&scope.tenant, &scope.env, &scope.team] {
+/// Enforces:
+/// - Non-empty tenant/env/team.
+/// - Max 64 characters per component.
+/// - Path-traversal rejection (`..`, `/`, `\`) — security-critical.
+/// - Only ASCII alphanumerics, hyphens, and underscores (keeps URIs clean).
+///
+/// The allow-list check has been removed: scope components no longer need to
+/// match the bundle's pre-existing tenant/env/team lists, enabling users to
+/// create new scopes directly from the UI.
+pub fn validate_scope(scope: &ScopeKey, _bundle: &BundleMeta) -> Result<(), ValidationError> {
+    for (part, name) in [
+        (&scope.tenant, "tenant"),
+        (&scope.env, "env"),
+        (&scope.team, "team"),
+    ] {
+        if part.is_empty() {
+            return Err(ValidationError::new(
+                &format!("scope.empty_{name}"),
+                &format!("ui.error.scope_{name}_empty"),
+            ));
+        }
+        if part.len() > 64 {
+            return Err(ValidationError::new(
+                &format!("scope.{name}_too_long"),
+                "ui.error.scope_too_long",
+            ));
+        }
+        // Path traversal check — security-critical, always enforced.
         if part.contains("..") || part.contains('/') || part.contains('\\') {
             return Err(ValidationError::new(
                 "scope.path_traversal",
                 "ui.error.scope_invalid",
             ));
         }
-    }
-    if !bundle.available_tenants.iter().any(|t| t == &scope.tenant) {
-        return Err(ValidationError::new(
-            "scope.invalid_tenant",
-            "ui.error.invalid_tenant",
-        ));
-    }
-    if !bundle.available_envs.iter().any(|e| e == &scope.env) {
-        return Err(ValidationError::new(
-            "scope.invalid_env",
-            "ui.error.invalid_env",
-        ));
-    }
-    if !bundle.available_teams.iter().any(|t| t == &scope.team) {
-        return Err(ValidationError::new(
-            "scope.invalid_team",
-            "ui.error.invalid_team",
-        ));
+        // Only allow alphanumeric + hyphen + underscore to keep URIs clean.
+        if !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(ValidationError::new(
+                &format!("scope.{name}_invalid_chars"),
+                "ui.error.scope_invalid",
+            ));
+        }
     }
     Ok(())
 }

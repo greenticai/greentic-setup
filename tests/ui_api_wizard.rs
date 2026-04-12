@@ -149,19 +149,19 @@ async fn start_with_one_provider_creates_session() {
     assert_eq!(field["required"], true);
 }
 
-/// wizard_start rejects invalid scope.
+/// wizard_start rejects invalid scope (invalid chars in tenant).
 #[tokio::test]
 async fn start_rejects_bad_scope() {
     let app = app_with_one_provider();
     let (status, body) = send(
         &app,
         Method::GET,
-        "/api/wizard/start?tenant=evil&env=dev&team=default",
+        "/api/wizard/start?tenant=evil!corp&env=dev&team=default",
         None,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "scope.invalid_tenant");
+    assert_eq!(body["error"]["code"], "scope.tenant_invalid_chars");
 }
 
 /// wizard_next with valid answers advances the step.

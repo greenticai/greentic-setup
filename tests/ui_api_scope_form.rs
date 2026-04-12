@@ -168,13 +168,13 @@ async fn get_scope_form_rejects_invalid_scope() {
     let (status, body) = send(
         &app,
         Method::GET,
-        "/api/scope/form?tenant=evil&env=dev&team=default",
+        "/api/scope/form?tenant=evil!corp&env=dev&team=default",
         None,
     )
     .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "scope.invalid_tenant");
+    assert_eq!(body["error"]["code"], "scope.tenant_invalid_chars");
 }
 
 /// POST /api/scope/form with a missing required field returns 400 with

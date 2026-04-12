@@ -118,10 +118,10 @@ async fn response_echoes_requested_scope() {
 }
 
 #[tokio::test]
-async fn rejects_unknown_tenant_400() {
-    let (status, body) = get_body("/api/overview?tenant=evil&env=dev&team=default").await;
+async fn rejects_invalid_tenant_chars_400() {
+    let (status, body) = get_body("/api/overview?tenant=evil!corp&env=dev&team=default").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "scope.invalid_tenant");
+    assert_eq!(body["error"]["code"], "scope.tenant_invalid_chars");
 }
 
 #[tokio::test]

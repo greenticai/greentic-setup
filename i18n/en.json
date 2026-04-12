@@ -318,5 +318,19 @@
   "ui.error.rate_limit_exceeded": "Too many requests. Please slow down.",
   "ui.error.bundle_yaml_read_failed": "Failed to read bundle.yaml.",
   "ui.error.bundle_yaml_write_failed": "Failed to update bundle.yaml.",
-  "ui.error.rebuild_failed": "Rebuild failed: {reason}"
+  "ui.error.rebuild_failed": "Rebuild failed: {reason}",
+
+  "ui.configure.back_to_overview": "← Back to Overview",
+  "ui.configure.step_label": "Step {current} of {total}",
+  "ui.configure.btn.back": "← Back",
+  "ui.configure.btn.continue": "Continue →",
+  "ui.configure.review_title": "Review your configuration",
+  "ui.configure.review_subtitle": "Review the values you've entered before saving.",
+  "ui.configure.add_scope_title": "Add new scope",
+  "ui.configure.add_scope_subtitle": "Enter the tenant, environment, and team for the new scope.",
+  "ui.configure.click_to_edit": "Click to configure",
+  "ui.error.scope_tenant_empty": "Tenant is required.",
+  "ui.error.scope_env_empty": "Environment is required.",
+  "ui.error.scope_team_empty": "Team is required.",
+  "ui.error.scope_too_long": "Scope component too long (max 64 characters)."
 }

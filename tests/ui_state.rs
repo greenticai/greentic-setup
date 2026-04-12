@@ -20,8 +20,22 @@ fn scope_status_serializes_snake_case() {
     assert_eq!(json, r#""not_configured""#);
 }
 
+/// Any clean tenant/env/team triple passes validation regardless of whether
+/// the values appear in the bundle's pre-existing allow-list.
 #[test]
-fn validate_scope_accepts_allowed_tenant() {
+fn validate_scope_accepts_valid_chars() {
+    let bundle = BundleMeta::test_fixture();
+    let scope = ScopeKey {
+        tenant: "new-tenant".into(),
+        env: "staging".into(),
+        team: "team_alpha".into(),
+    };
+    assert!(validate_scope(&scope, &bundle).is_ok());
+}
+
+/// Strings that were already in the bundle fixture still pass.
+#[test]
+fn validate_scope_accepts_known_fixture_scope() {
     let bundle = BundleMeta::test_fixture();
     let scope = ScopeKey {
         tenant: "demo".into(),
@@ -32,15 +46,63 @@ fn validate_scope_accepts_allowed_tenant() {
 }
 
 #[test]
-fn validate_scope_rejects_unknown_tenant() {
+fn validate_scope_rejects_empty_tenant() {
     let bundle = BundleMeta::test_fixture();
     let scope = ScopeKey {
-        tenant: "evil".into(),
+        tenant: "".into(),
         env: "dev".into(),
         team: "default".into(),
     };
     let err = validate_scope(&scope, &bundle).unwrap_err();
-    assert_eq!(err.code, "scope.invalid_tenant");
+    assert_eq!(err.code, "scope.empty_tenant");
+}
+
+#[test]
+fn validate_scope_rejects_empty_env() {
+    let bundle = BundleMeta::test_fixture();
+    let scope = ScopeKey {
+        tenant: "demo".into(),
+        env: "".into(),
+        team: "default".into(),
+    };
+    let err = validate_scope(&scope, &bundle).unwrap_err();
+    assert_eq!(err.code, "scope.empty_env");
+}
+
+#[test]
+fn validate_scope_rejects_empty_team() {
+    let bundle = BundleMeta::test_fixture();
+    let scope = ScopeKey {
+        tenant: "demo".into(),
+        env: "dev".into(),
+        team: "".into(),
+    };
+    let err = validate_scope(&scope, &bundle).unwrap_err();
+    assert_eq!(err.code, "scope.empty_team");
+}
+
+#[test]
+fn validate_scope_rejects_tenant_too_long() {
+    let bundle = BundleMeta::test_fixture();
+    let scope = ScopeKey {
+        tenant: "a".repeat(65),
+        env: "dev".into(),
+        team: "default".into(),
+    };
+    let err = validate_scope(&scope, &bundle).unwrap_err();
+    assert_eq!(err.code, "scope.tenant_too_long");
+}
+
+#[test]
+fn validate_scope_rejects_invalid_chars() {
+    let bundle = BundleMeta::test_fixture();
+    let scope = ScopeKey {
+        tenant: "acme!corp".into(),
+        env: "dev".into(),
+        team: "default".into(),
+    };
+    let err = validate_scope(&scope, &bundle).unwrap_err();
+    assert_eq!(err.code, "scope.tenant_invalid_chars");
 }
 
 #[test]
@@ -57,14 +119,13 @@ fn validate_scope_rejects_path_traversal_in_env() {
 
 #[test]
 fn validate_scope_rejects_slash_in_team() {
-    // Add "a/b" to the allow-list so the path-traversal check runs, not the unknown-team check.
-    let mut bundle = BundleMeta::test_fixture();
-    bundle.available_teams.push("a/b".into());
+    let bundle = BundleMeta::test_fixture();
     let scope = ScopeKey {
         tenant: "demo".into(),
         env: "dev".into(),
         team: "a/b".into(),
     };
     let err = validate_scope(&scope, &bundle).unwrap_err();
+    // Path traversal check fires before invalid-chars check.
     assert_eq!(err.code, "scope.path_traversal");
 }

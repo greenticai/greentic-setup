@@ -153,7 +153,7 @@ async fn list_never_leaks_raw_values() {
     );
 }
 
-/// GET /api/secrets rejects bad scope.
+/// GET /api/secrets rejects bad scope (invalid chars in tenant).
 #[tokio::test]
 async fn list_rejects_invalid_scope() {
     let dir = tempdir().unwrap();
@@ -162,7 +162,7 @@ async fn list_rejects_invalid_scope() {
     let (status, body) = send(
         &app,
         Method::GET,
-        "/api/secrets?tenant=evil&env=dev&team=default",
+        "/api/secrets?tenant=evil!corp&env=dev&team=default",
         None,
     )
     .await;

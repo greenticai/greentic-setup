@@ -7,6 +7,25 @@ document.addEventListener('alpine:init', () => {
     providers: [],      // [{ id, display_name, form_spec, current_values }]
     answers: {},        // { provider_id: { field_key: value } }
     fieldErrors: {},    // { provider_id: { field_key: error_key } }
+    currentStep: 0,     // 0-indexed; maps to providers[currentStep], or review if === providers.length
+
+    get totalSteps() {
+      return this.providers.length + 1; // +1 for review step
+    },
+
+    isReviewStep() {
+      return this.currentStep === this.providers.length;
+    },
+
+    currentProvider() {
+      return this.providers[this.currentStep] || null;
+    },
+
+    reset() {
+      this.currentStep = 0;
+      this.saveError = null;
+      this.fieldErrors = {};
+    },
 
     async refresh() {
       this.loading = true;
@@ -26,6 +45,7 @@ document.addEventListener('alpine:init', () => {
         }
         this.answers = init;
         this.fieldErrors = {};
+        this.currentStep = 0;
       } catch (err) {
         this.error = err;
       } finally {
@@ -43,6 +63,46 @@ document.addEventListener('alpine:init', () => {
       // Clear field-level error on edit.
       if (this.fieldErrors[providerId] && this.fieldErrors[providerId][fieldKey]) {
         delete this.fieldErrors[providerId][fieldKey];
+      }
+    },
+
+    /// Display a value for the review step: masked if secret, raw if not.
+    displayValue(providerId, fieldKey, isSecret) {
+      const v = this.fieldValue(providerId, fieldKey);
+      if (v === undefined || v === null || v === '') return '(empty)';
+      const s = String(v);
+      if (isSecret) {
+        if (s.length <= 4) return '••••';
+        return '••••' + s.slice(-4);
+      }
+      return s;
+    },
+
+    /// Whether the user can advance to the next step (required fields filled).
+    canAdvance() {
+      if (this.isReviewStep()) return this.canSave();
+      const provider = this.currentProvider();
+      if (!provider) return false;
+      const pa = this.answers[provider.id] || {};
+      for (const q of (provider.form_spec && provider.form_spec.questions) || []) {
+        if (q.required) {
+          const v = pa[q.id];
+          if (v === undefined || v === null) return false;
+          if (typeof v === 'string' && v.trim() === '') return false;
+        }
+      }
+      return true;
+    },
+
+    nextStep() {
+      if (this.canAdvance() && this.currentStep < this.providers.length) {
+        this.currentStep++;
+      }
+    },
+
+    prevStep() {
+      if (this.currentStep > 0) {
+        this.currentStep--;
       }
     },
 
@@ -82,7 +142,7 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
-    // Whether all required fields across all providers have non-empty values.
+    /// Whether all required fields across all providers have non-empty values.
     canSave() {
       for (const provider of this.providers) {
         const pa = this.answers[provider.id] || {};

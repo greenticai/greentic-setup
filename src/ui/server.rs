@@ -158,7 +158,7 @@ pub async fn discover_bundle(
         } else {
             discovered_tenants
         };
-        // Always include the CLI-supplied initial tenant so validate_scope accepts it.
+        // Include the CLI-supplied initial tenant so it appears in the UI dropdown.
         if !t.contains(&options.initial_tenant) {
             t.push(options.initial_tenant.clone());
         }

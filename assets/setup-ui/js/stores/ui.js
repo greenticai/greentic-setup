@@ -12,6 +12,9 @@ document.addEventListener('alpine:init', () => {
     onboardingDismissed: false,
     // Whether any mutation has occurred since the last successful rebuild.
     pendingMutations: false,
+    // Add-scope modal state.
+    showAddScopeModal: false,
+    newScope: { tenant: '', env: '', team: '' },
 
     init() {
       // Read initial state injected by the server.
@@ -40,8 +43,7 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('locale').init(initial.locale || 'en', initial.strings || {});
       }
 
-      // Initialize scope. Prefer the CLI-provided initial scope, then the
-      // first value in each allow-list as fallback.
+      // Initialize scope from CLI-provided initial scope.
       const bundle = initial.bundle || {};
       const initialScope = initial.initial_scope || {};
       if (Alpine.store('scope')) {
@@ -61,23 +63,19 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('bundle').availableTeams = bundle.available_teams || [];
       }
 
-      // Initial view is chosen by the server:
+      // Initial view chosen by the server:
       // - "configure" when no scopes are configured or when --answers was provided
       // - "overview" otherwise
-      // The wizard view has been replaced by the unified Configure view.
-      this.currentView = initial.view === 'configure' ? 'configure' : 'overview';
-      this.breadcrumb = this.currentView === 'configure' ? 'Configure' : 'Overview';
-
-      if (this.currentView === 'configure' && Alpine.store('scopeForm')) {
-        // Boot into the Configure view — load FormSpec + current values.
-        Promise.resolve().then(() => {
-          Alpine.store('scopeForm').refresh();
-        });
-      } else if (Alpine.store('overview')) {
-        // On overview, refresh the stats immediately.
-        Promise.resolve().then(() => {
-          Alpine.store('overview').refresh();
-        });
+      // Configure is no longer a direct nav target; enter it via openConfigure().
+      if (initial.view === 'configure') {
+        // Use the CLI-seeded scope directly.
+        this.openConfigure(null);
+      } else {
+        this.currentView = 'overview';
+        this.breadcrumb = 'Overview';
+        if (Alpine.store('overview')) {
+          Promise.resolve().then(() => Alpine.store('overview').refresh());
+        }
       }
 
       // Poll pending state from server.
@@ -101,13 +99,36 @@ document.addEventListener('alpine:init', () => {
       this.onboardingDismissed = true;
     },
 
+    /// Open the Configure view for a given scope object { tenant, env, team }.
+    /// Pass null to use the current scope store state unchanged.
+    openConfigure(scope) {
+      if (scope) {
+        Alpine.store('scope').set(scope.tenant, scope.env, scope.team);
+      }
+      this.currentView = 'configure';
+      this.breadcrumb = 'Configure';
+      if (Alpine.store('scopeForm')) {
+        Alpine.store('scopeForm').reset();
+        Alpine.store('scopeForm').refresh();
+      }
+    },
+
+    /// Confirm adding a new scope from the modal; navigate to Configure.
+    confirmAddScope() {
+      const s = this.newScope;
+      if (!s.tenant.trim() || !s.env.trim() || !s.team.trim()) return;
+      this.showAddScopeModal = false;
+      this.newScope = { tenant: '', env: '', team: '' };
+      this.openConfigure({ tenant: s.tenant.trim(), env: s.env.trim(), team: s.team.trim() });
+    },
+
     navigate(view) {
       this.currentView = view;
+      this.breadcrumb = view.charAt(0).toUpperCase() + view.slice(1);
       // Lazy-load the relevant store data.
-      // "secrets" is removed from the SPA nav (merged into "configure").
+      // Configure is not a direct nav target; enter via openConfigure().
       const storeMap = {
         overview: 'overview',
-        configure: 'scopeForm',
         providers: 'providers',
         capabilities: 'capabilities',
       };
