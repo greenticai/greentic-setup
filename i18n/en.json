@@ -333,5 +333,8 @@
   "ui.error.scope_tenant_empty": "Tenant is required.",
   "ui.error.scope_env_empty": "Environment is required.",
   "ui.error.scope_team_empty": "Team is required.",
-  "ui.error.scope_too_long": "Scope component too long (max 64 characters)."
+  "ui.error.scope_too_long": "Scope component too long (max 64 characters).",
+  "ui.overview.scope_card.status_ok": "Configured",
+  "ui.overview.scope_card.status_partial": "Needs attention",
+  "ui.overview.scope_card.status_empty": "Not configured"
 }

@@ -124,39 +124,142 @@
   margin-top: var(--space-2);
 }
 
-/* Scope card */
+/* ─── Scope card ───
+ * Each card represents one (tenant, env, team) scope.
+ * Clickable → opens the Configure view for that scope.
+ * Two-tier layout: top row (name + status + arrow) + bottom row (provider chips).
+ */
 .scope-card {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
-  padding: var(--space-4) var(--space-6);
+  padding: 0;
   margin-bottom: var(--space-3);
-  transition: border-color var(--ease-base);
+  transition: border-color var(--ease-base), box-shadow var(--ease-base), transform var(--ease-base);
+  overflow: hidden;
+  cursor: pointer;
 }
-.scope-card:hover { border-color: var(--fg-dim); }
-.scope-card.active { border-color: var(--brand); background: var(--brand-bg); }
-.scope-card-head {
+.scope-card:hover {
+  border-color: var(--brand-border);
+  box-shadow: 0 2px 12px hsl(166 70% 45% / 0.08);
+  transform: translateY(-1px);
+}
+.scope-card.active {
+  border-color: var(--brand);
+  background: var(--brand-bg);
+}
+
+/* Top tier: scope identity + status badge + arrow */
+.scope-card-top {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  margin-bottom: var(--space-3);
+  padding: var(--space-4) var(--space-6);
 }
-.scope-card-title { font-size: 14px; font-weight: 500; }
-.scope-card-path {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
+
+/* Scope icon — initials derived from tenant */
+.scope-card-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.scope-card.active .scope-card-icon {
+  background: var(--brand);
+  color: var(--brand-ink);
+}
+
+/* Name block: tenant/env title + team subtitle */
+.scope-card-info {
+  flex: 1;
+  min-width: 0;
+}
+.scope-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  line-height: 1.3;
+}
+.scope-card-subtitle {
+  font-size: 11px;
   color: var(--fg-dim);
-  margin-inline-start: auto;
+  margin-top: 1px;
+  font-family: var(--font-mono);
 }
+
+/* Status badge */
+.scope-card-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: var(--r-full);
+  font-size: 10px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.scope-card-status--ok {
+  background: hsl(142 60% 55% / 0.1);
+  color: var(--success);
+}
+.scope-card-status--partial {
+  background: hsl(42 80% 62% / 0.1);
+  color: var(--warning);
+}
+.scope-card-status--empty {
+  background: var(--surface-2);
+  color: var(--fg-dim);
+}
+.scope-card-status::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* Arrow affordance */
+.scope-card-arrow {
+  color: var(--fg-dim);
+  font-size: 16px;
+  flex-shrink: 0;
+  transition: transform var(--ease-base), color var(--ease-base);
+  margin-inline-start: var(--space-2);
+}
+.scope-card:hover .scope-card-arrow {
+  color: var(--brand);
+  transform: translateX(3px);
+}
+
+/* Bottom tier: provider chips row */
+.scope-card-providers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 var(--space-6) var(--space-4);
+}
+
+/* ─── Provider chip ─── */
 .provider-chip {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: 6px;
   border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  padding: var(--space-2) var(--space-3);
-  font-size: 11px;
+  border-radius: var(--r-full);
+  padding: 4px 10px;
+  font-size: 10.5px;
   color: var(--fg-muted);
-  margin-inline-end: var(--space-2);
+  background: var(--surface-2);
+  transition: border-color var(--ease-fast);
 }
 .provider-chip::before {
   content: '';
@@ -166,7 +269,7 @@
   background: currentColor;
   opacity: 0.6;
 }
-.provider-chip.ok { color: var(--success); border-color: hsl(142 60% 55% / 0.3); }
+.provider-chip.ok { color: var(--success); border-color: hsl(142 60% 55% / 0.2); background: hsl(142 60% 55% / 0.06); }
 .provider-chip.warn { color: var(--warning); border-color: hsl(42 80% 62% / 0.3); }
 .provider-chip.add {
   color: var(--fg-dim);

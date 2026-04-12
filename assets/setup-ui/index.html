@@ -126,19 +126,30 @@
       </div>
 
       <template x-for="(s, i) in $store.overview.scopes" :key="i">
-        <div class="scope-card" :class="i === 0 ? 'active' : ''" style="cursor:pointer" @click="$store.ui.openConfigure(s.scope)">
-          <div class="scope-card-head">
-            <span class="scope-card-title" x-text="s.scope.tenant + ' / ' + s.scope.env"></span>
-            <span x-show="i === 0" style="color:var(--brand);font-size:10px" x-text="'&#8212; ' + t('ui.overview.scope_card.active_label')"></span>
-            <span class="scope-card-path" x-text="'team=' + s.scope.team"></span>
-            <span style="margin-inline-start:auto;color:var(--fg-dim);font-size:10px" x-text="t('ui.configure.click_to_edit')"></span>
+        <div class="scope-card" :class="i === 0 ? 'active' : ''" @click="$store.ui.openConfigure(s.scope)">
+
+          <!-- Top tier: icon + name + status + arrow -->
+          <div class="scope-card-top">
+            <div class="scope-card-icon" x-text="s.scope.tenant.substring(0, 2)"></div>
+            <div class="scope-card-info">
+              <div class="scope-card-title" x-text="s.scope.tenant + ' / ' + s.scope.env"></div>
+              <div class="scope-card-subtitle" x-text="'team=' + s.scope.team + ' · ' + s.providers.length + ' providers · ' + s.providers.reduce((sum, p) => sum + p.secrets_count, 0) + ' secrets'"></div>
+            </div>
+            <span
+              class="scope-card-status"
+              :class="s.status === 'configured' ? 'scope-card-status--ok' : s.status === 'partial' ? 'scope-card-status--partial' : 'scope-card-status--empty'"
+              x-text="s.status === 'configured' ? t('ui.overview.scope_card.status_ok') : s.status === 'partial' ? t('ui.overview.scope_card.status_partial') : t('ui.overview.scope_card.status_empty')"
+            ></span>
+            <span class="scope-card-arrow">&#8250;</span>
           </div>
-          <div @click.stop>
+
+          <!-- Bottom tier: provider chips -->
+          <div class="scope-card-providers" @click.stop>
             <template x-for="(p, pi) in s.providers" :key="pi">
               <span class="provider-chip" :class="p.configured ? 'ok' : 'warn'" x-text="p.display_name"></span>
             </template>
-            <span class="provider-chip add" x-text="t('ui.overview.scope_card.add_provider')">+ Add provider</span>
           </div>
+
         </div>
       </template>
 
