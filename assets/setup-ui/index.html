@@ -81,8 +81,6 @@
           </template>
         </select>
       </label>
-      <button class="btn btn--ghost" @click="$store.ui.toggleAdvanced()" :class="$store.ui.advancedMode ? 'btn--primary' : ''" x-text="t('ui.topbar.advanced_mode')">Advanced</button>
-      <button class="btn" :class="$store.ui.pendingMutations ? 'btn--primary' : ''" :disabled="!$store.ui.pendingMutations" @click="$store.ui.triggerRebuild()" x-text="$store.ui.pendingMutations ? t('ui.topbar.apply_changes') : t('ui.topbar.no_pending_changes')">No pending changes</button>
     </div>
 
     <!-- ==================== OVERVIEW VIEW ==================== -->
