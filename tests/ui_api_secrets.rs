@@ -69,6 +69,7 @@ fn state_with_bundle(bundle: BundleMeta) -> Arc<AppState> {
             provider_id: "messaging-telegram".to_string(),
             display_name: "Telegram".to_string(),
             form_spec: minimal_form_spec("messaging-telegram"),
+            pack_path: std::path::PathBuf::from("/tmp/fake-pack.gtpack"),
         }],
     )
 }

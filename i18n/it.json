@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Indietro",
   "ui.configure.btn.continue": "Continua →",
   "ui.configure.click_to_edit": "Fai clic per configurare",
+  "ui.configure.docs_link": "Documentazione",
   "ui.configure.loading": "Caricamento provider...",
   "ui.configure.no_providers": "Nessun provider trovato in questo bundle. Aggiungi prima i pacchetti provider.",
   "ui.configure.review_subtitle": "Controlla i valori che hai inserito prima di salvare.",

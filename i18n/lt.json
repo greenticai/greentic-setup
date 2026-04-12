@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Atgal",
   "ui.configure.btn.continue": "Tęsti →",
   "ui.configure.click_to_edit": "Spustelėkite, kad sukonfigūruotumėte",
+  "ui.configure.docs_link": "Dokumentacija",
   "ui.configure.loading": "Įkeliami teikėjai...",
   "ui.configure.no_providers": "Šiame rinkinyje teikėjų nerasta. Pirmiausia pridėkite teikėjų paketus.",
   "ui.configure.review_subtitle": "Prieš išsaugodami peržiūrėkite įvestas reikšmes.",

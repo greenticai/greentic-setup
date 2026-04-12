@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Vissza",
   "ui.configure.btn.continue": "Tovább →",
   "ui.configure.click_to_edit": "Kattintson a konfiguráláshoz",
+  "ui.configure.docs_link": "Dokumentáció",
   "ui.configure.loading": "Szolgáltatók betöltése...",
   "ui.configure.no_providers": "Ebben a csomagban nem találhatók szolgáltatók. Először adjon hozzá szolgáltatócsomagokat.",
   "ui.configure.review_subtitle": "Mentés előtt ellenőrizze a megadott értékeket.",

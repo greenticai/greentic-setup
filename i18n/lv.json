@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Atpakaļ",
   "ui.configure.btn.continue": "Turpināt →",
   "ui.configure.click_to_edit": "Noklikšķiniet, lai konfigurētu",
+  "ui.configure.docs_link": "Dokumentācija",
   "ui.configure.loading": "Ielādē nodrošinātājus...",
   "ui.configure.no_providers": "Šajā komplektā nav atrasti nodrošinātāji. Vispirms pievienojiet nodrošinātāju pakotnes.",
   "ui.configure.review_subtitle": "Pirms saglabāšanas pārskatiet ievadītās vērtības.",

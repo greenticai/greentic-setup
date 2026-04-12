@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← ย้อนกลับ",
   "ui.configure.btn.continue": "ดำเนินการต่อ →",
   "ui.configure.click_to_edit": "คลิกเพื่อตั้งค่า",
+  "ui.configure.docs_link": "เอกสารประกอบ",
   "ui.configure.loading": "กำลังโหลดผู้ให้บริการ...",
   "ui.configure.no_providers": "ไม่พบผู้ให้บริการในบันเดิลนี้ เพิ่มแพ็กผู้ให้บริการก่อน",
   "ui.configure.review_subtitle": "ตรวจสอบค่าที่คุณป้อนก่อนบันทึก",

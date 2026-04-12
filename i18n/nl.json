@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Terug",
   "ui.configure.btn.continue": "Doorgaan →",
   "ui.configure.click_to_edit": "Klik om te configureren",
+  "ui.configure.docs_link": "Documentatie",
   "ui.configure.loading": "Providers laden...",
   "ui.configure.no_providers": "Geen providers gevonden in deze bundel. Voeg eerst providerpakketten toe.",
   "ui.configure.review_subtitle": "Controleer de waarden die je hebt ingevoerd voordat je opslaat.",

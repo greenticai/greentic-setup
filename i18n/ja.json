@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← 戻る",
   "ui.configure.btn.continue": "続ける →",
   "ui.configure.click_to_edit": "クリックして設定",
+  "ui.configure.docs_link": "ドキュメント",
   "ui.configure.loading": "プロバイダーを読み込み中...",
   "ui.configure.no_providers": "このバンドルにプロバイダーが見つかりません。先にプロバイダーパックを追加してください。",
   "ui.configure.review_subtitle": "保存する前に、入力した値を確認してください。",

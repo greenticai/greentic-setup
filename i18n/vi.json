@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Quay lại",
   "ui.configure.btn.continue": "Tiếp tục →",
   "ui.configure.click_to_edit": "Nhấp để cấu hình",
+  "ui.configure.docs_link": "Tài liệu",
   "ui.configure.loading": "Đang tải nhà cung cấp...",
   "ui.configure.no_providers": "Không tìm thấy nhà cung cấp nào trong gói này. Hãy thêm các gói nhà cung cấp trước.",
   "ui.configure.review_subtitle": "Xem lại các giá trị bạn đã nhập trước khi lưu.",

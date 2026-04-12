@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← മടങ്ങുക",
   "ui.configure.btn.continue": "തുടരുക →",
   "ui.configure.click_to_edit": "കോൺഫിഗർ ചെയ്യാൻ ക്ലിക്ക് ചെയ്യുക",
+  "ui.configure.docs_link": "ഡോക്യുമെന്റേഷൻ",
   "ui.configure.loading": "പ്രൊവൈഡറുകൾ ലോഡ് ചെയ്യുന്നു...",
   "ui.configure.no_providers": "ഈ ബണ്ടിലിൽ പ്രൊവൈഡറുകൾ കണ്ടെത്തിയില്ല. ആദ്യം പ്രൊവൈഡർ പാക്കുകൾ ചേർക്കുക.",
   "ui.configure.review_subtitle": "സേവ് ചെയ്യുന്നതിന് മുമ്പ് നിങ്ങൾ നൽകിയ മൂല്യങ്ങൾ പരിശോധിക്കുക.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Retour",
   "ui.configure.btn.continue": "Continuer →",
   "ui.configure.click_to_edit": "Cliquer pour configurer",
+  "ui.configure.docs_link": "Documentation",
   "ui.configure.loading": "Chargement des fournisseurs...",
   "ui.configure.no_providers": "Aucun fournisseur trouvé dans ce bundle. Ajoutez d'abord des packs de fournisseurs.",
   "ui.configure.review_subtitle": "Vérifiez les valeurs que vous avez saisies avant d'enregistrer.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Tillbaka",
   "ui.configure.btn.continue": "Fortsätt →",
   "ui.configure.click_to_edit": "Klicka för att konfigurera",
+  "ui.configure.docs_link": "Dokumentation",
   "ui.configure.loading": "Laddar leverantörer...",
   "ui.configure.no_providers": "Inga leverantörer hittades i detta paket. Lägg först till leverantörspaket.",
   "ui.configure.review_subtitle": "Granska värdena du har angett innan du sparar.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Tilbage",
   "ui.configure.btn.continue": "Fortsæt →",
   "ui.configure.click_to_edit": "Klik for at konfigurere",
+  "ui.configure.docs_link": "Dokumentation",
   "ui.configure.loading": "Indlæser udbydere...",
   "ui.configure.no_providers": "Ingen udbydere fundet i denne pakke. Tilføj først udbyderpakker.",
   "ui.configure.review_subtitle": "Gennemgå de værdier, du har indtastet, før du gemmer.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← ආපසු",
   "ui.configure.btn.continue": "ඉදිරියට →",
   "ui.configure.click_to_edit": "සැකසීමට ක්ලික් කරන්න",
+  "ui.configure.docs_link": "ලේඛන",
   "ui.configure.loading": "සපයන්නන් පූරණය කරමින්...",
   "ui.configure.no_providers": "මෙම bundle එකේ සපයන්නන් හමු නොවීය. පළමුව provider packs එක් කරන්න.",
   "ui.configure.review_subtitle": "සුරැකීමට පෙර ඔබ ඇතුළත් කළ අගයන් සමාලෝචනය කරන්න.",

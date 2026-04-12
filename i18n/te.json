@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← వెనుకకు",
   "ui.configure.btn.continue": "కొనసాగించు →",
   "ui.configure.click_to_edit": "కాన్ఫిగర్ చేయడానికి క్లిక్ చేయండి",
+  "ui.configure.docs_link": "డాక్యుమెంటేషన్",
   "ui.configure.loading": "ప్రొవైడర్‌లను లోడ్ చేస్తోంది...",
   "ui.configure.no_providers": "ఈ బండిల్‌లో ఎలాంటి ప్రొవైడర్‌లు కనుగొనబడలేదు. ముందుగా ప్రొవైడర్ ప్యాక్‌లను జోడించండి.",
   "ui.configure.review_subtitle": "సేవ్ చేయడానికి ముందు మీరు నమోదు చేసిన విలువలను సమీక్షించండి.",

@@ -202,14 +202,27 @@
 
               <!-- Text / Password input -->
               <template x-if="!question.choices && question.kind !== 'Boolean'">
-                <input
-                  class="field-input"
-                  :type="question.secret ? 'password' : 'text'"
-                  :value="$store.scopeForm.fieldValue($store.scopeForm.currentProvider().id, question.id)"
-                  @input="$store.scopeForm.setFieldValue($store.scopeForm.currentProvider().id, question.id, $event.target.value)"
-                  :autocomplete="question.secret ? 'off' : 'on'"
-                  :spellcheck="question.secret ? 'false' : 'true'"
-                >
+                <div>
+                  <input
+                    class="field-input"
+                    :type="question.secret ? 'password' : 'text'"
+                    :value="$store.scopeForm.fieldValue($store.scopeForm.currentProvider().id, question.id)"
+                    @input="$store.scopeForm.setFieldValue($store.scopeForm.currentProvider().id, question.id, $event.target.value)"
+                    :autocomplete="question.secret ? 'off' : 'on'"
+                    :spellcheck="question.secret ? 'false' : 'true'"
+                    :placeholder="$store.scopeForm.getExtra($store.scopeForm.currentProvider().id, question.id, 'placeholder') || ''"
+                  >
+                  <a
+                    x-show="!!$store.scopeForm.getExtra($store.scopeForm.currentProvider().id, question.id, 'docs_url')"
+                    :href="$store.scopeForm.getExtra($store.scopeForm.currentProvider().id, question.id, 'docs_url') || '#'"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style="font-size:11px;color:var(--brand);display:inline-flex;align-items:center;gap:4px;margin-top:4px;text-decoration:none"
+                  >
+                    <span>&#128218;</span>
+                    <span x-text="t('ui.configure.docs_link')">Documentation</span>
+                  </a>
+                </div>
               </template>
 
               <!-- Select for choices -->

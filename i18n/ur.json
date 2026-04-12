@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← واپس",
   "ui.configure.btn.continue": "جاری رکھیں →",
   "ui.configure.click_to_edit": "ترتیب دینے کے لیے کلک کریں",
+  "ui.configure.docs_link": "دستاویزات",
   "ui.configure.loading": "فراہم کنندگان لوڈ ہو رہے ہیں...",
   "ui.configure.no_providers": "اس بنڈل میں کوئی فراہم کنندہ نہیں ملا۔ پہلے provider packs شامل کریں۔",
   "ui.configure.review_subtitle": "محفوظ کرنے سے پہلے درج کردہ قدروں کا جائزہ لیں۔",

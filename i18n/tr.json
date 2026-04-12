@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Geri",
   "ui.configure.btn.continue": "Devam Et →",
   "ui.configure.click_to_edit": "Yapılandırmak için tıklayın",
+  "ui.configure.docs_link": "Dokümantasyon",
   "ui.configure.loading": "Sağlayıcılar yükleniyor...",
   "ui.configure.no_providers": "Bu pakette sağlayıcı bulunamadı. Önce sağlayıcı paketlerini ekleyin.",
   "ui.configure.review_subtitle": "Kaydetmeden önce girdiğiniz değerleri gözden geçirin.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← رجوع",
   "ui.configure.btn.continue": "متابعة →",
   "ui.configure.click_to_edit": "انقر للإعداد",
+  "ui.configure.docs_link": "الوثائق",
   "ui.configure.loading": "جارٍ تحميل المزوّدين...",
   "ui.configure.no_providers": "لم يتم العثور على أي مزوّدين في هذه الحزمة. أضف حزم المزوّدين أولاً.",
   "ui.configure.review_subtitle": "راجع القيم التي أدخلتها قبل الحفظ.",

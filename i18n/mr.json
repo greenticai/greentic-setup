@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← मागे",
   "ui.configure.btn.continue": "पुढे चालू ठेवा →",
   "ui.configure.click_to_edit": "कॉन्फिगर करण्यासाठी क्लिक करा",
+  "ui.configure.docs_link": "दस्तऐवजीकरण",
   "ui.configure.loading": "प्रदाता लोड होत आहेत...",
   "ui.configure.no_providers": "या बंडलमध्ये कोणतेही प्रदाते सापडले नाहीत. आधी प्रदाता पॅक जोडा.",
   "ui.configure.review_subtitle": "सेव्ह करण्यापूर्वी तुम्ही प्रविष्ट केलेल्या मूल्यांचे पुनरावलोकन करा.",

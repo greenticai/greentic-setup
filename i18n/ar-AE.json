@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← رجوع",
   "ui.configure.btn.continue": "متابعة →",
   "ui.configure.click_to_edit": "انقر للتهيئة",
+  "ui.configure.docs_link": "الوثائق",
   "ui.configure.loading": "جارٍ تحميل الموفرين...",
   "ui.configure.no_providers": "لم يتم العثور على موفرين في هذه الحزمة. أضف حزم الموفرين أولاً.",
   "ui.configure.review_subtitle": "راجع القيم التي أدخلتها قبل الحفظ.",

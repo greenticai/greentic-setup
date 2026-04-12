@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Nazad",
   "ui.configure.btn.continue": "Nastavi →",
   "ui.configure.click_to_edit": "Kliknite da podesite",
+  "ui.configure.docs_link": "Dokumentacija",
   "ui.configure.loading": "Učitavanje provajdera...",
   "ui.configure.no_providers": "Nijedan provajder nije pronađen u ovom paketu. Prvo dodajte pakete provajdera.",
   "ui.configure.review_subtitle": "Pregledajte vrednosti koje ste uneli pre čuvanja.",

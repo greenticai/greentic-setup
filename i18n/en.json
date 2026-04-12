@@ -329,6 +329,7 @@
   "ui.configure.add_scope_title": "Add new scope",
   "ui.configure.add_scope_subtitle": "Enter the tenant, environment, and team for the new scope.",
   "ui.configure.click_to_edit": "Click to configure",
+  "ui.configure.docs_link": "Documentation",
   "ui.error.scope_tenant_empty": "Tenant is required.",
   "ui.error.scope_env_empty": "Environment is required.",
   "ui.error.scope_team_empty": "Team is required.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← ກັບຄືນ",
   "ui.configure.btn.continue": "ສືບຕໍ່ →",
   "ui.configure.click_to_edit": "ຄລິກເພື່ອຕັ້ງຄ່າ",
+  "ui.configure.docs_link": "ເອກະສານ",
   "ui.configure.loading": "ກຳລັງໂຫຼດຜູ້ໃຫ້ບໍລິການ...",
   "ui.configure.no_providers": "ບໍ່ພົບຜູ້ໃຫ້ບໍລິການໃນ bundle ນີ້. ເພີ່ມ provider packs ກ່ອນ.",
   "ui.configure.review_subtitle": "ກວດສອບຄ່າທີ່ທ່ານໄດ້ປ້ອນກ່ອນບັນທຶກ.",

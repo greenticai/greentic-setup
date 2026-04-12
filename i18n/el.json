@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Πίσω",
   "ui.configure.btn.continue": "Συνέχεια →",
   "ui.configure.click_to_edit": "Κάντε κλικ για διαμόρφωση",
+  "ui.configure.docs_link": "Τεκμηρίωση",
   "ui.configure.loading": "Φόρτωση παρόχων...",
   "ui.configure.no_providers": "Δεν βρέθηκαν πάροχοι σε αυτό το πακέτο. Προσθέστε πρώτα πακέτα παρόχων.",
   "ui.configure.review_subtitle": "Ελέγξτε τις τιμές που έχετε εισαγάγει πριν από την αποθήκευση.",

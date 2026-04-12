@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Назад",
   "ui.configure.btn.continue": "Продовжити →",
   "ui.configure.click_to_edit": "Натисніть, щоб налаштувати",
+  "ui.configure.docs_link": "Документація",
   "ui.configure.loading": "Завантаження провайдерів...",
   "ui.configure.no_providers": "У цьому пакеті не знайдено провайдерів. Спочатку додайте пакети провайдерів.",
   "ui.configure.review_subtitle": "Перегляньте введені значення перед збереженням.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Tagasi",
   "ui.configure.btn.continue": "Jätka →",
   "ui.configure.click_to_edit": "Klõpsa seadistamiseks",
+  "ui.configure.docs_link": "Dokumentatsioon",
   "ui.configure.loading": "Laadin pakkujaid...",
   "ui.configure.no_providers": "Selles paketis pakkujaid ei leitud. Lisa esmalt pakkujapaketid.",
   "ui.configure.review_subtitle": "Vaata enne salvestamist üle sisestatud väärtused.",

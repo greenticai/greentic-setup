@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Bumalik",
   "ui.configure.btn.continue": "Magpatuloy →",
   "ui.configure.click_to_edit": "I-click para i-configure",
+  "ui.configure.docs_link": "Dokumentasyon",
   "ui.configure.loading": "Nilo-load ang mga provider...",
   "ui.configure.no_providers": "Walang nahanap na mga provider sa bundle na ito. Magdagdag muna ng mga provider pack.",
   "ui.configure.review_subtitle": "Suriin ang mga halagang inilagay mo bago i-save.",

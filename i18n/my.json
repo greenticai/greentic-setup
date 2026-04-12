@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← နောက်သို့",
   "ui.configure.btn.continue": "ဆက်လုပ်ရန် →",
   "ui.configure.click_to_edit": "ပြင်ဆင်သတ်မှတ်ရန် နှိပ်ပါ",
+  "ui.configure.docs_link": "စာရွက်စာတမ်း",
   "ui.configure.loading": "ပံ့ပိုးသူများကို ဖွင့်နေသည်...",
   "ui.configure.no_providers": "ဤ bundle တွင် ပံ့ပိုးသူများ မတွေ့ပါ။ ပထမဦးစွာ provider pack များကို ထည့်ပါ။",
   "ui.configure.review_subtitle": "မသိမ်းမီ သင်ထည့်သွင်းထားသော တန်ဖိုးများကို ပြန်လည်စစ်ဆေးပါ။",

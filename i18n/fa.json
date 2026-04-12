@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← بازگشت",
   "ui.configure.btn.continue": "ادامه →",
   "ui.configure.click_to_edit": "برای پیکربندی کلیک کنید",
+  "ui.configure.docs_link": "مستندات",
   "ui.configure.loading": "در حال بارگذاری ارائه‌دهندگان...",
   "ui.configure.no_providers": "هیچ ارائه‌دهنده‌ای در این بسته پیدا نشد. ابتدا بسته‌های ارائه‌دهنده را اضافه کنید.",
   "ui.configure.review_subtitle": "مقادیر واردشده را قبل از ذخیره بررسی کنید.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Atrás",
   "ui.configure.btn.continue": "Continuar →",
   "ui.configure.click_to_edit": "Haz clic para configurar",
+  "ui.configure.docs_link": "Documentación",
   "ui.configure.loading": "Cargando proveedores...",
   "ui.configure.no_providers": "No se encontraron proveedores en este paquete. Agrega primero los paquetes de proveedores.",
   "ui.configure.review_subtitle": "Revisa los valores que has ingresado antes de guardar.",

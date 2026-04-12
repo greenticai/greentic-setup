@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Späť",
   "ui.configure.btn.continue": "Pokračovať →",
   "ui.configure.click_to_edit": "Kliknite pre konfiguráciu",
+  "ui.configure.docs_link": "Dokumentácia",
   "ui.configure.loading": "Načítavajú sa poskytovatelia...",
   "ui.configure.no_providers": "V tomto balíku sa nenašli žiadni poskytovatelia. Najprv pridajte balíky poskytovateľov.",
   "ui.configure.review_subtitle": "Pred uložením skontrolujte zadané hodnoty.",

@@ -4,10 +4,11 @@ document.addEventListener('alpine:init', () => {
     saving: false,
     error: null,
     saveError: null,
-    providers: [],      // [{ id, display_name, form_spec, current_values }]
-    answers: {},        // { provider_id: { field_key: value } }
-    fieldErrors: {},    // { provider_id: { field_key: error_key } }
-    currentStep: 0,     // 0-indexed; maps to providers[currentStep], or review if === providers.length
+    providers: [],        // [{ id, display_name, form_spec, current_values, question_extras }]
+    answers: {},          // { provider_id: { field_key: value } }
+    fieldErrors: {},      // { provider_id: { field_key: error_key } }
+    questionExtras: {},   // { provider_id: { question_id: { placeholder, docs_url, group } } }
+    currentStep: 0,       // 0-indexed; maps to providers[currentStep], or review if === providers.length
 
     get totalSteps() {
       return this.providers.length + 1; // +1 for review step
@@ -25,6 +26,7 @@ document.addEventListener('alpine:init', () => {
       this.currentStep = 0;
       this.saveError = null;
       this.fieldErrors = {};
+      this.questionExtras = {};
     },
 
     async refresh() {
@@ -40,10 +42,13 @@ document.addEventListener('alpine:init', () => {
         this.providers = data.providers || [];
         // Initialize answers from current_values for each provider.
         const init = {};
+        const extras = {};
         for (const p of this.providers) {
           init[p.id] = { ...(p.current_values || {}) };
+          extras[p.id] = p.question_extras || {};
         }
         this.answers = init;
+        this.questionExtras = extras;
         this.fieldErrors = {};
         this.currentStep = 0;
       } catch (err) {
@@ -51,6 +56,16 @@ document.addEventListener('alpine:init', () => {
       } finally {
         this.loading = false;
       }
+    },
+
+    /// Get a single extra metadata field for a question.
+    /// Returns null when extras are absent for that provider or question.
+    getExtra(providerId, questionId, field) {
+      const pe = this.questionExtras[providerId];
+      if (!pe) return null;
+      const qe = pe[questionId];
+      if (!qe) return null;
+      return qe[field] || null;
     },
 
     fieldValue(providerId, fieldKey) {

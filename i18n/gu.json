@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← પાછા",
   "ui.configure.btn.continue": "ચાલુ રાખો →",
   "ui.configure.click_to_edit": "કોન્ફિગર કરવા માટે ક્લિક કરો",
+  "ui.configure.docs_link": "દસ્તાવેજીકરણ",
   "ui.configure.loading": "પ્રદાતાઓ લોડ થઈ રહ્યા છે...",
   "ui.configure.no_providers": "આ બંડલમાં કોઈ પ્રદાતા મળ્યા નથી. પહેલા પ્રદાતા પૅક્સ ઉમેરો.",
   "ui.configure.review_subtitle": "સાચવતા પહેલાં તમે દાખલ કરેલ મૂલ્યોની સમીક્ષા કરો.",

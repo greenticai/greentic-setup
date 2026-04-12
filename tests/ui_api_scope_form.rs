@@ -63,6 +63,7 @@ fn state_with_one_provider() -> Arc<AppState> {
             provider_id: "messaging-telegram".to_string(),
             display_name: "Telegram".to_string(),
             form_spec: minimal_form_spec("messaging-telegram"),
+            pack_path: std::path::PathBuf::from("/tmp/fake-pack.gtpack"),
         }],
     )
 }
@@ -225,6 +226,7 @@ async fn post_scope_form_with_valid_answers_persists() {
             provider_id: "messaging-telegram".to_string(),
             display_name: "Telegram".to_string(),
             form_spec: minimal_form_spec("messaging-telegram"),
+            pack_path: std::path::PathBuf::from("/tmp/fake-pack.gtpack"),
         }],
     );
 

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Înapoi",
   "ui.configure.btn.continue": "Continuă →",
   "ui.configure.click_to_edit": "Faceți clic pentru configurare",
+  "ui.configure.docs_link": "Documentație",
   "ui.configure.loading": "Se încarcă furnizorii...",
   "ui.configure.no_providers": "Nu au fost găsiți furnizori în acest pachet. Adăugați mai întâi pachete de furnizori.",
   "ui.configure.review_subtitle": "Revizuiți valorile introduse înainte de salvare.",

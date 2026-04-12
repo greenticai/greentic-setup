@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← वापस",
   "ui.configure.btn.continue": "जारी रखें →",
   "ui.configure.click_to_edit": "कॉन्फ़िगर करने के लिए क्लिक करें",
+  "ui.configure.docs_link": "प्रलेखन",
   "ui.configure.loading": "प्रदाता लोड हो रहे हैं...",
   "ui.configure.no_providers": "इस बंडल में कोई प्रदाता नहीं मिला। पहले प्रदाता पैक जोड़ें।",
   "ui.configure.review_subtitle": "सहेजने से पहले आपके द्वारा दर्ज किए गए मानों की समीक्षा करें।",

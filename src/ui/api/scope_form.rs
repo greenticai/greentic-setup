@@ -46,6 +46,20 @@ pub struct ScopeFormResponse {
     pub providers: Vec<ProviderFormEntry>,
 }
 
+/// Extended metadata for a single question, sourced from `assets/setup.yaml`.
+///
+/// These fields are not part of the `qa_spec::FormSpec` schema; they come from
+/// the provider's legacy setup spec. Missing fields are omitted from JSON.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct QuestionExtras {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
 /// One provider's FormSpec + current values (raw, for editing).
 #[derive(Debug, Serialize)]
 pub struct ProviderFormEntry {
@@ -56,6 +70,9 @@ pub struct ProviderFormEntry {
     /// Only keys with an existing value are included (no empty placeholders).
     /// Values are raw strings — this is intentional for the edit form.
     pub current_values: HashMap<String, String>,
+    /// Extra per-question metadata from `assets/setup.yaml` (placeholder,
+    /// docs_url, group). Keyed by question id. Empty when setup.yaml is absent.
+    pub question_extras: HashMap<String, QuestionExtras>,
 }
 
 /// Request body for `POST /api/scope/form`.
@@ -168,11 +185,33 @@ fn read_provider_form_entries(
             .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
             .collect();
 
+        // Load extended question metadata from setup.yaml inside the pack.
+        // Failures are non-fatal — missing setup.yaml produces an empty map.
+        let question_extras: HashMap<String, QuestionExtras> =
+            match crate::setup_input::load_setup_spec(&pf.pack_path) {
+                Ok(Some(spec)) => {
+                    spec.questions
+                        .into_iter()
+                        .filter(|q| !q.name.is_empty())
+                        .map(|q| {
+                            let extras = QuestionExtras {
+                                placeholder: q.placeholder,
+                                docs_url: q.docs_url,
+                                group: q.group,
+                            };
+                            (q.name, extras)
+                        })
+                        .collect()
+                }
+                _ => HashMap::new(),
+            };
+
         entries.push(ProviderFormEntry {
             id: pf.provider_id.clone(),
             display_name: pf.display_name.clone(),
             form_spec: pf.form_spec.clone(),
             current_values: plain_values,
+            question_extras,
         });
 
         // Explicitly drop to zeroize secrets from this provider before moving to next.

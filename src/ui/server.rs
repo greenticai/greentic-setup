@@ -205,6 +205,7 @@ pub async fn discover_bundle(
                                 .clone()
                                 .unwrap_or_else(|| title_case_id(&p.provider_id)),
                             form_spec,
+                            pack_path: p.pack_path.clone(),
                         })
                     })
                     .collect();

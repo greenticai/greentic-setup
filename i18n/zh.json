@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← 返回",
   "ui.configure.btn.continue": "继续 →",
   "ui.configure.click_to_edit": "点击进行配置",
+  "ui.configure.docs_link": "文档",
   "ui.configure.loading": "正在加载提供商...",
   "ui.configure.no_providers": "此包中未找到提供商。请先添加提供商包。",
   "ui.configure.review_subtitle": "保存前请检查你输入的值。",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Retounen",
   "ui.configure.btn.continue": "Kontinye →",
   "ui.configure.click_to_edit": "Klike pou konfigire",
+  "ui.configure.docs_link": "Dokimantasyon",
   "ui.configure.loading": "Chaje founisè yo...",
   "ui.configure.no_providers": "Pa gen okenn founisè jwenn nan pake sa a. Ajoute pake founisè yo anvan.",
   "ui.configure.review_subtitle": "Revize valè ou antre yo anvan ou sove.",

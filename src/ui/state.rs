@@ -240,6 +240,9 @@ pub struct ProviderFormData {
     pub provider_id: String,
     pub display_name: String,
     pub form_spec: qa_spec::FormSpec,
+    /// Path to the `.gtpack` file, used to load extended question metadata
+    /// (placeholder, docs_url, group) from `assets/setup.yaml`.
+    pub pack_path: std::path::PathBuf,
 }
 
 /// A single secret entry returned by `GET /api/secrets`.

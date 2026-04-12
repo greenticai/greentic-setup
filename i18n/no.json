@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Tilbake",
   "ui.configure.btn.continue": "Fortsett →",
   "ui.configure.click_to_edit": "Klikk for å konfigurere",
+  "ui.configure.docs_link": "Dokumentasjon",
   "ui.configure.loading": "Laster inn leverandører...",
   "ui.configure.no_providers": "Ingen leverandører funnet i denne pakken. Legg til leverandørpakker først.",
   "ui.configure.review_subtitle": "Se gjennom verdiene du har angitt før du lagrer.",

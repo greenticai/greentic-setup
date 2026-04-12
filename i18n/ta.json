@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← பின்",
   "ui.configure.btn.continue": "தொடரவும் →",
   "ui.configure.click_to_edit": "கட்டமைக்க கிளிக் செய்யவும்",
+  "ui.configure.docs_link": "ஆவணங்கள்",
   "ui.configure.loading": "வழங்குநர்கள் ஏற்றப்படுகின்றனர்...",
   "ui.configure.no_providers": "இந்த தொகுப்பில் வழங்குநர்கள் எதுவும் கிடைக்கவில்லை. முதலில் வழங்குநர் தொகுப்புகளைச் சேர்க்கவும்.",
   "ui.configure.review_subtitle": "சேமிப்பதற்கு முன் நீங்கள் உள்ளிட்ட மதிப்புகளை பரிசீலிக்கவும்.",

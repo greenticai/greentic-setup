@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Kembali",
   "ui.configure.btn.continue": "Teruskan →",
   "ui.configure.click_to_edit": "Klik untuk mengkonfigurasi",
+  "ui.configure.docs_link": "Dokumentasi",
   "ui.configure.loading": "Memuatkan penyedia...",
   "ui.configure.no_providers": "Tiada penyedia ditemui dalam bundle ini. Tambahkan pek penyedia terlebih dahulu.",
   "ui.configure.review_subtitle": "Semak nilai yang anda masukkan sebelum menyimpan.",

@@ -108,6 +108,7 @@
   "ui.configure.btn.back": "← Takaisin",
   "ui.configure.btn.continue": "Jatka →",
   "ui.configure.click_to_edit": "Klikkaa määrittääksesi",
+  "ui.configure.docs_link": "Dokumentaatio",
   "ui.configure.loading": "Ladataan palveluntarjoajia...",
   "ui.configure.no_providers": "Tästä paketista ei löytynyt palveluntarjoajia. Lisää ensin palveluntarjoajapaketit.",
   "ui.configure.review_subtitle": "Tarkista antamasi arvot ennen tallentamista.",
