@@ -324,8 +324,8 @@
       <div class="empty-row" x-show="$store.providers.error" x-text="$store.providers.error ? t($store.providers.error.key || 'ui.error.unknown') : ''"></div>
 
       <!-- Add provider modal -->
-      <div x-show="$store.providers.showAddModal" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
-        <div style="background:var(--surface);border-radius:10px;padding:28px;min-width:420px;max-width:560px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+      <div class="modal-overlay" x-show="$store.providers.showAddModal" x-cloak>
+        <div class="modal-card">
           <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.providers.add')">Add provider</h3>
           <div class="field">
             <label class="field-label" x-text="t('ui.providers.add_placeholder')"></label>
@@ -373,8 +373,8 @@
 <!-- ==================== MODALS (body-level for proper centering) ==================== -->
 
 <!-- Add scope modal -->
-<div x-show="$store.ui.showAddScopeModal" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
-  <div style="background:var(--surface);border-radius:12px;padding:32px;width:90%;max-width:480px;box-shadow:0 12px 40px rgba(0,0,0,.3)">
+<div class="modal-overlay" x-show="$store.ui.showAddScopeModal" x-cloak>
+  <div class="modal-card">
     <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.configure.add_scope_title')">Add new scope</h3>
     <p style="color:var(--fg-muted);font-size:12px;margin-bottom:16px" x-text="t('ui.configure.add_scope_subtitle')">Enter the tenant, environment, and team for the new scope.</p>
 
@@ -404,6 +404,29 @@
 
 <style>
   [x-cloak] { display: none !important; }
+  .modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+  }
+  .modal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    width: 90%;
+    max-width: 480px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+  }
 </style>
 
 <!-- JS layer — loaded in dependency order. -->
