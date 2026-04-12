@@ -91,10 +91,16 @@
           <h2 style="font-size:24px;font-weight:600" x-text="t('ui.overview.welcome_title')">Welcome back</h2>
           <p style="color:var(--fg-muted);margin-top:4px" x-text="t('ui.overview.welcome_summary', { count: $store.overview.stats.scopes_count, warnings: $store.overview.stats.warnings_count })">&#8212;</p>
         </div>
-        <button class="btn btn--primary" @click="$store.ui.showAddScopeModal = true">
-          <span>+</span>
-          <span x-text="t('ui.overview.add_scope_btn')">Add new scope</span>
-        </button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn" @click="$refs.importInput.click()">
+            <span x-text="t('ui.overview.import_btn')">Import</span>
+          </button>
+          <input type="file" accept=".json" x-ref="importInput" style="display:none" @change="$store.ui.importScope($event)">
+          <button class="btn btn--primary" @click="$store.ui.showAddScopeModal = true">
+            <span>+</span>
+            <span x-text="t('ui.overview.add_scope_btn')">Add new scope</span>
+          </button>
+        </div>
       </div>
 
       <!-- Stats row -->
@@ -138,6 +144,7 @@
               :class="s.status === 'configured' ? 'scope-card-status--ok' : s.status === 'partial' ? 'scope-card-status--partial' : 'scope-card-status--empty'"
               x-text="s.status === 'configured' ? t('ui.overview.scope_card.status_ok') : s.status === 'partial' ? t('ui.overview.scope_card.status_partial') : t('ui.overview.scope_card.status_empty')"
             ></span>
+            <button class="btn btn--ghost" style="font-size:11px;padding:4px 10px" @click.stop="$store.ui.exportScope(s.scope)" x-text="t('ui.overview.export_btn')">Export</button>
             <span class="scope-card-arrow">&#8250;</span>
           </div>
 
@@ -294,8 +301,36 @@
         </div>
       </template>
 
+      <!-- Post-setup manual instructions panel (shown after save when providers need external portal steps) -->
+      <template x-if="$store.scopeForm.manualSteps.length > 0 && !$store.scopeForm.saving">
+        <div>
+          <div style="background:hsl(42 80% 62% / 0.08);border:1px solid hsl(42 80% 62% / 0.25);border-radius:var(--r-lg);padding:var(--space-6);margin-top:var(--space-6)">
+            <h3 style="font-size:16px;font-weight:600;margin-bottom:var(--space-3);display:flex;align-items:center;gap:8px">
+              <span>&#9888;</span>
+              <span x-text="t('ui.configure.manual_steps_title')">Manual steps required</span>
+            </h3>
+            <p style="color:var(--fg-muted);font-size:12px;margin-bottom:var(--space-4)" x-text="t('ui.configure.manual_steps_subtitle')">
+              Some providers need manual configuration in their external portals.
+            </p>
+
+            <template x-for="instr in $store.scopeForm.manualSteps" :key="instr.provider_name">
+              <div style="margin-bottom:var(--space-4)">
+                <div style="font-weight:600;font-size:13px;margin-bottom:var(--space-2)" x-text="instr.provider_name"></div>
+                <template x-for="(step, si) in instr.steps" :key="si">
+                  <div style="font-size:12px;color:var(--fg-muted);padding:4px 0 4px 16px;border-left:2px solid var(--border);margin-bottom:2px;font-family:var(--font-mono);word-break:break-all" x-text="step"></div>
+                </template>
+              </div>
+            </template>
+          </div>
+
+          <div style="display:flex;justify-content:flex-end;margin-top:var(--space-4)">
+            <button class="btn btn--primary" @click="$store.scopeForm.manualSteps = []; $store.ui.currentView = 'overview'" x-text="t('ui.configure.done_btn')">Done</button>
+          </div>
+        </div>
+      </template>
+
       <!-- Navigation buttons -->
-      <div x-show="!$store.scopeForm.loading && $store.scopeForm.providers.length > 0" style="display:flex;gap:10px;margin-top:24px;padding-top:20px;border-top:1px solid var(--border);justify-content:space-between">
+      <div x-show="!$store.scopeForm.loading && $store.scopeForm.providers.length > 0 && $store.scopeForm.manualSteps.length === 0" style="display:flex;gap:10px;margin-top:24px;padding-top:20px;border-top:1px solid var(--border);justify-content:space-between">
         <button
           class="btn"
           :disabled="$store.scopeForm.currentStep === 0"
@@ -306,7 +341,7 @@
           class="btn btn--primary"
           :disabled="!$store.scopeForm.canAdvance() || $store.scopeForm.saving"
           :style="(!$store.scopeForm.canAdvance() || $store.scopeForm.saving) ? 'opacity:0.5;cursor:not-allowed' : ''"
-          @click="$store.scopeForm.isReviewStep() ? $store.scopeForm.save().then(() => { if (!$store.scopeForm.saveError) $store.ui.currentView = 'overview' }) : $store.scopeForm.nextStep()"
+          @click="$store.scopeForm.isReviewStep() ? $store.scopeForm.save().then(() => { if (!$store.scopeForm.saveError) { if ($store.scopeForm.manualSteps.length === 0) { $store.ui.currentView = 'overview'; } } }) : $store.scopeForm.nextStep()"
           x-text="$store.scopeForm.isReviewStep() ? ($store.scopeForm.saving ? t('ui.configure.saving') : t('ui.configure.save_all')) : t('ui.configure.btn.continue')">Continue →</button>
       </div>
 

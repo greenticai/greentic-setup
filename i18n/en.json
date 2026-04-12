@@ -336,5 +336,11 @@
   "ui.error.scope_too_long": "Scope component too long (max 64 characters).",
   "ui.overview.scope_card.status_ok": "Configured",
   "ui.overview.scope_card.status_partial": "Needs attention",
-  "ui.overview.scope_card.status_empty": "Not configured"
+  "ui.overview.scope_card.status_empty": "Not configured",
+  "ui.configure.manual_steps_title": "Manual steps required",
+  "ui.configure.manual_steps_subtitle": "Some providers need manual configuration in their external portals. Complete these steps before testing.",
+  "ui.configure.done_btn": "Done",
+  "ui.overview.export_btn": "Export",
+  "ui.overview.import_btn": "Import",
+  "ui.error.import_invalid_json": "Invalid JSON file. Please select a valid answers file."
 }

@@ -138,6 +138,69 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    /// Export scope answers as a downloadable JSON file.
+    async exportScope(scope) {
+      try {
+        const data = await window.api.post('/api/scope/export', { scope });
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${scope.tenant}-${scope.env}-${scope.team}-answers.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        const msg = Alpine.store('locale')
+          ? Alpine.store('locale').t('ui.error.unknown')
+          : 'Export failed';
+        console.error('[ui] exportScope failed', err);
+        alert(msg);
+      }
+    },
+
+    /// Import scope answers from a JSON file and persist via /api/scope/form.
+    async importScope(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      let text;
+      try {
+        text = await file.text();
+      } catch (e) {
+        console.error('[ui] importScope: failed to read file', e);
+        return;
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        const msg = Alpine.store('locale')
+          ? Alpine.store('locale').t('ui.error.import_invalid_json')
+          : 'Invalid JSON file. Please select a valid answers file.';
+        alert(msg);
+        event.target.value = '';
+        return;
+      }
+      const scope = {
+        tenant: data.tenant || 'default',
+        env: data.env || 'dev',
+        team: data.team || 'default',
+      };
+      try {
+        await window.api.post('/api/scope/form', {
+          scope,
+          by_provider: data.setup_answers || data.by_provider || {},
+        });
+      } catch (err) {
+        const msg = Alpine.store('locale')
+          ? Alpine.store('locale').t('ui.error.execute_failed')
+          : 'Import failed';
+        console.error('[ui] importScope: persist failed', err);
+        alert(msg);
+      }
+      event.target.value = '';
+      if (Alpine.store('overview')) Alpine.store('overview').refresh();
+    },
+
     async triggerRebuild() {
       if (!this.pendingMutations) return;
       try {

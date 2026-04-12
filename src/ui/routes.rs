@@ -17,7 +17,7 @@ use crate::ui::api::locale::{get_locale, post_shutdown};
 use crate::ui::api::overview::get_overview;
 use crate::ui::api::providers::{delete_provider, get_providers, post_provider};
 use crate::ui::api::rebuild::{get_rebuild_pending, post_rebuild};
-use crate::ui::api::scope_form::{get_scope_form, post_scope_form};
+use crate::ui::api::scope_form::{get_scope_form, post_scope_export, post_scope_form};
 use crate::ui::api::secrets::{
     delete_secret, get_secrets, post_reveal_secret, post_secret, put_secret,
 };
@@ -60,6 +60,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Unified scope form (Configure view)
         .route("/scope/form", get(get_scope_form))
         .route("/scope/form", post(post_scope_form))
+        // Scope answers export (returns raw secrets for download; bearer-authed)
+        .route("/scope/export", post(post_scope_export))
         // Wizard (kept for tests + diagnostic use; not exposed in SPA UI)
         .route("/wizard/start", get(wizard_start))
         .route("/wizard/next", post(wizard_next))
