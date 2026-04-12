@@ -290,35 +290,7 @@
       <div x-show="$store.scopeForm.saveError" class="empty-row" style="color:var(--danger);margin-top:12px" x-text="$store.scopeForm.saveError ? t($store.scopeForm.saveError.key || 'ui.error.unknown') : ''"></div>
     </div>
 
-    <!-- ==================== ADD SCOPE MODAL ==================== -->
-    <div x-show="$store.ui.showAddScopeModal" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
-      <div style="background:var(--surface);border-radius:10px;padding:28px;min-width:460px;max-width:560px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
-        <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.configure.add_scope_title')">Add new scope</h3>
-        <p style="color:var(--fg-muted);font-size:12px;margin-bottom:16px" x-text="t('ui.configure.add_scope_subtitle')">Enter the tenant, environment, and team for the new scope.</p>
-
-        <div class="field">
-          <label class="field-label" data-required="" x-text="t('ui.scope.tenant_label')">tenant</label>
-          <input class="field-input" type="text" x-model="$store.ui.newScope.tenant" placeholder="e.g. acme-corp">
-        </div>
-        <div class="field">
-          <label class="field-label" data-required="" x-text="t('ui.scope.env_label')">env</label>
-          <input class="field-input" type="text" x-model="$store.ui.newScope.env" placeholder="e.g. prod">
-        </div>
-        <div class="field">
-          <label class="field-label" data-required="" x-text="t('ui.scope.team_label')">team</label>
-          <input class="field-input" type="text" x-model="$store.ui.newScope.team" placeholder="e.g. default">
-        </div>
-
-        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
-          <button class="btn btn--ghost" @click="$store.ui.showAddScopeModal = false; $store.ui.newScope = { tenant: '', env: '', team: '' }" x-text="t('ui.secrets.cancel')">Cancel</button>
-          <button
-            class="btn btn--primary"
-            :disabled="!$store.ui.newScope.tenant.trim() || !$store.ui.newScope.env.trim() || !$store.ui.newScope.team.trim()"
-            @click="$store.ui.confirmAddScope()"
-            x-text="t('ui.configure.btn.continue')">Continue →</button>
-        </div>
-      </div>
-    </div>
+    <!-- Add scope modal moved to body root (outside .shell) for proper centering -->
 
     <!-- ==================== PROVIDERS VIEW ==================== -->
     <div class="content" x-show="$store.ui.currentView === 'providers'" x-cloak>
@@ -396,6 +368,38 @@
     </div>
 
   </main>
+</div>
+
+<!-- ==================== MODALS (body-level for proper centering) ==================== -->
+
+<!-- Add scope modal -->
+<div x-show="$store.ui.showAddScopeModal" x-cloak style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100">
+  <div style="background:var(--surface);border-radius:12px;padding:32px;width:90%;max-width:480px;box-shadow:0 12px 40px rgba(0,0,0,.3)">
+    <h3 style="font-size:18px;font-weight:600;margin-bottom:16px" x-text="t('ui.configure.add_scope_title')">Add new scope</h3>
+    <p style="color:var(--fg-muted);font-size:12px;margin-bottom:16px" x-text="t('ui.configure.add_scope_subtitle')">Enter the tenant, environment, and team for the new scope.</p>
+
+    <div class="field">
+      <label class="field-label" data-required="" x-text="t('ui.scope.tenant_label')">tenant</label>
+      <input class="field-input" style="max-width:100%" type="text" x-model="$store.ui.newScope.tenant" placeholder="e.g. acme-corp">
+    </div>
+    <div class="field">
+      <label class="field-label" data-required="" x-text="t('ui.scope.env_label')">env</label>
+      <input class="field-input" style="max-width:100%" type="text" x-model="$store.ui.newScope.env" placeholder="e.g. prod">
+    </div>
+    <div class="field">
+      <label class="field-label" data-required="" x-text="t('ui.scope.team_label')">team</label>
+      <input class="field-input" style="max-width:100%" type="text" x-model="$store.ui.newScope.team" placeholder="e.g. default">
+    </div>
+
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px">
+      <button class="btn btn--ghost" @click="$store.ui.showAddScopeModal = false; $store.ui.newScope = { tenant: '', env: '', team: '' }" x-text="t('ui.secrets.cancel')">Cancel</button>
+      <button
+        class="btn btn--primary"
+        :disabled="!$store.ui.newScope.tenant.trim() || !$store.ui.newScope.env.trim() || !$store.ui.newScope.team.trim()"
+        @click="$store.ui.confirmAddScope()"
+        x-text="t('ui.configure.btn.continue')">Continue →</button>
+    </div>
+  </div>
 </div>
 
 <style>
