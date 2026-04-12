@@ -90,6 +90,23 @@ pub struct PostScopeFormBody {
 pub struct PostScopeFormResponse {
     pub success: bool,
     pub providers_saved: usize,
+    pub manual_steps: Vec<crate::webhook::ProviderInstruction>,
+}
+
+/// Request body for `POST /api/scope/export`.
+#[derive(Debug, Deserialize)]
+pub struct PostScopeExportBody {
+    pub scope: ScopeKey,
+}
+
+/// Response for `POST /api/scope/export`.
+/// Contains the full answers document with raw secret values for export/download.
+#[derive(Debug, Serialize)]
+pub struct ScopeExportResponse {
+    pub tenant: String,
+    pub team: String,
+    pub env: String,
+    pub setup_answers: HashMap<String, HashMap<String, String>>,
 }
 
 // ── GET /api/scope/form ───────────────────────────────────────────────────────
@@ -313,19 +330,124 @@ pub async fn post_scope_form(
     // This is a direct persist — no rebuild is needed, so we clear pending.
     state.pending_mutations.store(false, std::sync::atomic::Ordering::Relaxed);
 
+    // Collect post-setup manual instructions for providers that need external portal steps.
+    let provider_configs: Vec<(String, serde_json::Value)> = body
+        .by_provider
+        .iter()
+        .map(|(pid, answers)| (pid.clone(), answers.clone()))
+        .collect();
+    let manual_steps = crate::webhook::collect_post_setup_instructions(
+        &provider_configs,
+        &scope.tenant,
+        body.scope.team.as_str(),
+    );
+
     info!(
         action = "scope_form_saved",
         tenant = %scope.tenant,
         env = %scope.env,
         team = %scope.team,
         providers_saved = count,
+        manual_steps_count = manual_steps.len(),
         "scope form saved successfully"
     );
 
     Ok(Json(PostScopeFormResponse {
         success: true,
         providers_saved: count,
+        manual_steps,
     }))
+}
+
+// ── POST /api/scope/export ────────────────────────────────────────────────────
+
+/// Export all scope answers (including raw secret values) as a JSON document.
+///
+/// Security: same trust model as `GET /api/scope/form` — bearer-authed, same-origin.
+/// Raw values are never logged; only identity fields are recorded in audit log.
+pub async fn post_scope_export(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PostScopeExportBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let scope = &body.scope;
+    validate_scope(scope, &state.bundle).map_err(|e| ApiError::validation(&e.code, &e.key))?;
+
+    info!(
+        action = "scope_export",
+        tenant = %scope.tenant,
+        env = %scope.env,
+        team = %scope.team,
+        "scope export requested"
+    );
+
+    let bundle_path = state.bundle.path.clone();
+    let provider_forms = state.provider_forms.clone();
+    let scope_clone = scope.clone();
+
+    let setup_answers: HashMap<String, HashMap<String, String>> =
+        tokio::task::spawn_blocking(move || {
+            read_export_answers(&bundle_path, &scope_clone, &provider_forms)
+        })
+        .await
+        .map_err(|e| {
+            ApiError::internal("scope_export.task_panic", "ui.error.internal")
+                .with_params(json!({ "message": e.to_string() }))
+        })?
+        .map_err(|_| ApiError::internal("scope_export.read_failed", "ui.error.secrets_list_failed"))?;
+
+    Ok(Json(ScopeExportResponse {
+        tenant: scope.tenant.clone(),
+        team: scope.team.clone(),
+        env: scope.env.clone(),
+        setup_answers,
+    }))
+}
+
+/// Read all answers for export (runs in blocking context).
+fn read_export_answers(
+    bundle_path: &std::path::Path,
+    scope: &ScopeKey,
+    provider_forms: &[crate::ui::state::ProviderFormData],
+) -> anyhow::Result<HashMap<String, HashMap<String, String>>> {
+    let mini_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let store = crate::secrets::open_dev_store(bundle_path)?;
+    let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    for pf in provider_forms {
+        let mut provider_answers: HashMap<String, Zeroizing<String>> = HashMap::new();
+
+        for q in &pf.form_spec.questions {
+            let uri = crate::canonical_secret_uri(
+                &scope.env,
+                &scope.tenant,
+                Some(scope.team.as_str()),
+                &pf.provider_id,
+                &q.id,
+            );
+
+            let bytes = mini_rt.block_on(store.get(&uri));
+            if let Ok(b) = bytes
+                && !b.is_empty()
+                && let Ok(text) = String::from_utf8(b)
+            {
+                provider_answers.insert(q.id.clone(), Zeroizing::new(text));
+            }
+        }
+
+        if !provider_answers.is_empty() {
+            let plain: HashMap<String, String> = provider_answers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+                .collect();
+            result.insert(pf.provider_id.clone(), plain);
+            drop(provider_answers);
+        }
+    }
+
+    Ok(result)
 }
 
 /// Persist answers for all providers (runs in blocking context).

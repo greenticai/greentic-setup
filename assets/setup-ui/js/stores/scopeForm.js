@@ -9,6 +9,7 @@ document.addEventListener('alpine:init', () => {
     fieldErrors: {},      // { provider_id: { field_key: error_key } }
     questionExtras: {},   // { provider_id: { question_id: { placeholder, docs_url, group } } }
     currentStep: 0,       // 0-indexed; maps to providers[currentStep], or review if === providers.length
+    manualSteps: [],      // [{ provider_name, steps }] — populated after save when manual portal steps are needed
 
     get totalSteps() {
       return this.providers.length + 1; // +1 for review step
@@ -27,6 +28,7 @@ document.addEventListener('alpine:init', () => {
       this.saveError = null;
       this.fieldErrors = {};
       this.questionExtras = {};
+      this.manualSteps = [];
     },
 
     async refresh() {
@@ -157,12 +159,14 @@ document.addEventListener('alpine:init', () => {
           scope: { tenant: scope.tenant, env: scope.env, team: scope.team },
           by_provider: this.answers,
         });
+        // Store any manual post-setup instructions returned by the backend.
+        this.manualSteps = data.manual_steps || [];
         // Refresh overview to reflect new state.
         if (Alpine.store('overview')) {
           await Alpine.store('overview').refresh();
         }
-        // Success — toast component is planned for a later phase.
         console.info('[scopeForm] saved', data);
+        return data;
       } catch (err) {
         this.saveError = err;
         // If err.fields is populated, distribute to fieldErrors by provider.
