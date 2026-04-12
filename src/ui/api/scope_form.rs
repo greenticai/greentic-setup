@@ -58,6 +58,8 @@ pub struct QuestionExtras {
     pub docs_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_if: Option<String>,
 }
 
 /// One provider's FormSpec + current values (raw, for editing).
@@ -187,7 +189,7 @@ fn read_provider_form_entries(
 
         // Load extended question metadata from setup.yaml inside the pack.
         // Failures are non-fatal — missing setup.yaml produces an empty map.
-        let question_extras: HashMap<String, QuestionExtras> =
+        let mut question_extras: HashMap<String, QuestionExtras> =
             match crate::setup_input::load_setup_spec(&pf.pack_path) {
                 Ok(Some(spec)) => {
                     spec.questions
@@ -198,6 +200,7 @@ fn read_provider_form_entries(
                                 placeholder: q.placeholder,
                                 docs_url: q.docs_url,
                                 group: q.group,
+                                visible_if: None,
                             };
                             (q.name, extras)
                         })
@@ -205,6 +208,20 @@ fn read_provider_form_entries(
                 }
                 _ => HashMap::new(),
             };
+
+        // Merge visible_if expressions from FormSpec questions into question_extras.
+        for q in &pf.form_spec.questions {
+            let vis = q
+                .visible_if
+                .as_ref()
+                .and_then(crate::ui::api::wizard_engine::expr_to_string);
+            if vis.is_some() {
+                question_extras
+                    .entry(q.id.clone())
+                    .or_default()
+                    .visible_if = vis;
+            }
+        }
 
         entries.push(ProviderFormEntry {
             id: pf.provider_id.clone(),

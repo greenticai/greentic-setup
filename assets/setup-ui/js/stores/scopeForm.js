@@ -81,6 +81,32 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    /// Evaluate whether a question should be visible based on its visible_if expression.
+    /// Returns true if the field should be shown.
+    ///
+    /// Supports two formats:
+    ///   "field_name==value"  → show if answers[field_name] === value
+    ///   "field_name"         → show if answers[field_name] is truthy (non-empty, non-null, non-"false")
+    isVisible(providerId, questionId) {
+      const vis = this.getExtra(providerId, questionId, 'visible_if');
+      if (!vis) return true; // No condition → always visible.
+
+      const pa = this.answers[providerId] || {};
+
+      if (vis.includes('==')) {
+        const [field, expected] = vis.split('==', 2);
+        const actual = String(pa[field] || '');
+        return actual === expected;
+      }
+
+      // Truthy check: non-empty, non-null, not literally "false".
+      const val = pa[vis];
+      if (val === undefined || val === null || val === '' || val === 'false' || val === false) {
+        return false;
+      }
+      return true;
+    },
+
     /// Display a value for the review step: masked if secret, raw if not.
     displayValue(providerId, fieldKey, isSecret) {
       const v = this.fieldValue(providerId, fieldKey);
@@ -100,11 +126,11 @@ document.addEventListener('alpine:init', () => {
       if (!provider) return false;
       const pa = this.answers[provider.id] || {};
       for (const q of (provider.form_spec && provider.form_spec.questions) || []) {
-        if (q.required) {
-          const v = pa[q.id];
-          if (v === undefined || v === null) return false;
-          if (typeof v === 'string' && v.trim() === '') return false;
-        }
+        if (!q.required) continue;
+        if (!this.isVisible(provider.id, q.id)) continue; // Skip hidden fields.
+        const v = pa[q.id];
+        if (v === undefined || v === null) return false;
+        if (typeof v === 'string' && v.trim() === '') return false;
       }
       return true;
     },
@@ -163,11 +189,11 @@ document.addEventListener('alpine:init', () => {
         const pa = this.answers[provider.id] || {};
         const questions = (provider.form_spec && provider.form_spec.questions) || [];
         for (const q of questions) {
-          if (q.required) {
-            const v = pa[q.id];
-            if (v === undefined || v === null) return false;
-            if (typeof v === 'string' && v.trim() === '') return false;
-          }
+          if (!q.required) continue;
+          if (!this.isVisible(provider.id, q.id)) continue; // Skip hidden fields.
+          const v = pa[q.id];
+          if (v === undefined || v === null) return false;
+          if (typeof v === 'string' && v.trim() === '') return false;
         }
       }
       return true;

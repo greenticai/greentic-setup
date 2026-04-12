@@ -29,7 +29,7 @@ fn question_type_to_field_type(kind: QuestionType, secret: bool) -> FieldType {
 /// Returns `None` for expression types that cannot be meaningfully represented
 /// as a simple string (the SPA does not evaluate complex expressions; only simple
 /// field-equality conditions are passed through).
-fn expr_to_string(expr: &qa_spec::Expr) -> Option<String> {
+pub(crate) fn expr_to_string(expr: &qa_spec::Expr) -> Option<String> {
     match expr {
         qa_spec::Expr::Answer { path } => Some(path.clone()),
         qa_spec::Expr::Eq { left, right } => {
