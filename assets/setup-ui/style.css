@@ -45,6 +45,8 @@ body{font-family:var(--font);background:var(--bg);color:var(--fg);min-height:100
   background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius);
   text-align:left;font-family:inherit;color:var(--fg);
 }
+.provider-card.clickable{cursor:pointer;transition:border-color .15s,background .15s}
+.provider-card.clickable:hover{border-color:var(--primary);background:rgba(37,195,158,.05)}
 .provider-card .prov-icon{
   flex-shrink:0;width:2.25rem;height:2.25rem;
   display:flex;align-items:center;justify-content:center;
@@ -260,3 +262,10 @@ select{cursor:pointer;appearance:none;
 .center-msg{text-align:center;padding:6rem 1rem}
 .executing-text{font-size:.875rem;font-weight:500;color:var(--fg)}
 .executing-sub{font-size:.75rem;color:var(--muted);margin-top:.25rem}
+
+/* ── Tunnel options ── */
+.tunnel-options{display:flex;flex-direction:column;gap:.5rem}
+.tunnel-option{display:flex;align-items:flex-start;gap:.75rem;padding:.875rem 1rem;border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;transition:border-color .15s,background .15s}
+.tunnel-option:hover{border-color:var(--primary);background:rgba(37,195,158,.05)}
+.tunnel-option.selected{border-color:var(--primary);background:rgba(37,195,158,.1)}
+.tunnel-option input[type="radio"]{margin-top:.25rem;accent-color:var(--primary)}

@@ -111,6 +111,8 @@ struct ExecuteRequest {
     team: Option<String>,
     #[serde(default)]
     env: Option<String>,
+    #[serde(default)]
+    tunnel: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -619,6 +621,14 @@ async fn post_execute(
     let team = req.team.or_else(|| state.team.clone());
     let env = req.env.unwrap_or_else(|| state.env.clone());
     let answers = req.answers;
+
+    // Persist tunnel config from the UI selection.
+    if let Some(mode) = req.tunnel.as_deref() {
+        let tunnel = crate::platform_setup::TunnelAnswers {
+            mode: Some(mode.to_string()),
+        };
+        let _ = crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel);
+    }
 
     let result = tokio::task::spawn_blocking(move || {
         execute_setup(&bundle_path, &tenant, team.as_deref(), &env, answers)

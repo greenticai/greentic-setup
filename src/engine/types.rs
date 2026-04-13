@@ -40,6 +40,7 @@ pub struct SetupRequest {
     pub access_changes: Vec<AccessChangeSelection>,
     pub static_routes: StaticRoutesPolicy,
     pub deployment_targets: Vec<crate::deployment_targets::DeploymentTargetRecord>,
+    pub tunnel: Option<crate::platform_setup::TunnelAnswers>,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
     /// Filter by provider domain (messaging, events, secrets, oauth).
     pub domain_filter: Option<String>,
