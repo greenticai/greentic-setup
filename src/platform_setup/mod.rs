@@ -11,7 +11,9 @@ pub use persistence::{
     load_static_routes_artifact, load_tunnel_artifact, persist_static_routes_artifact,
     persist_tunnel_artifact, static_routes_artifact_path, tunnel_artifact_path,
 };
-pub use prompts::{prompt_static_routes_policy, prompt_static_routes_policy_with_answers};
+pub use prompts::{
+    prompt_static_routes_policy, prompt_static_routes_policy_with_answers, prompt_tunnel_mode,
+};
 pub use types::{PlatformSetupAnswers, StaticRoutesAnswers, StaticRoutesPolicy, TunnelAnswers};
 
 #[cfg(test)]

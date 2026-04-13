@@ -119,9 +119,17 @@ pub fn run_interactive_wizard(
     let mut all_answers = serde_json::Map::new();
     let existing_static_routes = load_effective_static_routes_defaults(bundle_path, tenant, team)?;
     let static_routes = prompt_static_routes_policy(env, existing_static_routes.as_ref())?;
-    let deployment_targets = crate::deployment_targets::prompt_deployment_targets(
-        &crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?,
-    )?;
+    let deployer_candidates =
+        crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
+    let deployment_targets =
+        crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
+
+    // Prompt for tunnel mode when no deployer packs are present (local dev).
+    let tunnel = if deployer_candidates.is_empty() {
+        Some(crate::platform_setup::prompt_tunnel_mode(None)?)
+    } else {
+        None
+    };
 
     let discovered = discovery::discover(bundle_path)?;
 
@@ -134,7 +142,7 @@ pub fn run_interactive_wizard(
             platform_setup: PlatformSetupAnswers {
                 static_routes: Some(static_routes.to_answers()),
                 deployment_targets,
-                tunnel: None,
+                tunnel,
             },
             setup_answers: all_answers,
         });
@@ -216,7 +224,7 @@ pub fn run_interactive_wizard(
         platform_setup: PlatformSetupAnswers {
             static_routes: Some(static_routes.to_answers()),
             deployment_targets,
-            tunnel: None,
+            tunnel,
         },
         setup_answers: all_answers,
     })
@@ -249,11 +257,15 @@ pub fn complete_loaded_answers_with_prompts(
             };
         loaded.platform_setup.static_routes = Some(static_routes.to_answers());
     }
+    let deployer_candidates =
+        crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
     if loaded.platform_setup.deployment_targets.is_empty() {
         loaded.platform_setup.deployment_targets =
-            crate::deployment_targets::prompt_deployment_targets(
-                &crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?,
-            )?;
+            crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
+    }
+    // Prompt for tunnel mode when no deployer and not already configured.
+    if deployer_candidates.is_empty() && loaded.platform_setup.tunnel.is_none() {
+        loaded.platform_setup.tunnel = Some(crate::platform_setup::prompt_tunnel_mode(None)?);
     }
 
     // ── Confirm environment variable placeholders ────────────────────────────
