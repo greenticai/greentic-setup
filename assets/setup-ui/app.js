@@ -78,6 +78,7 @@
       tenant: tenant || "demo",
       env: env || "dev",
       team: team || "",
+      tunnel: "cloudflared",
       answers: answers,
       sharedAnswers: {},
       providersDone: {},
@@ -110,6 +111,7 @@
       case "loading": renderLoading(); break;
       case "dashboard": renderDashboard(); break;
       case "scope-edit": renderScopeEdit(); break;
+      case "tunnel": renderTunnel(); break;
       case "providers": renderProviders(); break;
       case "shared": renderForm(state.sharedQuestions, t("ui.shared.title"), t("ui.shared.description"), null, submitShared); break;
       case "provider-form": renderProviderForm(); break;
@@ -497,6 +499,71 @@
       scope.tenant = tenant;
       scope.env = document.getElementById("f-scope-env").value;
       scope.team = document.getElementById("f-scope-team").value.trim();
+      state.phase = "tunnel";
+      render();
+    });
+  }
+
+  // ── Tunnel configuration ──
+
+  function renderTunnel() {
+    var scope = cs();
+    var html =
+      '<div class="fade-in">' +
+        '<div class="step-header">' +
+          '<button class="btn btn-ghost btn-sm btn-back" id="btn-back">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+            ' ' + esc(t("ui.back")) +
+          '</button>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="card-header">' +
+            '<h2 class="card-title">Tunnel</h2>' +
+            '<p class="card-desc">External messaging channels (Webex, Telegram, Slack, etc.) need a public URL to deliver webhooks to your local machine. Choose a tunnel service.</p>' +
+          '</div>' +
+          '<div class="card-content"><div class="form-fields">' +
+            '<div class="field">' +
+              '<label class="field-label">Tunnel service</label>' +
+              '<div class="tunnel-options">' +
+                '<label class="tunnel-option' + (scope.tunnel === "cloudflared" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="cloudflared"' + (scope.tunnel === "cloudflared" ? ' checked' : '') + ' />' +
+                  '<div><strong>Cloudflare Tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Free, no account needed. Auto-installs if missing.</span></div>' +
+                '</label>' +
+                '<label class="tunnel-option' + (scope.tunnel === "ngrok" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="ngrok"' + (scope.tunnel === "ngrok" ? ' checked' : '') + ' />' +
+                  '<div><strong>ngrok</strong><br/><span style="opacity:.7;font-size:.85rem">Requires ngrok account and binary installed.</span></div>' +
+                '</label>' +
+                '<label class="tunnel-option' + (scope.tunnel === "off" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="off"' + (scope.tunnel === "off" ? ' checked' : '') + ' />' +
+                  '<div><strong>No tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Local only. External webhooks will not work.</span></div>' +
+                '</label>' +
+              '</div>' +
+            '</div>' +
+          '</div></div>' +
+          '<div class="card-footer">' +
+            '<button class="btn btn-primary btn-lg" id="btn-tunnel-continue" style="width:100%">' + esc(t("ui.continue")) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    app.innerHTML = html;
+
+    // Highlight selected option
+    document.querySelectorAll('input[name="tunnel"]').forEach(function (radio) {
+      radio.addEventListener("change", function () {
+        document.querySelectorAll(".tunnel-option").forEach(function (el) { el.classList.remove("selected"); });
+        radio.closest(".tunnel-option").classList.add("selected");
+      });
+    });
+
+    document.getElementById("btn-back").addEventListener("click", function () {
+      state.phase = "scope-edit";
+      render();
+    });
+
+    document.getElementById("btn-tunnel-continue").addEventListener("click", function () {
+      var selected = document.querySelector('input[name="tunnel"]:checked');
+      scope.tunnel = selected ? selected.value : "cloudflared";
       state.phase = "providers";
       render();
     });
@@ -871,6 +938,7 @@
       answers: scope.answers,
       tenant: scope.tenant,
       env: scope.env,
+      tunnel: scope.tunnel || null,
     };
     if (scope.team) payload.team = scope.team;
     fetch("/api/execute", {
