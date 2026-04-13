@@ -22,6 +22,12 @@ pub const SHARED_QUESTION_IDS: &[&str] = &[
     // (e.g., slack.com, telegram.org, webexapis.com)
 ];
 
+/// Questions hidden from interactive prompts (both terminal and web UI) because
+/// they are auto-injected by the operator at runtime (e.g. tunnel URL
+/// auto-detection via ngrok/cloudflared). The questions are still accepted if
+/// supplied via `--answers` file or prefill.
+pub const HIDDEN_FROM_PROMPTS: &[&str] = &["public_base_url"];
+
 /// Information about a provider and its FormSpec for multi-provider setup.
 #[derive(Clone)]
 pub struct ProviderFormSpec {
@@ -162,6 +168,10 @@ pub fn prompt_shared_questions(
         .shared_questions
         .iter()
         .filter(|q| {
+            // Skip questions hidden from interactive prompts (auto-injected by operator)
+            if HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()) {
+                return false;
+            }
             // Skip optional questions in normal mode
             if !advanced && !q.required {
                 return false;
@@ -213,6 +223,11 @@ pub fn prompt_shared_questions(
     }
 
     for question in &shared.shared_questions {
+        // Skip questions hidden from interactive prompts (auto-injected by operator)
+        if HIDDEN_FROM_PROMPTS.contains(&question.id.as_str()) {
+            continue;
+        }
+
         // Skip if we already have a valid answer
         if answers.contains_key(&question.id) {
             continue;
