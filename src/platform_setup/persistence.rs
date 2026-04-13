@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::platform_setup::types::StaticRoutesPolicy;
+use crate::platform_setup::types::{StaticRoutesPolicy, TunnelAnswers};
 
 /// Get the path to the static routes artifact file.
 pub fn static_routes_artifact_path(bundle_root: &Path) -> PathBuf {
@@ -82,6 +82,36 @@ pub fn load_effective_static_routes_defaults(
         return Ok(None);
     }
     Ok(Some(policy))
+}
+
+/// Get the path to the tunnel configuration artifact file.
+pub fn tunnel_artifact_path(bundle_root: &Path) -> PathBuf {
+    bundle_root.join(".greentic").join("tunnel.json")
+}
+
+/// Load tunnel answers from the bundle artifact file.
+pub fn load_tunnel_artifact(bundle_root: &Path) -> Result<Option<TunnelAnswers>> {
+    let path = tunnel_artifact_path(bundle_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let answers: TunnelAnswers = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(answers))
+}
+
+/// Persist tunnel answers to the bundle artifact file.
+pub fn persist_tunnel_artifact(bundle_root: &Path, answers: &TunnelAnswers) -> Result<PathBuf> {
+    let path = tunnel_artifact_path(bundle_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string_pretty(answers).context("serialize tunnel answers")?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
 }
 
 /// Persist static routes policy to the bundle artifact file.

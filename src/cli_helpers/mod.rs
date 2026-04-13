@@ -134,6 +134,7 @@ pub fn run_interactive_wizard(
             platform_setup: PlatformSetupAnswers {
                 static_routes: Some(static_routes.to_answers()),
                 deployment_targets,
+                tunnel: None,
             },
             setup_answers: all_answers,
         });
@@ -215,6 +216,7 @@ pub fn run_interactive_wizard(
         platform_setup: PlatformSetupAnswers {
             static_routes: Some(static_routes.to_answers()),
             deployment_targets,
+            tunnel: None,
         },
         setup_answers: all_answers,
     })
