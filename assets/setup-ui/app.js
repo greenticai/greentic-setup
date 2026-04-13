@@ -838,7 +838,7 @@
     state.providers.forEach(function (p) {
       var store = scope.answers[p.provider_id] || {};
       Object.keys(scope.sharedAnswers).forEach(function (k) {
-        if (!store[k]) store[k] = scope.sharedAnswers[k];
+        store[k] = scope.sharedAnswers[k];
       });
       scope.answers[p.provider_id] = store;
     });
