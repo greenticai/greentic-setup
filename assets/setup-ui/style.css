@@ -45,6 +45,8 @@ body{font-family:var(--font);background:var(--bg);color:var(--fg);min-height:100
   background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius);
   text-align:left;font-family:inherit;color:var(--fg);
 }
+.provider-card.clickable{cursor:pointer;transition:border-color .15s,background .15s}
+.provider-card.clickable:hover{border-color:var(--primary);background:rgba(37,195,158,.05)}
 .provider-card .prov-icon{
   flex-shrink:0;width:2.25rem;height:2.25rem;
   display:flex;align-items:center;justify-content:center;

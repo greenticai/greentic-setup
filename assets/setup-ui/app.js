@@ -587,13 +587,13 @@
         '</div>' +
         '<div class="provider-list">';
 
-    state.providers.forEach(function (p) {
+    state.providers.forEach(function (p, idx) {
       var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
       var displayName = formatProviderName(p);
       html +=
-        '<div class="provider-card">' +
+        '<div class="provider-card clickable" data-prov-idx="' + idx + '">' +
           '<div class="prov-icon">' + esc(displayName.charAt(0)) + '</div>' +
           '<div>' +
             '<div class="prov-name">' + esc(displayName) + '</div>' +
@@ -607,16 +607,15 @@
 
     if (state.sharedQuestions.length > 0 && !scope.sharedAnswersDone) {
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
-    } else if (!allDone) {
-      var nextIdx = state.providers.findIndex(function (p) { return !scope.providersDone[p.provider_id]; });
-      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[nextIdx])])) + '</button>';
     } else {
-      html += '<button class="btn btn-primary btn-lg" id="btn-review" style="width:100%">' + esc(t("ui.review_execute")) + '</button>';
+      // Always offer sequential edit starting from the first provider
+      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="0" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[0])])) + '</button>';
     }
 
     html +=
       '<div style="text-align:center;margin-top:.75rem;display:flex;justify-content:center;gap:.5rem">' +
         '<button class="btn btn-ghost" id="btn-back-scope">' + esc(t("ui.back")) + '</button>' +
+        (allDone ? '<button class="btn btn-ghost" id="btn-review">' + esc(t("ui.review_execute")) + '</button>' : '') +
       '</div></div>';
 
     app.innerHTML = html;
@@ -635,8 +634,18 @@
     var reviewBtn = document.getElementById("btn-review");
     if (reviewBtn) reviewBtn.addEventListener("click", function () { state.phase = "review"; render(); });
 
+    // Click on any provider card to edit it
+    document.querySelectorAll(".provider-card.clickable").forEach(function (card) {
+      card.addEventListener("click", function () {
+        var idx = parseInt(card.getAttribute("data-prov-idx"), 10);
+        state.currentProvider = idx;
+        state.phase = "provider-form";
+        render();
+      });
+    });
+
     document.getElementById("btn-back-scope").addEventListener("click", function () {
-      state.phase = "scope-edit";
+      state.phase = "tunnel";
       render();
     });
   }
@@ -862,10 +871,13 @@
   }
 
   function advanceProvider() {
-    var scope = cs();
-    var next = state.providers.findIndex(function (p) { return !scope.providersDone[p.provider_id]; });
-    if (next >= 0) { state.currentProvider = next; state.phase = "provider-form"; }
-    else { state.phase = "review"; }
+    var nextIdx = state.currentProvider + 1;
+    if (nextIdx < state.providers.length) {
+      state.currentProvider = nextIdx;
+      state.phase = "provider-form";
+    } else {
+      state.phase = "review";
+    }
     render();
   }
 
