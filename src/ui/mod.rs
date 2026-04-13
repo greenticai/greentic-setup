@@ -26,6 +26,8 @@ use crate::platform_setup::StaticRoutesPolicy;
 use crate::qa::wizard;
 use crate::{SetupEngine, SetupMode, discovery, setup_to_formspec};
 
+use crate::qa::shared_questions::HIDDEN_FROM_PROMPTS;
+
 // ── Types ──
 
 struct UiState {
@@ -528,8 +530,10 @@ async fn get_providers(
 
     // Inject saved values into shared questions (pick from first provider that has the value)
     // Answers from --answers file take priority over saved secrets.
+    // Filter out questions that are auto-injected by the operator (e.g. public_base_url).
     let shared_questions: Vec<QuestionInfo> = shared_question_specs
         .iter()
+        .filter(|q| !HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()))
         .map(|q| {
             let mut info = form_question_to_info(q, Some(&i18n));
             // First try --answers prefill (check all providers for the shared question)
@@ -577,6 +581,7 @@ async fn get_providers(
                     .form_spec
                     .questions
                     .iter()
+                    .filter(|q| !HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()))
                     .map(|q| {
                         let mut info = form_question_to_info(q, Some(&i18n));
                         if let Some(ext) = extras.and_then(|m| m.get(&q.id)) {

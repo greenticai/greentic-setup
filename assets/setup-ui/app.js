@@ -54,11 +54,18 @@
         if (data.i18n) i18n = data.i18n;
         state.providerForms = {};
         (data.provider_forms || []).forEach(function (pf) {
+          pf.questions = filterHiddenQuestions(pf.questions || []);
           state.providerForms[pf.provider_id] = pf;
         });
-        state.sharedQuestions = data.shared_questions || [];
+        state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
         render();
       });
+  }
+
+  // Questions auto-injected by the operator (e.g. tunnel URL auto-detection).
+  var HIDDEN_QUESTION_IDS = ["public_base_url"];
+  function filterHiddenQuestions(questions) {
+    return questions.filter(function (q) { return HIDDEN_QUESTION_IDS.indexOf(q.id) === -1; });
   }
 
   // ── State ──
@@ -147,9 +154,10 @@
         state.providers = data.providers || [];
         state.providerForms = {};
         (data.provider_forms || []).forEach(function (pf) {
+          pf.questions = filterHiddenQuestions(pf.questions || []);
           state.providerForms[pf.provider_id] = pf;
         });
-        state.sharedQuestions = data.shared_questions || [];
+        state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
 
         if (state.providers.length === 0) {
           app.innerHTML =
