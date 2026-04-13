@@ -385,6 +385,7 @@ pub fn apply_remove(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             access_changes: request.access_changes.clone(),
             static_routes: request.static_routes.clone(),
             deployment_targets: request.deployment_targets.clone(),
+            tunnel: request.tunnel.clone(),
             setup_answers: request.setup_answers.clone(),
         },
     })
@@ -491,6 +492,7 @@ pub fn build_metadata(
         access_changes: request.access_changes.clone(),
         static_routes: request.static_routes.clone(),
         deployment_targets: request.deployment_targets.clone(),
+        tunnel: request.tunnel.clone(),
         setup_answers: request.setup_answers.clone(),
     }
 }
