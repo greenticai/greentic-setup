@@ -1044,7 +1044,7 @@ mod tests {
     use super::persist_ui_draft;
     use crate::secrets::open_dev_store;
     use greentic_secrets_lib::SecretsStore;
-    use serde_json::json;
+    use serde_json::{Map as JsonMap, Value, json};
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
