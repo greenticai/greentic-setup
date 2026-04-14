@@ -3,6 +3,7 @@
 //! Provides helpers for locating the dev secrets file and
 //! [`SecretsSetup`] for ensuring pack secrets are seeded.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,7 @@ use greentic_secrets_lib::core::Error as SecretError;
 use greentic_secrets_lib::{
     ApplyOptions, DevStore, SecretFormat, SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed,
 };
+use serde_cbor::Value as CborValue;
 use tracing::{debug, info};
 
 use crate::canonical_secret_uri;
@@ -220,6 +222,14 @@ fn placeholder_entry(uri: String) -> SeedEntry {
 /// Tries `assets/secret-requirements.json` first, then falls back to
 /// CBOR manifest extraction.
 pub fn load_secret_keys_from_pack(pack_path: &Path) -> Result<Vec<String>> {
+    Ok(load_secret_requirements_from_pack(pack_path)?
+        .into_iter()
+        .map(|req| req.key)
+        .collect())
+}
+
+/// Rich secret requirements extracted from a `.gtpack` archive.
+pub fn load_secret_requirements_from_pack(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
     let file = std::fs::File::open(pack_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
 
@@ -231,19 +241,105 @@ pub fn load_secret_keys_from_pack(pack_path: &Path) -> Result<Vec<String>> {
     ] {
         match archive.by_name(entry_name) {
             Ok(reader) => {
-                let reqs: Vec<SecretRequirement> = serde_json::from_reader(reader)?;
-                return Ok(reqs.into_iter().map(|r| r.key).collect());
+                let reqs: Vec<PackSecretRequirement> = serde_json::from_reader(reader)?;
+                return Ok(dedup_requirements(reqs));
             }
             Err(zip::result::ZipError::FileNotFound) => continue,
             Err(err) => return Err(err.into()),
         }
     }
-    Ok(vec![])
+
+    let mut reqs = Vec::new();
+    for index in 0..archive.len() {
+        let name = {
+            let entry = archive.by_index(index)?;
+            entry.name().to_string()
+        };
+        if name != "manifest.cbor" && !name.ends_with(".manifest.cbor") {
+            continue;
+        }
+        let mut entry = archive.by_name(&name)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+        let value: CborValue = serde_cbor::from_slice(&bytes)?;
+        collect_secret_requirements_from_cbor(&value, &mut reqs);
+    }
+
+    Ok(dedup_requirements(reqs))
 }
 
-#[derive(serde::Deserialize)]
-struct SecretRequirement {
-    key: String,
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PackSecretRequirement {
+    pub key: String,
+    #[serde(default = "default_required")]
+    pub required: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+fn default_required() -> bool {
+    true
+}
+
+fn dedup_requirements(reqs: Vec<PackSecretRequirement>) -> Vec<PackSecretRequirement> {
+    let mut by_key = BTreeMap::new();
+    for req in reqs {
+        by_key.entry(req.key.clone()).or_insert(req);
+    }
+    by_key.into_values().collect()
+}
+
+fn collect_secret_requirements_from_cbor(value: &CborValue, out: &mut Vec<PackSecretRequirement>) {
+    match value {
+        CborValue::Array(values) => {
+            for value in values {
+                collect_secret_requirements_from_cbor(value, out);
+            }
+        }
+        CborValue::Map(map) => {
+            if let Some(req) = parse_secret_requirement_map(map) {
+                out.push(req);
+            }
+            for value in map.values() {
+                collect_secret_requirements_from_cbor(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_secret_requirement_map(
+    map: &BTreeMap<CborValue, CborValue>,
+) -> Option<PackSecretRequirement> {
+    let key = map_get_text(map, "key")?;
+    let has_secret_shape = map.contains_key(&CborValue::Text("required".to_string()))
+        || map.contains_key(&CborValue::Text("scope".to_string()))
+        || map.contains_key(&CborValue::Text("format".to_string()))
+        || map.contains_key(&CborValue::Text("description".to_string()));
+    if !has_secret_shape {
+        return None;
+    }
+    Some(PackSecretRequirement {
+        key,
+        required: map_get_bool(map, "required").unwrap_or(true),
+        description: map_get_text(map, "description"),
+    })
+}
+
+fn map_get_text(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<String> {
+    map.get(&CborValue::Text(key.to_string()))
+        .and_then(|value| match value {
+            CborValue::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+fn map_get_bool(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<bool> {
+    map.get(&CborValue::Text(key.to_string()))
+        .and_then(|value| match value {
+            CborValue::Bool(flag) => Some(*flag),
+            _ => None,
+        })
 }
 
 /// Open a `DevStore` from a bundle root path (convenience).
@@ -319,8 +415,47 @@ mod tests {
         let keys = load_secret_keys_from_pack(&pack).expect("load keys");
         assert_eq!(
             keys,
-            vec!["BOT_TOKEN".to_string(), "API_SECRET".to_string()]
+            vec!["API_SECRET".to_string(), "BOT_TOKEN".to_string()]
         );
+    }
+
+    #[test]
+    fn load_secret_keys_from_pack_reads_cbor_manifest_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pack = temp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", SimpleFileOptions::default())
+            .expect("start entry");
+        let manifest = serde_json::json!({
+            "components": [
+                {
+                    "host": {
+                        "secrets": {
+                            "required": [
+                                {
+                                    "key": "auth.param.get_weather.key",
+                                    "required": true,
+                                    "description": "Weather key",
+                                    "scope": {"env": "runtime", "tenant": "runtime"},
+                                    "format": "text"
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+        let bytes = serde_cbor::to_vec(&manifest).expect("serialize cbor");
+        zip.write_all(&bytes).expect("write manifest");
+        zip.finish().expect("finish zip");
+
+        let keys = load_secret_keys_from_pack(&pack).expect("load keys");
+        assert_eq!(keys, vec!["auth.param.get_weather.key".to_string()]);
+
+        let reqs = load_secret_requirements_from_pack(&pack).expect("load reqs");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].description.as_deref(), Some("Weather key"));
     }
 
     #[test]

@@ -246,7 +246,10 @@ mod tests {
 
         match output {
             SetupOutputTarget::Directory(path) => {
-                assert_eq!(path, dir.path().join("cloud-deploy-demo.gtbundle"));
+                let expected = env::current_dir()
+                    .expect("cwd after set")
+                    .join("cloud-deploy-demo.gtbundle");
+                assert_eq!(path, expected);
             }
             SetupOutputTarget::Archive(path) => {
                 panic!("expected directory output, got archive {}", path.display());

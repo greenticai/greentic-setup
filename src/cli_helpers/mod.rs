@@ -132,9 +132,10 @@ pub fn run_interactive_wizard(
     };
 
     let discovered = discovery::discover(bundle_path)?;
+    let setup_targets = discovered.setup_targets();
 
-    if discovered.providers.is_empty() {
-        println!("No providers found in bundle. Nothing to configure.");
+    if setup_targets.is_empty() {
+        println!("No setup packs found in bundle. Nothing to configure.");
         return Ok(LoadedAnswers {
             tenant: None,
             team: None,
@@ -148,19 +149,15 @@ pub fn run_interactive_wizard(
         });
     }
 
-    println!(
-        "Found {} provider(s) to configure:",
-        discovered.providers.len()
-    );
-    for provider in &discovered.providers {
+    println!("Found {} pack(s) to configure:", setup_targets.len());
+    for provider in &setup_targets {
         println!("  - {} ({})", provider.provider_id, provider.domain);
     }
     println!();
 
     // ── Collect and prompt shared questions once ────────────────────────────
     // Build FormSpecs for all providers to identify shared questions
-    let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
-        .providers
+    let provider_form_specs: Vec<wizard::ProviderFormSpec> = setup_targets
         .iter()
         .filter_map(|provider| {
             setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
@@ -187,7 +184,7 @@ pub fn run_interactive_wizard(
     };
 
     // ── Configure each provider ─────────────────────────────────────────────
-    for provider in &discovered.providers {
+    for provider in &setup_targets {
         let provider_id = &provider.provider_id;
         let form_spec = setup_to_formspec::pack_to_form_spec(&provider.pack_path, provider_id);
 
@@ -280,11 +277,11 @@ pub fn complete_loaded_answers_with_prompts(
     }
 
     let discovered = discovery::discover(bundle_path)?;
+    let setup_targets = discovered.setup_targets();
 
     // ── Collect and prompt shared questions once ────────────────────────────
     // Build FormSpecs for ALL providers to identify shared questions
-    let all_provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
-        .providers
+    let all_provider_form_specs: Vec<wizard::ProviderFormSpec> = setup_targets
         .iter()
         .filter_map(|provider| {
             setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
@@ -332,7 +329,7 @@ pub fn complete_loaded_answers_with_prompts(
     };
 
     // ── Complete answers for each provider ──────────────────────────────────
-    for provider in &discovered.providers {
+    for provider in &setup_targets {
         let provider_id = &provider.provider_id;
         let existing = loaded
             .setup_answers

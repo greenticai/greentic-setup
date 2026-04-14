@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 
-/// A bundle source that can be resolved to a local directory path.
+/// A bundle source that can be resolved to a local artifact path.
 #[derive(Clone, Debug)]
 pub enum BundleSource {
     /// Local directory path (absolute or relative).
@@ -95,7 +95,7 @@ impl BundleSource {
         Ok(Self::LocalDir(path))
     }
 
-    /// Resolve the source to a local directory path.
+    /// Resolve the source to a local artifact path.
     ///
     /// For local sources, validates the path exists.
     /// For remote sources, fetches and extracts to a local cache directory.
@@ -104,11 +104,11 @@ impl BundleSource {
             Self::LocalDir(path) => resolve_local_path(path),
             Self::FileUri(path) => resolve_local_path(path),
             #[cfg(feature = "oci")]
-            Self::Oci { reference } => resolve_oci_reference(reference),
+            Self::Oci { reference } => resolve_oci_pack_reference(reference),
             #[cfg(feature = "oci")]
-            Self::Repo { reference } => resolve_oci_reference(reference),
+            Self::Repo { reference } => resolve_distributor_reference(reference),
             #[cfg(feature = "oci")]
-            Self::Store { reference } => resolve_oci_reference(reference),
+            Self::Store { reference } => resolve_distributor_reference(reference),
         }
     }
 
@@ -121,11 +121,11 @@ impl BundleSource {
             Self::LocalDir(path) => resolve_local_path(path),
             Self::FileUri(path) => resolve_local_path(path),
             #[cfg(feature = "oci")]
-            Self::Oci { reference } => resolve_oci_reference_async(reference).await,
+            Self::Oci { reference } => resolve_oci_pack_reference_async(reference).await,
             #[cfg(feature = "oci")]
-            Self::Repo { reference } => resolve_oci_reference_async(reference).await,
+            Self::Repo { reference } => resolve_distributor_reference_async(reference).await,
             #[cfg(feature = "oci")]
-            Self::Store { reference } => resolve_oci_reference_async(reference).await,
+            Self::Store { reference } => resolve_distributor_reference_async(reference).await,
         }
     }
 
@@ -216,26 +216,140 @@ fn resolve_local_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Resolve an OCI/repo/store reference using greentic-distributor-client.
+/// Resolve an OCI pack reference using the pack fetcher.
 #[cfg(feature = "oci")]
-fn resolve_oci_reference(reference: &str) -> anyhow::Result<PathBuf> {
+fn resolve_oci_pack_reference(reference: &str) -> anyhow::Result<PathBuf> {
     use tokio::runtime::Runtime;
 
     let rt = Runtime::new().context("failed to create tokio runtime")?;
-    rt.block_on(resolve_oci_reference_async(reference))
+    rt.block_on(resolve_oci_pack_reference_async(reference))
 }
 
-/// Resolve an OCI/repo/store reference asynchronously.
+/// Resolve an OCI pack reference asynchronously.
 #[cfg(feature = "oci")]
-async fn resolve_oci_reference_async(reference: &str) -> anyhow::Result<PathBuf> {
-    use greentic_distributor_client::oci_packs::fetch_pack_to_cache;
+async fn resolve_oci_pack_reference_async(reference: &str) -> anyhow::Result<PathBuf> {
+    use greentic_distributor_client::oci_packs::DefaultRegistryClient;
+    use greentic_distributor_client::{OciPackFetcher, PackFetchOptions};
 
-    let resolved = fetch_pack_to_cache(reference)
+    let oci_reference = reference.strip_prefix("oci://").unwrap_or(reference).trim();
+    let options = PackFetchOptions {
+        allow_tags: true,
+        ..PackFetchOptions::default()
+    };
+    let fetched =
+        if let Some((username, password)) = registry_basic_auth_for_reference(oci_reference) {
+            let client = DefaultRegistryClient::with_basic_auth(username, password);
+            OciPackFetcher::with_client(client, options)
+                .fetch_pack_to_cache(oci_reference)
+                .await
+        } else {
+            OciPackFetcher::<DefaultRegistryClient>::new(options)
+                .fetch_pack_to_cache(oci_reference)
+                .await
+        }
+        .with_context(|| format!("failed to fetch OCI pack reference: {}", reference))?;
+
+    if fetched.path.exists() {
+        return Ok(fetched.path);
+    }
+
+    anyhow::bail!(
+        "resolved bundle reference without a local cached artifact: {}",
+        reference
+    );
+}
+
+#[cfg(feature = "oci")]
+fn registry_basic_auth_for_reference(reference: &str) -> Option<(String, String)> {
+    let registry = reference.split('/').next().unwrap_or_default();
+
+    let generic_username = std::env::var("OCI_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let generic_password = std::env::var("OCI_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if let (Some(username), Some(password)) = (generic_username, generic_password) {
+        return Some((username, password));
+    }
+
+    if registry == "ghcr.io" {
+        let password = std::env::var("GHCR_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("GITHUB_TOKEN")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
+        let username = std::env::var("GHCR_USERNAME")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("GHCR_USER")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                std::env::var("GITHUB_ACTOR")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| std::env::var("USER").ok().filter(|value| !value.is_empty()));
+
+        if let (Some(username), Some(password)) = (username, password) {
+            return Some((username, password));
+        }
+    }
+
+    None
+}
+
+/// Resolve a repo/store reference using greentic-distributor-client.
+#[cfg(feature = "oci")]
+fn resolve_distributor_reference(reference: &str) -> anyhow::Result<PathBuf> {
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(resolve_distributor_reference_async(reference))
+}
+
+/// Resolve a repo/store reference asynchronously.
+#[cfg(feature = "oci")]
+async fn resolve_distributor_reference_async(reference: &str) -> anyhow::Result<PathBuf> {
+    use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
+
+    let client = DistClient::new(DistOptions::default());
+    let source = client
+        .parse_source(reference)
+        .with_context(|| format!("failed to parse bundle reference: {}", reference))?;
+    let resolved = client
+        .resolve(source, ResolvePolicy)
         .await
         .with_context(|| format!("failed to resolve bundle reference: {}", reference))?;
+    let fetched = client
+        .fetch(&resolved, CachePolicy)
+        .await
+        .with_context(|| format!("failed to fetch bundle reference: {}", reference))?;
 
-    // The resolved artifact contains a path to the cached content
-    Ok(resolved.path)
+    if fetched.local_path.exists() {
+        return Ok(fetched.local_path);
+    }
+    if let Some(path) = fetched.wasm_path
+        && path.exists()
+    {
+        return Ok(path);
+    }
+    if let Some(path) = fetched.cache_path
+        && path.exists()
+    {
+        return Ok(path);
+    }
+
+    anyhow::bail!(
+        "resolved bundle reference without a local cached artifact: {}",
+        reference
+    );
 }
 
 #[cfg(test)]
@@ -311,5 +425,21 @@ mod tests {
         let oci = BundleSource::parse("oci://ghcr.io/test").unwrap();
         assert!(oci.is_remote());
         assert!(!oci.is_local());
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn remote_references_preserve_original_strings() {
+        let refs = [
+            "oci://ghcr.io/greentic/example-pack:latest",
+            "repo://greentic/example-pack",
+            "store://greentic-biz/demo/example-pack:latest",
+        ];
+
+        for raw in refs {
+            let parsed = BundleSource::parse(raw).unwrap();
+            assert_eq!(parsed.as_str(), raw);
+            assert!(parsed.is_remote());
+        }
     }
 }

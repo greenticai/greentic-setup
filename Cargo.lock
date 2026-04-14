@@ -1470,6 +1470,7 @@ dependencies = [
  "greentic-secrets-lib",
  "greentic-types",
  "oci-distribution",
+ "reqwest 0.13.2",
  "rpassword",
  "semver",
  "serde",
@@ -1601,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",

@@ -5,6 +5,7 @@
   var i18n = {};
   var currentLocale = "en";
   var localeOptions = [];
+  var draftSaveTimer = null;
 
   function t(key, args) {
     var text = i18n[key] || key.replace(/^ui\./, "");
@@ -112,6 +113,56 @@
 
   /** Get the scope currently being edited. */
   function cs() { return state.scopes[state.currentScopeIdx]; }
+
+  function buildPersistableAnswers(scope) {
+    var answers = {};
+    state.providers.forEach(function (p) {
+      var providerAnswers = {};
+      var existing = scope.answers[p.provider_id] || {};
+      Object.keys(existing).forEach(function (k) { providerAnswers[k] = existing[k]; });
+      Object.keys(scope.sharedAnswers || {}).forEach(function (k) {
+        if (providerAnswers[k] === undefined || providerAnswers[k] === null || providerAnswers[k] === "") {
+          providerAnswers[k] = scope.sharedAnswers[k];
+        }
+      });
+      if (Object.keys(providerAnswers).length > 0) {
+        answers[p.provider_id] = providerAnswers;
+      }
+    });
+    return answers;
+  }
+
+  function persistDraftNow() {
+    var scope = cs();
+    if (!scope) return Promise.resolve();
+    var payload = {
+      answers: buildPersistableAnswers(scope),
+      tenant: scope.tenant,
+      env: scope.env,
+    };
+    if (scope.team) payload.team = scope.team;
+    if (Object.keys(payload.answers).length === 0) return Promise.resolve();
+    return fetch("/api/draft", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!res.ok) console.warn("Draft persistence failed:", res.error || "unknown error");
+    })
+    .catch(function (err) {
+      console.warn("Draft persistence failed:", err.message);
+    });
+  }
+
+  function scheduleDraftSave() {
+    if (draftSaveTimer) clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(function () {
+      draftSaveTimer = null;
+      persistDraftNow();
+    }, 500);
+  }
 
   function render() {
     switch (state.phase) {
@@ -705,14 +756,28 @@
     app.innerHTML = html;
     restoreFormValues(questions);
     setupVisibility(questions);
+    app.querySelectorAll("#form-area input, #form-area select, #form-area textarea").forEach(function (el) {
+      var handler = function () {
+        collectFormValues(questions);
+        scheduleDraftSave();
+      };
+      el.addEventListener("input", handler);
+      el.addEventListener("change", handler);
+    });
 
     var goBack = backFn || function () { state.phase = backPhase || "providers"; render(); };
-    document.getElementById("btn-back").addEventListener("click", function () { collectFormValues(questions); goBack(); });
-    document.getElementById("btn-prev").addEventListener("click", function () { collectFormValues(questions); goBack(); });
+    document.getElementById("btn-back").addEventListener("click", function () {
+      collectFormValues(questions);
+      persistDraftNow().finally(goBack);
+    });
+    document.getElementById("btn-prev").addEventListener("click", function () {
+      collectFormValues(questions);
+      persistDraftNow().finally(goBack);
+    });
     document.getElementById("btn-submit").addEventListener("click", function () {
       if (!validateForm(questions)) return;
       collectFormValues(questions);
-      onSubmit();
+      persistDraftNow().finally(onSubmit);
     });
   }
 
