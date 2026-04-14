@@ -313,43 +313,6 @@ fn resolve_pack_ref(pack_ref: &str) -> anyhow::Result<PathBuf> {
     Ok(resolved)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::platform_setup::StaticRoutesPolicy;
-    use std::collections::BTreeSet;
-
-    fn empty_metadata(pack_refs: Vec<String>) -> SetupPlanMetadata {
-        SetupPlanMetadata {
-            bundle_name: None,
-            pack_refs,
-            tenants: Vec::new(),
-            default_assignments: Vec::new(),
-            providers: Vec::new(),
-            update_ops: BTreeSet::new(),
-            remove_targets: BTreeSet::new(),
-            packs_remove: Vec::new(),
-            providers_remove: Vec::new(),
-            tenants_remove: Vec::new(),
-            access_changes: Vec::new(),
-            static_routes: StaticRoutesPolicy::default(),
-            deployment_targets: Vec::new(),
-            setup_answers: serde_json::Map::new(),
-            tunnel: None,
-        }
-    }
-
-    #[test]
-    fn resolve_packs_errors_when_any_pack_ref_fails() {
-        let metadata = empty_metadata(vec!["/definitely/missing/example.gtpack".to_string()]);
-        let err = execute_resolve_packs(Path::new("."), &metadata).unwrap_err();
-        let message = err.to_string();
-
-        assert!(message.contains("failed to resolve 1 pack ref"));
-        assert!(message.contains("/definitely/missing/example.gtpack"));
-    }
-}
-
 /// Remove provider artifacts and config directories.
 pub fn execute_remove_provider_artifacts(
     bundle_path: &Path,
@@ -594,6 +557,7 @@ mod tests {
             static_routes: StaticRoutesPolicy::default(),
             deployment_targets: Vec::new(),
             setup_answers: serde_json::Map::new(),
+            tunnel: None,
         }
     }
 

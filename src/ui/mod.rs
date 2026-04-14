@@ -117,6 +117,15 @@ struct ExecuteRequest {
     tunnel: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct DraftSaveRequest {
+    answers: JsonMap<String, Value>,
+    tenant: String,
+    #[serde(default)]
+    team: Option<String>,
+    env: String,
+}
+
 #[derive(Serialize)]
 struct ScopeResponse {
     tenant: String,
@@ -194,6 +203,7 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/scope", get(get_scope))
         .route("/api/existing-scopes", get(get_existing_scopes))
         .route("/api/providers", get(get_providers))
+        .route("/api/draft", post(post_draft))
         .route("/api/execute", post(post_execute))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
@@ -650,6 +660,30 @@ async fn post_execute(
     Json(result)
 }
 
+async fn post_draft(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<DraftSaveRequest>,
+) -> Json<Value> {
+    match persist_ui_draft(
+        &state.bundle_path,
+        &req.tenant,
+        req.team.as_deref(),
+        &req.env,
+        &req.answers,
+    )
+    .await
+    {
+        Ok(persisted) => Json(serde_json::json!({
+            "ok": true,
+            "persisted": persisted,
+        })),
+        Err(err) => Json(serde_json::json!({
+            "ok": false,
+            "error": err.to_string(),
+        })),
+    }
+}
+
 #[derive(Deserialize)]
 struct ExportRequest {
     scopes: Vec<ExportScope>,
@@ -896,6 +930,48 @@ async fn load_saved_secrets(
     result
 }
 
+async fn persist_ui_draft(
+    bundle_path: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    env: &str,
+    answers: &JsonMap<String, Value>,
+) -> Result<JsonMap<String, Value>> {
+    let discovered = discovery::discover(bundle_path).ok();
+    let mut persisted = JsonMap::new();
+
+    for (provider_id, provider_answers) in answers {
+        let Some(config) = provider_answers.as_object() else {
+            continue;
+        };
+        if config.is_empty() {
+            continue;
+        }
+
+        let pack_path = discovered.as_ref().and_then(|d| {
+            d.find_setup_target(provider_id)
+                .map(|provider| provider.pack_path.as_path())
+        });
+
+        let keys = crate::qa::persist::persist_all_config_as_secrets(
+            bundle_path,
+            env,
+            tenant,
+            team,
+            provider_id,
+            provider_answers,
+            pack_path,
+        )
+        .await?;
+
+        if !keys.is_empty() {
+            persisted.insert(provider_id.clone(), serde_json::to_value(keys)?);
+        }
+    }
+
+    Ok(persisted)
+}
+
 /// Extract a non-empty string from a JSON value (handles String, Number, Bool).
 fn value_as_nonempty_string(v: &Value) -> Option<String> {
     match v {
@@ -960,5 +1036,85 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         placeholder: None,
         group: None,
         docs_url: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persist_ui_draft;
+    use crate::secrets::open_dev_store;
+    use greentic_secrets_lib::SecretsStore;
+    use serde_json::json;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn write_pack_with_secret_requirements(
+        path: &std::path::Path,
+        pack_id: &str,
+        req_json: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(format!(r#"{{"pack_id":"{pack_id}"}}"#).as_bytes())?;
+        zip.start_file(
+            "assets/secret-requirements.json",
+            SimpleFileOptions::default(),
+        )?;
+        zip.write_all(req_json.as_bytes())?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_ui_draft_writes_provider_answers_to_dev_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle_root = temp.path();
+        std::fs::create_dir_all(bundle_root.join("packs")).expect("packs dir");
+
+        let pack_path = bundle_root.join("packs").join("weatherapi-pack.gtpack");
+        write_pack_with_secret_requirements(
+            &pack_path,
+            "weatherapi-pack",
+            r#"[{"key":"auth.param.get_weather.key"}]"#,
+        )
+        .expect("pack");
+
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "weatherapi-pack": {
+                "auth_param_get_weather_key": "test-weather-key"
+            }
+        }))
+        .expect("answers");
+
+        let persisted = persist_ui_draft(bundle_root, "dev-tenant", None, "dev", &answers)
+            .await
+            .expect("persist draft");
+        assert_eq!(
+            persisted.get("weatherapi-pack"),
+            Some(&json!(["auth_param_get_weather_key"]))
+        );
+
+        let store = open_dev_store(bundle_root).expect("open store");
+        let base_uri = crate::canonical_secret_uri(
+            "dev",
+            "dev-tenant",
+            None,
+            "weatherapi-pack",
+            "auth_param_get_weather_key",
+        );
+        let alias_uri = crate::canonical_secret_uri(
+            "dev",
+            "dev-tenant",
+            None,
+            "weatherapi-pack",
+            "auth.param.get_weather.key",
+        );
+        let base_value =
+            String::from_utf8(store.get(&base_uri).await.expect("base")).expect("base utf8");
+        let alias_value =
+            String::from_utf8(store.get(&alias_uri).await.expect("alias")).expect("alias utf8");
+        assert_eq!(base_value, "test-weather-key");
+        assert_eq!(alias_value, "test-weather-key");
     }
 }
