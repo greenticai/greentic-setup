@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
       - name: Run tests (including perf guards)
         run: cargo test --all --all-features
