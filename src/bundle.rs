@@ -100,15 +100,13 @@ fn bundle_has_app_packs(bundle_root: &Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(&workspace) else {
         return false;
     };
-    // Simple check: look for a non-empty `app_packs:` list.
-    // A full YAML parse is avoided here to keep the dependency footprint minimal.
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("- packs/") || trimmed.starts_with("- ./packs/") {
-            return true;
-        }
-    }
-    false
+    let Ok(workspace) = serde_yaml_bw::from_str::<YamlValue>(&contents) else {
+        return false;
+    };
+    let Some(workspace_map) = workspace.as_mapping() else {
+        return false;
+    };
+    !yaml_string_list(workspace_map, "app_packs").is_empty()
 }
 
 /// Embedded quickstart pack bytes (built from `assets/default-welcome.gtpack`).
@@ -685,6 +683,25 @@ mod tests {
         assert!(
             !root.join("packs").join("default.gtpack").exists(),
             "default.gtpack should NOT be created when app_packs are declared"
+        );
+    }
+
+    #[test]
+    fn default_pack_skipped_when_bundle_has_external_app_pack_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("external-ref-bundle");
+        std::fs::create_dir_all(root.join("packs")).unwrap();
+        std::fs::write(
+            root.join(BUNDLE_WORKSPACE_MARKER),
+            "schema_version: 1\napp_packs:\n  - demos/deep-research-demo.gtpack\n",
+        )
+        .unwrap();
+
+        create_demo_bundle_structure(&root, Some("test")).unwrap();
+
+        assert!(
+            !root.join("packs").join("default.gtpack").exists(),
+            "default.gtpack should NOT be created when bundle.yaml declares an external app pack ref"
         );
     }
 

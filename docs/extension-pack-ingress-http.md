@@ -1,133 +1,175 @@
 # Extension Pack HTTP Ingress And `public_base_url`
 
-This note is meant to be Codex-friendly and answer one concrete question:
+This guide answers a simple question:
 
-How does an extension pack ask for HTTP ingress, and how does it get
-`public_base_url` injected?
+How does a pack say "I need a public HTTP surface" and how does it receive
+`public_base_url`?
 
-## Short answer
+This document is written for humans first. You do not need to know every
+runtime detail to follow it.
 
-There is no separate `"ingress-http": true` switch today.
+## Short Answer
 
-An extension pack effectively asks for HTTP ingress by combining:
+There is no single `ingress-http = true` switch.
 
-1. A pack-declared public web/static surface when needed
-   via the `greentic.static-routes.v1` extension.
-2. A setup/config field named `public_base_url` when the pack needs an
-   externally reachable base URL for callbacks, webhooks, or public UI links.
-3. The appropriate ingress capability or host contract
-   such as messaging ingress handling.
+A pack effectively asks for HTTP ingress by combining:
 
-## 1. Requesting public HTTP surface
+1. a declared public web or static surface
+2. a setup field called `public_base_url` when it needs an externally reachable
+   URL
+3. the correct ingress-related capability or host behavior for that pack type
 
-If the pack needs the host to expose public HTTP/static content, it declares
-the static routes extension:
+In practice, a pack says:
 
-- extension key: `greentic.static-routes.v1`
-- parser/validator:
-  [static_routes.rs](/home/vgrishkyan/greentic/greentic-pack/crates/greentic-pack/src/static_routes.rs)
+- "please expose me publicly"
+- "please tell me what public URL users or callbacks should use"
 
-This is what the host/runtime inspects to decide whether the bundle has
-bundle-level static routes and therefore needs public HTTP serving.
+## What `public_base_url` Means
 
-Relevant runtime inspection:
-
-- [startup_contract.rs](/home/vgrishkyan/greentic/greentic-start/src/startup_contract.rs)
-
-Important point:
-
-- a pack requests HTTP/public web surface declaratively through the
-  static-routes extension
-- not through an ad-hoc runtime flag
-
-## 2. Requesting `public_base_url`
-
-If the pack needs a public URL injected into setup/runtime config, it should
-declare a setup question or config field named `public_base_url`.
-
-Examples already in the repo:
-
-- [messaging-webchat/setup.yaml](/home/vgrishkyan/greentic/greentic-messaging-providers/packs/messaging-webchat/setup.yaml)
-- [messaging-slack/setup.yaml](/home/vgrishkyan/greentic/greentic-messaging-providers/packs/messaging-slack/setup.yaml)
-- [messaging-webex/setup.yaml](/home/vgrishkyan/greentic/greentic-messaging-providers/packs/messaging-webex/setup.yaml)
-
-This means:
-
-- the pack is saying "I need an externally reachable base URL"
-- setup/onboarding can then ask for it or inject it from runtime/tunnel state
-
-## 3. Where `public_base_url` comes from
-
-There are two sources:
-
-1. Explicit setup answers:
-   - `platform_setup.static_routes.public_base_url`
-   - provider-level setup answers containing `public_base_url`
-2. Runtime-discovered public URL:
-   - tunnel/public endpoint discovered by runtime and written back into runtime state
-
-Relevant code:
-
-- static routes normalization and validation:
-  [platform_setup.rs](/home/vgrishkyan/greentic/greentic-setup/src/platform_setup.rs)
-- setup persistence:
-  [engine.rs](/home/vgrishkyan/greentic/greentic-setup/src/engine.rs)
-- runtime startup contract:
-  [startup_contract.rs](/home/vgrishkyan/greentic/greentic-start/src/startup_contract.rs)
-- runtime public URL handling:
-  [runtime.rs](/home/vgrishkyan/greentic/greentic-start/src/runtime.rs)
-
-## 4. How it gets injected
-
-For provider/setup execution, `public_base_url` is injected into the setup
-payload/config when available.
-
-Relevant code:
-
-- [providers.rs](/home/vgrishkyan/greentic/greentic-start/src/providers.rs)
-
-Current behavior there:
-
-- if `public_base_url` is known, it is inserted into both:
-  - top-level payload field `public_base_url`
-  - nested `config.public_base_url`
-
-This makes it easy for pack code to consume it regardless of whether the setup
-component expects it at the top level or inside config.
-
-## 5. How webhook-style ingress uses it
-
-Webhook-oriented packs typically need `public_base_url` so the host can build a
-callback URL.
+`public_base_url` is the base URL that outside systems can reach.
 
 Examples:
 
-- [webhook.rs](/home/vgrishkyan/greentic/greentic-setup/src/webhook.rs)
-- [webhook_setup.rs](/home/vgrishkyan/greentic/greentic-start/src/onboard/webhook_setup.rs)
+- `http://127.0.0.1:8080` for a simple local setup
+- `https://my-demo.example.com` for a deployed environment
+- a temporary tunnel URL when you are testing locally
 
-The host builds URLs like:
+Packs often need this when they:
 
-- messaging webhook:
-  `"{public_base_url}/v1/messaging/ingress/{provider_id}/{tenant}/{team}"`
+- serve a public web UI
+- need webhook callbacks
+- generate links that users open in a browser
 
-So for webhook-driven packs, the practical contract is:
+## How A Pack Requests Public HTTP Surface
 
-1. declare/setup `public_base_url`
-2. expose the relevant ingress capability
-3. let setup/runtime compose the final callback URL
+If a pack needs the host to expose public HTTP or static content, it declares
+that through its pack metadata, usually via the static-routes extension.
 
-## 6. Recommended pack authoring rule
+Important idea:
 
-If a pack needs public HTTP ingress or externally reachable callback URLs:
+- public serving is declared by the pack
+- it is not meant to be an ad-hoc runtime-only toggle
 
-1. Declare `greentic.static-routes.v1` if it needs bundle-level public web/static surface.
-2. Declare a `public_base_url` setup/config field if it needs an external base URL.
-3. Optionally declare `ingress_path` if the pack wants a configurable path suffix.
-4. Implement the relevant ingress capability (`messaging.provider_ingress.v1`, etc.).
+That allows the host and setup flow to reason about whether a bundle needs:
 
-## 7. One-line answer
+- public static content
+- public web routes
+- a public base URL
 
-Today an extension pack requests HTTP ingress declaratively through
-`greentic.static-routes.v1` plus its ingress capability, and it receives
-`public_base_url` by declaring that field in setup/config so setup/runtime can
-inject the resolved public URL into the provider payload.
+## How A Pack Requests `public_base_url`
+
+If a pack needs a public URL, it should expose a setup or config field named
+`public_base_url`.
+
+That tells the setup and runtime layers:
+
+- this pack expects a public base URL
+- that URL may come from explicit setup answers or from runtime-discovered
+  tunnel state
+
+This is the normal contract for packs that need browser-facing links or
+webhook callbacks.
+
+## Where `public_base_url` Comes From
+
+There are two common sources.
+
+### 1. Explicit setup answers
+
+Examples:
+
+- `platform_setup.static_routes.public_base_url`
+- provider-specific setup answers that include `public_base_url`
+
+This is the easiest model to understand:
+
+- the user or deployer already knows the public URL
+- they supply it during setup
+
+### 2. Runtime-discovered public URL
+
+Sometimes the public URL is discovered at startup time.
+
+For example:
+
+- a tunnel is created
+- the runtime learns the public endpoint
+- runtime state is updated with that public URL
+
+This is common in local development when a public callback URL is needed but no
+fixed domain exists yet.
+
+## How Injection Works
+
+When `public_base_url` is known, it can be passed into provider setup or runtime
+config payloads.
+
+The exact shape depends on the consumer, but the important human-level idea is:
+
+- packs do not usually need to discover the public URL by themselves
+- the host or runtime can inject it once it is known
+
+This makes pack behavior more predictable and avoids each pack inventing a
+different way to ask for the same information.
+
+## Why Webhook Packs Need It
+
+Webhook-driven integrations need a callback URL that outside services can call.
+
+That callback URL is usually built from:
+
+- `public_base_url`
+- a route pattern
+- tenant and team information when applicable
+
+Conceptually, it looks like:
+
+```text
+{public_base_url}/v1/.../ingress/.../{tenant}/{team}
+```
+
+So when a pack needs inbound callbacks, the real dependency is not just
+"HTTP ingress". It is:
+
+1. a public route
+2. a public base URL
+3. the correct ingress behavior
+
+## Recommended Rule For Pack Authors
+
+If your pack needs public ingress or callback URLs, follow this pattern:
+
+1. Declare the public web or static surface in pack metadata.
+2. Add a `public_base_url` setup field if the pack needs an externally
+   reachable URL.
+3. Add any extra route field only when you genuinely need configurable path
+   behavior.
+4. Implement the correct ingress capability for the pack type.
+
+This gives setup and runtime one consistent way to help the pack.
+
+## Common Misunderstanding
+
+It is easy to think:
+
+"If the pack needs inbound HTTP, there must be one special ingress flag."
+
+But the real contract is broader than that.
+
+A pack usually needs:
+
+- public exposure
+- URL knowledge
+- routing behavior
+
+That is why `public_base_url` matters so much.
+
+## Practical Summary
+
+If a pack needs a public UI or callback URL:
+
+- declare the public surface
+- declare `public_base_url`
+- let setup or runtime inject the resolved URL
+
+That is the current Greentic model.

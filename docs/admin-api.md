@@ -582,4 +582,5 @@ admin:
 
 - [mTLS Setup Guide](./mtls-setup.md) - Certificate generation
 - [Adaptive Cards Guide](./adaptive-cards.md) - Card-based setup flow
-- [Demo Guide](./demo-guide.md) - Getting started with bundles
+- [README](../README.md) - Human-friendly overview of setup and bundle concepts
+- [Coding Agents Guide](./coding-agents.md) - Ownership boundaries across the Greentic toolchain
