@@ -69,9 +69,10 @@ pub fn resolve_setup_scope_with_bundle(
 ) -> (String, Option<String>, String) {
     let (mut tenant, team, env) = resolve_setup_scope(tenant, team, env, loaded);
 
-    // If tenant is still the CLI default ("demo") and the bundle has a tenants/
-    // directory, detect the actual tenant from existing directories.
+    // If tenant is still the CLI default ("demo") and it did not come from the
+    // answers file, detect the actual tenant from existing directories.
     if tenant == "demo"
+        && loaded.tenant.is_none()
         && let Some(detected) = detect_tenant_from_bundle(bundle_dir)
     {
         tenant = detected;
@@ -394,7 +395,7 @@ pub fn ensure_deployment_targets_present(bundle_path: &Path, loaded: &LoadedAnsw
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_setup_scope;
+    use super::{resolve_setup_scope, resolve_setup_scope_with_bundle};
     use crate::engine::LoadedAnswers;
 
     #[test]
@@ -428,5 +429,28 @@ mod tests {
         assert_eq!(resolved.0, "sandbox");
         assert_eq!(resolved.1.as_deref(), Some("ops"));
         assert_eq!(resolved.2, "staging");
+    }
+
+    #[test]
+    fn bundle_detection_does_not_override_answers_tenant_demo() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("tenants").join("default")).expect("tenant dir");
+
+        let loaded = LoadedAnswers {
+            tenant: Some("demo".to_string()),
+            ..Default::default()
+        };
+
+        let (tenant, team, env) = resolve_setup_scope_with_bundle(
+            "demo".to_string(),
+            None,
+            "dev".to_string(),
+            &loaded,
+            temp.path(),
+        );
+
+        assert_eq!(tenant, "demo");
+        assert_eq!(team, None);
+        assert_eq!(env, "dev");
     }
 }
