@@ -166,10 +166,8 @@ pub fn build_sectioned_flow(form_spec: &FormSpec, sections: &[FlowSection]) -> Q
         match steps.get_mut(&step_chain[i]) {
             Some(StepSpec::Message(msg)) => msg.next = Some(next),
             Some(StepSpec::Question(q)) => q.next = Some(next),
-            Some(StepSpec::Decision(d)) => {
-                if d.default_goto.is_none() {
-                    d.default_goto = Some(next);
-                }
+            Some(StepSpec::Decision(d)) if d.default_goto.is_none() => {
+                d.default_goto = Some(next);
             }
             _ => {}
         }
