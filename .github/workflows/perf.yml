@@ -4,7 +4,7 @@ name: Perf (lightweight)
 
 on:
   schedule:
-    - cron: "36 4 * * *"
+    - cron: "40 3 * * *"
   workflow_dispatch:
   push:
     branches: [main]
