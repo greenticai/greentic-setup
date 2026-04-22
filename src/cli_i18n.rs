@@ -4,6 +4,9 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::sync::Arc;
+
+use greentic_i18n_lib::{DefaultResolver, I18nRequest, I18nResolver, I18nTag, normalize_tag};
 
 /// CLI internationalization support.
 pub struct CliI18n {
@@ -16,9 +19,11 @@ impl CliI18n {
     ///
     /// If no locale is specified, the system locale (LC_ALL, LANG) is used.
     pub fn from_request(requested: Option<&str>) -> Result<Self, String> {
-        let resolved = resolve_locale(requested);
         let fallback = load_catalog("en")?;
-        let catalog = load_catalog(&resolved).unwrap_or_else(|_| fallback.clone());
+        let catalog = resolve_locale_candidates(requested)
+            .into_iter()
+            .find_map(|locale| load_catalog(&locale).ok())
+            .unwrap_or_else(|| fallback.clone());
         Ok(Self { catalog, fallback })
     }
 
@@ -60,21 +65,32 @@ impl CliI18n {
     }
 }
 
-fn resolve_locale(requested: Option<&str>) -> String {
-    if let Some(locale) = requested.and_then(normalize_locale) {
-        return locale;
-    }
-    if let Some(locale) = env::var("LC_ALL")
-        .ok()
-        .as_deref()
+fn resolve_locale_candidates(requested: Option<&str>) -> Vec<String> {
+    let requested = requested
         .and_then(normalize_locale)
-    {
-        return locale;
+        .or_else(|| {
+            env::var("LC_ALL")
+                .ok()
+                .as_deref()
+                .and_then(normalize_locale)
+        })
+        .or_else(|| env::var("LANG").ok().as_deref().and_then(normalize_locale))
+        .unwrap_or_else(|| "en".to_string());
+
+    let resolver = Arc::new(DefaultResolver::default());
+    let fallback_chain = I18nTag::new(&requested)
+        .ok()
+        .and_then(|tag| resolver.resolve(I18nRequest::new(Some(tag), None)).ok())
+        .map(|resolution| resolution.fallback_chain)
+        .unwrap_or_default();
+
+    let mut candidates = Vec::new();
+    push_unique(&mut candidates, requested);
+    for tag in fallback_chain {
+        push_unique(&mut candidates, tag.as_str().to_string());
     }
-    if let Some(locale) = env::var("LANG").ok().as_deref().and_then(normalize_locale) {
-        return locale;
-    }
-    "en".to_string()
+    push_unique(&mut candidates, "en".to_string());
+    candidates
 }
 
 fn normalize_locale(value: &str) -> Option<String> {
@@ -84,10 +100,15 @@ fn normalize_locale(value: &str) -> Option<String> {
     }
     let pre_dot = trimmed.split('.').next().unwrap_or(trimmed);
     let normalized = pre_dot.replace('_', "-");
-    if normalized.is_empty() {
-        return None;
+    normalize_tag(&normalized)
+        .ok()
+        .map(|tag| tag.as_str().to_string())
+}
+
+fn push_unique(values: &mut Vec<String>, candidate: String) {
+    if !values.contains(&candidate) {
+        values.push(candidate);
     }
-    Some(normalized)
 }
 
 fn load_catalog(locale: &str) -> Result<BTreeMap<String, String>, String> {
@@ -219,5 +240,12 @@ mod tests {
         let i18n = CliI18n::from_request(Some("en")).expect("should create i18n");
         let msg = i18n.tf("cli.bundle.init.creating", &["/path/to/bundle"]);
         assert!(msg.contains("/path/to/bundle"));
+    }
+
+    #[test]
+    fn request_uses_parent_locale_fallback_chain() {
+        let candidates = resolve_locale_candidates(Some("en_US"));
+        assert_eq!(candidates.first().map(String::as_str), Some("en-US"));
+        assert!(candidates.iter().any(|value| value == "en"));
     }
 }

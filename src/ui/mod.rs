@@ -424,6 +424,8 @@ async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Js
                     }
                 }
             }
+            let merged_answers =
+                sanitize_answers_for_provider_forms(&merged_answers, &provider_form_specs);
 
             scopes.push(serde_json::json!({
                 "tenant": tenant,
@@ -801,6 +803,7 @@ fn execute_setup(
     env: &str,
     answers: JsonMap<String, Value>,
 ) -> ExecutionResult {
+    let answers = sanitize_answers_for_bundle_forms(bundle_path, &answers);
     let config = SetupConfig {
         tenant: tenant.to_string(),
         team: team.map(String::from),
@@ -937,10 +940,11 @@ async fn persist_ui_draft(
     env: &str,
     answers: &JsonMap<String, Value>,
 ) -> Result<JsonMap<String, Value>> {
+    let answers = sanitize_answers_for_bundle_forms(bundle_path, answers);
     let discovered = discovery::discover(bundle_path).ok();
     let mut persisted = JsonMap::new();
 
-    for (provider_id, provider_answers) in answers {
+    for (provider_id, provider_answers) in &answers {
         let Some(config) = provider_answers.as_object() else {
             continue;
         };
@@ -970,6 +974,77 @@ async fn persist_ui_draft(
     }
 
     Ok(persisted)
+}
+
+fn sanitize_answers_for_bundle_forms(
+    bundle_path: &Path,
+    answers: &JsonMap<String, Value>,
+) -> JsonMap<String, Value> {
+    let mut provider_form_specs = Vec::new();
+
+    if let Ok(discovered) = discovery::discover(bundle_path) {
+        for provider in discovered.setup_targets() {
+            if let Some(form_spec) =
+                setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id)
+            {
+                provider_form_specs.push(wizard::ProviderFormSpec {
+                    provider_id: provider.provider_id.clone(),
+                    form_spec,
+                });
+            }
+        }
+    }
+
+    if provider_form_specs.is_empty() {
+        return answers.clone();
+    }
+
+    sanitize_answers_for_provider_forms(answers, &provider_form_specs)
+}
+
+fn sanitize_answers_for_provider_forms(
+    answers: &JsonMap<String, Value>,
+    provider_form_specs: &[wizard::ProviderFormSpec],
+) -> JsonMap<String, Value> {
+    use std::collections::{HashMap, HashSet};
+
+    let allowed_by_provider: HashMap<&str, HashSet<&str>> = provider_form_specs
+        .iter()
+        .map(|provider| {
+            (
+                provider.provider_id.as_str(),
+                provider
+                    .form_spec
+                    .questions
+                    .iter()
+                    .map(|question| question.id.as_str())
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let mut sanitized = JsonMap::new();
+
+    for (provider_id, provider_answers) in answers {
+        let Some(allowed_keys) = allowed_by_provider.get(provider_id.as_str()) else {
+            continue;
+        };
+        let Some(map) = provider_answers.as_object() else {
+            continue;
+        };
+
+        let filtered: JsonMap<String, Value> = map
+            .iter()
+            .filter(|(key, _)| allowed_keys.contains(key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        if !filtered.is_empty() {
+            sanitized.insert(provider_id.clone(), Value::Object(filtered));
+        }
+    }
+
+    sanitized
 }
 
 /// Extract a non-empty string from a JSON value (handles String, Number, Bool).
@@ -1041,9 +1116,11 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 
 #[cfg(test)]
 mod tests {
-    use super::persist_ui_draft;
+    use super::{persist_ui_draft, sanitize_answers_for_provider_forms};
+    use crate::qa::wizard::ProviderFormSpec;
     use crate::secrets::open_dev_store;
     use greentic_secrets_lib::SecretsStore;
+    use qa_spec::{FormSpec, QuestionSpec, QuestionType};
     use serde_json::{Map as JsonMap, Value, json};
     use std::io::Write;
     use zip::write::SimpleFileOptions;
@@ -1064,6 +1141,72 @@ mod tests {
         zip.write_all(req_json.as_bytes())?;
         zip.finish()?;
         Ok(())
+    }
+
+    fn provider_form_spec(provider_id: &str, question_ids: &[&str]) -> ProviderFormSpec {
+        ProviderFormSpec {
+            provider_id: provider_id.to_string(),
+            form_spec: FormSpec {
+                id: format!("{provider_id}-setup"),
+                title: provider_id.to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                presentation: None,
+                progress_policy: None,
+                secrets_policy: None,
+                store: vec![],
+                validations: vec![],
+                includes: vec![],
+                questions: question_ids
+                    .iter()
+                    .map(|question_id| QuestionSpec {
+                        id: (*question_id).to_string(),
+                        kind: QuestionType::String,
+                        title: (*question_id).to_string(),
+                        title_i18n: None,
+                        description: None,
+                        description_i18n: None,
+                        required: false,
+                        choices: None,
+                        default_value: None,
+                        secret: false,
+                        visible_if: None,
+                        constraint: None,
+                        list: None,
+                        computed: None,
+                        policy: Default::default(),
+                        computed_overridable: false,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn sanitize_answers_for_provider_forms_drops_stale_keys_after_rename() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "deep-research-demo": {
+                "api_key": "old-value",
+                "api_key_secret": "new-value",
+                "provider": "ollama"
+            }
+        }))
+        .expect("answers");
+
+        let provider_form_specs = vec![provider_form_spec(
+            "deep-research-demo",
+            &["api_key_secret", "provider"],
+        )];
+
+        let sanitized = sanitize_answers_for_provider_forms(&answers, &provider_form_specs);
+
+        assert_eq!(
+            sanitized.get("deep-research-demo"),
+            Some(&json!({
+                "api_key_secret": "new-value",
+                "provider": "ollama"
+            }))
+        );
     }
 
     #[tokio::test]
