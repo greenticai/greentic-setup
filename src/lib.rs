@@ -24,6 +24,7 @@ pub mod platform_setup;
 pub mod reload;
 pub mod secret_name;
 pub mod secrets;
+pub mod secrets_prompt;
 pub mod setup_input;
 pub mod setup_to_formspec;
 pub mod tenant_config;

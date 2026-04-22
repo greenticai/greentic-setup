@@ -232,6 +232,15 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         return Ok(());
     }
 
+    // Diff-only interactive prompting: ask the user only for required
+    // pack secrets that are missing from BOTH the dev store AND
+    // seeds.yaml. Existing values are never re-prompted. Empty
+    // optional values are skipped. --non-interactive skips this step.
+    if !non_interactive {
+        prompt_missing_pack_secrets_blocking(&bundle_dir, engine.config(), provider_id.as_deref())
+            .context(i18n.t("cli.setup.passphrase.failed"))?;
+    }
+
     engine
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
@@ -243,6 +252,66 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     println!("\n{}", i18n.tf(done_key, &[&provider_display]));
 
     Ok(())
+}
+
+/// Discover packs in the bundle, enumerate their required secrets,
+/// and interactively prompt the user for any value that is missing
+/// from both the dev store and `seeds.yaml`. Returns immediately if
+/// no missing keys are found — existing values are never re-prompted.
+fn prompt_missing_pack_secrets_blocking(
+    bundle_dir: &Path,
+    config: &crate::engine::SetupConfig,
+    provider_filter: Option<&str>,
+) -> Result<()> {
+    use crate::secrets::SecretsSetup;
+    use crate::secrets_prompt::prompt_missing_keys;
+
+    // The discovery + missing-key enumeration + persistence are all
+    // async at the underlying SecretsBackend level. Wrap a single
+    // tokio runtime around them; this mirrors the pattern used by
+    // engine/executors.rs::persist_all_config_as_secrets.
+    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime for secret prompts")?;
+
+    rt.block_on(async {
+        let setup = SecretsSetup::new(
+            bundle_dir,
+            &config.env,
+            &config.tenant,
+            config.team.as_deref(),
+        )?;
+
+        let discovered = match crate::discovery::discover(bundle_dir) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+
+        let mut all_missing = Vec::new();
+        for target in discovered.setup_targets() {
+            if let Some(filter) = provider_filter
+                && target.provider_id != filter
+            {
+                continue;
+            }
+            let missing = setup
+                .missing_pack_secrets(&target.pack_path, &target.provider_id)
+                .await?;
+            all_missing.extend(missing);
+        }
+
+        if all_missing.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "\n{} required secret value(s) missing — please enter them:",
+            all_missing.len()
+        );
+        let entered = prompt_missing_keys(&all_missing)?;
+        for (uri, value) in entered {
+            setup.set_secret_text(&uri, &value).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 /// Resolve a passphrase from the CLI flags + bundle state and install

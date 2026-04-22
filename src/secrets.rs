@@ -135,6 +135,66 @@ impl SecretsSetup {
         &self.store
     }
 
+    /// Resolve required-but-missing secret keys for a pack without
+    /// seeding placeholders. The caller (typically the setup CLI) is
+    /// expected to prompt the user for each returned `MissingKey` and
+    /// then call [`SecretsSetup::set_secret_text`] to populate it.
+    ///
+    /// Keys that resolve via `seeds.yaml` are still seeded
+    /// transparently — they do NOT appear in the returned vector. Only
+    /// keys with no existing value AND no seed entry are returned.
+    pub async fn missing_pack_secrets(
+        &self,
+        pack_path: &Path,
+        provider_id: &str,
+    ) -> Result<Vec<MissingKey>> {
+        let reqs = load_secret_requirements_from_pack(pack_path)?;
+        let mut missing = Vec::new();
+        for req in reqs {
+            let uri = canonical_secret_uri(
+                &self.env,
+                &self.tenant,
+                self.team.as_deref(),
+                provider_id,
+                &req.key,
+            );
+            match self.store.get(&uri).await {
+                Ok(_) => continue,
+                Err(SecretError::NotFound { .. }) => {}
+                Err(err) => return Err(anyhow!("failed to read secret {uri}: {err}")),
+            }
+            // Auto-apply seed entry transparently if available.
+            if let Some(seed) = self.seeds.get(&uri) {
+                let _report = apply_seed(
+                    &self.store,
+                    &SeedDoc {
+                        entries: vec![seed.clone()],
+                    },
+                    ApplyOptions::default(),
+                )
+                .await;
+                continue;
+            }
+            missing.push(MissingKey {
+                provider_id: provider_id.to_string(),
+                key: req.key.clone(),
+                uri,
+                description: req.description.clone(),
+                required: req.required,
+                looks_secret: looks_secret(&req.key),
+            });
+        }
+        Ok(missing)
+    }
+
+    /// Persist a single text-valued secret at the given canonical URI.
+    pub async fn set_secret_text(&self, uri: &str, value: &str) -> Result<()> {
+        self.store
+            .put(uri, SecretFormat::Text, value.as_bytes())
+            .await
+            .map_err(|err| anyhow!("failed to write secret {uri}: {err}"))
+    }
+
     /// Ensure all required secrets for a pack exist in the dev store.
     ///
     /// Reads `assets/secret-requirements.json` from the pack and seeds any
@@ -191,6 +251,46 @@ impl SecretsSetup {
         }
         Ok(())
     }
+}
+
+/// Description of a required pack secret that has no value in the
+/// store and no entry in `seeds.yaml`. Returned by
+/// [`SecretsSetup::missing_pack_secrets`]; callers should prompt the
+/// user and persist via [`SecretsSetup::set_secret_text`].
+#[derive(Debug, Clone)]
+pub struct MissingKey {
+    /// Provider that declared the requirement (e.g. `messaging-telegram`).
+    pub provider_id: String,
+    /// The key name as declared in the pack manifest (e.g. `BOT_TOKEN`).
+    pub key: String,
+    /// Canonical secret URI (already includes env/tenant/team scope).
+    pub uri: String,
+    /// Human-readable description from the pack manifest, if any.
+    pub description: Option<String>,
+    /// Whether this key is marked `required: true` in the manifest.
+    pub required: bool,
+    /// True when the key name looks like a secret (token/password/etc.)
+    /// and should be prompted with no-echo input. False for plain
+    /// configuration values that can be echoed.
+    pub looks_secret: bool,
+}
+
+/// Heuristic: name suggests this is a secret value (no-echo prompt) vs
+/// a plain config value (echoed prompt).
+fn looks_secret(key: &str) -> bool {
+    let k = key.to_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "apikey",
+        "private_key",
+        "credential",
+        "passphrase",
+    ]
+    .iter()
+    .any(|needle| k.contains(needle))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
