@@ -11,13 +11,29 @@ pub(crate) const PACK_DECLARED_POLICY: &str = "pack_declared";
 pub(crate) const SURFACE_ENABLED: &str = "enabled";
 pub(crate) const SURFACE_DISABLED: &str = "disabled";
 
-/// Platform-level setup answers containing static routes and deployment targets.
+/// Platform-level setup answers containing static routes, deployment targets,
+/// and tunnel configuration.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlatformSetupAnswers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_routes: Option<StaticRoutesAnswers>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deployment_targets: Vec<DeploymentTargetRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelAnswers>,
+}
+
+/// Tunnel configuration for local development.
+///
+/// When `mode` is `"cloudflared"` or `"ngrok"`, `greentic-start` will
+/// automatically enable the corresponding tunnel without requiring CLI
+/// flags or an interactive prompt.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelAnswers {
+    /// `"cloudflared"`, `"ngrok"`, or `"off"`. When absent the runtime
+    /// falls back to its own default (auto-detect or interactive prompt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// User-provided answers for static routes configuration.

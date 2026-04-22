@@ -5,6 +5,7 @@
   var i18n = {};
   var currentLocale = "en";
   var localeOptions = [];
+  var draftSaveTimer = null;
 
   function t(key, args) {
     var text = i18n[key] || key.replace(/^ui\./, "");
@@ -54,11 +55,18 @@
         if (data.i18n) i18n = data.i18n;
         state.providerForms = {};
         (data.provider_forms || []).forEach(function (pf) {
+          pf.questions = filterHiddenQuestions(pf.questions || []);
           state.providerForms[pf.provider_id] = pf;
         });
-        state.sharedQuestions = data.shared_questions || [];
+        state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
         render();
       });
+  }
+
+  // Questions auto-injected by the operator (e.g. tunnel URL auto-detection).
+  var HIDDEN_QUESTION_IDS = ["public_base_url"];
+  function filterHiddenQuestions(questions) {
+    return questions.filter(function (q) { return HIDDEN_QUESTION_IDS.indexOf(q.id) === -1; });
   }
 
   // ── State ──
@@ -78,6 +86,7 @@
       tenant: tenant || "demo",
       env: env || "dev",
       team: team || "",
+      tunnel: "cloudflared",
       answers: answers,
       sharedAnswers: {},
       providersDone: {},
@@ -105,11 +114,62 @@
   /** Get the scope currently being edited. */
   function cs() { return state.scopes[state.currentScopeIdx]; }
 
+  function buildPersistableAnswers(scope) {
+    var answers = {};
+    state.providers.forEach(function (p) {
+      var providerAnswers = {};
+      var existing = scope.answers[p.provider_id] || {};
+      Object.keys(existing).forEach(function (k) { providerAnswers[k] = existing[k]; });
+      Object.keys(scope.sharedAnswers || {}).forEach(function (k) {
+        if (providerAnswers[k] === undefined || providerAnswers[k] === null || providerAnswers[k] === "") {
+          providerAnswers[k] = scope.sharedAnswers[k];
+        }
+      });
+      if (Object.keys(providerAnswers).length > 0) {
+        answers[p.provider_id] = providerAnswers;
+      }
+    });
+    return answers;
+  }
+
+  function persistDraftNow() {
+    var scope = cs();
+    if (!scope) return Promise.resolve();
+    var payload = {
+      answers: buildPersistableAnswers(scope),
+      tenant: scope.tenant,
+      env: scope.env,
+    };
+    if (scope.team) payload.team = scope.team;
+    if (Object.keys(payload.answers).length === 0) return Promise.resolve();
+    return fetch("/api/draft", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!res.ok) console.warn("Draft persistence failed:", res.error || "unknown error");
+    })
+    .catch(function (err) {
+      console.warn("Draft persistence failed:", err.message);
+    });
+  }
+
+  function scheduleDraftSave() {
+    if (draftSaveTimer) clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(function () {
+      draftSaveTimer = null;
+      persistDraftNow();
+    }, 500);
+  }
+
   function render() {
     switch (state.phase) {
       case "loading": renderLoading(); break;
       case "dashboard": renderDashboard(); break;
       case "scope-edit": renderScopeEdit(); break;
+      case "tunnel": renderTunnel(); break;
       case "providers": renderProviders(); break;
       case "shared": renderForm(state.sharedQuestions, t("ui.shared.title"), t("ui.shared.description"), null, submitShared); break;
       case "provider-form": renderProviderForm(); break;
@@ -145,9 +205,10 @@
         state.providers = data.providers || [];
         state.providerForms = {};
         (data.provider_forms || []).forEach(function (pf) {
+          pf.questions = filterHiddenQuestions(pf.questions || []);
           state.providerForms[pf.provider_id] = pf;
         });
-        state.sharedQuestions = data.shared_questions || [];
+        state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
 
         if (state.providers.length === 0) {
           app.innerHTML =
@@ -497,6 +558,71 @@
       scope.tenant = tenant;
       scope.env = document.getElementById("f-scope-env").value;
       scope.team = document.getElementById("f-scope-team").value.trim();
+      state.phase = "tunnel";
+      render();
+    });
+  }
+
+  // ── Tunnel configuration ──
+
+  function renderTunnel() {
+    var scope = cs();
+    var html =
+      '<div class="fade-in">' +
+        '<div class="step-header">' +
+          '<button class="btn btn-ghost btn-sm btn-back" id="btn-back">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+            ' ' + esc(t("ui.back")) +
+          '</button>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="card-header">' +
+            '<h2 class="card-title">Tunnel</h2>' +
+            '<p class="card-desc">External messaging channels (Webex, Telegram, Slack, etc.) need a public URL to deliver webhooks to your local machine. Choose a tunnel service.</p>' +
+          '</div>' +
+          '<div class="card-content"><div class="form-fields">' +
+            '<div class="field">' +
+              '<label class="field-label">Tunnel service</label>' +
+              '<div class="tunnel-options">' +
+                '<label class="tunnel-option' + (scope.tunnel === "cloudflared" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="cloudflared"' + (scope.tunnel === "cloudflared" ? ' checked' : '') + ' />' +
+                  '<div><strong>Cloudflare Tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Free, no account needed. Auto-installs if missing.</span></div>' +
+                '</label>' +
+                '<label class="tunnel-option' + (scope.tunnel === "ngrok" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="ngrok"' + (scope.tunnel === "ngrok" ? ' checked' : '') + ' />' +
+                  '<div><strong>ngrok</strong><br/><span style="opacity:.7;font-size:.85rem">Requires ngrok account and binary installed.</span></div>' +
+                '</label>' +
+                '<label class="tunnel-option' + (scope.tunnel === "off" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="off"' + (scope.tunnel === "off" ? ' checked' : '') + ' />' +
+                  '<div><strong>No tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Local only. External webhooks will not work.</span></div>' +
+                '</label>' +
+              '</div>' +
+            '</div>' +
+          '</div></div>' +
+          '<div class="card-footer">' +
+            '<button class="btn btn-primary btn-lg" id="btn-tunnel-continue" style="width:100%">' + esc(t("ui.continue")) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    app.innerHTML = html;
+
+    // Highlight selected option
+    document.querySelectorAll('input[name="tunnel"]').forEach(function (radio) {
+      radio.addEventListener("change", function () {
+        document.querySelectorAll(".tunnel-option").forEach(function (el) { el.classList.remove("selected"); });
+        radio.closest(".tunnel-option").classList.add("selected");
+      });
+    });
+
+    document.getElementById("btn-back").addEventListener("click", function () {
+      state.phase = "scope-edit";
+      render();
+    });
+
+    document.getElementById("btn-tunnel-continue").addEventListener("click", function () {
+      var selected = document.querySelector('input[name="tunnel"]:checked');
+      scope.tunnel = selected ? selected.value : "cloudflared";
       state.phase = "providers";
       render();
     });
@@ -520,13 +646,13 @@
         '</div>' +
         '<div class="provider-list">';
 
-    state.providers.forEach(function (p) {
+    state.providers.forEach(function (p, idx) {
       var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
       var displayName = formatProviderName(p);
       html +=
-        '<div class="provider-card">' +
+        '<div class="provider-card clickable" data-prov-idx="' + idx + '">' +
           '<div class="prov-icon">' + esc(displayName.charAt(0)) + '</div>' +
           '<div>' +
             '<div class="prov-name">' + esc(displayName) + '</div>' +
@@ -540,16 +666,15 @@
 
     if (state.sharedQuestions.length > 0 && !scope.sharedAnswersDone) {
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
-    } else if (!allDone) {
-      var nextIdx = state.providers.findIndex(function (p) { return !scope.providersDone[p.provider_id]; });
-      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + nextIdx + '" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[nextIdx])])) + '</button>';
     } else {
-      html += '<button class="btn btn-primary btn-lg" id="btn-review" style="width:100%">' + esc(t("ui.review_execute")) + '</button>';
+      // Always offer sequential edit starting from the first provider
+      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="0" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[0])])) + '</button>';
     }
 
     html +=
       '<div style="text-align:center;margin-top:.75rem;display:flex;justify-content:center;gap:.5rem">' +
         '<button class="btn btn-ghost" id="btn-back-scope">' + esc(t("ui.back")) + '</button>' +
+        (allDone ? '<button class="btn btn-ghost" id="btn-review">' + esc(t("ui.review_execute")) + '</button>' : '') +
       '</div></div>';
 
     app.innerHTML = html;
@@ -568,8 +693,18 @@
     var reviewBtn = document.getElementById("btn-review");
     if (reviewBtn) reviewBtn.addEventListener("click", function () { state.phase = "review"; render(); });
 
+    // Click on any provider card to edit it
+    document.querySelectorAll(".provider-card.clickable").forEach(function (card) {
+      card.addEventListener("click", function () {
+        var idx = parseInt(card.getAttribute("data-prov-idx"), 10);
+        state.currentProvider = idx;
+        state.phase = "provider-form";
+        render();
+      });
+    });
+
     document.getElementById("btn-back-scope").addEventListener("click", function () {
-      state.phase = "scope-edit";
+      state.phase = "tunnel";
       render();
     });
   }
@@ -621,14 +756,28 @@
     app.innerHTML = html;
     restoreFormValues(questions);
     setupVisibility(questions);
+    app.querySelectorAll("#form-area input, #form-area select, #form-area textarea").forEach(function (el) {
+      var handler = function () {
+        collectFormValues(questions);
+        scheduleDraftSave();
+      };
+      el.addEventListener("input", handler);
+      el.addEventListener("change", handler);
+    });
 
     var goBack = backFn || function () { state.phase = backPhase || "providers"; render(); };
-    document.getElementById("btn-back").addEventListener("click", function () { collectFormValues(questions); goBack(); });
-    document.getElementById("btn-prev").addEventListener("click", function () { collectFormValues(questions); goBack(); });
+    document.getElementById("btn-back").addEventListener("click", function () {
+      collectFormValues(questions);
+      persistDraftNow().finally(goBack);
+    });
+    document.getElementById("btn-prev").addEventListener("click", function () {
+      collectFormValues(questions);
+      persistDraftNow().finally(goBack);
+    });
     document.getElementById("btn-submit").addEventListener("click", function () {
       if (!validateForm(questions)) return;
       collectFormValues(questions);
-      onSubmit();
+      persistDraftNow().finally(onSubmit);
     });
   }
 
@@ -762,7 +911,7 @@
     state.providers.forEach(function (p) {
       var store = scope.answers[p.provider_id] || {};
       Object.keys(scope.sharedAnswers).forEach(function (k) {
-        if (!store[k]) store[k] = scope.sharedAnswers[k];
+        store[k] = scope.sharedAnswers[k];
       });
       scope.answers[p.provider_id] = store;
     });
@@ -795,10 +944,13 @@
   }
 
   function advanceProvider() {
-    var scope = cs();
-    var next = state.providers.findIndex(function (p) { return !scope.providersDone[p.provider_id]; });
-    if (next >= 0) { state.currentProvider = next; state.phase = "provider-form"; }
-    else { state.phase = "review"; }
+    var nextIdx = state.currentProvider + 1;
+    if (nextIdx < state.providers.length) {
+      state.currentProvider = nextIdx;
+      state.phase = "provider-form";
+    } else {
+      state.phase = "review";
+    }
     render();
   }
 
@@ -871,6 +1023,7 @@
       answers: scope.answers,
       tenant: scope.tenant,
       env: scope.env,
+      tunnel: scope.tunnel || null,
     };
     if (scope.team) payload.team = scope.team;
     fetch("/api/execute", {

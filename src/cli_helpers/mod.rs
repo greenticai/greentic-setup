@@ -69,9 +69,10 @@ pub fn resolve_setup_scope_with_bundle(
 ) -> (String, Option<String>, String) {
     let (mut tenant, team, env) = resolve_setup_scope(tenant, team, env, loaded);
 
-    // If tenant is still the CLI default ("demo") and the bundle has a tenants/
-    // directory, detect the actual tenant from existing directories.
+    // If tenant is still the CLI default ("demo") and it did not come from the
+    // answers file, detect the actual tenant from existing directories.
     if tenant == "demo"
+        && loaded.tenant.is_none()
         && let Some(detected) = detect_tenant_from_bundle(bundle_dir)
     {
         tenant = detected;
@@ -119,14 +120,23 @@ pub fn run_interactive_wizard(
     let mut all_answers = serde_json::Map::new();
     let existing_static_routes = load_effective_static_routes_defaults(bundle_path, tenant, team)?;
     let static_routes = prompt_static_routes_policy(env, existing_static_routes.as_ref())?;
-    let deployment_targets = crate::deployment_targets::prompt_deployment_targets(
-        &crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?,
-    )?;
+    let deployer_candidates =
+        crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
+    let deployment_targets =
+        crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
+
+    // Prompt for tunnel mode when no deployer packs are present (local dev).
+    let tunnel = if deployer_candidates.is_empty() {
+        Some(crate::platform_setup::prompt_tunnel_mode(None)?)
+    } else {
+        None
+    };
 
     let discovered = discovery::discover(bundle_path)?;
+    let setup_targets = discovered.setup_targets();
 
-    if discovered.providers.is_empty() {
-        println!("No providers found in bundle. Nothing to configure.");
+    if setup_targets.is_empty() {
+        println!("No setup packs found in bundle. Nothing to configure.");
         return Ok(LoadedAnswers {
             tenant: None,
             team: None,
@@ -134,24 +144,21 @@ pub fn run_interactive_wizard(
             platform_setup: PlatformSetupAnswers {
                 static_routes: Some(static_routes.to_answers()),
                 deployment_targets,
+                tunnel,
             },
             setup_answers: all_answers,
         });
     }
 
-    println!(
-        "Found {} provider(s) to configure:",
-        discovered.providers.len()
-    );
-    for provider in &discovered.providers {
+    println!("Found {} pack(s) to configure:", setup_targets.len());
+    for provider in &setup_targets {
         println!("  - {} ({})", provider.provider_id, provider.domain);
     }
     println!();
 
     // ── Collect and prompt shared questions once ────────────────────────────
     // Build FormSpecs for all providers to identify shared questions
-    let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
-        .providers
+    let provider_form_specs: Vec<wizard::ProviderFormSpec> = setup_targets
         .iter()
         .filter_map(|provider| {
             setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
@@ -178,7 +185,7 @@ pub fn run_interactive_wizard(
     };
 
     // ── Configure each provider ─────────────────────────────────────────────
-    for provider in &discovered.providers {
+    for provider in &setup_targets {
         let provider_id = &provider.provider_id;
         let form_spec = setup_to_formspec::pack_to_form_spec(&provider.pack_path, provider_id);
 
@@ -215,6 +222,7 @@ pub fn run_interactive_wizard(
         platform_setup: PlatformSetupAnswers {
             static_routes: Some(static_routes.to_answers()),
             deployment_targets,
+            tunnel,
         },
         setup_answers: all_answers,
     })
@@ -247,11 +255,15 @@ pub fn complete_loaded_answers_with_prompts(
             };
         loaded.platform_setup.static_routes = Some(static_routes.to_answers());
     }
+    let deployer_candidates =
+        crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
     if loaded.platform_setup.deployment_targets.is_empty() {
         loaded.platform_setup.deployment_targets =
-            crate::deployment_targets::prompt_deployment_targets(
-                &crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?,
-            )?;
+            crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
+    }
+    // Prompt for tunnel mode when no deployer and not already configured.
+    if deployer_candidates.is_empty() && loaded.platform_setup.tunnel.is_none() {
+        loaded.platform_setup.tunnel = Some(crate::platform_setup::prompt_tunnel_mode(None)?);
     }
 
     // ── Confirm environment variable placeholders ────────────────────────────
@@ -266,11 +278,11 @@ pub fn complete_loaded_answers_with_prompts(
     }
 
     let discovered = discovery::discover(bundle_path)?;
+    let setup_targets = discovered.setup_targets();
 
     // ── Collect and prompt shared questions once ────────────────────────────
     // Build FormSpecs for ALL providers to identify shared questions
-    let all_provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
-        .providers
+    let all_provider_form_specs: Vec<wizard::ProviderFormSpec> = setup_targets
         .iter()
         .filter_map(|provider| {
             setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
@@ -318,7 +330,7 @@ pub fn complete_loaded_answers_with_prompts(
     };
 
     // ── Complete answers for each provider ──────────────────────────────────
-    for provider in &discovered.providers {
+    for provider in &setup_targets {
         let provider_id = &provider.provider_id;
         let existing = loaded
             .setup_answers
@@ -383,7 +395,7 @@ pub fn ensure_deployment_targets_present(bundle_path: &Path, loaded: &LoadedAnsw
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_setup_scope;
+    use super::{resolve_setup_scope, resolve_setup_scope_with_bundle};
     use crate::engine::LoadedAnswers;
 
     #[test]
@@ -417,5 +429,28 @@ mod tests {
         assert_eq!(resolved.0, "sandbox");
         assert_eq!(resolved.1.as_deref(), Some("ops"));
         assert_eq!(resolved.2, "staging");
+    }
+
+    #[test]
+    fn bundle_detection_does_not_override_answers_tenant_demo() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("tenants").join("default")).expect("tenant dir");
+
+        let loaded = LoadedAnswers {
+            tenant: Some("demo".to_string()),
+            ..Default::default()
+        };
+
+        let (tenant, team, env) = resolve_setup_scope_with_bundle(
+            "demo".to_string(),
+            None,
+            "dev".to_string(),
+            &loaded,
+            temp.path(),
+        );
+
+        assert_eq!(tenant, "demo");
+        assert_eq!(team, None);
+        assert_eq!(env, "dev");
     }
 }

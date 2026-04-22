@@ -26,6 +26,8 @@ use crate::platform_setup::StaticRoutesPolicy;
 use crate::qa::wizard;
 use crate::{SetupEngine, SetupMode, discovery, setup_to_formspec};
 
+use crate::qa::shared_questions::HIDDEN_FROM_PROMPTS;
+
 // ── Types ──
 
 struct UiState {
@@ -111,6 +113,17 @@ struct ExecuteRequest {
     team: Option<String>,
     #[serde(default)]
     env: Option<String>,
+    #[serde(default)]
+    tunnel: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DraftSaveRequest {
+    answers: JsonMap<String, Value>,
+    tenant: String,
+    #[serde(default)]
+    team: Option<String>,
+    env: String,
 }
 
 #[derive(Serialize)]
@@ -190,6 +203,7 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/scope", get(get_scope))
         .route("/api/existing-scopes", get(get_existing_scopes))
         .route("/api/providers", get(get_providers))
+        .route("/api/draft", post(post_draft))
         .route("/api/execute", post(post_execute))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
@@ -371,7 +385,7 @@ async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Js
     let discovered = discovery::discover(bundle_path).ok();
     let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
         .iter()
-        .flat_map(|d| d.providers.iter())
+        .flat_map(|d| d.setup_targets())
         .filter_map(|p| {
             setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id).map(|fs| {
                 wizard::ProviderFormSpec {
@@ -453,8 +467,9 @@ async fn get_providers(
         }
     };
 
-    let provider_form_specs: Vec<wizard::ProviderFormSpec> = discovered
-        .providers
+    let setup_targets = discovered.setup_targets();
+
+    let provider_form_specs: Vec<wizard::ProviderFormSpec> = setup_targets
         .iter()
         .filter_map(|provider| {
             setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
@@ -475,8 +490,7 @@ async fn get_providers(
         vec![]
     };
 
-    let providers: Vec<ProviderInfo> = discovered
-        .providers
+    let providers: Vec<ProviderInfo> = setup_targets
         .iter()
         .map(|p| {
             let form = setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id);
@@ -494,7 +508,7 @@ async fn get_providers(
         String,
         std::collections::HashMap<String, SetupQuestionExtras>,
     > = std::collections::HashMap::new();
-    for provider in &discovered.providers {
+    for provider in &setup_targets {
         if let Ok(Some(spec)) = crate::setup_input::load_setup_spec(&provider.pack_path) {
             let mut map = std::collections::HashMap::new();
             for q in &spec.questions {
@@ -526,8 +540,10 @@ async fn get_providers(
 
     // Inject saved values into shared questions (pick from first provider that has the value)
     // Answers from --answers file take priority over saved secrets.
+    // Filter out questions that are auto-injected by the operator (e.g. public_base_url).
     let shared_questions: Vec<QuestionInfo> = shared_question_specs
         .iter()
+        .filter(|q| !HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()))
         .map(|q| {
             let mut info = form_question_to_info(q, Some(&i18n));
             // First try --answers prefill (check all providers for the shared question)
@@ -575,6 +591,7 @@ async fn get_providers(
                     .form_spec
                     .questions
                     .iter()
+                    .filter(|q| !HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()))
                     .map(|q| {
                         let mut info = form_question_to_info(q, Some(&i18n));
                         if let Some(ext) = extras.and_then(|m| m.get(&q.id)) {
@@ -620,6 +637,14 @@ async fn post_execute(
     let env = req.env.unwrap_or_else(|| state.env.clone());
     let answers = req.answers;
 
+    // Persist tunnel config from the UI selection.
+    if let Some(mode) = req.tunnel.as_deref() {
+        let tunnel = crate::platform_setup::TunnelAnswers {
+            mode: Some(mode.to_string()),
+        };
+        let _ = crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel);
+    }
+
     let result = tokio::task::spawn_blocking(move || {
         execute_setup(&bundle_path, &tenant, team.as_deref(), &env, answers)
     })
@@ -633,6 +658,30 @@ async fn post_execute(
 
     *state.result.lock().unwrap() = Some(result.clone());
     Json(result)
+}
+
+async fn post_draft(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<DraftSaveRequest>,
+) -> Json<Value> {
+    match persist_ui_draft(
+        &state.bundle_path,
+        &req.tenant,
+        req.team.as_deref(),
+        &req.env,
+        &req.answers,
+    )
+    .await
+    {
+        Ok(persisted) => Json(serde_json::json!({
+            "ok": true,
+            "persisted": persisted,
+        })),
+        Err(err) => Json(serde_json::json!({
+            "ok": false,
+            "error": err.to_string(),
+        })),
+    }
 }
 
 #[derive(Deserialize)]
@@ -661,7 +710,7 @@ async fn post_export(
     let discovered = discovery::discover(&bundle_path).ok();
     let secret_fields: std::collections::HashSet<String> = discovered
         .iter()
-        .flat_map(|d| d.providers.iter())
+        .flat_map(|d| d.setup_targets())
         .filter_map(|p| setup_to_formspec::pack_to_form_spec(&p.pack_path, &p.provider_id))
         .flat_map(|spec| spec.questions.into_iter())
         .filter(|q| q.secret)
@@ -881,6 +930,48 @@ async fn load_saved_secrets(
     result
 }
 
+async fn persist_ui_draft(
+    bundle_path: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    env: &str,
+    answers: &JsonMap<String, Value>,
+) -> Result<JsonMap<String, Value>> {
+    let discovered = discovery::discover(bundle_path).ok();
+    let mut persisted = JsonMap::new();
+
+    for (provider_id, provider_answers) in answers {
+        let Some(config) = provider_answers.as_object() else {
+            continue;
+        };
+        if config.is_empty() {
+            continue;
+        }
+
+        let pack_path = discovered.as_ref().and_then(|d| {
+            d.find_setup_target(provider_id)
+                .map(|provider| provider.pack_path.as_path())
+        });
+
+        let keys = crate::qa::persist::persist_all_config_as_secrets(
+            bundle_path,
+            env,
+            tenant,
+            team,
+            provider_id,
+            provider_answers,
+            pack_path,
+        )
+        .await?;
+
+        if !keys.is_empty() {
+            persisted.insert(provider_id.clone(), serde_json::to_value(keys)?);
+        }
+    }
+
+    Ok(persisted)
+}
+
 /// Extract a non-empty string from a JSON value (handles String, Number, Bool).
 fn value_as_nonempty_string(v: &Value) -> Option<String> {
     match v {
@@ -945,5 +1036,85 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         placeholder: None,
         group: None,
         docs_url: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persist_ui_draft;
+    use crate::secrets::open_dev_store;
+    use greentic_secrets_lib::SecretsStore;
+    use serde_json::{Map as JsonMap, Value, json};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn write_pack_with_secret_requirements(
+        path: &std::path::Path,
+        pack_id: &str,
+        req_json: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(format!(r#"{{"pack_id":"{pack_id}"}}"#).as_bytes())?;
+        zip.start_file(
+            "assets/secret-requirements.json",
+            SimpleFileOptions::default(),
+        )?;
+        zip.write_all(req_json.as_bytes())?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_ui_draft_writes_provider_answers_to_dev_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle_root = temp.path();
+        std::fs::create_dir_all(bundle_root.join("packs")).expect("packs dir");
+
+        let pack_path = bundle_root.join("packs").join("weatherapi-pack.gtpack");
+        write_pack_with_secret_requirements(
+            &pack_path,
+            "weatherapi-pack",
+            r#"[{"key":"auth.param.get_weather.key"}]"#,
+        )
+        .expect("pack");
+
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "weatherapi-pack": {
+                "auth_param_get_weather_key": "test-weather-key"
+            }
+        }))
+        .expect("answers");
+
+        let persisted = persist_ui_draft(bundle_root, "dev-tenant", None, "dev", &answers)
+            .await
+            .expect("persist draft");
+        assert_eq!(
+            persisted.get("weatherapi-pack"),
+            Some(&json!(["auth_param_get_weather_key"]))
+        );
+
+        let store = open_dev_store(bundle_root).expect("open store");
+        let base_uri = crate::canonical_secret_uri(
+            "dev",
+            "dev-tenant",
+            None,
+            "weatherapi-pack",
+            "auth_param_get_weather_key",
+        );
+        let alias_uri = crate::canonical_secret_uri(
+            "dev",
+            "dev-tenant",
+            None,
+            "weatherapi-pack",
+            "auth.param.get_weather.key",
+        );
+        let base_value =
+            String::from_utf8(store.get(&base_uri).await.expect("base")).expect("base utf8");
+        let alias_value =
+            String::from_utf8(store.get(&alias_uri).await.expect("alias")).expect("alias utf8");
+        assert_eq!(base_value, "test-weather-key");
+        assert_eq!(alias_value, "test-weather-key");
     }
 }

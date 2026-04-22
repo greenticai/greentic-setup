@@ -188,7 +188,7 @@ pub fn plan_reload(bundle: &std::path::Path, diff: &BundleDiff) -> ReloadPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{DetectedDomains, ProviderIdSource};
+    use crate::discovery::{DetectedDomains, DetectedPackKind, ProviderIdSource};
 
     fn make_provider(id: &str, path: &str) -> DetectedProvider {
         DetectedProvider {
@@ -197,6 +197,7 @@ mod tests {
             domain: "messaging".to_string(),
             pack_path: PathBuf::from(path),
             id_source: ProviderIdSource::Manifest,
+            kind: DetectedPackKind::Provider,
         }
     }
 
@@ -210,6 +211,7 @@ mod tests {
                 secrets: false,
             },
             providers,
+            app_packs: Vec::new(),
         }
     }
 

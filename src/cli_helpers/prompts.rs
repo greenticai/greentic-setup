@@ -75,15 +75,17 @@ pub fn prompt_setup_params(cli: &Cli, i18n: &CliI18n) -> Result<SetupParams> {
                 secrets: false,
             },
             providers: Vec::new(),
+            app_packs: Vec::new(),
         });
 
     // Show existing packs
     println!();
-    if discovered.providers.is_empty() {
+    let setup_targets = discovered.setup_targets();
+    if setup_targets.is_empty() {
         println!("  No packs found in bundle.");
     } else {
-        println!("  Found {} pack(s) in bundle:", discovered.providers.len());
-        for p in &discovered.providers {
+        println!("  Found {} pack(s) in bundle:", setup_targets.len());
+        for p in setup_targets {
             println!("    - {} ({})", p.provider_id, p.domain);
         }
     }

@@ -195,6 +195,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         )
         .context(i18n.t("cli.error.failed_read_answers"))?,
         deployment_targets: loaded_answers.platform_setup.deployment_targets,
+        tunnel: loaded_answers.platform_setup.tunnel,
         setup_answers: loaded_answers.setup_answers,
         ..Default::default()
     };
@@ -308,34 +309,39 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
 
     // Load answers from --answers file for UI pre-fill (values + scope).
-    let (prefill_answers, answers_tenant, answers_team, answers_env) =
-        if let Some(answers_path) = &cli.answers {
-            println!(
-                "{}",
-                i18n.tf(
-                    "setup.answers.loaded",
-                    &[&answers_path.display().to_string()],
-                ),
-            );
-            let loader_engine = SetupEngine::new(SetupConfig {
-                tenant: cli.tenant.clone(),
-                team: cli.team.clone(),
-                env: cli.env.clone(),
-                offline: false,
-                verbose: false,
-            });
-            let loaded = loader_engine
-                .load_answers(answers_path, cli.key.as_deref(), true)
-                .context(i18n.t("cli.error.failed_read_answers"))?;
-            (
-                Some(loaded.setup_answers),
-                loaded.tenant,
-                loaded.team,
-                loaded.env,
-            )
-        } else {
-            (None, None, None, None)
-        };
+    let (prefill_answers, answers_tenant, answers_team, answers_env) = if let Some(answers_path) =
+        &cli.answers
+    {
+        println!(
+            "{}",
+            i18n.tf(
+                "setup.answers.loaded",
+                &[&answers_path.display().to_string()],
+            ),
+        );
+        let loader_engine = SetupEngine::new(SetupConfig {
+            tenant: cli.tenant.clone(),
+            team: cli.team.clone(),
+            env: cli.env.clone(),
+            offline: false,
+            verbose: false,
+        });
+        let loaded = loader_engine
+            .load_answers(answers_path, cli.key.as_deref(), true)
+            .context(i18n.t("cli.error.failed_read_answers"))?;
+        // Persist tunnel config from answers so greentic-start can read it.
+        if let Some(tunnel) = loaded.platform_setup.tunnel.as_ref() {
+            let _ = greentic_setup::platform_setup::persist_tunnel_artifact(&bundle_dir, tunnel);
+        }
+        (
+            Some(loaded.setup_answers),
+            loaded.tenant,
+            loaded.team,
+            loaded.env,
+        )
+    } else {
+        (None, None, None, None)
+    };
 
     // Use scope from answers file when available, fall back to CLI args.
     // Track whether scope came from answers so the UI skips bundle detection.

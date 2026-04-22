@@ -1,7 +1,11 @@
 name: Perf (lightweight)
+# Moved off pull_request onto a nightly schedule. See plans/binary-bifurcation.md
+# Phase A (heavy-job sweep). Manual runs remain via workflow_dispatch.
 
 on:
-  pull_request:
+  schedule:
+    - cron: "40 3 * * *"
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -14,7 +18,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
       - name: Run tests (including perf guards)
         run: cargo test --all --all-features

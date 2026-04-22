@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use greentic_secrets_lib::{
-    ApplyOptions, DevStore, SecretFormat, SeedDoc, SeedEntry, SeedValue, apply_seed,
+    ApplyOptions, DevStore, SecretFormat, SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed,
 };
 use qa_spec::{FormSpec, VisibilityMode, resolve_visibility};
 use serde_json::{Map as JsonMap, Value};
@@ -122,6 +122,7 @@ pub async fn persist_all_config_as_secrets(
         return Ok(vec![]);
     }
 
+    let store_path = crate::secrets::ensure_path(bundle_root)?;
     let store = crate::secrets::open_dev_store(bundle_root)?;
 
     let mut entries = Vec::new();
@@ -161,13 +162,63 @@ pub async fn persist_all_config_as_secrets(
         return Ok(vec![]);
     }
 
+    tracing::info!(
+        provider_id,
+        env,
+        tenant,
+        team = team.unwrap_or("default"),
+        store_path = %store_path.display(),
+        entry_count = entries.len(),
+        uris = ?entries.iter().map(|e| e.uri.as_str()).collect::<Vec<_>>(),
+        "setup secrets persist: applying seed entries"
+    );
+
+    let verify_uris: Vec<String> = entries.iter().map(|e| e.uri.clone()).collect();
     let report = apply_seed(&store, &SeedDoc { entries }, ApplyOptions::default()).await;
     if !report.failed.is_empty() {
+        tracing::warn!(
+            provider_id,
+            env,
+            tenant,
+            team = team.unwrap_or("default"),
+            store_path = %store_path.display(),
+            failed = ?report.failed,
+            "setup secrets persist: apply_seed reported failures"
+        );
         return Err(anyhow::anyhow!(
             "failed to persist {} secret(s): {:?}",
             report.failed.len(),
             report.failed
         ));
+    }
+
+    // Read-after-write verification so handoff issues are visible in setup logs.
+    let mut verify_missing = Vec::new();
+    for uri in &verify_uris {
+        if store.get(uri).await.is_err() {
+            verify_missing.push(uri.clone());
+        }
+    }
+    if verify_missing.is_empty() {
+        tracing::info!(
+            provider_id,
+            env,
+            tenant,
+            team = team.unwrap_or("default"),
+            store_path = %store_path.display(),
+            verified = report.ok,
+            "setup secrets persist: post-write verification succeeded"
+        );
+    } else {
+        tracing::warn!(
+            provider_id,
+            env,
+            tenant,
+            team = team.unwrap_or("default"),
+            store_path = %store_path.display(),
+            missing_uris = ?verify_missing,
+            "setup secrets persist: post-write verification found missing entries"
+        );
     }
 
     Ok(saved_keys)
@@ -260,17 +311,10 @@ fn seed_secret_requirement_aliases(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct SecretRequirement {
-    key: String,
-}
-
-fn read_secret_requirements(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
-    let file = std::fs::File::open(pack_path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    let entry = archive.by_name("assets/secret-requirements.json")?;
-    let reqs: Vec<SecretRequirement> = serde_json::from_reader(entry)?;
-    Ok(reqs)
+fn read_secret_requirements(
+    pack_path: &Path,
+) -> Result<Vec<crate::secrets::PackSecretRequirement>> {
+    crate::secrets::load_secret_requirements_from_pack(pack_path)
 }
 
 fn value_to_text(value: &Value) -> String {

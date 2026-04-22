@@ -227,6 +227,111 @@ mod tests {
     }
 
     #[test]
+    fn pack_to_form_spec_falls_back_to_secret_requirements() {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pack_path = temp_dir.path().join("weather-app.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        writer.start_file("pack.manifest.json", options).unwrap();
+        writer
+            .write_all(br#"{"pack_id":"weather-app","display_name":"Weather App"}"#)
+            .unwrap();
+        writer
+            .start_file("assets/secret-requirements.json", options)
+            .unwrap();
+        writer.write_all(br#"[{"key":"WEATHER_API_KEY"}]"#).unwrap();
+        writer.finish().unwrap();
+
+        let form = pack_to_form_spec(&pack_path, "weather-app").expect("should synthesize form");
+        assert_eq!(form.questions.len(), 1);
+        assert_eq!(form.questions[0].id, "weather_api_key");
+        assert!(form.questions[0].secret);
+        assert!(form.questions[0].required);
+    }
+
+    #[test]
+    fn pack_to_form_spec_reads_secret_requirements_from_cbor_manifest() {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pack_path = temp_dir.path().join("weatherapi-pack.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        writer.start_file("manifest.cbor", options).unwrap();
+        let manifest = serde_json::json!({
+            "components": [
+                {
+                    "host": {
+                        "secrets": {
+                            "required": [
+                                {
+                                    "key": "auth.param.get_weather.key",
+                                    "required": true,
+                                    "description": "WeatherAPI key for current weather requests.",
+                                    "scope": {"env": "runtime", "tenant": "runtime"},
+                                    "format": "text"
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+        writer
+            .write_all(&serde_cbor::to_vec(&manifest).unwrap())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let form =
+            pack_to_form_spec(&pack_path, "weatherapi-pack").expect("should synthesize form");
+        assert_eq!(form.questions.len(), 1);
+        assert_eq!(form.questions[0].id, "auth_param_get_weather_key");
+        assert_eq!(
+            form.questions[0].description.as_deref(),
+            Some("WeatherAPI key for current weather requests.")
+        );
+    }
+
+    #[test]
+    fn pack_to_form_spec_does_not_duplicate_existing_secret_question() {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pack_path = temp_dir.path().join("webex-app.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        writer.start_file("assets/setup.yaml", options).unwrap();
+        writer
+            .write_all(
+                b"title: Webex\nquestions:\n  - name: bot_token\n    required: true\n    secret: true\n",
+            )
+            .unwrap();
+        writer
+            .start_file("assets/secret-requirements.json", options)
+            .unwrap();
+        writer.write_all(br#"[{"key":"WEBEX_BOT_TOKEN"}]"#).unwrap();
+        writer.finish().unwrap();
+
+        let form = pack_to_form_spec(&pack_path, "webex-app").expect("should keep setup form");
+        assert_eq!(form.questions.len(), 1);
+        assert_eq!(form.questions[0].id, "bot_token");
+    }
+
+    #[test]
     fn extract_default_from_help_slack_format() {
         // Exact format from Slack's setup.yaml
         let help = "Slack API base URL (default: https://slack.com/api)";

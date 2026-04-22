@@ -8,10 +8,13 @@ mod url;
 // Re-export public types
 pub use persistence::{
     load_effective_static_routes_defaults, load_runtime_public_base_url,
-    load_static_routes_artifact, persist_static_routes_artifact, static_routes_artifact_path,
+    load_static_routes_artifact, load_tunnel_artifact, persist_static_routes_artifact,
+    persist_tunnel_artifact, static_routes_artifact_path, tunnel_artifact_path,
 };
-pub use prompts::{prompt_static_routes_policy, prompt_static_routes_policy_with_answers};
-pub use types::{PlatformSetupAnswers, StaticRoutesAnswers, StaticRoutesPolicy};
+pub use prompts::{
+    prompt_static_routes_policy, prompt_static_routes_policy_with_answers, prompt_tunnel_mode,
+};
+pub use types::{PlatformSetupAnswers, StaticRoutesAnswers, StaticRoutesPolicy, TunnelAnswers};
 
 #[cfg(test)]
 mod tests {

@@ -1,10 +1,10 @@
-//! Interactive prompts for static routes policy configuration.
+//! Interactive prompts for static routes and tunnel configuration.
 
 use anyhow::Result;
 use dialoguer::{Confirm, Input, Select};
 
 use crate::platform_setup::types::{
-    SURFACE_DISABLED, SURFACE_ENABLED, StaticRoutesAnswers, StaticRoutesPolicy,
+    SURFACE_DISABLED, SURFACE_ENABLED, StaticRoutesAnswers, StaticRoutesPolicy, TunnelAnswers,
 };
 
 /// Prompt user for static routes policy configuration.
@@ -117,4 +117,29 @@ pub(crate) fn merge_prompt_seed(
     }
 
     current
+}
+
+/// Prompt for tunnel mode when no deployer packs are present.
+///
+/// Offers Cloudflare Tunnel (default), ngrok, or no tunnel.
+pub fn prompt_tunnel_mode(current: Option<&TunnelAnswers>) -> Result<TunnelAnswers> {
+    let choices = ["Cloudflare Tunnel (cloudflared)", "ngrok", "No tunnel"];
+    let default_index = match current.and_then(|t| t.mode.as_deref()) {
+        Some("ngrok") => 1,
+        Some("off") => 2,
+        _ => 0, // cloudflared is default
+    };
+    let index = Select::new()
+        .with_prompt("Tunnel for external webhooks (Webex, Telegram, etc.)")
+        .items(choices)
+        .default(default_index)
+        .interact()?;
+    let mode = match index {
+        0 => "cloudflared",
+        1 => "ngrok",
+        _ => "off",
+    };
+    Ok(TunnelAnswers {
+        mode: Some(mode.to_string()),
+    })
 }
