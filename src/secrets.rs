@@ -96,13 +96,24 @@ pub struct SecretsSetup {
 impl SecretsSetup {
     pub fn new(bundle_root: &Path, env: &str, tenant: &str, team: Option<&str>) -> Result<Self> {
         let store_path = ensure_path(bundle_root)?;
-        info!(path = %store_path.display(), "secrets: using dev store backend");
-        let store = DevStore::with_path(&store_path).map_err(|err| {
-            anyhow!(
-                "failed to open dev secrets store {}: {err}",
-                store_path.display()
-            )
-        })?;
+        let store = if let Some(provider) = GLOBAL_KEY_PROVIDER.get() {
+            let allow = ALLOW_DOWNGRADE.get().copied().unwrap_or(false);
+            info!(path = %store_path.display(), "secrets: using encrypted dev store backend");
+            DevStore::with_path_encrypted(&store_path, provider.clone(), allow).map_err(|err| {
+                anyhow!(
+                    "failed to open encrypted dev secrets store {}: {err}",
+                    store_path.display()
+                )
+            })?
+        } else {
+            info!(path = %store_path.display(), "secrets: using legacy dev store backend");
+            DevStore::with_path(&store_path).map_err(|err| {
+                anyhow!(
+                    "failed to open dev secrets store {}: {err}",
+                    store_path.display()
+                )
+            })?
+        };
         let seeds = load_seed_entries(bundle_root)?;
         Ok(Self {
             store,
@@ -343,14 +354,52 @@ fn map_get_bool(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<bool>
 }
 
 /// Open a `DevStore` from a bundle root path (convenience).
+///
+/// If a global key provider has been installed via
+/// [`set_global_key_provider`], the store is opened with AES-256-GCM
+/// encryption. Otherwise it opens in legacy plaintext mode (back-compat).
 pub fn open_dev_store(bundle_root: &Path) -> Result<DevStore> {
     let store_path = ensure_path(bundle_root)?;
-    DevStore::with_path(&store_path).map_err(|err| {
-        anyhow!(
-            "failed to open dev secrets store {}: {err}",
-            store_path.display()
-        )
-    })
+    if let Some(provider) = GLOBAL_KEY_PROVIDER.get() {
+        let allow = ALLOW_DOWNGRADE.get().copied().unwrap_or(false);
+        DevStore::with_path_encrypted(&store_path, provider.clone(), allow).map_err(|err| {
+            anyhow!(
+                "failed to open encrypted dev secrets store {}: {err}",
+                store_path.display()
+            )
+        })
+    } else {
+        DevStore::with_path(&store_path).map_err(|err| {
+            anyhow!(
+                "failed to open dev secrets store {}: {err}",
+                store_path.display()
+            )
+        })
+    }
+}
+
+static GLOBAL_KEY_PROVIDER: std::sync::OnceLock<
+    std::sync::Arc<secrets_provider_dev::PassphraseKeyProvider>,
+> = std::sync::OnceLock::new();
+static ALLOW_DOWNGRADE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install a process-global passphrase-derived key provider.
+///
+/// All subsequent calls to [`open_dev_store`] (and [`SecretsSetup::new`])
+/// will use AES-256-GCM with this provider. Idempotent — only the first
+/// call wins. Call this exactly once at CLI startup, after resolving the
+/// user passphrase, and before any code path that opens the dev store.
+pub fn set_global_key_provider(
+    provider: std::sync::Arc<secrets_provider_dev::PassphraseKeyProvider>,
+    allow_downgrade: bool,
+) {
+    let _ = GLOBAL_KEY_PROVIDER.set(provider);
+    let _ = ALLOW_DOWNGRADE.set(allow_downgrade);
+}
+
+/// Returns true if a global key provider has been installed.
+pub fn has_global_key_provider() -> bool {
+    GLOBAL_KEY_PROVIDER.get().is_some()
 }
 
 #[cfg(test)]

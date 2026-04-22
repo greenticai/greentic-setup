@@ -1,6 +1,12 @@
 //! Setup and update commands for bundle configuration.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
+use greentic_secrets_cli::passphrase::{PassphraseSource, resolve as resolve_passphrase};
+use greentic_secrets_passphrase::{PromptMode, derive_master_key, peek_header};
+use secrets_provider_dev::PassphraseKeyProvider;
 
 use crate::cli_args::*;
 use crate::cli_helpers::{
@@ -43,9 +49,41 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         backup,
         skip_secrets_init,
         best_effort,
+        passphrase_stdin,
+        passphrase_file,
+        reconfigure,
+        allow_downgrade,
     } = args;
 
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
+
+    // If --reconfigure: wipe existing dev store + marker so first-run prompt fires.
+    if reconfigure {
+        let store_path = crate::secrets::default_path(&bundle_dir);
+        let _ = std::fs::remove_file(&store_path);
+        let marker = {
+            let mut p = store_path.clone();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            p.set_file_name(format!("{name}.encrypted-marker"));
+            p
+        };
+        let _ = std::fs::remove_file(&marker);
+        eprintln!("{}", i18n.t("cli.setup.passphrase.reconfigured"));
+    }
+
+    // Initialize the global passphrase-derived KeyProvider before any
+    // dev store open. Subsequent calls to crate::secrets::open_dev_store
+    // (and SecretsSetup::new) will use AES-256-GCM with this provider.
+    init_global_passphrase_provider(
+        &bundle_dir,
+        passphrase_stdin,
+        passphrase_file.as_deref(),
+        allow_downgrade,
+        i18n,
+    )?;
 
     let provider_display = provider_id.clone().unwrap_or_else(|| "all".to_string());
 
@@ -204,5 +242,54 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     };
     println!("\n{}", i18n.tf(done_key, &[&provider_display]));
 
+    Ok(())
+}
+
+/// Resolve a passphrase from the CLI flags + bundle state and install
+/// the resulting `PassphraseKeyProvider` as the process-global key
+/// provider. Idempotent — only the first call wins.
+fn init_global_passphrase_provider(
+    bundle_dir: &Path,
+    passphrase_stdin: bool,
+    passphrase_file: Option<&Path>,
+    allow_downgrade: bool,
+    i18n: &CliI18n,
+) -> Result<()> {
+    if crate::secrets::has_global_key_provider() {
+        return Ok(());
+    }
+
+    let store_path = crate::secrets::default_path(bundle_dir);
+    let existing_header = peek_header(&store_path).ok().flatten();
+    let mode = if existing_header.is_some() {
+        PromptMode::Unlock
+    } else {
+        PromptMode::Initial
+    };
+
+    let source = if let Some(p) = passphrase_file {
+        PassphraseSource::File(p)
+    } else if passphrase_stdin || std::env::var("GREENTIC_PASSPHRASE_STDIN").as_deref() == Ok("1") {
+        PassphraseSource::Stdin
+    } else {
+        PassphraseSource::Tty(mode)
+    };
+
+    let passphrase = resolve_passphrase(source).context(i18n.t("cli.setup.passphrase.failed"))?;
+
+    let salt = match &existing_header {
+        Some(h) => h.salt,
+        None => greentic_secrets_passphrase::random_salt(),
+    };
+    let master_key =
+        derive_master_key(&passphrase, &salt).context(i18n.t("cli.setup.passphrase.kdf_failed"))?;
+    drop(passphrase);
+
+    let provider = Arc::new(PassphraseKeyProvider::new(master_key, salt));
+    crate::secrets::set_global_key_provider(provider, allow_downgrade);
+
+    if existing_header.is_none() {
+        eprintln!("{}", i18n.t("cli.setup.passphrase.first_setup_complete"));
+    }
     Ok(())
 }

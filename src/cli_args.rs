@@ -189,6 +189,18 @@ pub struct BundleSetupArgs {
     /// Advanced mode — show all questions including optional ones
     #[arg(long = "advanced")]
     pub advanced: bool,
+    /// Read passphrase from stdin instead of prompting on the TTY.
+    #[arg(long = "passphrase-stdin", conflicts_with = "passphrase_file")]
+    pub passphrase_stdin: bool,
+    /// Read passphrase from the named file (must be mode 0600, owned by current user).
+    #[arg(long = "passphrase-file", value_name = "PATH")]
+    pub passphrase_file: Option<PathBuf>,
+    /// Wipe the existing secret store and re-prompt for everything.
+    #[arg(long = "reconfigure")]
+    pub reconfigure: bool,
+    /// Bypass the downgrade-attack guard (only meaningful when `.encrypted-marker` exists but the store is in legacy plaintext format).
+    #[arg(long = "allow-downgrade")]
+    pub allow_downgrade: bool,
 }
 
 #[derive(Args, Debug, Clone)]
