@@ -1487,16 +1487,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "greentic-i18n"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb91ab8082b35cad324daac10ffe7a8072aeaef308066b8569f750c4e3599da6"
-dependencies = [
- "greentic-i18n-lib",
- "serde_json",
-]
-
-[[package]]
 name = "greentic-i18n-lib"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1623,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -1634,7 +1624,7 @@ dependencies = [
  "criterion",
  "dialoguer",
  "greentic-distributor-client",
- "greentic-i18n",
+ "greentic-i18n-lib",
  "greentic-secrets-lib",
  "greentic-types",
  "hmac 0.13.0",
