@@ -210,14 +210,19 @@ pub struct BundleSetupArgs {
     /// Advanced mode — show all questions including optional ones
     #[arg(long = "advanced")]
     pub advanced: bool,
-    // NOTE: --passphrase-stdin, --passphrase-file, --reconfigure, and
+    // --passphrase-stdin, --passphrase-file, --reconfigure, and
     // --allow-downgrade are defined at the top-level `Cli` struct with
     // `global = true` so they apply uniformly across `bundle setup`,
-    // `bundle update`, and the `--ui` flow. The subcommand handler
-    // reads them from `Cli` (passed in) rather than from this struct.
+    // `bundle update`, and the `--ui` flow. These fields are populated
+    // programmatically by the dispatcher (bridge_passphrase) and must
+    // be hidden from clap so it does not parse them as positional args.
+    #[arg(skip)]
     pub passphrase_stdin: bool,
+    #[arg(skip)]
     pub passphrase_file: Option<PathBuf>,
+    #[arg(skip)]
     pub reconfigure: bool,
+    #[arg(skip)]
     pub allow_downgrade: bool,
 }
 
