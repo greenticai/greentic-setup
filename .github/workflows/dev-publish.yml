@@ -22,3 +22,14 @@ jobs:
       binary-crates: "greentic-setup"
       dual-role-binary-crates: "greentic-setup"
     secrets: inherit
+
+  dev-binaries:
+    needs: dev-publish
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [greentic-setup]
+    uses: greenticai/.github/.github/workflows/dev-release-binaries.yml@main
+    with:
+      package: ${{ matrix.package }}
+      version: ${{ needs.dev-publish.outputs.version }}
