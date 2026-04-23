@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -25,8 +25,12 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 greentic-distributor-client = { version = "0.5", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 greentic-i18n = "0.5"
-greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
+greentic-secrets-lib = { version = "0.6", features = ["providers-dev"] }
+greentic-secrets-provider-dev = "0.6"
+greentic-secrets-cli = "0.6"
+greentic-secrets-passphrase = "0.6"
 greentic-types = { version = "0.5", features = ["serde"] }
+secrecy = { version = "0.10", default-features = false }
 hmac = "0.13"
 qa-spec = "0.5"
 regex = "1"
@@ -58,3 +62,13 @@ criterion = "0.8"
 [[bench]]
 name = "perf"
 harness = false
+
+# TEMPORARY: while greentic-secrets v0.6.0 is awaiting publish via PR
+# https://github.com/greenticai/greentic-secrets/pull/51, point at the local
+# clone. Remove this entire [patch.crates-io] block before merging this PR.
+[patch.crates-io]
+greentic-secrets-spec = { path = "../greentic-secrets/greentic-secrets-spec" }
+greentic-secrets-lib = { path = "../greentic-secrets/greentic-secrets-lib" }
+greentic-secrets-provider-dev = { path = "../greentic-secrets/providers/greentic-dev" }
+greentic-secrets-passphrase = { path = "../greentic-secrets/crates/greentic-secrets-passphrase" }
+greentic-secrets-cli = { path = "../greentic-secrets/crates/greentic-secrets-cli" }

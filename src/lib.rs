@@ -24,6 +24,7 @@ pub mod platform_setup;
 pub mod reload;
 pub mod secret_name;
 pub mod secrets;
+pub mod secrets_prompt;
 pub mod setup_input;
 pub mod setup_to_formspec;
 pub mod tenant_config;
@@ -104,7 +105,7 @@ mod tests {
 
     #[test]
     fn version_is_correct() {
-        assert!(version().starts_with("0.5"));
+        assert!(version().starts_with("0.6"));
     }
 
     #[test]

@@ -66,12 +66,23 @@ fn main() -> Result<()> {
         return run_ui_mode(&cli, i18n);
     }
 
+    // Helper: populate the four global passphrase / reconfigure flags
+    // from the top-level Cli into the per-subcommand args, since they
+    // are defined at the global level for ergonomics.
+    let bridge_passphrase = |mut args: greentic_setup::cli_args::BundleSetupArgs| -> greentic_setup::cli_args::BundleSetupArgs {
+        args.passphrase_stdin = cli.passphrase_stdin;
+        args.passphrase_file = cli.passphrase_file.clone();
+        args.reconfigure = cli.reconfigure;
+        args.allow_downgrade = cli.allow_downgrade;
+        args
+    };
+
     match cli.command {
         Some(Command::Bundle(cmd)) => match cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
             BundleCommand::Add(args) => cli_commands::add(args, i18n),
-            BundleCommand::Setup(args) => cli_commands::setup(args, i18n),
-            BundleCommand::Update(args) => cli_commands::update(args, i18n),
+            BundleCommand::Setup(args) => cli_commands::setup(bridge_passphrase(args), i18n),
+            BundleCommand::Update(args) => cli_commands::update(bridge_passphrase(args), i18n),
             BundleCommand::Remove(args) => cli_commands::remove(args, i18n),
             BundleCommand::Build(args) => cli_commands::build(args, i18n),
             BundleCommand::List(args) => cli_commands::list(args, i18n),
@@ -307,6 +318,37 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
 
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
+
+    // If --reconfigure: wipe existing dev store + marker so first-run prompt fires.
+    if cli.reconfigure {
+        let store_path = greentic_setup::secrets::default_path(&bundle_dir);
+        let _ = std::fs::remove_file(&store_path);
+        let marker = {
+            let mut p = store_path.clone();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            p.set_file_name(format!("{name}.encrypted-marker"));
+            p
+        };
+        let _ = std::fs::remove_file(&marker);
+        eprintln!(
+            "Existing dev secrets store removed; you will be prompted for a fresh passphrase."
+        );
+    }
+
+    // Resolve passphrase + install global key provider on the controlling
+    // terminal BEFORE launching the web server. All subsequent UI handlers
+    // that open the dev store via `crate::secrets::open_dev_store` will
+    // transparently use the AES-256-GCM-backed store.
+    greentic_setup::secrets::init_global_passphrase_provider(
+        &bundle_dir,
+        cli.passphrase_stdin,
+        cli.passphrase_file.as_deref(),
+        cli.allow_downgrade,
+    )
+    .context(i18n.t("cli.setup.passphrase.failed"))?;
 
     // Load answers from --answers file for UI pre-fill (values + scope).
     let (prefill_answers, answers_tenant, answers_team, answers_env) = if let Some(answers_path) =

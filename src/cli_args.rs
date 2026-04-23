@@ -76,6 +76,27 @@ pub struct Cli {
     #[arg(long = "no-ui", global = true)]
     pub no_ui: bool,
 
+    /// Read passphrase from stdin (instead of prompting on the TTY).
+    #[arg(
+        long = "passphrase-stdin",
+        global = true,
+        conflicts_with = "passphrase_file"
+    )]
+    pub passphrase_stdin: bool,
+
+    /// Read passphrase from file (must be mode 0600, owned by current user).
+    #[arg(long = "passphrase-file", value_name = "PATH", global = true)]
+    pub passphrase_file: Option<PathBuf>,
+
+    /// Wipe the existing secret store and re-prompt for everything.
+    #[arg(long = "reconfigure", global = true)]
+    pub reconfigure: bool,
+
+    /// Bypass the downgrade-attack guard (only meaningful when an
+    /// `.encrypted-marker` exists but the store is in legacy plaintext format).
+    #[arg(long = "allow-downgrade", global = true)]
+    pub allow_downgrade: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -189,6 +210,20 @@ pub struct BundleSetupArgs {
     /// Advanced mode — show all questions including optional ones
     #[arg(long = "advanced")]
     pub advanced: bool,
+    // --passphrase-stdin, --passphrase-file, --reconfigure, and
+    // --allow-downgrade are defined at the top-level `Cli` struct with
+    // `global = true` so they apply uniformly across `bundle setup`,
+    // `bundle update`, and the `--ui` flow. These fields are populated
+    // programmatically by the dispatcher (bridge_passphrase) and must
+    // be hidden from clap so it does not parse them as positional args.
+    #[arg(skip)]
+    pub passphrase_stdin: bool,
+    #[arg(skip)]
+    pub passphrase_file: Option<PathBuf>,
+    #[arg(skip)]
+    pub reconfigure: bool,
+    #[arg(skip)]
+    pub allow_downgrade: bool,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -96,13 +96,24 @@ pub struct SecretsSetup {
 impl SecretsSetup {
     pub fn new(bundle_root: &Path, env: &str, tenant: &str, team: Option<&str>) -> Result<Self> {
         let store_path = ensure_path(bundle_root)?;
-        info!(path = %store_path.display(), "secrets: using dev store backend");
-        let store = DevStore::with_path(&store_path).map_err(|err| {
-            anyhow!(
-                "failed to open dev secrets store {}: {err}",
-                store_path.display()
-            )
-        })?;
+        let store = if let Some(provider) = GLOBAL_KEY_PROVIDER.get() {
+            let allow = ALLOW_DOWNGRADE.get().copied().unwrap_or(false);
+            info!(path = %store_path.display(), "secrets: using encrypted dev store backend");
+            DevStore::with_path_encrypted(&store_path, provider.clone(), allow).map_err(|err| {
+                anyhow!(
+                    "failed to open encrypted dev secrets store {}: {err}",
+                    store_path.display()
+                )
+            })?
+        } else {
+            info!(path = %store_path.display(), "secrets: using legacy dev store backend");
+            DevStore::with_path(&store_path).map_err(|err| {
+                anyhow!(
+                    "failed to open dev secrets store {}: {err}",
+                    store_path.display()
+                )
+            })?
+        };
         let seeds = load_seed_entries(bundle_root)?;
         Ok(Self {
             store,
@@ -122,6 +133,66 @@ impl SecretsSetup {
     /// Reference to the underlying `DevStore`.
     pub fn store(&self) -> &DevStore {
         &self.store
+    }
+
+    /// Resolve required-but-missing secret keys for a pack without
+    /// seeding placeholders. The caller (typically the setup CLI) is
+    /// expected to prompt the user for each returned `MissingKey` and
+    /// then call [`SecretsSetup::set_secret_text`] to populate it.
+    ///
+    /// Keys that resolve via `seeds.yaml` are still seeded
+    /// transparently — they do NOT appear in the returned vector. Only
+    /// keys with no existing value AND no seed entry are returned.
+    pub async fn missing_pack_secrets(
+        &self,
+        pack_path: &Path,
+        provider_id: &str,
+    ) -> Result<Vec<MissingKey>> {
+        let reqs = load_secret_requirements_from_pack(pack_path)?;
+        let mut missing = Vec::new();
+        for req in reqs {
+            let uri = canonical_secret_uri(
+                &self.env,
+                &self.tenant,
+                self.team.as_deref(),
+                provider_id,
+                &req.key,
+            );
+            match self.store.get(&uri).await {
+                Ok(_) => continue,
+                Err(SecretError::NotFound { .. }) => {}
+                Err(err) => return Err(anyhow!("failed to read secret {uri}: {err}")),
+            }
+            // Auto-apply seed entry transparently if available.
+            if let Some(seed) = self.seeds.get(&uri) {
+                let _report = apply_seed(
+                    &self.store,
+                    &SeedDoc {
+                        entries: vec![seed.clone()],
+                    },
+                    ApplyOptions::default(),
+                )
+                .await;
+                continue;
+            }
+            missing.push(MissingKey {
+                provider_id: provider_id.to_string(),
+                key: req.key.clone(),
+                uri,
+                description: req.description.clone(),
+                required: req.required,
+                looks_secret: looks_secret(&req.key),
+            });
+        }
+        Ok(missing)
+    }
+
+    /// Persist a single text-valued secret at the given canonical URI.
+    pub async fn set_secret_text(&self, uri: &str, value: &str) -> Result<()> {
+        self.store
+            .put(uri, SecretFormat::Text, value.as_bytes())
+            .await
+            .map_err(|err| anyhow!("failed to write secret {uri}: {err}"))
     }
 
     /// Ensure all required secrets for a pack exist in the dev store.
@@ -180,6 +251,46 @@ impl SecretsSetup {
         }
         Ok(())
     }
+}
+
+/// Description of a required pack secret that has no value in the
+/// store and no entry in `seeds.yaml`. Returned by
+/// [`SecretsSetup::missing_pack_secrets`]; callers should prompt the
+/// user and persist via [`SecretsSetup::set_secret_text`].
+#[derive(Debug, Clone)]
+pub struct MissingKey {
+    /// Provider that declared the requirement (e.g. `messaging-telegram`).
+    pub provider_id: String,
+    /// The key name as declared in the pack manifest (e.g. `BOT_TOKEN`).
+    pub key: String,
+    /// Canonical secret URI (already includes env/tenant/team scope).
+    pub uri: String,
+    /// Human-readable description from the pack manifest, if any.
+    pub description: Option<String>,
+    /// Whether this key is marked `required: true` in the manifest.
+    pub required: bool,
+    /// True when the key name looks like a secret (token/password/etc.)
+    /// and should be prompted with no-echo input. False for plain
+    /// configuration values that can be echoed.
+    pub looks_secret: bool,
+}
+
+/// Heuristic: name suggests this is a secret value (no-echo prompt) vs
+/// a plain config value (echoed prompt).
+fn looks_secret(key: &str) -> bool {
+    let k = key.to_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "apikey",
+        "private_key",
+        "credential",
+        "passphrase",
+    ]
+    .iter()
+    .any(|needle| k.contains(needle))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -343,14 +454,152 @@ fn map_get_bool(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<bool>
 }
 
 /// Open a `DevStore` from a bundle root path (convenience).
+///
+/// If a global key provider has been installed via
+/// [`set_global_key_provider`], the store is opened with AES-256-GCM
+/// encryption. Otherwise it opens in legacy plaintext mode (back-compat).
 pub fn open_dev_store(bundle_root: &Path) -> Result<DevStore> {
     let store_path = ensure_path(bundle_root)?;
-    DevStore::with_path(&store_path).map_err(|err| {
-        anyhow!(
-            "failed to open dev secrets store {}: {err}",
-            store_path.display()
-        )
-    })
+    if let Some(provider) = GLOBAL_KEY_PROVIDER.get() {
+        let allow = ALLOW_DOWNGRADE.get().copied().unwrap_or(false);
+        DevStore::with_path_encrypted(&store_path, provider.clone(), allow).map_err(|err| {
+            anyhow!(
+                "failed to open encrypted dev secrets store {}: {err}",
+                store_path.display()
+            )
+        })
+    } else {
+        DevStore::with_path(&store_path).map_err(|err| {
+            anyhow!(
+                "failed to open dev secrets store {}: {err}",
+                store_path.display()
+            )
+        })
+    }
+}
+
+static GLOBAL_KEY_PROVIDER: std::sync::OnceLock<
+    std::sync::Arc<secrets_provider_dev::PassphraseKeyProvider>,
+> = std::sync::OnceLock::new();
+static ALLOW_DOWNGRADE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install a process-global passphrase-derived key provider.
+///
+/// All subsequent calls to [`open_dev_store`] (and [`SecretsSetup::new`])
+/// will use AES-256-GCM with this provider. Idempotent — only the first
+/// call wins. Call this exactly once at CLI startup, after resolving the
+/// user passphrase, and before any code path that opens the dev store.
+pub fn set_global_key_provider(
+    provider: std::sync::Arc<secrets_provider_dev::PassphraseKeyProvider>,
+    allow_downgrade: bool,
+) {
+    let _ = GLOBAL_KEY_PROVIDER.set(provider);
+    let _ = ALLOW_DOWNGRADE.set(allow_downgrade);
+}
+
+/// Returns true if a global key provider has been installed.
+pub fn has_global_key_provider() -> bool {
+    GLOBAL_KEY_PROVIDER.get().is_some()
+}
+
+/// Resolve a passphrase from the given source, derive the master key,
+/// and install the resulting `PassphraseKeyProvider` as the
+/// process-global key provider so subsequent calls to
+/// [`open_dev_store`] (and [`SecretsSetup::new`]) automatically use
+/// AES-256-GCM. Idempotent — only the first call wins.
+///
+/// Used by both the plain-CLI setup flow (`bundle setup` /
+/// `bundle update`) and the web UI launcher (`run_ui_mode`) so the
+/// passphrase prompt UX is identical regardless of entry point. The
+/// browser-based UI runs against the encrypted backend transparently
+/// because every handler that opens the dev store goes through
+/// [`open_dev_store`].
+pub fn init_global_passphrase_provider(
+    bundle_root: &Path,
+    passphrase_stdin: bool,
+    passphrase_file: Option<&Path>,
+    allow_downgrade: bool,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use greentic_secrets_cli::passphrase::{PassphraseSource, resolve as resolve_passphrase};
+    use greentic_secrets_passphrase::{PromptMode, derive_master_key, peek_header, random_salt};
+    use std::sync::Arc;
+
+    if has_global_key_provider() {
+        return Ok(());
+    }
+
+    let store_path = default_path(bundle_root);
+    let existing_header = peek_header(&store_path).ok().flatten();
+
+    // Downgrade-attack guard: if a marker file exists alongside the
+    // store but the on-disk store has no encrypted-v1 header, refuse
+    // to proceed. The marker indicates the bundle was previously
+    // protected by a passphrase; a missing header means someone (or
+    // some bug) replaced the encrypted file with legacy plaintext.
+    if existing_header.is_none() && !allow_downgrade {
+        let mut marker = store_path.clone();
+        if let Some(name) = marker.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            marker.set_file_name(format!("{name}.encrypted-marker"));
+            if marker.exists() {
+                anyhow::bail!(
+                    "refusing to load legacy plaintext store after encryption was previously \
+                     enabled (downgrade-attack guard); pass --allow-downgrade to override"
+                );
+            }
+        }
+    }
+
+    let mode = if existing_header.is_some() {
+        PromptMode::Unlock
+    } else {
+        PromptMode::Initial
+    };
+
+    let source = if let Some(p) = passphrase_file {
+        PassphraseSource::File(p)
+    } else if passphrase_stdin || std::env::var("GREENTIC_PASSPHRASE_STDIN").as_deref() == Ok("1") {
+        PassphraseSource::Stdin
+    } else {
+        PassphraseSource::Tty(mode)
+    };
+
+    let passphrase = resolve_passphrase(source).context("failed to resolve passphrase")?;
+
+    let salt = match &existing_header {
+        Some(h) => h.salt,
+        None => random_salt(),
+    };
+    let master_key =
+        derive_master_key(&passphrase, &salt).context("failed to derive master key")?;
+    drop(passphrase);
+
+    let provider = Arc::new(secrets_provider_dev::PassphraseKeyProvider::new(
+        master_key, salt,
+    ));
+    set_global_key_provider(provider, allow_downgrade);
+
+    if existing_header.is_some() {
+        // For an existing encrypted store, fail-fast on wrong
+        // passphrase by trying to open + decrypt one record. Otherwise
+        // wrong passphrases would only be detected later by code that
+        // happens to read a secret — and command paths that
+        // short-circuit early (e.g. --emit-answers) would never
+        // discover the mismatch.
+        match open_dev_store(bundle_root) {
+            Ok(_store) => {}
+            Err(err) => {
+                let msg = format!("{err:#}");
+                if msg.contains("InvalidPassphrase") || msg.to_lowercase().contains("passphrase") {
+                    anyhow::bail!("passphrase incorrect");
+                }
+                return Err(err);
+            }
+        }
+    } else {
+        eprintln!("Setup complete. Remember your passphrase — there is no recovery.");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
