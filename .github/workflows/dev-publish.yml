@@ -19,4 +19,6 @@ jobs:
     uses: greenticai/.github/.github/workflows/dev-publish.yml@main
     with:
       crates: "greentic-setup"
+      binary-crates: "greentic-setup"
+      dual-role-binary-crates: "greentic-setup"
     secrets: inherit
