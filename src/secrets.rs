@@ -531,6 +531,25 @@ pub fn init_global_passphrase_provider(
 
     let store_path = default_path(bundle_root);
     let existing_header = peek_header(&store_path).ok().flatten();
+
+    // Downgrade-attack guard: if a marker file exists alongside the
+    // store but the on-disk store has no encrypted-v1 header, refuse
+    // to proceed. The marker indicates the bundle was previously
+    // protected by a passphrase; a missing header means someone (or
+    // some bug) replaced the encrypted file with legacy plaintext.
+    if existing_header.is_none() && !allow_downgrade {
+        let mut marker = store_path.clone();
+        if let Some(name) = marker.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            marker.set_file_name(format!("{name}.encrypted-marker"));
+            if marker.exists() {
+                anyhow::bail!(
+                    "refusing to load legacy plaintext store after encryption was previously \
+                     enabled (downgrade-attack guard); pass --allow-downgrade to override"
+                );
+            }
+        }
+    }
+
     let mode = if existing_header.is_some() {
         PromptMode::Unlock
     } else {
@@ -560,7 +579,24 @@ pub fn init_global_passphrase_provider(
     ));
     set_global_key_provider(provider, allow_downgrade);
 
-    if existing_header.is_none() {
+    if existing_header.is_some() {
+        // For an existing encrypted store, fail-fast on wrong
+        // passphrase by trying to open + decrypt one record. Otherwise
+        // wrong passphrases would only be detected later by code that
+        // happens to read a secret — and command paths that
+        // short-circuit early (e.g. --emit-answers) would never
+        // discover the mismatch.
+        match open_dev_store(bundle_root) {
+            Ok(_store) => {}
+            Err(err) => {
+                let msg = format!("{err:#}");
+                if msg.contains("InvalidPassphrase") || msg.to_lowercase().contains("passphrase") {
+                    anyhow::bail!("passphrase incorrect");
+                }
+                return Err(err);
+            }
+        }
+    } else {
         eprintln!("Setup complete. Remember your passphrase — there is no recovery.");
     }
     Ok(())
