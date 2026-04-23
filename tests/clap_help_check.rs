@@ -35,23 +35,31 @@ fn assert_no_passphrase_value_flag(help: &str, label: &str) {
 }
 
 #[test]
-fn bundle_setup_help_does_not_offer_inline_passphrase_flag() {
-    let help = run_help(&["bundle", "setup", "--help"]);
-    assert_no_passphrase_value_flag(&help, "bundle setup");
+fn top_level_help_offers_safe_passphrase_sources_only() {
+    let help = run_help(&["--help"]);
+    assert_no_passphrase_value_flag(&help, "top-level");
     assert!(
         help.contains("--passphrase-stdin"),
-        "expected --passphrase-stdin in help"
+        "expected --passphrase-stdin in top-level help (it's a global flag)"
     );
     assert!(
         help.contains("--passphrase-file"),
-        "expected --passphrase-file in help"
+        "expected --passphrase-file in top-level help (it's a global flag)"
     );
 }
 
 #[test]
-fn bundle_update_help_does_not_offer_inline_passphrase_flag() {
+fn bundle_setup_help_never_lists_inline_passphrase_value_flag() {
+    // Global passphrase flags are intentionally NOT listed in
+    // subcommand help (they're only at top level). What we MUST
+    // guarantee is that no --passphrase=<value> flag was
+    // accidentally added at the subcommand level either.
+    let help = run_help(&["bundle", "setup", "--help"]);
+    assert_no_passphrase_value_flag(&help, "bundle setup");
+}
+
+#[test]
+fn bundle_update_help_never_lists_inline_passphrase_value_flag() {
     let help = run_help(&["bundle", "update", "--help"]);
     assert_no_passphrase_value_flag(&help, "bundle update");
-    assert!(help.contains("--passphrase-stdin"));
-    assert!(help.contains("--passphrase-file"));
 }

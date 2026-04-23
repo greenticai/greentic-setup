@@ -502,6 +502,70 @@ pub fn has_global_key_provider() -> bool {
     GLOBAL_KEY_PROVIDER.get().is_some()
 }
 
+/// Resolve a passphrase from the given source, derive the master key,
+/// and install the resulting `PassphraseKeyProvider` as the
+/// process-global key provider so subsequent calls to
+/// [`open_dev_store`] (and [`SecretsSetup::new`]) automatically use
+/// AES-256-GCM. Idempotent — only the first call wins.
+///
+/// Used by both the plain-CLI setup flow (`bundle setup` /
+/// `bundle update`) and the web UI launcher (`run_ui_mode`) so the
+/// passphrase prompt UX is identical regardless of entry point. The
+/// browser-based UI runs against the encrypted backend transparently
+/// because every handler that opens the dev store goes through
+/// [`open_dev_store`].
+pub fn init_global_passphrase_provider(
+    bundle_root: &Path,
+    passphrase_stdin: bool,
+    passphrase_file: Option<&Path>,
+    allow_downgrade: bool,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use greentic_secrets_cli::passphrase::{PassphraseSource, resolve as resolve_passphrase};
+    use greentic_secrets_passphrase::{PromptMode, derive_master_key, peek_header, random_salt};
+    use std::sync::Arc;
+
+    if has_global_key_provider() {
+        return Ok(());
+    }
+
+    let store_path = default_path(bundle_root);
+    let existing_header = peek_header(&store_path).ok().flatten();
+    let mode = if existing_header.is_some() {
+        PromptMode::Unlock
+    } else {
+        PromptMode::Initial
+    };
+
+    let source = if let Some(p) = passphrase_file {
+        PassphraseSource::File(p)
+    } else if passphrase_stdin || std::env::var("GREENTIC_PASSPHRASE_STDIN").as_deref() == Ok("1") {
+        PassphraseSource::Stdin
+    } else {
+        PassphraseSource::Tty(mode)
+    };
+
+    let passphrase = resolve_passphrase(source).context("failed to resolve passphrase")?;
+
+    let salt = match &existing_header {
+        Some(h) => h.salt,
+        None => random_salt(),
+    };
+    let master_key =
+        derive_master_key(&passphrase, &salt).context("failed to derive master key")?;
+    drop(passphrase);
+
+    let provider = Arc::new(secrets_provider_dev::PassphraseKeyProvider::new(
+        master_key, salt,
+    ));
+    set_global_key_provider(provider, allow_downgrade);
+
+    if existing_header.is_none() {
+        eprintln!("Setup complete. Remember your passphrase — there is no recovery.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
