@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,13 +23,9 @@ jobs:
       dual-role-binary-crates: "greentic-setup"
     secrets: inherit
 
-  dev-binaries:
+  dev-binaries-greentic-setup:
     needs: dev-publish
-    strategy:
-      fail-fast: false
-      matrix:
-        package: [greentic-setup]
     uses: greenticai/.github/.github/workflows/dev-release-binaries.yml@main
     with:
-      package: ${{ matrix.package }}
+      package: greentic-setup
       version: ${{ needs.dev-publish.outputs.version }}
