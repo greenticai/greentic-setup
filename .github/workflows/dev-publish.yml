@@ -15,17 +15,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Stage 1 — tests + version stamping. Outputs the stamped dev version
+  # {M.m.GITHUB_RUN_ID} consumed by binaries + publish.
+  dev-prepare:
+    uses: greenticai/.github/.github/workflows/dev-prepare.yml@main
+
+  dev-binaries-greentic-setup:
+    needs: dev-prepare
+    uses: greenticai/.github/.github/workflows/dev-release-binaries.yml@main
+    with:
+      package: greentic-setup
+      version: ${{ needs.dev-prepare.outputs.version }}
+
   dev-publish:
+    needs: [dev-prepare, dev-binaries-greentic-setup]
     uses: greenticai/.github/.github/workflows/dev-publish.yml@main
     with:
+      version: ${{ needs.dev-prepare.outputs.version }}
       crates: "greentic-setup"
       binary-crates: "greentic-setup"
       dual-role-binary-crates: "greentic-setup"
     secrets: inherit
-
-  dev-binaries-greentic-setup:
-    needs: dev-publish
-    uses: greenticai/.github/.github/workflows/dev-release-binaries.yml@main
-    with:
-      package: greentic-setup
-      version: ${{ needs.dev-publish.outputs.version }}
