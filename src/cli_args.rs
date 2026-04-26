@@ -68,13 +68,17 @@ pub struct Cli {
     pub advanced: bool,
 
     /// Launch web-based setup UI in browser (enabled by default).
-    /// Use --no-ui for plain-text mode (SSH or headless deployments).
+    /// Use --no-ui to disable the UI; stdin prompts may still be used.
     #[arg(long = "ui", global = true, default_value_t = true)]
     pub ui: bool,
 
-    /// Force plain-text mode (for SSH or headless deployments)
+    /// Disable web UI; stdin prompts may still be used.
     #[arg(long = "no-ui", global = true)]
     pub no_ui: bool,
+
+    /// Strict non-interactive mode: no prompts, fail if answers incomplete
+    #[arg(long = "non-interactive", global = true)]
+    pub non_interactive: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -177,8 +181,8 @@ pub struct BundleSetupArgs {
     /// Continue on error (best effort)
     #[arg(long = "best-effort")]
     pub best_effort: bool,
-    /// Non-interactive mode (require --answers)
-    #[arg(long = "non-interactive")]
+    /// Populated from the global --non-interactive flag before dispatch.
+    #[arg(skip)]
     pub non_interactive: bool,
     /// Dry run (plan only, don't execute)
     #[arg(long = "dry-run")]
