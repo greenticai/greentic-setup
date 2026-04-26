@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli_args::*;
 use crate::cli_helpers::{
-    complete_loaded_answers_with_prompts, ensure_deployment_targets_present, resolve_bundle_dir,
-    resolve_setup_scope, run_interactive_wizard,
+    complete_loaded_answers_with_prompts, ensure_deployment_targets_present,
+    ensure_required_setup_answers_present, resolve_bundle_dir, resolve_setup_scope,
+    run_interactive_wizard,
 };
 use crate::cli_i18n::CliI18n;
 use crate::engine::{LoadedAnswers, SetupConfig, SetupRequest};
@@ -123,6 +124,8 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     };
     if non_interactive {
         ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
+        ensure_required_setup_answers_present(&bundle_dir, &loaded_answers)
+            .context("Missing required answers in --non-interactive mode")?;
     }
 
     let providers = provider_id.clone().map_or_else(Vec::new, |id| vec![id]);

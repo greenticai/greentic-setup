@@ -7,6 +7,8 @@ mod prompts;
 use std::path::Path;
 
 use anyhow::Result;
+use qa_spec::{VisibilityMode, resolve_visibility};
+use serde_json::Value;
 
 use crate::discovery;
 use crate::engine::LoadedAnswers;
@@ -391,6 +393,55 @@ pub fn ensure_deployment_targets_present(bundle_path: &Path, loaded: &LoadedAnsw
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// Ensure loaded answers satisfy all visible required setup questions.
+pub fn ensure_required_setup_answers_present(
+    bundle_path: &Path,
+    loaded: &LoadedAnswers,
+) -> Result<()> {
+    let discovered = discovery::discover(bundle_path)?;
+    for provider in discovered.setup_targets() {
+        let Some(spec) =
+            setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id)
+        else {
+            continue;
+        };
+        if spec.questions.is_empty() {
+            continue;
+        }
+
+        let answers = loaded
+            .setup_answers
+            .get(&provider.provider_id)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let answer_map = answers.as_object().ok_or_else(|| {
+            anyhow::anyhow!("answers for {} must be an object", provider.provider_id)
+        })?;
+        let visibility = resolve_visibility(&spec, &answers, VisibilityMode::Visible);
+
+        for question in spec.questions.iter().filter(|question| question.required) {
+            if !visibility.get(&question.id).copied().unwrap_or(true) {
+                continue;
+            }
+            let Some(value) = answer_map.get(&question.id) else {
+                anyhow::bail!(
+                    "missing required setup answer for {}.{}",
+                    provider.provider_id,
+                    question.id
+                );
+            };
+            if !wizard::answer_satisfies_question(question, value) {
+                anyhow::bail!(
+                    "missing required setup answer for {}.{}",
+                    provider.provider_id,
+                    question.id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -28,8 +28,9 @@ use greentic_setup::cli_args::{BundleCommand, Cli, Command};
 use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
     SetupOutputTarget, complete_loaded_answers_with_prompts, copy_dir_recursive,
-    ensure_deployment_targets_present, prompt_setup_params, resolve_bundle_source,
-    resolve_setup_scope_with_bundle, run_interactive_wizard, setup_output_target,
+    ensure_deployment_targets_present, ensure_required_setup_answers_present, prompt_setup_params,
+    resolve_bundle_source, resolve_setup_scope_with_bundle, run_interactive_wizard,
+    setup_output_target,
 };
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
@@ -62,7 +63,7 @@ fn main() -> Result<()> {
 
     // Launch web UI by default unless --no-ui is set.
     #[cfg(feature = "ui")]
-    if cli.ui && !cli.no_ui && cli.command.is_none() {
+    if cli.ui && !cli.no_ui && !cli.non_interactive && cli.command.is_none() {
         return run_ui_mode(&cli, i18n);
     }
 
@@ -70,8 +71,14 @@ fn main() -> Result<()> {
         Some(Command::Bundle(cmd)) => match cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
             BundleCommand::Add(args) => cli_commands::add(args, i18n),
-            BundleCommand::Setup(args) => cli_commands::setup(args, i18n),
-            BundleCommand::Update(args) => cli_commands::update(args, i18n),
+            BundleCommand::Setup(mut args) => {
+                args.non_interactive = cli.non_interactive;
+                cli_commands::setup(args, i18n)
+            }
+            BundleCommand::Update(mut args) => {
+                args.non_interactive = cli.non_interactive;
+                cli_commands::update(args, i18n)
+            }
             BundleCommand::Remove(args) => cli_commands::remove(args, i18n),
             BundleCommand::Build(args) => cli_commands::build(args, i18n),
             BundleCommand::List(args) => cli_commands::list(args, i18n),
@@ -134,8 +141,10 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             )
         );
         loader_engine
-            .load_answers(answers_path, cli.key.as_deref(), true)
+            .load_answers(answers_path, cli.key.as_deref(), !cli.non_interactive)
             .context(i18n.t("cli.error.failed_read_answers"))?
+    } else if cli.non_interactive {
+        anyhow::bail!("{}", i18n.t("cli.error.answers_required"));
     } else if cli.emit_answers.is_some() || cli.dry_run {
         LoadedAnswers::default()
     } else {
@@ -166,7 +175,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!();
 
-    let loaded_answers = if cli.answers.is_some() {
+    let loaded_answers = if cli.answers.is_some() && !cli.non_interactive {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
             &tenant,
@@ -180,6 +189,10 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     };
     if cli.answers.is_some() {
         ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
+    }
+    if cli.non_interactive {
+        ensure_required_setup_answers_present(&bundle_dir, &loaded_answers)
+            .context("Missing required answers in --non-interactive mode")?;
     }
 
     let request = SetupRequest {
@@ -217,7 +230,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
 
     if let Some(emit_path) = &cli.emit_answers {
         engine
-            .emit_answers(&plan, emit_path, cli.key.as_deref(), true)
+            .emit_answers(&plan, emit_path, cli.key.as_deref(), !cli.non_interactive)
             .context(i18n.t("cli.error.failed_emit_answers"))?;
         println!(
             "\n{}",
@@ -390,6 +403,46 @@ mod tests {
                 assert_eq!(args.out, std::path::PathBuf::from("/tmp/demo.gtbundle"));
             }
             other => panic!("expected bundle build subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_interactive_parses_as_global_simple_flag() {
+        let cli = Cli::parse_from([
+            "greentic-setup",
+            "--non-interactive",
+            "--answers",
+            "answers.json",
+            "./demo-bundle",
+        ]);
+
+        assert!(cli.non_interactive);
+        assert_eq!(
+            cli.answers.as_deref(),
+            Some(std::path::Path::new("answers.json"))
+        );
+    }
+
+    #[test]
+    fn non_interactive_parses_after_bundle_subcommand() {
+        let cli = Cli::parse_from([
+            "greentic-setup",
+            "bundle",
+            "setup",
+            "--non-interactive",
+            "--answers",
+            "answers.json",
+        ]);
+
+        assert!(cli.non_interactive);
+        match cli.command {
+            Some(Command::Bundle(BundleCommand::Setup(args))) => {
+                assert_eq!(
+                    args.answers.as_deref(),
+                    Some(std::path::Path::new("answers.json"))
+                );
+            }
+            other => panic!("expected bundle setup subcommand, got {other:?}"),
         }
     }
 }
