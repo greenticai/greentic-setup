@@ -334,9 +334,81 @@ fn is_placeholder_public_base_url(value: &str) -> bool {
         || normalized.contains("127.0.0.1")
 }
 
+/// Synchronize webchat-gui `skin` answer to the tenant config JSON.
+///
+/// Only runs for `messaging-webchat-gui` providers. When the operator picks a
+/// non-empty `skin` value in setup (e.g. `3aigent`), this writes that value to
+/// the `skin` field in `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`,
+/// falling back to `default.json` if a tenant-specific file does not exist.
+///
+/// The webchat-gui SPA's runtime-bootstrap reads this field and, when present,
+/// overrides URL-path skin loading to load `/skins/<skin>/skin.json` instead.
+pub fn sync_skin_to_tenant_config(
+    bundle_path: &Path,
+    tenant: &str,
+    provider_id: &str,
+    answers: &Value,
+) -> Result<bool> {
+    if !provider_id.contains("webchat-gui") {
+        return Ok(false);
+    }
+
+    let skin = answers
+        .as_object()
+        .and_then(|m| m.get("skin"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(skin) = skin else {
+        return Ok(false);
+    };
+
+    let tenant_path = bundle_path
+        .join("assets/webchat-gui/config/tenants")
+        .join(format!("{tenant}.json"));
+    let target = if tenant_path.exists() {
+        tenant_path
+    } else {
+        bundle_path.join("assets/webchat-gui/config/tenants/default.json")
+    };
+
+    if !target.exists() {
+        return Ok(false);
+    }
+
+    let raw = std::fs::read_to_string(&target)
+        .with_context(|| format!("read tenant config {}", target.display()))?;
+    let mut config: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse tenant config {}", target.display()))?;
+
+    let obj = match config.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(false),
+    };
+
+    let already_set = obj
+        .get("skin")
+        .and_then(Value::as_str)
+        .map(|existing| existing == skin)
+        .unwrap_or(false);
+    if already_set {
+        return Ok(false);
+    }
+
+    obj.insert("skin".to_string(), Value::String(skin.to_string()));
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&target, output)
+        .with_context(|| format!("write tenant config {}", target.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_placeholder_public_base_url, resolve_public_base_url, update_tenant_config};
+    use super::{
+        is_placeholder_public_base_url, resolve_public_base_url, sync_skin_to_tenant_config,
+        update_tenant_config,
+    };
     use serde_json::{Map, Value, json};
 
     #[test]
@@ -406,5 +478,88 @@ mod tests {
         assert!(is_placeholder_public_base_url("http://localhost:8080"));
         assert!(is_placeholder_public_base_url("http://127.0.0.1:8080"));
         assert!(!is_placeholder_public_base_url("https://demo.example.net"));
+    }
+
+    #[test]
+    fn sync_skin_skips_non_webchat_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers = json!({ "skin": "3aigent" });
+        let changed =
+            sync_skin_to_tenant_config(temp.path(), "demo", "messaging-slack", &answers).unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn sync_skin_skips_when_answer_missing_or_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        std::fs::write(tenants_dir.join("demo.json"), r#"{"tenant_id":"demo"}"#).unwrap();
+
+        for empty in [json!({}), json!({"skin": ""}), json!({"skin": "   "})] {
+            let changed =
+                sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &empty)
+                    .unwrap();
+            assert!(!changed, "should not write for {empty}");
+        }
+    }
+
+    #[test]
+    fn sync_skin_writes_field_to_tenant_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(
+            &tenant_file,
+            r#"{"tenant_id":"demo","legacy_skin":"_template"}"#,
+        )
+        .unwrap();
+
+        let answers = json!({ "skin": "3aigent" });
+        let changed =
+            sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        assert_eq!(updated["skin"].as_str(), Some("3aigent"));
+        // legacy_skin must be preserved (separate concern)
+        assert_eq!(updated["legacy_skin"].as_str(), Some("_template"));
+    }
+
+    #[test]
+    fn sync_skin_falls_back_to_default_json_when_tenant_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
+
+        let answers = json!({ "skin": "3aigent" });
+        let changed =
+            sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&default_file).unwrap()).unwrap();
+        assert_eq!(updated["skin"].as_str(), Some("3aigent"));
+    }
+
+    #[test]
+    fn sync_skin_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo","skin":"3aigent"}"#).unwrap();
+
+        let answers = json!({ "skin": "3aigent" });
+        let changed =
+            sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(!changed, "no-op when value already matches");
     }
 }
