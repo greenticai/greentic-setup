@@ -404,11 +404,30 @@ pub fn execute_remove_provider_artifacts(
 
 /// Search sibling bundles for provider packs referenced in setup_answers
 /// and install them into this bundle if missing.
+///
+/// "Missing" is determined by pack_id, not filename: a pack file with any
+/// filename that declares the matching pack_id in its manifest counts as
+/// already installed. Otherwise a custom-named pack (e.g. a tenant-specific
+/// build placed alongside the canonical name) gets clobbered every time
+/// setup runs.
 pub fn auto_install_provider_packs(bundle_path: &Path, metadata: &SetupPlanMetadata) {
     let bundle_abs =
         std::fs::canonicalize(bundle_path).unwrap_or_else(|_| bundle_path.to_path_buf());
 
+    let installed_ids: std::collections::HashSet<String> = discovery::discover(bundle_path)
+        .map(|d| {
+            d.providers
+                .into_iter()
+                .chain(d.app_packs)
+                .map(|p| p.provider_id)
+                .collect()
+        })
+        .unwrap_or_default();
+
     for provider_id in metadata.setup_answers.keys() {
+        if installed_ids.contains(provider_id) {
+            continue;
+        }
         let target_dir = get_pack_target_dir(bundle_path, provider_id);
         let target_path = target_dir.join(format!("{provider_id}.gtpack"));
         if target_path.exists() {
@@ -611,5 +630,60 @@ mod tests {
 
         assert!(message.contains("failed to resolve 1 pack ref"));
         assert!(message.contains("/definitely/missing/example.gtpack"));
+    }
+
+    /// Regression: a custom-named pack whose manifest declares the matching
+    /// pack_id must satisfy `auto_install_provider_packs`. Filename-only
+    /// detection caused tenant-specific builds (e.g. `*-3aigent.gtpack`) to
+    /// be clobbered by the canonical name on every setup run.
+    #[test]
+    fn auto_install_skips_when_pack_id_matches_under_custom_filename() {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        let messaging_dir = bundle.join("providers").join("messaging");
+        std::fs::create_dir_all(&messaging_dir).expect("create messaging dir");
+
+        let custom_pack = messaging_dir.join("messaging-webchat-gui-3aigent.gtpack");
+        let file = std::fs::File::create(&custom_pack).expect("create pack file");
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("pack.manifest.json", options)
+            .expect("start manifest");
+        writer
+            .write_all(
+                serde_json::json!({
+                    "pack_id": "messaging-webchat-gui",
+                    "display_name": "WebChat GUI",
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .expect("write manifest");
+        writer.finish().expect("finish zip");
+
+        let canonical_pack = messaging_dir.join("messaging-webchat-gui.gtpack");
+        assert!(!canonical_pack.exists(), "precondition: canonical absent");
+
+        let mut metadata = empty_metadata(vec![]);
+        metadata.setup_answers.insert(
+            "messaging-webchat-gui".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+
+        auto_install_provider_packs(&bundle, &metadata);
+
+        assert!(
+            custom_pack.exists(),
+            "custom-named pack must be left in place"
+        );
+        assert!(
+            !canonical_pack.exists(),
+            "must not auto-install canonical-named duplicate when pack_id already present"
+        );
     }
 }
