@@ -231,6 +231,30 @@ pub fn execute_apply_pack_setup(
             }
         }
 
+        // Materialize a provider config envelope so runtime/provider ingest
+        // paths can read setup-applied config, not just raw setup answers.
+        if let Some(pack_path) = pack_path {
+            crate::config_envelope::write_provider_config_envelope(
+                &bundle_path.join(".providers"),
+                provider_id,
+                "setup-input",
+                answers,
+                pack_path,
+                false,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to write provider config envelope for {} using {}",
+                    provider_id,
+                    pack_path.display()
+                )
+            })?;
+        } else if config.verbose {
+            println!(
+                "  [config] WARNING: no resolved pack path for {provider_id}; skipped config envelope write"
+            );
+        }
+
         // Sync OAuth answers to tenant config JSON for webchat-gui providers
         match crate::tenant_config::sync_oauth_to_tenant_config(
             bundle_path,
