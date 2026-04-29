@@ -110,7 +110,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!("{}", i18n.tf("cli.bundle.setup.domain", &[&domain]));
 
-    let loaded_answers = if answers.is_some() && !non_interactive {
+    let loaded_answers = if answers.is_some() {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
             &tenant,

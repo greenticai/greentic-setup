@@ -175,7 +175,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!();
 
-    let loaded_answers = if cli.answers.is_some() && !cli.non_interactive {
+    let loaded_answers = if cli.answers.is_some() {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
             &tenant,
