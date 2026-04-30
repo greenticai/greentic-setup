@@ -5,7 +5,7 @@
 //! to enable/disable OAuth providers and set client IDs. This ensures the
 //! webchat-gui runtime serves the correct auth config without manual editing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
@@ -49,17 +49,55 @@ const OIDC_PROVIDERS: &[OidcProviderDef] = &[
     },
 ];
 
+/// Resolve the target tenant config file, scaffolding `<tenant>.json` from
+/// `default.json` when it does not yet exist.
+///
+/// The webchat-gui SPA's runtime-bootstrap fetches `/config/tenants/<tenant>.json`
+/// directly via `originalFetch` (bypassing its own 404-fallback interceptor) when
+/// resolving skin / nav_links overrides. If we instead patched `default.json`
+/// here, those tenant-specific fields would never be picked up at runtime, *and*
+/// the template would be polluted with the wrong `tenant_id`. So when the
+/// tenant-specific file is missing, we copy `default.json` to `<tenant>.json`
+/// (rewriting `tenant_id`) and write into the new file.
+///
+/// Returns `Ok(None)` when neither `<tenant>.json` nor `default.json` exists —
+/// callers should treat that as a no-op.
+fn resolve_or_scaffold_tenant_config(bundle_path: &Path, tenant: &str) -> Result<Option<PathBuf>> {
+    let tenants_dir = bundle_path.join("assets/webchat-gui/config/tenants");
+    let tenant_path = tenants_dir.join(format!("{tenant}.json"));
+    if tenant_path.exists() {
+        return Ok(Some(tenant_path));
+    }
+
+    let default_path = tenants_dir.join("default.json");
+    if !default_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&default_path)
+        .with_context(|| format!("read default tenant config {}", default_path.display()))?;
+    let mut config: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse default tenant config {}", default_path.display()))?;
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert("tenant_id".to_string(), Value::String(tenant.to_string()));
+    }
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&tenant_path, output)
+        .with_context(|| format!("scaffold tenant config {}", tenant_path.display()))?;
+    Ok(Some(tenant_path))
+}
+
 /// Synchronize webchat-gui OAuth answers to the tenant config JSON.
 ///
 /// Only runs for `messaging-webchat-gui` providers. Updates the tenant config
-/// at `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`.
+/// at `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`, scaffolding
+/// the file from `default.json` when missing.
 pub fn sync_oauth_to_tenant_config(
     bundle_path: &Path,
     tenant: &str,
     provider_id: &str,
     answers: &Value,
 ) -> Result<bool> {
-    // Only apply to webchat-gui providers
     if !provider_id.contains("webchat-gui") {
         return Ok(false);
     }
@@ -69,34 +107,17 @@ pub fn sync_oauth_to_tenant_config(
         None => return Ok(false),
     };
 
-    // Check if OAuth is configured in answers
     let oauth_enabled = answers_obj
         .get("oauth_enabled")
         .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
         .unwrap_or(false);
 
-    // Find tenant config file
-    let config_path = bundle_path
-        .join("assets/webchat-gui/config/tenants")
-        .join(format!("{tenant}.json"));
-
-    if !config_path.exists() {
-        // Try default.json as fallback
-        let default_path = bundle_path.join("assets/webchat-gui/config/tenants/default.json");
-        if default_path.exists() {
-            return update_tenant_config(
-                &default_path,
-                tenant,
-                oauth_enabled,
-                answers_obj,
-                resolve_public_base_url(bundle_path, tenant, answers_obj)?,
-            );
-        }
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
         return Ok(false);
-    }
+    };
 
     update_tenant_config(
-        &config_path,
+        &target,
         tenant,
         oauth_enabled,
         answers_obj,
@@ -364,18 +385,9 @@ pub fn sync_skin_to_tenant_config(
         return Ok(false);
     };
 
-    let tenant_path = bundle_path
-        .join("assets/webchat-gui/config/tenants")
-        .join(format!("{tenant}.json"));
-    let target = if tenant_path.exists() {
-        tenant_path
-    } else {
-        bundle_path.join("assets/webchat-gui/config/tenants/default.json")
-    };
-
-    if !target.exists() {
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
         return Ok(false);
-    }
+    };
 
     let raw = std::fs::read_to_string(&target)
         .with_context(|| format!("read tenant config {}", target.display()))?;
@@ -467,18 +479,9 @@ pub fn sync_nav_links_to_tenant_config(
             .collect()
     };
 
-    let tenant_path = bundle_path
-        .join("assets/webchat-gui/config/tenants")
-        .join(format!("{tenant}.json"));
-    let target = if tenant_path.exists() {
-        tenant_path
-    } else {
-        bundle_path.join("assets/webchat-gui/config/tenants/default.json")
-    };
-
-    if !target.exists() {
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
         return Ok(false);
-    }
+    };
 
     let raw_config = std::fs::read_to_string(&target)
         .with_context(|| format!("read tenant config {}", target.display()))?;
@@ -506,8 +509,9 @@ pub fn sync_nav_links_to_tenant_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_placeholder_public_base_url, resolve_public_base_url, sync_nav_links_to_tenant_config,
-        sync_skin_to_tenant_config, update_tenant_config,
+        is_placeholder_public_base_url, resolve_or_scaffold_tenant_config, resolve_public_base_url,
+        sync_nav_links_to_tenant_config, sync_oauth_to_tenant_config, sync_skin_to_tenant_config,
+        update_tenant_config,
     };
     use serde_json::{Map, Value, json};
 
@@ -630,12 +634,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_skin_falls_back_to_default_json_when_tenant_missing() {
+    fn sync_skin_scaffolds_tenant_json_from_default_when_missing() {
         let temp = tempfile::tempdir().unwrap();
         let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
         std::fs::create_dir_all(&tenants_dir).unwrap();
         let default_file = tenants_dir.join("default.json");
-        std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
+        std::fs::write(
+            &default_file,
+            r#"{"tenant_id":"default","legacy_skin":"_template"}"#,
+        )
+        .unwrap();
 
         let answers = json!({ "skin": "3aigent" });
         let changed =
@@ -643,9 +651,33 @@ mod tests {
                 .unwrap();
         assert!(changed);
 
-        let updated: Value =
+        // demo.json was scaffolded with skin field and remapped tenant_id
+        let demo_file = tenants_dir.join("demo.json");
+        assert!(demo_file.exists(), "demo.json must be scaffolded");
+        let demo_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&demo_file).unwrap()).unwrap();
+        assert_eq!(demo_parsed["tenant_id"].as_str(), Some("demo"));
+        assert_eq!(demo_parsed["skin"].as_str(), Some("3aigent"));
+        assert_eq!(demo_parsed["legacy_skin"].as_str(), Some("_template"));
+
+        // default.json must be left untouched — runtime depends on it as a template
+        let default_after: Value =
             serde_json::from_str(&std::fs::read_to_string(&default_file).unwrap()).unwrap();
-        assert_eq!(updated["skin"].as_str(), Some("3aigent"));
+        assert_eq!(default_after["tenant_id"].as_str(), Some("default"));
+        assert!(default_after.get("skin").is_none());
+    }
+
+    #[test]
+    fn sync_skin_returns_false_when_no_tenant_or_default_config_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+
+        let answers = json!({ "skin": "3aigent" });
+        let changed =
+            sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(!changed);
     }
 
     #[test]
@@ -804,5 +836,117 @@ mod tests {
             sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
                 .unwrap_err();
         assert!(err.to_string().contains("parse nav_links_json"));
+    }
+
+    #[test]
+    fn sync_nav_links_scaffolds_tenant_json_from_default_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
+
+        let answers = json!({ "nav_links_json": r#"[{"label":"Help","url":"/help"}]"# });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let demo_file = tenants_dir.join("demo.json");
+        assert!(demo_file.exists());
+        let demo_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&demo_file).unwrap()).unwrap();
+        assert_eq!(demo_parsed["tenant_id"].as_str(), Some("demo"));
+        assert_eq!(demo_parsed["nav_links"][0]["label"].as_str(), Some("Help"));
+
+        let default_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&default_file).unwrap()).unwrap();
+        assert!(default_parsed.get("nav_links").is_none());
+    }
+
+    #[test]
+    fn sync_oauth_scaffolds_tenant_json_from_default_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(
+            &default_file,
+            serde_json::to_string_pretty(&json!({
+                "tenant_id": "default",
+                "auth": { "providers": [] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let answers = json!({
+            "oauth_enabled": true,
+            "oauth_enable_google": true,
+            "oauth_google_client_id": "client-xyz"
+        });
+        let changed =
+            sync_oauth_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let demo_file = tenants_dir.join("demo.json");
+        assert!(demo_file.exists());
+        let demo_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&demo_file).unwrap()).unwrap();
+        assert_eq!(demo_parsed["tenant_id"].as_str(), Some("demo"));
+        let provider = demo_parsed["auth"]["providers"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|p| p["id"] == "demo-google"))
+            .expect("demo-google provider was added");
+        assert_eq!(provider["enabled"].as_bool(), Some(true));
+        assert_eq!(provider["clientId"].as_str(), Some("client-xyz"));
+
+        // default.json must not be polluted
+        let default_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&default_file).unwrap()).unwrap();
+        let default_providers = default_parsed["auth"]["providers"].as_array().unwrap();
+        assert!(default_providers.is_empty(), "default.json must stay empty");
+    }
+
+    #[test]
+    fn resolve_or_scaffold_returns_existing_tenant_file_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo","skin":"existing"}"#).unwrap();
+
+        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "demo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, tenant_file);
+
+        // File contents must be untouched
+        assert_eq!(
+            std::fs::read_to_string(&tenant_file).unwrap(),
+            r#"{"tenant_id":"demo","skin":"existing"}"#
+        );
+    }
+
+    #[test]
+    fn resolve_or_scaffold_returns_none_when_neither_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "demo").unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_or_scaffold_for_default_tenant_returns_default_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
+
+        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, default_file);
     }
 }
