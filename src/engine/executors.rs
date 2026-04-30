@@ -291,6 +291,24 @@ pub fn execute_apply_pack_setup(
             }
         }
 
+        // Sync `nav_links_json` answer to tenant config JSON for webchat-gui providers
+        match crate::tenant_config::sync_nav_links_to_tenant_config(
+            bundle_path,
+            &config.tenant,
+            provider_id,
+            answers,
+        ) {
+            Ok(true) => {
+                if config.verbose {
+                    println!("  [nav_links] updated tenant config for {provider_id}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                println!("  [nav_links] WARNING: failed to update tenant config: {e}");
+            }
+        }
+
         // Register webhooks if the provider needs one (e.g. Telegram, Slack, Webex)
         if let Some(result) = crate::webhook::register_webhook(
             provider_id,

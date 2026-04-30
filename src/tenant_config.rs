@@ -403,11 +403,111 @@ pub fn sync_skin_to_tenant_config(
     Ok(true)
 }
 
+/// Sync the webchat-gui setup answer `nav_links_json` into the tenant config's
+/// `nav_links` array.
+///
+/// Operators enter the array as a JSON string in the wizard
+/// (e.g. `[{"label":"Module 5","url":"https://...","external":true}]`). This
+/// function parses that string, validates each entry has non-empty `label` and
+/// `url` strings (skipping malformed entries instead of failing), and writes
+/// the resulting array to `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`.
+///
+/// An empty answer (or one that parses to an empty array) clears any existing
+/// `nav_links` so removing all entries via the wizard hides the topbar nav at
+/// runtime.
+///
+/// The webchat-gui SPA's runtime-bootstrap reads this array and renders one
+/// anchor per entry between the brand block and the locale picker.
+pub fn sync_nav_links_to_tenant_config(
+    bundle_path: &Path,
+    tenant: &str,
+    provider_id: &str,
+    answers: &Value,
+) -> Result<bool> {
+    if !provider_id.contains("webchat-gui") {
+        return Ok(false);
+    }
+
+    let raw_answer = answers
+        .as_object()
+        .and_then(|m| m.get("nav_links_json"))
+        .and_then(Value::as_str)
+        .map(str::trim);
+
+    // Treat absent or whitespace-only answers as "no opinion" — leave existing
+    // config alone. An explicit empty string or "[]" clears the array.
+    let Some(raw) = raw_answer else {
+        return Ok(false);
+    };
+
+    let parsed_links: Vec<Value> = if raw.is_empty() {
+        Vec::new()
+    } else {
+        let parsed: Value = serde_json::from_str(raw)
+            .with_context(|| format!("parse nav_links_json answer (expected JSON array): {raw}"))?;
+        let Some(arr) = parsed.as_array() else {
+            anyhow::bail!("nav_links_json must be a JSON array, got: {raw}");
+        };
+        arr.iter()
+            .filter_map(|entry| {
+                let obj = entry.as_object()?;
+                let label = obj.get("label").and_then(Value::as_str).map(str::trim)?;
+                let url = obj.get("url").and_then(Value::as_str).map(str::trim)?;
+                if label.is_empty() || url.is_empty() {
+                    return None;
+                }
+                let mut clean = serde_json::Map::new();
+                clean.insert("label".to_string(), Value::String(label.to_string()));
+                clean.insert("url".to_string(), Value::String(url.to_string()));
+                if obj.get("external").and_then(Value::as_bool) == Some(true) {
+                    clean.insert("external".to_string(), Value::Bool(true));
+                }
+                Some(Value::Object(clean))
+            })
+            .collect()
+    };
+
+    let tenant_path = bundle_path
+        .join("assets/webchat-gui/config/tenants")
+        .join(format!("{tenant}.json"));
+    let target = if tenant_path.exists() {
+        tenant_path
+    } else {
+        bundle_path.join("assets/webchat-gui/config/tenants/default.json")
+    };
+
+    if !target.exists() {
+        return Ok(false);
+    }
+
+    let raw_config = std::fs::read_to_string(&target)
+        .with_context(|| format!("read tenant config {}", target.display()))?;
+    let mut config: Value = serde_json::from_str(&raw_config)
+        .with_context(|| format!("parse tenant config {}", target.display()))?;
+
+    let obj = match config.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(false),
+    };
+
+    let next = Value::Array(parsed_links);
+    if obj.get("nav_links") == Some(&next) {
+        return Ok(false);
+    }
+
+    obj.insert("nav_links".to_string(), next);
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&target, output)
+        .with_context(|| format!("write tenant config {}", target.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_placeholder_public_base_url, resolve_public_base_url, sync_skin_to_tenant_config,
-        update_tenant_config,
+        is_placeholder_public_base_url, resolve_public_base_url, sync_nav_links_to_tenant_config,
+        sync_skin_to_tenant_config, update_tenant_config,
     };
     use serde_json::{Map, Value, json};
 
@@ -561,5 +661,148 @@ mod tests {
             sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
                 .unwrap();
         assert!(!changed, "no-op when value already matches");
+    }
+
+    #[test]
+    fn sync_nav_links_skips_non_webchat_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers = json!({ "nav_links_json": r#"[{"label":"X","url":"/x"}]"# });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-slack", &answers)
+                .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn sync_nav_links_skips_when_answer_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        std::fs::write(tenants_dir.join("demo.json"), r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({});
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(!changed, "absent answer leaves config alone");
+    }
+
+    #[test]
+    fn sync_nav_links_writes_array_to_tenant_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({
+            "nav_links_json": r#"[
+                { "label": "Module 5", "url": "https://example.com/m5", "external": true },
+                { "label": "Help",     "url": "/help" }
+            ]"#
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().expect("nav_links array");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0]["label"].as_str(), Some("Module 5"));
+        assert_eq!(links[0]["url"].as_str(), Some("https://example.com/m5"));
+        assert_eq!(links[0]["external"].as_bool(), Some(true));
+        assert_eq!(links[1]["label"].as_str(), Some("Help"));
+        assert_eq!(links[1]["url"].as_str(), Some("/help"));
+        // external defaults to absent (not false) when omitted
+        assert!(links[1].get("external").is_none());
+    }
+
+    #[test]
+    fn sync_nav_links_drops_malformed_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        // Mix of valid + bad entries: missing url, empty label, non-object.
+        let answers = json!({
+            "nav_links_json": r#"[
+                { "label": "Good", "url": "/ok" },
+                { "label": "No URL" },
+                { "label": "", "url": "/blank" },
+                "not an object",
+                { "label": "Also good", "url": "https://x" }
+            ]"#
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0]["label"].as_str(), Some("Good"));
+        assert_eq!(links[1]["label"].as_str(), Some("Also good"));
+    }
+
+    #[test]
+    fn sync_nav_links_clears_existing_when_answer_is_empty_array() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(
+            &tenant_file,
+            r#"{"tenant_id":"demo","nav_links":[{"label":"Old","url":"/old"}]}"#,
+        )
+        .unwrap();
+
+        let answers = json!({ "nav_links_json": "[]" });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        assert!(updated["nav_links"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_nav_links_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(
+            &tenant_file,
+            r#"{"tenant_id":"demo","nav_links":[{"label":"X","url":"/x"}]}"#,
+        )
+        .unwrap();
+
+        let answers = json!({ "nav_links_json": r#"[{"label":"X","url":"/x"}]"# });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(!changed, "no-op when content already matches");
+    }
+
+    #[test]
+    fn sync_nav_links_returns_error_on_invalid_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        std::fs::write(tenants_dir.join("demo.json"), r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({ "nav_links_json": "not valid json" });
+        let err =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap_err();
+        assert!(err.to_string().contains("parse nav_links_json"));
     }
 }
