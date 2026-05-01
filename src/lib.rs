@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod engine;
 pub mod flow;
 pub mod gtbundle;
+pub mod operator_yaml;
 pub mod plan;
 pub mod platform_setup;
 pub mod reload;

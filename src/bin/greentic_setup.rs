@@ -34,6 +34,7 @@ use greentic_setup::cli_helpers::{
 };
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
+use greentic_setup::operator_yaml;
 use greentic_setup::plan::TenantSelection;
 use greentic_setup::platform_setup::StaticRoutesPolicy;
 use greentic_setup::{SetupEngine, SetupMode, bundle, gtbundle};
@@ -68,7 +69,7 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Bundle(cmd)) => match cmd {
+        Some(Command::Bundle(cmd)) => match *cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
             BundleCommand::Add(args) => cli_commands::add(args, i18n),
             BundleCommand::Setup(mut args) => {
@@ -84,8 +85,56 @@ fn main() -> Result<()> {
             BundleCommand::List(args) => cli_commands::list(args, i18n),
             BundleCommand::Status(args) => cli_commands::status(args, i18n),
         },
+        Some(Command::ConfigureNotifier(args)) => run_configure_notifier(args, i18n),
         None => run_simple_setup(&cli, i18n),
     }
+}
+
+/// Enable the Redis backplane notifier for WebChat WebSocket fan-out.
+fn run_configure_notifier(
+    args: greentic_setup::cli_args::ConfigureNotifierArgs,
+    i18n: &CliI18n,
+) -> Result<()> {
+    use dialoguer::Confirm;
+
+    // Check that state-redis is configured before prompting (spec §6.4).
+    // Presence of the envelope file is sufficient — greentic-start validates contents at boot.
+    let state_redis_envelope = args
+        .operator_root
+        .join("providers")
+        .join("state-redis")
+        .join("config.envelope.cbor");
+    if !state_redis_envelope.exists() {
+        println!("{}", i18n.t("webchat.notifier.skip.no_state_redis"));
+        return Ok(());
+    }
+
+    let enable = if args.accept {
+        true
+    } else {
+        Confirm::new()
+            .with_prompt(i18n.t("webchat.notifier.prompt.enable_redis"))
+            .default(true)
+            .interact()
+            .context("prompt interaction failed")?
+    };
+
+    if enable {
+        operator_yaml::enable_redis_notifier_in_greentic_yaml(&args.operator_root)?;
+        let yaml_path = args
+            .operator_root
+            .join("greentic.yaml")
+            .display()
+            .to_string();
+        println!(
+            "{}",
+            i18n.tf("webchat.notifier.success.wrote", &[&yaml_path])
+        );
+    } else {
+        println!("{}", i18n.t("webchat.notifier.skip.user_declined"));
+    }
+
+    Ok(())
 }
 
 /// Run simple setup mode: greentic-setup [OPTIONS] <BUNDLE>
@@ -395,13 +444,16 @@ mod tests {
         ]);
 
         match cli.command {
-            Some(Command::Bundle(BundleCommand::Build(args))) => {
-                assert_eq!(
-                    args.bundle.as_deref(),
-                    Some(std::path::Path::new("./demo-bundle"))
-                );
-                assert_eq!(args.out, std::path::PathBuf::from("/tmp/demo.gtbundle"));
-            }
+            Some(Command::Bundle(cmd)) => match *cmd {
+                BundleCommand::Build(args) => {
+                    assert_eq!(
+                        args.bundle.as_deref(),
+                        Some(std::path::Path::new("./demo-bundle"))
+                    );
+                    assert_eq!(args.out, std::path::PathBuf::from("/tmp/demo.gtbundle"));
+                }
+                other => panic!("expected bundle build subcommand, got {other:?}"),
+            },
             other => panic!("expected bundle build subcommand, got {other:?}"),
         }
     }
@@ -436,12 +488,15 @@ mod tests {
 
         assert!(cli.non_interactive);
         match cli.command {
-            Some(Command::Bundle(BundleCommand::Setup(args))) => {
-                assert_eq!(
-                    args.answers.as_deref(),
-                    Some(std::path::Path::new("answers.json"))
-                );
-            }
+            Some(Command::Bundle(cmd)) => match *cmd {
+                BundleCommand::Setup(args) => {
+                    assert_eq!(
+                        args.answers.as_deref(),
+                        Some(std::path::Path::new("answers.json"))
+                    );
+                }
+                other => panic!("expected bundle setup subcommand, got {other:?}"),
+            },
             other => panic!("expected bundle setup subcommand, got {other:?}"),
         }
     }

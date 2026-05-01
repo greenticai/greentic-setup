@@ -203,5 +203,7 @@
   "ui.q.oauth_custom_scopes": "Scopes",
 
   "webchat.notifier.prompt.enable_redis": "Enable Redis backplane for WebChat WebSocket multi-replica fan-out?",
-  "webchat.notifier.skip.no_state_redis": "Skipping Redis backplane: state-redis provider is not configured."
+  "webchat.notifier.skip.no_state_redis": "Skipping Redis backplane: state-redis provider is not configured.",
+  "webchat.notifier.skip.user_declined": "Skipping Redis backplane (declined).",
+  "webchat.notifier.success.wrote": "Wrote webchat.notifier.backend=redis to {}"
 }
