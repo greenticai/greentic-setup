@@ -347,6 +347,40 @@ fn resolve_public_base_url(
     Ok(from_policy)
 }
 
+/// Sanitize a nav-link `label` value: trim whitespace and accept either a
+/// plain string or a locale-keyed object whose values are strings.
+///
+/// Returns:
+/// - `Some(String("..."))` for a non-empty trimmed string,
+/// - `Some(Object({...}))` for an object that has at least one non-empty
+///   trimmed string value (entries with non-string values are dropped),
+/// - `None` otherwise.
+fn sanitize_nav_label(value: &Value) -> Option<Value> {
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(Value::String(trimmed.to_string()));
+    }
+    if let Some(map) = value.as_object() {
+        let mut clean = serde_json::Map::new();
+        for (locale, v) in map {
+            if let Some(s) = v.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    clean.insert(locale.clone(), Value::String(trimmed.to_string()));
+                }
+            }
+        }
+        if clean.is_empty() {
+            return None;
+        }
+        return Some(Value::Object(clean));
+    }
+    None
+}
+
 fn is_placeholder_public_base_url(value: &str) -> bool {
     let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
     normalized.is_empty()
@@ -430,6 +464,12 @@ pub fn sync_skin_to_tenant_config(
 ///
 /// The webchat-gui SPA's runtime-bootstrap reads this array and renders one
 /// anchor per entry between the brand block and the locale picker.
+///
+/// Each entry's `label` may be either a plain string (single-language) or a
+/// locale-keyed JSON object such as `{"en": "Help", "id": "Bantuan"}`. The
+/// runtime resolves the displayed label by selectedLocale → base language →
+/// `en` → first non-empty value. Object form lets operators ship one entry
+/// per locale without duplicating the URL.
 pub fn sync_nav_links_to_tenant_config(
     bundle_path: &Path,
     tenant: &str,
@@ -463,13 +503,13 @@ pub fn sync_nav_links_to_tenant_config(
         arr.iter()
             .filter_map(|entry| {
                 let obj = entry.as_object()?;
-                let label = obj.get("label").and_then(Value::as_str).map(str::trim)?;
+                let label_value = sanitize_nav_label(obj.get("label")?)?;
                 let url = obj.get("url").and_then(Value::as_str).map(str::trim)?;
-                if label.is_empty() || url.is_empty() {
+                if url.is_empty() {
                     return None;
                 }
                 let mut clean = serde_json::Map::new();
-                clean.insert("label".to_string(), Value::String(label.to_string()));
+                clean.insert("label".to_string(), label_value);
                 clean.insert("url".to_string(), Value::String(url.to_string()));
                 if obj.get("external").and_then(Value::as_bool) == Some(true) {
                     clean.insert("external".to_string(), Value::Bool(true));
@@ -780,6 +820,74 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert_eq!(links[0]["label"].as_str(), Some("Good"));
         assert_eq!(links[1]["label"].as_str(), Some("Also good"));
+    }
+
+    #[test]
+    fn sync_nav_links_accepts_locale_keyed_label_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({
+            "nav_links_json": r#"[
+                { "label": { "en": "Help", "id": "Bantuan", "de": "Hilfe" }, "url": "/help" },
+                { "label": "Plain", "url": "/plain" }
+            ]"#
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        // First entry: object label preserved with all locales
+        let label0 = &links[0]["label"];
+        assert!(label0.is_object());
+        assert_eq!(label0["en"].as_str(), Some("Help"));
+        assert_eq!(label0["id"].as_str(), Some("Bantuan"));
+        assert_eq!(label0["de"].as_str(), Some("Hilfe"));
+        // Second entry: plain string preserved
+        assert_eq!(links[1]["label"].as_str(), Some("Plain"));
+    }
+
+    #[test]
+    fn sync_nav_links_drops_label_object_with_only_empty_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        // Object label where all values are empty/whitespace, plus an entry
+        // that mixes valid + non-string values (only the strings survive).
+        let answers = json!({
+            "nav_links_json": r#"[
+                { "label": { "en": "", "id": "  " }, "url": "/dropped" },
+                { "label": { "en": "Help", "id": 123, "de": "Hilfe" }, "url": "/help" }
+            ]"#
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().unwrap();
+        assert_eq!(links.len(), 1, "first entry was dropped (no usable label)");
+        let label = &links[0]["label"];
+        assert!(label.is_object());
+        assert_eq!(label["en"].as_str(), Some("Help"));
+        assert_eq!(label["de"].as_str(), Some("Hilfe"));
+        assert!(
+            label.get("id").is_none(),
+            "non-string locale entries are stripped"
+        );
     }
 
     #[test]
