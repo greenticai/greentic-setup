@@ -4,6 +4,17 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+/// Arguments for the `configure-notifier` subcommand.
+#[derive(Args, Debug, Clone)]
+pub struct ConfigureNotifierArgs {
+    /// Operator root directory containing (or to create) greentic.yaml.
+    #[arg(long = "operator-root", default_value = ".")]
+    pub operator_root: PathBuf,
+    /// Skip the Y/N prompt and accept (for non-interactive/CI use).
+    #[arg(long = "accept")]
+    pub accept: bool,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "greentic-setup")]
 #[command(version)]
@@ -88,7 +99,11 @@ pub struct Cli {
 pub enum Command {
     /// Bundle lifecycle management (advanced)
     #[command(subcommand)]
-    Bundle(BundleCommand),
+    Bundle(Box<BundleCommand>),
+    /// Enable the Redis backplane notifier for WebChat WebSocket fan-out.
+    ///
+    /// Writes `webchat.notifier.backend: redis` to the operator's greentic.yaml.
+    ConfigureNotifier(ConfigureNotifierArgs),
 }
 
 #[derive(Subcommand, Debug, Clone)]
