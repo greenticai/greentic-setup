@@ -200,5 +200,8 @@
   "ui.q.oauth_custom_auth_url": "Authorization URL",
   "ui.q.oauth_custom_token_url": "Token URL",
   "ui.q.oauth_custom_client_id": "Client ID",
-  "ui.q.oauth_custom_scopes": "Scopes"
+  "ui.q.oauth_custom_scopes": "Scopes",
+
+  "webchat.notifier.prompt.enable_redis": "Enable Redis backplane for WebChat WebSocket multi-replica fan-out?",
+  "webchat.notifier.skip.no_state_redis": "Skipping Redis backplane: state-redis provider is not configured."
 }
