@@ -231,12 +231,18 @@ pub fn run_interactive_wizard(
 }
 
 /// Complete loaded answers by prompting for missing values.
+///
+/// When `non_interactive` is true, prompts are skipped so a missing
+/// `platform_setup` field doesn't deadlock automation runs on a hidden
+/// TTY prompt — the value is left for the runtime defaults (or for
+/// `ensure_required_setup_answers_present` to flag downstream).
 pub fn complete_loaded_answers_with_prompts(
     bundle_path: &Path,
     tenant: &str,
     team: Option<&str>,
     env: &str,
     advanced: bool,
+    non_interactive: bool,
     mut loaded: LoadedAnswers,
 ) -> Result<LoadedAnswers> {
     let existing_static_routes = load_effective_static_routes_defaults(bundle_path, tenant, team)?;
@@ -244,7 +250,7 @@ pub fn complete_loaded_answers_with_prompts(
         None => true,
         Some(answers) => StaticRoutesPolicy::normalize(Some(answers), env).is_err(),
     };
-    if static_routes_need_prompt {
+    if static_routes_need_prompt && !non_interactive {
         let static_routes =
             if let Some(current_answers) = loaded.platform_setup.static_routes.as_ref() {
                 prompt_static_routes_policy_with_answers(
@@ -259,12 +265,12 @@ pub fn complete_loaded_answers_with_prompts(
     }
     let deployer_candidates =
         crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
-    if loaded.platform_setup.deployment_targets.is_empty() {
+    if loaded.platform_setup.deployment_targets.is_empty() && !non_interactive {
         loaded.platform_setup.deployment_targets =
             crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
     }
-    // Prompt for tunnel mode when no deployer and not already configured.
-    if deployer_candidates.is_empty() && loaded.platform_setup.tunnel.is_none() {
+    if deployer_candidates.is_empty() && loaded.platform_setup.tunnel.is_none() && !non_interactive
+    {
         loaded.platform_setup.tunnel = Some(crate::platform_setup::prompt_tunnel_mode(None)?);
     }
 

@@ -182,6 +182,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             team.as_deref(),
             &env,
             advanced,
+            cli.non_interactive,
             loaded_answers,
         )?
     } else {
