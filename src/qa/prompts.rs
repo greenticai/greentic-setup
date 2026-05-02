@@ -68,8 +68,13 @@ pub fn prompt_form_spec_answers_with_existing(
         {
             continue;
         }
-        // In normal mode, skip optional missing questions.
-        if !advanced && !question.required {
+        // In normal mode, skip optional missing questions — except `List`
+        // (table) kinds. A table is a structural hand-off to the operator
+        // ("here's where nav-links / repeating data go") that doesn't make
+        // sense to silently hide based on the required flag, even when
+        // optional. They get the table; if they want to skip rows they
+        // answer "n" to "Add a row?" and move on.
+        if !advanced && !question.required && question.kind != QuestionType::List {
             continue;
         }
         if let Some(value) = ask_form_spec_question(question)? {
