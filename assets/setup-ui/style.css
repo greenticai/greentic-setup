@@ -25,6 +25,12 @@
 html{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 body{font-family:var(--font);background:var(--bg);color:var(--fg);min-height:100dvh;display:flex;justify-content:center;padding:3rem 1rem}
 .container{width:100%;max-width:620px}
+/* Wider container when the form contains a table (kind: List) so 5–7
+   columns of inputs aren't squeezed. JS toggles this class on `<body>`
+   after rendering a question that includes `list_columns`. */
+body.has-wide-form .container{max-width:1180px}
+.table-wrap{overflow-x:auto}
+.row-table{min-width:max-content}
 
 /* ── Animation ── */
 .fade-in{animation:fadeIn .25s ease}
