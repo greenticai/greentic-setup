@@ -117,6 +117,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
             team.as_deref(),
             &env,
             advanced,
+            non_interactive,
             loaded_answers,
         )?
     } else {
