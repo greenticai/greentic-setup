@@ -4,7 +4,7 @@ name: Dev Publish
 
 on:
   push:
-    branches: [develop]
+    branches: [research]
   workflow_dispatch:
 
 permissions:
