@@ -839,16 +839,29 @@
     return html;
   }
 
-  /// Common locale codes operators are most likely to add as nav-link
-  /// translations. Sourced from the webchat-gui pack's i18n bundle. Sorted
-  /// roughly by demo-deployment frequency.
+  /// Locale codes ↔ native names. Mirrors `SUPPORTED_LOCALES` in the
+  /// webchat-gui SPA's `runtime-bootstrap.js` so the wizard offers exactly
+  /// the same set of translations that ship in the i18n bundle. Keep
+  /// these two lists in sync when adding/removing a locale.
   var I18N_LOCALES = [
-    ['en', 'English'], ['id', 'Indonesia'], ['de', 'Deutsch'],
-    ['fr', 'Français'], ['es', 'Español'], ['it', 'Italiano'],
-    ['pt', 'Português'], ['nl', 'Nederlands'], ['ja', '日本語'],
-    ['zh', '中文'], ['ko', '한국어'], ['ar', 'العربية'],
-    ['hi', 'हिन्दी'], ['ru', 'Русский'], ['tr', 'Türkçe'],
-    ['vi', 'Tiếng Việt'], ['th', 'ภาษาไทย']
+    ['ar', 'العربية'], ['ar-AE', 'العربية (الإمارات)'], ['ar-DZ', 'العربية (الجزائر)'],
+    ['ar-EG', 'العربية (مصر)'], ['ar-IQ', 'العربية (العراق)'], ['ar-MA', 'العربية (المغرب)'],
+    ['ar-SA', 'العربية (السعودية)'], ['ar-SD', 'العربية (السودان)'], ['ar-SY', 'العربية (سوريا)'],
+    ['ar-TN', 'العربية (تونس)'],
+    ['ay', "Aymar aru"], ['bg', 'Български'], ['bn', 'বাংলা'], ['cs', 'Čeština'],
+    ['da', 'Dansk'], ['de', 'Deutsch'], ['el', 'Ελληνικά'], ['en', 'English'],
+    ['en-GB', 'English (UK)'], ['es', 'Español'], ['et', 'Eesti'], ['fa', 'فارسی'],
+    ['fi', 'Suomi'], ['fr', 'Français'], ['gn', "Avañe'ẽ"], ['gu', 'ગુજરાતી'],
+    ['hi', 'हिन्दी'], ['hr', 'Hrvatski'], ['ht', 'Kreyòl ayisyen'], ['hu', 'Magyar'],
+    ['id', 'Bahasa Indonesia'], ['it', 'Italiano'], ['ja', '日本語'], ['km', 'ខ្មែរ'],
+    ['kn', 'ಕನ್ನಡ'], ['ko', '한국어'], ['lo', 'ລາວ'], ['lt', 'Lietuvių'],
+    ['lv', 'Latviešu'], ['ml', 'മലയാളം'], ['mr', 'मराठी'], ['ms', 'Bahasa Melayu'],
+    ['my', 'မြန်မာ'], ['nah', 'Nāhuatl'], ['ne', 'नेपाली'], ['nl', 'Nederlands'],
+    ['no', 'Norsk'], ['pa', 'ਪੰਜਾਬੀ'], ['pl', 'Polski'], ['pt', 'Português'],
+    ['qu', 'Runa simi'], ['ro', 'Română'], ['ru', 'Русский'], ['si', 'සිංහල'],
+    ['sk', 'Slovenčina'], ['sr', 'Српски'], ['sv', 'Svenska'], ['ta', 'தமிழ்'],
+    ['te', 'తెలుగు'], ['th', 'ไทย'], ['tl', 'Tagalog'], ['tr', 'Türkçe'],
+    ['uk', 'Українська'], ['ur', 'اردو'], ['vi', 'Tiếng Việt'], ['zh', '中文']
   ];
 
   /// Build the inner DOM for a multilingual cell. `existing` is either a
