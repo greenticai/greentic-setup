@@ -95,6 +95,31 @@ struct QuestionInfo {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    /// Column schema for `kind: List` (table) questions. Each entry tells
+    /// the front-end how to render one cell per row. Absent for scalar
+    /// kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_columns: Option<Vec<ListColumnInfo>>,
+    /// Minimum row count for a `kind: List` question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_rows: Option<usize>,
+    /// Maximum row count for a `kind: List` question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_rows: Option<usize>,
+}
+
+/// Per-column metadata sent to the front-end so it can render one input
+/// per cell when the question kind is `List` (a.k.a. table).
+#[derive(Serialize, Clone)]
+struct ListColumnInfo {
+    id: String,
+    title: String,
+    kind: String,
+    required: bool,
+    help: Option<String>,
+    placeholder: Option<String>,
+    choices: Option<Vec<String>>,
+    default_value: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1093,6 +1118,28 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         })
         .or_else(|| q.description.clone());
 
+    let (list_columns, min_rows, max_rows) = q
+        .list
+        .as_ref()
+        .map(|list| {
+            let cols: Vec<ListColumnInfo> = list
+                .fields
+                .iter()
+                .map(|c| ListColumnInfo {
+                    id: c.id.clone(),
+                    title: c.title.clone(),
+                    kind: format!("{:?}", c.kind),
+                    required: c.required,
+                    help: c.description.clone(),
+                    placeholder: None,
+                    choices: c.choices.clone(),
+                    default_value: c.default_value.clone(),
+                })
+                .collect();
+            (Some(cols), list.min_items, list.max_items)
+        })
+        .unwrap_or((None, None, None));
+
     QuestionInfo {
         id: q.id.clone(),
         title,
@@ -1107,6 +1154,9 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         placeholder: None,
         group: None,
         docs_url: None,
+        list_columns,
+        min_rows,
+        max_rows,
     }
 }
 

@@ -755,6 +755,7 @@
 
     app.innerHTML = html;
     restoreFormValues(questions);
+    setupTableQuestions(questions);
     setupVisibility(questions);
     app.querySelectorAll("#form-area input, #form-area select, #form-area textarea").forEach(function (el) {
       var handler = function () {
@@ -787,7 +788,27 @@
       visAttr = ' data-vis-field="' + esc(q.visible_if.field) + '" data-vis-eq="' + esc(q.visible_if.eq || "") + '"';
     }
     var html = '<div class="field" id="field-' + esc(q.id) + '"' + visAttr + '>';
-    if (q.kind === "Boolean") {
+    if (q.kind === "List" && q.list_columns && q.list_columns.length > 0) {
+      // Repeating-row table input. Each row is one entry (e.g. nav link).
+      // The user clicks "+ Add row" to grow the list and the trash icon
+      // to drop a row. min_rows / max_rows enforce bounds at submit time.
+      html += '<label class="field-label">' + esc(q.title);
+      if (q.required) html += '<span class="required">*</span>';
+      html += '</label>';
+      if (q.help) html += '<p class="field-help">' + esc(q.help) + '</p>';
+      html += '<div class="table-wrap" id="t-' + esc(q.id) + '" data-q-id="' + esc(q.id) + '"';
+      if (q.min_rows != null) html += ' data-min-rows="' + esc(String(q.min_rows)) + '"';
+      if (q.max_rows != null) html += ' data-max-rows="' + esc(String(q.max_rows)) + '"';
+      html += '>';
+      html += '<table class="row-table"><thead><tr>';
+      q.list_columns.forEach(function (c) {
+        html += '<th>' + esc(c.title) + (c.required ? '<span class="required">*</span>' : '') + '</th>';
+      });
+      html += '<th class="row-table__action"></th></tr></thead>';
+      html += '<tbody data-rows></tbody></table>';
+      html += '<button type="button" class="btn-secondary" data-add-row>+ Add row</button>';
+      html += '</div>';
+    } else if (q.kind === "Boolean") {
       html +=
         '<div class="field-row">' +
           '<label class="field-label" for="f-' + esc(q.id) + '">' + esc(q.title) + '</label>' +
@@ -818,11 +839,94 @@
     return html;
   }
 
+  /// Append one editable row to a `kind: List` table. `values` is an
+  /// optional map of column id → cached value to pre-fill (used during
+  /// restore). The trash button removes the row.
+  function appendTableRow(wrap, q, values) {
+    var tbody = wrap.querySelector('[data-rows]');
+    if (!tbody) return;
+    var tr = document.createElement('tr');
+    tr.className = 'row-table__row';
+    q.list_columns.forEach(function (c) {
+      var td = document.createElement('td');
+      var name = 'col-' + c.id;
+      var existing = values && values[c.id];
+      if (c.kind === 'Boolean') {
+        var sw = document.createElement('label');
+        sw.className = 'switch';
+        sw.innerHTML = '<input type="checkbox" data-col="' + esc(c.id) + '" /><span class="switch-slider"></span>';
+        if (existing === true || existing === 'true') sw.querySelector('input').checked = true;
+        td.appendChild(sw);
+      } else if (c.choices && c.choices.length > 0) {
+        var sel = document.createElement('select');
+        sel.dataset.col = c.id;
+        c.choices.forEach(function (opt) {
+          var o = document.createElement('option');
+          o.value = opt; o.textContent = opt;
+          if (existing === opt) o.selected = true;
+          sel.appendChild(o);
+        });
+        td.appendChild(sel);
+      } else {
+        var inp = document.createElement('input');
+        inp.type = 'text';
+        inp.dataset.col = c.id;
+        inp.placeholder = c.placeholder || c.default_value || '';
+        if (existing != null) inp.value = String(existing);
+        td.appendChild(inp);
+      }
+      tr.appendChild(td);
+    });
+    var actionTd = document.createElement('td');
+    actionTd.className = 'row-table__action';
+    var rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'row-table__remove';
+    rm.title = 'Remove row';
+    rm.textContent = '✕';
+    rm.addEventListener('click', function () {
+      tr.parentNode && tr.parentNode.removeChild(tr);
+    });
+    actionTd.appendChild(rm);
+    tr.appendChild(actionTd);
+    tbody.appendChild(tr);
+  }
+
+  /// Wire up the "+ Add row" buttons and (when restoring) seed any
+  /// pre-existing rows. Called once after render.
+  function setupTableQuestions(questions) {
+    var scope = cs();
+    var store = state.phase === "shared" ? scope.sharedAnswers :
+      (scope.answers[state.providers[state.currentProvider].provider_id] || {});
+    questions.forEach(function (q) {
+      if (q.kind !== 'List' || !q.list_columns || q.list_columns.length === 0) return;
+      var wrap = document.getElementById('t-' + q.id);
+      if (!wrap) return;
+      var addBtn = wrap.querySelector('[data-add-row]');
+      addBtn.addEventListener('click', function () {
+        var max = q.max_rows;
+        var rowCount = wrap.querySelectorAll('tbody tr').length;
+        if (max != null && rowCount >= max) {
+          addBtn.disabled = true;
+          return;
+        }
+        appendTableRow(wrap, q, null);
+      });
+      // Restore previously saved rows.
+      var saved = store[q.id];
+      if (Array.isArray(saved)) {
+        saved.forEach(function (row) { appendTableRow(wrap, q, row); });
+      }
+    });
+  }
+
   function restoreFormValues(questions) {
     var scope = cs();
     var store = state.phase === "shared" ? scope.sharedAnswers :
       (scope.answers[state.providers[state.currentProvider].provider_id] || {});
     questions.forEach(function (q) {
+      // List/table questions are seeded by setupTableQuestions; skip here.
+      if (q.kind === "List") return;
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
       var val = store[q.id];
@@ -840,6 +944,34 @@
     var store = state.phase === "shared" ? scope.sharedAnswers :
       (scope.answers[state.providers[state.currentProvider].provider_id] || {});
     questions.forEach(function (q) {
+      if (q.kind === "List" && q.list_columns && q.list_columns.length > 0) {
+        var wrap = document.getElementById("t-" + q.id);
+        if (!wrap) return;
+        var rows = [];
+        wrap.querySelectorAll('tbody tr').forEach(function (tr) {
+          var rowObj = {};
+          q.list_columns.forEach(function (c) {
+            var cell = tr.querySelector('[data-col="' + c.id + '"]');
+            if (!cell) return;
+            if (c.kind === 'Boolean') {
+              if (cell.checked) rowObj[c.id] = true;
+            } else {
+              var v = (cell.value || '').trim();
+              if (v) rowObj[c.id] = v;
+            }
+          });
+          // Drop rows where every required column is empty — same rule as
+          // the CLI prompt (lets the user add a placeholder row and step
+          // out without filling it).
+          var hasRequired = q.list_columns.every(function (c) {
+            return !c.required || (rowObj[c.id] != null && rowObj[c.id] !== '');
+          });
+          if (hasRequired && Object.keys(rowObj).length > 0) rows.push(rowObj);
+        });
+        if (rows.length > 0) store[q.id] = rows;
+        else delete store[q.id];
+        return;
+      }
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
       var fieldDiv = document.getElementById("field-" + q.id);

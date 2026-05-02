@@ -269,3 +269,19 @@ select{cursor:pointer;appearance:none;
 .tunnel-option:hover{border-color:var(--primary);background:rgba(37,195,158,.05)}
 .tunnel-option.selected{border-color:var(--primary);background:rgba(37,195,158,.1)}
 .tunnel-option input[type="radio"]{margin-top:.25rem;accent-color:var(--primary)}
+
+/* ── Table-style (kind: List) repeating-row input ── */
+.table-wrap{margin-top:.5rem}
+.row-table{width:100%;border-collapse:separate;border-spacing:0;margin-bottom:.5rem}
+.row-table thead th{font-size:.75rem;font-weight:600;text-align:left;padding:.4rem .5rem;color:var(--muted);border-bottom:1px solid var(--border)}
+.row-table thead th .required{margin-left:.2rem}
+.row-table tbody td{padding:.4rem .35rem;vertical-align:middle}
+.row-table tbody tr:not(:last-child) td{border-bottom:1px solid var(--border)}
+.row-table tbody td input[type="text"],.row-table tbody td select{width:100%;padding:.45rem .55rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--fg);font:inherit}
+.row-table tbody td input[type="text"]:focus,.row-table tbody td select:focus{outline:2px solid var(--primary);outline-offset:1px;border-color:var(--primary)}
+.row-table__action{width:2.5rem;text-align:right}
+.row-table__remove{background:transparent;border:1px solid var(--border);color:var(--muted);width:1.75rem;height:1.75rem;border-radius:var(--radius);cursor:pointer;font-size:.875rem;line-height:1;padding:0;transition:border-color .15s,color .15s}
+.row-table__remove:hover{border-color:#dc2626;color:#dc2626}
+.btn-secondary{background:transparent;border:1px solid var(--border);color:var(--fg);padding:.5rem .875rem;border-radius:var(--radius);font:inherit;cursor:pointer;transition:border-color .15s,background .15s}
+.btn-secondary:hover{border-color:var(--primary);background:rgba(37,195,158,.05)}
+.btn-secondary:disabled{opacity:.5;cursor:not-allowed}
