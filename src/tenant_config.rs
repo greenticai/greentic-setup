@@ -356,34 +356,8 @@ fn sanitize_nav_link_array(arr: &[Value]) -> Vec<Value> {
         .filter_map(|entry| {
             let obj = entry.as_object()?;
             // `label` accepts either a plain string or a locale-keyed JSON
-            // object (e.g. `{"en":"Help","id":"Bantuan"}`). Power users hand-
-            // edit `tenants/<tenant>.json` to introduce the object form post
-            // setup; the wizard always writes a string.
-            let label_value = match obj.get("label")? {
-                Value::String(s) => {
-                    let trimmed = s.trim();
-                    if trimmed.is_empty() {
-                        return None;
-                    }
-                    Value::String(trimmed.to_string())
-                }
-                Value::Object(map) => {
-                    let mut clean = serde_json::Map::new();
-                    for (locale, v) in map {
-                        if let Some(s) = v.as_str() {
-                            let trimmed = s.trim();
-                            if !trimmed.is_empty() {
-                                clean.insert(locale.clone(), Value::String(trimmed.to_string()));
-                            }
-                        }
-                    }
-                    if clean.is_empty() {
-                        return None;
-                    }
-                    Value::Object(clean)
-                }
-                _ => return None,
-            };
+            // object (e.g. `{"en":"Help","id":"Bantuan"}`).
+            let label_value = sanitize_i18n_text(obj.get("label")?)?;
 
             let url = obj.get("url").and_then(Value::as_str).map(str::trim)?;
             if url.is_empty() {
@@ -396,9 +370,100 @@ fn sanitize_nav_link_array(arr: &[Value]) -> Vec<Value> {
             if obj.get("external").and_then(Value::as_bool) == Some(true) {
                 clean.insert("external".to_string(), Value::Bool(true));
             }
+            // Optional `num`: short prefix chip (e.g. "M5"). Same i18n
+            // resolution as label.
+            if let Some(num) = obj.get("num").and_then(sanitize_i18n_text_opt) {
+                clean.insert("num".to_string(), num);
+            }
+            // Tooltip is collected as three flat columns by the wizard
+            // (`tooltip_eyebrow`, `tooltip_title`, `tooltip_lede`); rebuild
+            // the nested `tooltip: { eyebrow?, title?, lede? }` object here
+            // so the runtime SPA's renderTopbarNav sees the canonical shape.
+            // Operators who hand-edit tenant.json can also pass `tooltip` as
+            // an already-nested object; if present, we sanitise that path
+            // instead of the flat columns.
+            let nested_tooltip = obj.get("tooltip").and_then(|v| v.as_object());
+            let tooltip_obj = if let Some(map) = nested_tooltip {
+                build_tooltip_obj(
+                    map.get("eyebrow"),
+                    map.get("title"),
+                    map.get("lede"),
+                )
+            } else {
+                build_tooltip_obj(
+                    obj.get("tooltip_eyebrow"),
+                    obj.get("tooltip_title"),
+                    obj.get("tooltip_lede"),
+                )
+            };
+            if let Some(t) = tooltip_obj {
+                clean.insert("tooltip".to_string(), t);
+            }
             Some(Value::Object(clean))
         })
         .collect()
+}
+
+/// Sanitize an i18n-aware text value: accepts either a plain string or a
+/// locale-keyed object whose values are strings. Returns `None` when the
+/// input is missing, the wrong shape, or has only empty values.
+fn sanitize_i18n_text(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(Value::String(trimmed.to_string()))
+            }
+        }
+        Value::Object(map) => {
+            let mut clean = serde_json::Map::new();
+            for (locale, v) in map {
+                if let Some(s) = v.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        clean.insert(locale.clone(), Value::String(trimmed.to_string()));
+                    }
+                }
+            }
+            if clean.is_empty() {
+                None
+            } else {
+                Some(Value::Object(clean))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convenience: take an `Option<&Value>` and return `Option<Value>`.
+fn sanitize_i18n_text_opt(value: &Value) -> Option<Value> {
+    sanitize_i18n_text(value)
+}
+
+/// Build a tooltip object from optional eyebrow/title/lede inputs. Returns
+/// `None` if all three are empty (no tooltip → omit the field).
+fn build_tooltip_obj(
+    eyebrow: Option<&Value>,
+    title: Option<&Value>,
+    lede: Option<&Value>,
+) -> Option<Value> {
+    let mut clean = serde_json::Map::new();
+    if let Some(v) = eyebrow.and_then(sanitize_i18n_text_opt) {
+        clean.insert("eyebrow".to_string(), v);
+    }
+    if let Some(v) = title.and_then(sanitize_i18n_text_opt) {
+        clean.insert("title".to_string(), v);
+    }
+    if let Some(v) = lede.and_then(sanitize_i18n_text_opt) {
+        clean.insert("lede".to_string(), v);
+    }
+    if clean.is_empty() {
+        None
+    } else {
+        Some(Value::Object(clean))
+    }
 }
 
 fn is_placeholder_public_base_url(value: &str) -> bool {
