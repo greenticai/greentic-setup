@@ -347,6 +347,60 @@ fn resolve_public_base_url(
     Ok(from_policy)
 }
 
+/// Sanitize a `nav_links` array (from either the table-wizard answer or a
+/// parsed `nav_links_json` string). Drops malformed entries silently —
+/// label or url missing/empty, label not a string or locale-keyed object —
+/// and normalises the on-disk shape to `{label, url, external?}`.
+fn sanitize_nav_link_array(arr: &[Value]) -> Vec<Value> {
+    arr.iter()
+        .filter_map(|entry| {
+            let obj = entry.as_object()?;
+            // `label` accepts either a plain string or a locale-keyed JSON
+            // object (e.g. `{"en":"Help","id":"Bantuan"}`). Power users hand-
+            // edit `tenants/<tenant>.json` to introduce the object form post
+            // setup; the wizard always writes a string.
+            let label_value = match obj.get("label")? {
+                Value::String(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    Value::String(trimmed.to_string())
+                }
+                Value::Object(map) => {
+                    let mut clean = serde_json::Map::new();
+                    for (locale, v) in map {
+                        if let Some(s) = v.as_str() {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                clean.insert(locale.clone(), Value::String(trimmed.to_string()));
+                            }
+                        }
+                    }
+                    if clean.is_empty() {
+                        return None;
+                    }
+                    Value::Object(clean)
+                }
+                _ => return None,
+            };
+
+            let url = obj.get("url").and_then(Value::as_str).map(str::trim)?;
+            if url.is_empty() {
+                return None;
+            }
+
+            let mut clean = serde_json::Map::new();
+            clean.insert("label".to_string(), label_value);
+            clean.insert("url".to_string(), Value::String(url.to_string()));
+            if obj.get("external").and_then(Value::as_bool) == Some(true) {
+                clean.insert("external".to_string(), Value::Bool(true));
+            }
+            Some(Value::Object(clean))
+        })
+        .collect()
+}
+
 fn is_placeholder_public_base_url(value: &str) -> bool {
     let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
     normalized.is_empty()
@@ -440,43 +494,41 @@ pub fn sync_nav_links_to_tenant_config(
         return Ok(false);
     }
 
-    let raw_answer = answers
-        .as_object()
-        .and_then(|m| m.get("nav_links_json"))
-        .and_then(Value::as_str)
-        .map(str::trim);
-
-    // Treat absent or whitespace-only answers as "no opinion" — leave existing
-    // config alone. An explicit empty string or "[]" clears the array.
-    let Some(raw) = raw_answer else {
-        return Ok(false);
+    let answers_obj = match answers.as_object() {
+        Some(m) => m,
+        None => return Ok(false),
     };
 
-    let parsed_links: Vec<Value> = if raw.is_empty() {
-        Vec::new()
+    // Three answer shapes are accepted, in priority order:
+    //
+    // 1. `nav_links` as a native array — produced by the new
+    //    `kind: table` wizard. Each row is already a JSON object with
+    //    `label`/`url`/`external` keys; we just sanitise.
+    // 2. `nav_links_json` as a JSON string — legacy advanced-input answer
+    //    that pre-dates the table wizard. Parsed, then sanitised.
+    // 3. Neither present — leave the existing tenant config untouched.
+    let parsed_links: Vec<Value> = if let Some(arr) =
+        answers_obj.get("nav_links").and_then(Value::as_array)
+    {
+        sanitize_nav_link_array(arr)
+    } else if let Some(raw) = answers_obj
+        .get("nav_links_json")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        if raw.is_empty() {
+            Vec::new()
+        } else {
+            let parsed: Value = serde_json::from_str(raw).with_context(|| {
+                format!("parse nav_links_json answer (expected JSON array): {raw}")
+            })?;
+            let Some(arr) = parsed.as_array() else {
+                anyhow::bail!("nav_links_json must be a JSON array, got: {raw}");
+            };
+            sanitize_nav_link_array(arr)
+        }
     } else {
-        let parsed: Value = serde_json::from_str(raw)
-            .with_context(|| format!("parse nav_links_json answer (expected JSON array): {raw}"))?;
-        let Some(arr) = parsed.as_array() else {
-            anyhow::bail!("nav_links_json must be a JSON array, got: {raw}");
-        };
-        arr.iter()
-            .filter_map(|entry| {
-                let obj = entry.as_object()?;
-                let label = obj.get("label").and_then(Value::as_str).map(str::trim)?;
-                let url = obj.get("url").and_then(Value::as_str).map(str::trim)?;
-                if label.is_empty() || url.is_empty() {
-                    return None;
-                }
-                let mut clean = serde_json::Map::new();
-                clean.insert("label".to_string(), Value::String(label.to_string()));
-                clean.insert("url".to_string(), Value::String(url.to_string()));
-                if obj.get("external").and_then(Value::as_bool) == Some(true) {
-                    clean.insert("external".to_string(), Value::Bool(true));
-                }
-                Some(Value::Object(clean))
-            })
-            .collect()
+        return Ok(false);
     };
 
     let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
@@ -717,6 +769,40 @@ mod tests {
             sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
                 .unwrap();
         assert!(!changed, "absent answer leaves config alone");
+    }
+
+    #[test]
+    fn sync_nav_links_accepts_native_array_from_table_wizard() {
+        // The new `kind: table` wizard writes the answer as a native JSON
+        // array (not a JSON-string-as-array) under the `nav_links` key.
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({
+            "nav_links": [
+                { "label": "Help", "url": "/help", "external": false },
+                { "label": "Docs", "url": "https://docs.example", "external": true },
+                // Whitespace-only label dropped silently.
+                { "label": "  ", "url": "/skipped" }
+            ]
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().expect("nav_links array");
+        assert_eq!(links.len(), 2, "third row dropped (label whitespace)");
+        assert_eq!(links[0]["label"].as_str(), Some("Help"));
+        assert_eq!(links[0]["url"].as_str(), Some("/help"));
+        assert!(links[0].get("external").is_none(), "external=false omitted");
+        assert_eq!(links[1]["label"].as_str(), Some("Docs"));
+        assert_eq!(links[1]["external"].as_bool(), Some(true));
     }
 
     #[test]

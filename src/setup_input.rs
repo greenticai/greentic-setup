@@ -110,6 +110,47 @@ pub struct SetupQuestion {
     /// URL to external setup documentation.
     #[serde(default)]
     pub docs_url: Option<String>,
+    /// Column definitions for `kind: table` questions. Each row's answer is a
+    /// JSON object whose keys match the columns' `key` field.
+    #[serde(default)]
+    pub columns: Vec<SetupTableColumn>,
+    /// Minimum required row count for a `kind: table` question.
+    #[serde(default)]
+    pub min_rows: Option<u16>,
+    /// Maximum row count for a `kind: table` question.
+    #[serde(default)]
+    pub max_rows: Option<u16>,
+}
+
+/// One column in a `kind: table` setup question.
+#[derive(Debug, Default, Deserialize)]
+pub struct SetupTableColumn {
+    /// JSON object key the column's value is stored under (e.g. `"label"`).
+    /// Stable identifier — do not rename without a migration.
+    #[serde(default)]
+    pub key: String,
+    /// Header label shown above the column / next to each row's input.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Column scalar kind. Same vocabulary as top-level `kind` — but nested
+    /// tables are not supported.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// Whether the column must be filled for a row to count as non-empty.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional inline help.
+    #[serde(default)]
+    pub help: Option<String>,
+    /// Optional placeholder shown when the cell is empty.
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    /// Optional pre-defined choices for `kind: choice` columns.
+    #[serde(default)]
+    pub choices: Vec<String>,
+    /// Optional per-row default applied to new rows.
+    #[serde(default)]
+    pub default: Option<Value>,
 }
 
 /// Conditional visibility for a setup question.
