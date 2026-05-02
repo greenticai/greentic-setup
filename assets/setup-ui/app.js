@@ -839,6 +839,112 @@
     return html;
   }
 
+  /// Common locale codes operators are most likely to add as nav-link
+  /// translations. Sourced from the webchat-gui pack's i18n bundle. Sorted
+  /// roughly by demo-deployment frequency.
+  var I18N_LOCALES = [
+    ['en', 'English'], ['id', 'Indonesia'], ['de', 'Deutsch'],
+    ['fr', 'Français'], ['es', 'Español'], ['it', 'Italiano'],
+    ['pt', 'Português'], ['nl', 'Nederlands'], ['ja', '日本語'],
+    ['zh', '中文'], ['ko', '한국어'], ['ar', 'العربية'],
+    ['hi', 'हिन्दी'], ['ru', 'Русский'], ['tr', 'Türkçe'],
+    ['vi', 'Tiếng Việt'], ['th', 'ภาษาไทย']
+  ];
+
+  /// Build the inner DOM for a multilingual cell. `existing` is either a
+  /// plain string (single-locale) or an object `{en: "...", id: "...", ...}`.
+  /// Operator can add/remove locale rows via the picker at the bottom.
+  function buildI18nCell(td, c, existing) {
+    var wrap = document.createElement('div');
+    wrap.className = 'i18n-cell';
+    wrap.dataset.col = c.id;
+    wrap.dataset.i18n = '1';
+
+    // Normalize `existing` into an object form for rendering. Plain string
+    // becomes `{en: <string>}`; missing → `{en: ''}` (the default row is
+    // always English).
+    var entries = {};
+    if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+      Object.keys(existing).forEach(function (k) {
+        if (typeof existing[k] === 'string') entries[k] = existing[k];
+      });
+    } else if (typeof existing === 'string') {
+      entries.en = existing;
+    } else {
+      entries.en = '';
+    }
+    if (entries.en === undefined) entries.en = '';
+
+    function addLocaleRow(locale, value) {
+      var row = document.createElement('div');
+      row.className = 'i18n-cell__locale-row';
+      row.dataset.locale = locale;
+      var lbl = document.createElement('span');
+      lbl.className = 'i18n-cell__locale-label';
+      lbl.textContent = locale;
+      row.appendChild(lbl);
+      var inp = document.createElement('input');
+      inp.type = 'text';
+      inp.placeholder = c.placeholder || c.default_value || '';
+      if (value != null) inp.value = String(value);
+      row.appendChild(inp);
+      if (locale !== 'en') {
+        var rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'i18n-cell__locale-remove';
+        rm.title = 'Remove ' + locale;
+        rm.textContent = '✕';
+        rm.addEventListener('click', function () {
+          row.parentNode && row.parentNode.removeChild(row);
+        });
+        row.appendChild(rm);
+      }
+      wrap.insertBefore(row, picker);
+    }
+
+    // English row first (always present, can't be removed).
+    var picker = document.createElement('div');
+    picker.className = 'i18n-cell__add';
+    var sel = document.createElement('select');
+    var optBlank = document.createElement('option');
+    optBlank.value = '';
+    optBlank.textContent = '+ language';
+    sel.appendChild(optBlank);
+    I18N_LOCALES.forEach(function (l) {
+      if (l[0] === 'en') return;
+      var o = document.createElement('option');
+      o.value = l[0];
+      o.textContent = l[0] + ' — ' + l[1];
+      sel.appendChild(o);
+    });
+    picker.appendChild(sel);
+    var addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'i18n-cell__add-btn';
+    addBtn.textContent = '+ Add';
+    addBtn.addEventListener('click', function () {
+      var locale = sel.value;
+      if (!locale) return;
+      // Skip if the locale is already in the cell.
+      if (wrap.querySelector('.i18n-cell__locale-row[data-locale="' + locale + '"]')) {
+        sel.value = '';
+        return;
+      }
+      addLocaleRow(locale, '');
+      sel.value = '';
+    });
+    picker.appendChild(addBtn);
+    wrap.appendChild(picker);
+
+    // Seed the EN row first, then any additional locales from `existing`.
+    addLocaleRow('en', entries.en);
+    Object.keys(entries).forEach(function (k) {
+      if (k === 'en') return;
+      addLocaleRow(k, entries[k]);
+    });
+    td.appendChild(wrap);
+  }
+
   /// Append one editable row to a `kind: List` table. `values` is an
   /// optional map of column id → cached value to pre-fill (used during
   /// restore). The trash button removes the row.
@@ -849,9 +955,10 @@
     tr.className = 'row-table__row';
     q.list_columns.forEach(function (c) {
       var td = document.createElement('td');
-      var name = 'col-' + c.id;
       var existing = values && values[c.id];
-      if (c.kind === 'Boolean') {
+      if (c.multilingual) {
+        buildI18nCell(td, c, existing);
+      } else if (c.kind === 'Boolean') {
         var sw = document.createElement('label');
         sw.className = 'switch';
         sw.innerHTML = '<input type="checkbox" data-col="' + esc(c.id) + '" /><span class="switch-slider"></span>';
@@ -951,6 +1058,30 @@
         wrap.querySelectorAll('tbody tr').forEach(function (tr) {
           var rowObj = {};
           q.list_columns.forEach(function (c) {
+            // Multilingual cell: gather per-locale inputs into either a
+            // plain string (single locale) or a locale-keyed object.
+            if (c.multilingual) {
+              var i18nWrap = tr.querySelector('.i18n-cell[data-col="' + c.id + '"]');
+              if (!i18nWrap) return;
+              var localeRows = i18nWrap.querySelectorAll('.i18n-cell__locale-row');
+              var bag = {};
+              localeRows.forEach(function (r) {
+                var locale = r.getAttribute('data-locale');
+                var inp = r.querySelector('input[type="text"]');
+                if (!inp) return;
+                var v = (inp.value || '').trim();
+                if (v) bag[locale] = v;
+              });
+              var keys = Object.keys(bag);
+              if (keys.length === 0) {
+                // empty — skip
+              } else if (keys.length === 1 && keys[0] === 'en') {
+                rowObj[c.id] = bag.en;
+              } else {
+                rowObj[c.id] = bag;
+              }
+              return;
+            }
             var cell = tr.querySelector('[data-col="' + c.id + '"]');
             if (!cell) return;
             if (c.kind === 'Boolean') {

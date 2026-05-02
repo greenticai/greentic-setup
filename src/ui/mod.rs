@@ -120,6 +120,11 @@ struct ListColumnInfo {
     placeholder: Option<String>,
     choices: Option<Vec<String>>,
     default_value: Option<String>,
+    /// When true, the front-end renders a multi-locale cell — operator can
+    /// add per-locale translations via "+ Add language". Persisted as a
+    /// locale-keyed object instead of a plain string.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    multilingual: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -133,6 +138,10 @@ struct SetupQuestionExtras {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    /// Per-column metadata for `kind: table` questions. Maps column `key`
+    /// → multilingual flag. Used by the UI to render i18n-aware cells.
+    /// Empty for non-table questions.
+    column_multilingual: std::collections::HashMap<String, bool>,
 }
 
 #[derive(Deserialize)]
@@ -545,12 +554,19 @@ async fn get_providers(
         if let Ok(Some(spec)) = crate::setup_input::load_setup_spec(&provider.pack_path) {
             let mut map = std::collections::HashMap::new();
             for q in &spec.questions {
+                let mut column_multilingual = std::collections::HashMap::new();
+                for col in &q.columns {
+                    if col.multilingual {
+                        column_multilingual.insert(col.key.clone(), true);
+                    }
+                }
                 map.insert(
                     q.name.clone(),
                     SetupQuestionExtras {
                         placeholder: q.placeholder.clone(),
                         group: q.group.clone(),
                         docs_url: q.docs_url.clone(),
+                        column_multilingual,
                     },
                 );
             }
@@ -633,6 +649,22 @@ async fn get_providers(
                             }
                             info.group = ext.group.clone();
                             info.docs_url = ext.docs_url.clone();
+                            // Overlay per-column multilingual flags onto the
+                            // table-rendering metadata (qa-spec QuestionSpec
+                            // has no slot for this hint, so we carry it
+                            // out-of-band via SetupQuestionExtras).
+                            if let Some(ref mut cols) = info.list_columns {
+                                for col in cols.iter_mut() {
+                                    if ext
+                                        .column_multilingual
+                                        .get(&col.id)
+                                        .copied()
+                                        .unwrap_or(false)
+                                    {
+                                        col.multilingual = true;
+                                    }
+                                }
+                            }
                         }
                         // --answers prefill takes priority over saved secrets
                         if let Some(val) = answers
@@ -1134,6 +1166,11 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
                     placeholder: None,
                     choices: c.choices.clone(),
                     default_value: c.default_value.clone(),
+                    // multilingual is set by the caller via overlay_setup_extras —
+                    // qa-spec QuestionSpec has no slot for it, so we leave it
+                    // false here and let the UI loop fix it up from
+                    // SetupQuestionExtras.column_multilingual.
+                    multilingual: false,
                 })
                 .collect();
             (Some(cols), list.min_items, list.max_items)

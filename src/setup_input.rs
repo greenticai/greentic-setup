@@ -151,6 +151,14 @@ pub struct SetupTableColumn {
     /// Optional per-row default applied to new rows.
     #[serde(default)]
     pub default: Option<Value>,
+    /// When true, the wizard renders a multi-locale cell instead of a
+    /// scalar input. Operator types the primary (English) value and may
+    /// add per-locale translations via "+ Add language". Persisted as a
+    /// locale-keyed object `{en: "...", id: "...", ...}` (or a plain
+    /// string when only one locale was filled). Only meaningful for
+    /// `kind: string` columns.
+    #[serde(default)]
+    pub multilingual: bool,
 }
 
 /// Conditional visibility for a setup question.
