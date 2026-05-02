@@ -754,6 +754,13 @@
       '</div>';
 
     app.innerHTML = html;
+    // Widen the centered container when the form contains a table (kind:
+    // List) — 7 columns of inputs need more horizontal room than the
+    // default 620px. Removed when navigating to a non-table form.
+    var hasTable = questions.some(function (q) {
+      return q.kind === "List" && q.list_columns && q.list_columns.length > 0;
+    });
+    document.body.classList.toggle("has-wide-form", !!hasTable);
     restoreFormValues(questions);
     setupTableQuestions(questions);
     setupVisibility(questions);
