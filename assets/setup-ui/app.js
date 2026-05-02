@@ -764,14 +764,23 @@
     restoreFormValues(questions);
     setupTableQuestions(questions);
     setupVisibility(questions);
-    app.querySelectorAll("#form-area input, #form-area select, #form-area textarea").forEach(function (el) {
-      var handler = function () {
+    // Event delegation so dynamically-added inputs (e.g. locale rows
+    // appended after clicking "+ Add" on the row-level language toolbar)
+    // also trigger collect + autosave. Attaching listeners only to inputs
+    // that exist at render time silently dropped post-render edits.
+    var formArea = document.getElementById("form-area");
+    if (formArea) {
+      var delegateHandler = function (e) {
+        var t = e.target;
+        if (!t) return;
+        var tag = (t.tagName || "").toLowerCase();
+        if (tag !== "input" && tag !== "select" && tag !== "textarea") return;
         collectFormValues(questions);
         scheduleDraftSave();
       };
-      el.addEventListener("input", handler);
-      el.addEventListener("change", handler);
-    });
+      formArea.addEventListener("input", delegateHandler);
+      formArea.addEventListener("change", delegateHandler);
+    }
 
     var goBack = backFn || function () { state.phase = backPhase || "providers"; render(); };
     document.getElementById("btn-back").addEventListener("click", function () {
@@ -809,7 +818,10 @@
       html += '>';
       html += '<table class="row-table"><thead><tr>';
       q.list_columns.forEach(function (c) {
-        html += '<th>' + esc(c.title) + (c.required ? '<span class="required">*</span>' : '') + '</th>';
+        var thAttrs = ' data-col="' + esc(c.id) + '"';
+        if (c.multilingual) thAttrs += ' data-multilingual="true"';
+        if (c.kind === 'Boolean') thAttrs += ' data-boolean="true"';
+        html += '<th' + thAttrs + '>' + esc(c.title) + (c.required ? '<span class="required">*</span>' : '') + '</th>';
       });
       html += '<th class="row-table__action"></th></tr></thead>';
       html += '<tbody data-rows></tbody></table>';
@@ -873,16 +885,15 @@
 
   /// Build the inner DOM for a multilingual cell. `existing` is either a
   /// plain string (single-locale) or an object `{en: "...", id: "...", ...}`.
-  /// Operator can add/remove locale rows via the picker at the bottom.
+  /// The cell only renders locale sub-rows; the "+ language" picker is
+  /// hoisted to a row-level toolbar so one click adds the locale to every
+  /// multilingual column in the row at once.
   function buildI18nCell(td, c, existing) {
     var wrap = document.createElement('div');
     wrap.className = 'i18n-cell';
     wrap.dataset.col = c.id;
     wrap.dataset.i18n = '1';
 
-    // Normalize `existing` into an object form for rendering. Plain string
-    // becomes `{en: <string>}`; missing → `{en: ''}` (the default row is
-    // always English).
     var entries = {};
     if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
       Object.keys(existing).forEach(function (k) {
@@ -896,6 +907,7 @@
     if (entries.en === undefined) entries.en = '';
 
     function addLocaleRow(locale, value) {
+      if (wrap.querySelector('.i18n-cell__locale-row[data-locale="' + locale + '"]')) return;
       var row = document.createElement('div');
       row.className = 'i18n-cell__locale-row';
       row.dataset.locale = locale;
@@ -908,24 +920,64 @@
       inp.placeholder = c.placeholder || c.default_value || '';
       if (value != null) inp.value = String(value);
       row.appendChild(inp);
-      if (locale !== 'en') {
-        var rm = document.createElement('button');
-        rm.type = 'button';
-        rm.className = 'i18n-cell__locale-remove';
-        rm.title = 'Remove ' + locale;
-        rm.textContent = '✕';
-        rm.addEventListener('click', function () {
-          row.parentNode && row.parentNode.removeChild(row);
-        });
-        row.appendChild(rm);
-      }
-      wrap.insertBefore(row, picker);
+      wrap.appendChild(row);
+    }
+    function removeLocaleRow(locale) {
+      if (locale === 'en') return;
+      var row = wrap.querySelector('.i18n-cell__locale-row[data-locale="' + locale + '"]');
+      if (row && row.parentNode) row.parentNode.removeChild(row);
     }
 
-    // English row first (always present, can't be removed).
-    var picker = document.createElement('div');
-    picker.className = 'i18n-cell__add';
+    // Expose for the row-level toolbar to drive.
+    wrap._addLocaleRow = addLocaleRow;
+    wrap._removeLocaleRow = removeLocaleRow;
+    wrap._listLocales = function () {
+      return Array.prototype.map.call(
+        wrap.querySelectorAll('.i18n-cell__locale-row'),
+        function (r) { return r.getAttribute('data-locale'); }
+      );
+    };
+
+    addLocaleRow('en', entries.en);
+    Object.keys(entries).forEach(function (k) {
+      if (k === 'en') return;
+      addLocaleRow(k, entries[k]);
+    });
+    td.appendChild(wrap);
+  }
+
+  /// Build the per-row language toolbar that drives every multilingual cell
+  /// in `tr` simultaneously. Renders one chip per active extra locale (EN
+  /// is the always-on baseline and not chip-rendered). Picking a locale +
+  /// "+ Add" appends a sub-row in every multilingual cell at once; clicking
+  /// a chip's ✕ removes it from every multilingual cell at once.
+  function buildLangToolbar(tr, q, columnCount) {
+    var multilingualCols = q.list_columns.filter(function (c) { return !!c.multilingual; });
+    if (multilingualCols.length === 0) return null;
+
+    var langTr = document.createElement('tr');
+    langTr.className = 'row-table__lang-row';
+    var langTd = document.createElement('td');
+    langTd.className = 'row-table__lang-toolbar';
+    langTd.colSpan = columnCount;
+
+    var hint = document.createElement('span');
+    hint.className = 'lang-toolbar__hint';
+    hint.textContent = 'Languages:';
+    langTd.appendChild(hint);
+
+    var enChip = document.createElement('span');
+    enChip.className = 'lang-toolbar__chip lang-toolbar__chip--baseline';
+    enChip.textContent = 'EN';
+    enChip.title = 'English (baseline, always present)';
+    langTd.appendChild(enChip);
+
+    var chipsHost = document.createElement('span');
+    chipsHost.className = 'lang-toolbar__chips';
+    langTd.appendChild(chipsHost);
+
     var sel = document.createElement('select');
+    sel.className = 'lang-toolbar__picker';
     var optBlank = document.createElement('option');
     optBlank.value = '';
     optBlank.textContent = '+ language';
@@ -937,32 +989,73 @@
       o.textContent = l[0] + ' — ' + l[1];
       sel.appendChild(o);
     });
-    picker.appendChild(sel);
+    langTd.appendChild(sel);
+
+    function rowI18nCells() {
+      return tr.querySelectorAll('.i18n-cell');
+    }
+    function syncOptionsFromActive(active) {
+      Array.prototype.forEach.call(sel.options, function (o) {
+        o.disabled = active.indexOf(o.value) >= 0 && o.value !== '';
+      });
+    }
+    function activeLocales() {
+      var set = {};
+      rowI18nCells().forEach(function (cell) {
+        cell._listLocales().forEach(function (l) { if (l !== 'en') set[l] = true; });
+      });
+      return Object.keys(set);
+    }
+    function renderChip(locale) {
+      var chip = document.createElement('span');
+      chip.className = 'lang-toolbar__chip';
+      chip.dataset.locale = locale;
+      chip.textContent = locale;
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'lang-toolbar__chip-remove';
+      rm.title = 'Remove ' + locale;
+      rm.textContent = '✕';
+      rm.addEventListener('click', function () {
+        rowI18nCells().forEach(function (cell) { cell._removeLocaleRow(locale); });
+        if (chip.parentNode) chip.parentNode.removeChild(chip);
+        syncOptionsFromActive(activeLocales());
+      });
+      chip.appendChild(rm);
+      chipsHost.appendChild(chip);
+    }
+    function addLocale(locale) {
+      if (!locale || locale === 'en') return;
+      if (chipsHost.querySelector('.lang-toolbar__chip[data-locale="' + locale + '"]')) return;
+      rowI18nCells().forEach(function (cell) { cell._addLocaleRow(locale, ''); });
+      renderChip(locale);
+      syncOptionsFromActive(activeLocales());
+    }
+
     var addBtn = document.createElement('button');
     addBtn.type = 'button';
-    addBtn.className = 'i18n-cell__add-btn';
+    addBtn.className = 'lang-toolbar__add';
     addBtn.textContent = '+ Add';
     addBtn.addEventListener('click', function () {
       var locale = sel.value;
       if (!locale) return;
-      // Skip if the locale is already in the cell.
-      if (wrap.querySelector('.i18n-cell__locale-row[data-locale="' + locale + '"]')) {
-        sel.value = '';
-        return;
-      }
-      addLocaleRow(locale, '');
+      addLocale(locale);
       sel.value = '';
     });
-    picker.appendChild(addBtn);
-    wrap.appendChild(picker);
+    langTd.appendChild(addBtn);
 
-    // Seed the EN row first, then any additional locales from `existing`.
-    addLocaleRow('en', entries.en);
-    Object.keys(entries).forEach(function (k) {
-      if (k === 'en') return;
-      addLocaleRow(k, entries[k]);
+    langTr.appendChild(langTd);
+    // Hydrate chips from any locales already seeded in the cells (saved_rows
+    // path). Also backfill empty sub-rows so every multilingual cell has the
+    // same locale set — keeps the row consistent and the chip-driven removal
+    // applies symmetrically across cells.
+    var initialActive = activeLocales();
+    initialActive.forEach(function (locale) {
+      rowI18nCells().forEach(function (cell) { cell._addLocaleRow(locale, ''); });
+      renderChip(locale);
     });
-    td.appendChild(wrap);
+    syncOptionsFromActive(initialActive);
+    return langTr;
   }
 
   /// Append one editable row to a `kind: List` table. `values` is an
@@ -975,6 +1068,9 @@
     tr.className = 'row-table__row';
     q.list_columns.forEach(function (c) {
       var td = document.createElement('td');
+      td.dataset.col = c.id;
+      if (c.multilingual) td.dataset.multilingual = 'true';
+      if (c.kind === 'Boolean') td.dataset.boolean = 'true';
       var existing = values && values[c.id];
       if (c.multilingual) {
         buildI18nCell(td, c, existing);
@@ -1011,12 +1107,19 @@
     rm.className = 'row-table__remove';
     rm.title = 'Remove row';
     rm.textContent = '✕';
-    rm.addEventListener('click', function () {
-      tr.parentNode && tr.parentNode.removeChild(tr);
-    });
     actionTd.appendChild(rm);
     tr.appendChild(actionTd);
     tbody.appendChild(tr);
+
+    // Append a sibling row carrying the row-level language toolbar, so
+    // every multilingual cell in `tr` shares one "+ language" picker.
+    var langTr = buildLangToolbar(tr, q, q.list_columns.length + 1);
+    if (langTr) tbody.appendChild(langTr);
+
+    rm.addEventListener('click', function () {
+      if (langTr && langTr.parentNode) langTr.parentNode.removeChild(langTr);
+      if (tr.parentNode) tr.parentNode.removeChild(tr);
+    });
   }
 
   /// Wire up the "+ Add row" buttons and (when restoring) seed any
@@ -1039,9 +1142,15 @@
         }
         appendTableRow(wrap, q, null);
       });
-      // Restore previously saved rows.
+      // Restore previously saved rows. In-memory wizard state takes
+      // precedence (so navigating back/forward keeps edits). Otherwise
+      // fall back to `q.saved_rows` which the server hydrates from the
+      // bundle's persisted tenant config (e.g. nav_links from tenant.json).
       var saved = store[q.id];
-      if (Array.isArray(saved)) {
+      if (!Array.isArray(saved) && Array.isArray(q.saved_rows)) {
+        saved = q.saved_rows;
+      }
+      if (Array.isArray(saved) && saved.length > 0) {
         saved.forEach(function (row) { appendTableRow(wrap, q, row); });
       }
     });
@@ -1075,7 +1184,7 @@
         var wrap = document.getElementById("t-" + q.id);
         if (!wrap) return;
         var rows = [];
-        wrap.querySelectorAll('tbody tr').forEach(function (tr) {
+        wrap.querySelectorAll('tbody tr.row-table__row').forEach(function (tr) {
           var rowObj = {};
           q.list_columns.forEach(function (c) {
             // Multilingual cell: gather per-locale inputs into either a
@@ -1102,7 +1211,14 @@
               }
               return;
             }
-            var cell = tr.querySelector('[data-col="' + c.id + '"]');
+            // Query INPUT / SELECT specifically — `<td>` itself also carries
+            // `data-col` (for CSS column targeting), so a bare `[data-col]`
+            // selector matches the parent cell first and `cell.value` reads
+            // back undefined, silently dropping every scalar/Boolean column
+            // and (because URL is required) the entire row.
+            var cell = tr.querySelector(
+              'input[data-col="' + c.id + '"], select[data-col="' + c.id + '"]'
+            );
             if (!cell) return;
             if (c.kind === 'Boolean') {
               if (cell.checked) rowObj[c.id] = true;
@@ -1121,6 +1237,12 @@
         });
         if (rows.length > 0) store[q.id] = rows;
         else delete store[q.id];
+        // Drop the legacy `<id>_json` advanced-input string if it leaked in
+        // from a prior setup run's setup-answers.json prefill — without this
+        // the ghost key wins over the new array key in tenant.json sync and
+        // the wizard's table edits silently disappear.
+        var legacyKey = q.id + '_json';
+        if (legacyKey in store) delete store[legacyKey];
         return;
       }
       var el = document.getElementById("f-" + q.id);
@@ -1309,6 +1431,16 @@
       tunnel: scope.tunnel || null,
     };
     if (scope.team) payload.team = scope.team;
+    // Surface table answers in the browser console so we can confirm what's
+    // actually being POSTed when the disk doesn't match expectations.
+    try {
+      Object.keys(scope.answers || {}).forEach(function (pid) {
+        var pa = scope.answers[pid];
+        if (pa && typeof pa === 'object' && Array.isArray(pa.nav_links)) {
+          console.log('[setup] POST /api/execute — ' + pid + ' nav_links:', JSON.parse(JSON.stringify(pa.nav_links)));
+        }
+      });
+    } catch (e) { /* logging is best-effort */ }
     fetch("/api/execute", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

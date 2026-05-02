@@ -28,9 +28,9 @@ body{font-family:var(--font);background:var(--bg);color:var(--fg);min-height:100
 /* Wider container when the form contains a table (kind: List) so 5–7
    columns of inputs aren't squeezed. JS toggles this class on `<body>`
    after rendering a question that includes `list_columns`. */
-body.has-wide-form .container{max-width:1180px}
-.table-wrap{overflow-x:auto}
-.row-table{min-width:max-content}
+body.has-wide-form .container{max-width:1380px}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.row-table{min-width:max-content;table-layout:auto}
 
 /* ── Animation ── */
 .fade-in{animation:fadeIn .25s ease}
@@ -279,9 +279,17 @@ select{cursor:pointer;appearance:none;
 /* ── Table-style (kind: List) repeating-row input ── */
 .table-wrap{margin-top:.5rem}
 .row-table{width:100%;border-collapse:separate;border-spacing:0;margin-bottom:.5rem;font-size:.8125rem}
-.row-table thead th{font-size:.8125rem;font-weight:500;text-align:left;padding:.4rem .5rem;color:var(--muted);border-bottom:1px solid var(--border)}
+.row-table thead th{font-size:.8125rem;font-weight:500;text-align:left;padding:.4rem .5rem;color:var(--muted);border-bottom:1px solid var(--border);white-space:nowrap}
 .row-table thead th .required{margin-left:.2rem;color:#dc2626}
-.row-table tbody td{padding:.4rem .35rem;vertical-align:top}
+.row-table tbody td{padding:.4rem .35rem;vertical-align:top;min-width:140px}
+.row-table thead th[data-multilingual="true"],
+.row-table tbody td[data-multilingual="true"]{min-width:260px}
+.row-table thead th[data-boolean="true"],
+.row-table tbody td[data-boolean="true"]{min-width:80px;width:80px}
+.row-table thead th[data-col="num"],
+.row-table tbody td[data-col="num"]{min-width:90px;width:100px}
+.row-table thead th[data-col="url"],
+.row-table tbody td[data-col="url"]{min-width:200px}
 .row-table tbody tr:not(:last-child) td{border-bottom:1px solid var(--border)}
 .row-table tbody td input[type="text"],
 .row-table tbody td select{
@@ -300,13 +308,20 @@ select{cursor:pointer;appearance:none;
 .btn-secondary:disabled{opacity:.5;cursor:not-allowed}
 
 /* ── Multilingual cell (column.multilingual: true) ── */
-.i18n-cell{display:flex;flex-direction:column;gap:.4rem}
-.i18n-cell__locale-row{display:flex;gap:.4rem;align-items:center}
-.i18n-cell__locale-label{font-size:.6875rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;min-width:1.8rem;text-align:center;padding:.25rem .4rem;border:1px solid var(--border);border-radius:calc(var(--radius) - 4px);background:var(--bg)}
-.i18n-cell__locale-row input[type="text"]{flex:1}
-.i18n-cell__locale-remove{flex:0 0 auto;background:transparent;border:1px solid var(--border);color:var(--muted);width:1.75rem;height:1.75rem;border-radius:var(--radius);cursor:pointer;font-size:.75rem;line-height:1;padding:0}
-.i18n-cell__locale-remove:hover{border-color:#dc2626;color:#dc2626}
-.i18n-cell__add{display:flex;gap:.4rem;align-items:center;font-size:.75rem}
-.i18n-cell__add select{height:1.75rem;padding:0 .4rem;font-size:.75rem;font-family:var(--font);background:var(--input-bg);color:var(--fg);border:1px solid var(--input-border);border-radius:calc(var(--radius) - 2px);width:auto;flex:0 0 auto}
-.i18n-cell__add-btn{background:transparent;border:1px solid var(--border);color:var(--primary);padding:.25rem .6rem;border-radius:var(--radius);font-size:.75rem;font-family:var(--font);cursor:pointer}
-.i18n-cell__add-btn:hover{background:rgba(37,195,158,.05);border-color:var(--primary)}
+.i18n-cell{display:flex;flex-direction:column;gap:.4rem;min-width:240px}
+.i18n-cell__locale-row{display:flex;gap:.4rem;align-items:center;flex-wrap:nowrap}
+.i18n-cell__locale-label{font-size:.6875rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;min-width:1.8rem;text-align:center;padding:.25rem .4rem;border:1px solid var(--border);border-radius:calc(var(--radius) - 4px);background:var(--bg);flex:0 0 auto;white-space:nowrap}
+.i18n-cell__locale-row input[type="text"]{flex:1 1 auto;min-width:0}
+
+/* ── Row-level language toolbar (shared by all multilingual cells) ── */
+.row-table tbody tr.row-table__lang-row td{padding:.5rem .35rem .9rem;border-bottom:1px solid var(--border);background:transparent}
+.row-table__lang-toolbar{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;font-size:.75rem}
+.lang-toolbar__hint{color:var(--muted);font-weight:500;letter-spacing:.02em;margin-right:.1rem}
+.lang-toolbar__chips{display:inline-flex;gap:.3rem;flex-wrap:wrap}
+.lang-toolbar__chip{display:inline-flex;align-items:center;gap:.3rem;padding:.2rem .25rem .2rem .5rem;font-size:.6875rem;font-weight:600;color:var(--fg);text-transform:uppercase;letter-spacing:.06em;background:var(--input-bg);border:1px solid var(--border);border-radius:9999px;line-height:1}
+.lang-toolbar__chip--baseline{padding-right:.55rem;color:var(--muted)}
+.lang-toolbar__chip-remove{background:transparent;border:0;color:var(--muted);width:1.1rem;height:1.1rem;border-radius:9999px;cursor:pointer;font-size:.7rem;line-height:1;padding:0;display:inline-flex;align-items:center;justify-content:center}
+.lang-toolbar__chip-remove:hover{color:#dc2626;background:rgba(220,38,38,.08)}
+.lang-toolbar__picker{height:1.85rem;padding:0 .5rem;font-size:.75rem;font-family:var(--font);background:var(--input-bg);color:var(--fg);border:1px solid var(--input-border);border-radius:calc(var(--radius) - 2px);width:auto;margin-left:auto}
+.lang-toolbar__add{background:transparent;border:1px solid var(--border);color:var(--primary);padding:.3rem .7rem;border-radius:var(--radius);font-size:.75rem;font-family:var(--font);cursor:pointer}
+.lang-toolbar__add:hover{background:rgba(37,195,158,.05);border-color:var(--primary)}

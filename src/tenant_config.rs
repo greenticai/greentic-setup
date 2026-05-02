@@ -545,6 +545,61 @@ pub fn sync_skin_to_tenant_config(
 ///
 /// The webchat-gui SPA's runtime-bootstrap reads this array and renders one
 /// anchor per entry between the brand block and the locale picker.
+/// Read the persisted `nav_links` array from `<bundle>/assets/webchat-gui/
+/// config/tenants/<tenant>.json` so the setup wizard can hydrate the table
+/// on a re-run. Falls back to `default.json` when no tenant-specific file
+/// exists. Returns `None` when neither file exists or `nav_links` is absent.
+pub fn read_existing_nav_links(bundle_path: &Path, tenant: &str) -> Option<Vec<Value>> {
+    let tenants_dir = bundle_path.join("assets/webchat-gui/config/tenants");
+    let candidates = [
+        tenants_dir.join(format!("{tenant}.json")),
+        tenants_dir.join("default.json"),
+    ];
+    for path in &candidates {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let value: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(arr) = value
+            .get("nav_links")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            // Flatten nested `tooltip` object into the flat
+            // `tooltip_eyebrow`/`tooltip_title`/`tooltip_lede` columns the
+            // wizard renders. The on-disk shape matches the runtime SPA's
+            // expectations; the wizard's column shape does not, so we
+            // translate here on hydration (and back to nested on write in
+            // sanitize_nav_link_array).
+            let flattened: Vec<Value> = arr
+                .iter()
+                .map(|entry| {
+                    let mut out = entry.as_object().cloned().unwrap_or_default();
+                    if let Some(tooltip) = out.remove("tooltip").and_then(|t| t.as_object().cloned())
+                    {
+                        for (sub_key, target_key) in [
+                            ("eyebrow", "tooltip_eyebrow"),
+                            ("title", "tooltip_title"),
+                            ("lede", "tooltip_lede"),
+                        ] {
+                            if let Some(v) = tooltip.get(sub_key) {
+                                out.insert(target_key.to_string(), v.clone());
+                            }
+                        }
+                    }
+                    Value::Object(out)
+                })
+                .collect();
+            return Some(flattened);
+        }
+    }
+    None
+}
+
 pub fn sync_nav_links_to_tenant_config(
     bundle_path: &Path,
     tenant: &str,

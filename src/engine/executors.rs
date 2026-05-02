@@ -292,6 +292,14 @@ pub fn execute_apply_pack_setup(
         }
 
         // Sync `nav_links_json` answer to tenant config JSON for webchat-gui providers
+        if provider_id.contains("webchat-gui") && config.verbose {
+            let preview = answers
+                .as_object()
+                .and_then(|m| m.get("nav_links"))
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".into()))
+                .unwrap_or_else(|| "<absent>".into());
+            println!("  [nav_links] received answer for {provider_id}: {preview}");
+        }
         match crate::tenant_config::sync_nav_links_to_tenant_config(
             bundle_path,
             &config.tenant,

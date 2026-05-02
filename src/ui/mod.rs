@@ -89,6 +89,13 @@ struct QuestionInfo {
     default_value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     saved_value: Option<String>,
+    /// Pre-populated rows for `kind: List` questions, hydrated on wizard
+    /// re-run from the bundle's existing tenant config (e.g. nav_links).
+    /// Each entry is a JSON object keyed by `column.id` whose value matches
+    /// the column kind (string for scalars, locale-keyed object for
+    /// multilingual cells).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saved_rows: Option<Vec<Value>>,
     help: Option<String>,
     choices: Option<Vec<String>>,
     visible_if: Option<VisibleIfInfo>,
@@ -453,7 +460,28 @@ async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Js
             // Merge saved secrets with file-based answers
             let mut merged_answers = JsonMap::new();
             for (pid, file_ans) in &provider_answers {
-                merged_answers.insert(pid.clone(), file_ans.clone());
+                let mut cloned = file_ans.clone();
+                // Migrate legacy `<id>_json` string answers to their array
+                // equivalent (the new `kind: table` wizard writes the array
+                // form). Without this the legacy ghost dominates the prefill
+                // and silently overrides the user's table edits on the next
+                // sync.
+                if let Some(map) = cloned.as_object_mut() {
+                    for legacy_key in [
+                        "nav_links_json".to_string(),
+                    ] {
+                        let canonical_key = legacy_key.trim_end_matches("_json").to_string();
+                        if !map.contains_key(&canonical_key)
+                            && let Some(Value::String(raw)) = map.get(&legacy_key)
+                            && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+                            && parsed.is_array()
+                        {
+                            map.insert(canonical_key, parsed);
+                        }
+                        map.remove(&legacy_key);
+                    }
+                }
+                merged_answers.insert(pid.clone(), cloned);
             }
             // Overlay saved secrets into answers
             for (pid, secrets) in &saved {
@@ -674,6 +702,50 @@ async fn get_providers(
                             info.saved_value = Some(val);
                         } else if let Some(val) = saved.and_then(|m| m.get(&q.id)) {
                             info.saved_value = Some(val.clone());
+                        }
+                        // Hydrate kind: List rows from --answers (if it
+                        // carries an array) or, for the webchat-gui
+                        // nav_links table, from the bundle's persisted
+                        // tenant.json so a wizard re-run pre-populates the
+                        // pills the operator just configured.
+                        if matches!(q.kind, qa_spec::QuestionType::List) {
+                            if let Some(arr) = answers
+                                .and_then(|m| m.get(&q.id))
+                                .and_then(Value::as_array)
+                                .filter(|a| !a.is_empty())
+                            {
+                                info.saved_rows = Some(arr.clone());
+                                eprintln!(
+                                    "[hydrate] {} {} → saved_rows from prefill: {} row(s)",
+                                    pfs.provider_id,
+                                    q.id,
+                                    arr.len()
+                                );
+                            } else if q.id == "nav_links"
+                                && pfs.provider_id.contains("webchat-gui")
+                            {
+                                match crate::tenant_config::read_existing_nav_links(
+                                    &state.bundle_path,
+                                    &state.tenant,
+                                ) {
+                                    Some(rows) => {
+                                        eprintln!(
+                                            "[hydrate] {} nav_links → saved_rows from tenant.json: {} row(s)",
+                                            pfs.provider_id,
+                                            rows.len()
+                                        );
+                                        info.saved_rows = Some(rows);
+                                    }
+                                    None => {
+                                        eprintln!(
+                                            "[hydrate] {} nav_links → tenant.json had no nav_links (bundle_path={}, tenant={})",
+                                            pfs.provider_id,
+                                            state.bundle_path.display(),
+                                            state.tenant
+                                        );
+                                    }
+                                }
+                            }
                         }
                         info
                     })
@@ -1185,6 +1257,7 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         secret: q.secret,
         default_value: q.default_value.clone(),
         saved_value: None,
+        saved_rows: None,
         help,
         choices: q.choices.clone(),
         visible_if,
