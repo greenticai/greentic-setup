@@ -29,7 +29,14 @@ pub fn emit_answers(
 ) -> anyhow::Result<()> {
     let bundle = &plan.bundle;
 
-    // Build the answers document structure
+    // Build the answers document structure.
+    // `platform_setup.tunnel` is emitted as a placeholder so
+    // `--non-interactive --answers` runs don't deadlock on a hidden
+    // tunnel-mode TTY prompt — see complete_loaded_answers_with_prompts.
+    let tunnel_value = match plan.metadata.tunnel.as_ref() {
+        Some(t) => serde_json::to_value(t)?,
+        None => serde_json::json!({ "mode": null }),
+    };
     let mut answers_doc = serde_json::json!({
         "greentic_setup_version": "1.0.0",
         "bundle_source": bundle.display().to_string(),
@@ -38,7 +45,8 @@ pub fn emit_answers(
         "env": config.env,
         "platform_setup": {
             "static_routes": plan.metadata.static_routes.to_answers(),
-            "deployment_targets": plan.metadata.deployment_targets
+            "deployment_targets": plan.metadata.deployment_targets,
+            "tunnel": tunnel_value
         },
         "setup_answers": {}
     });

@@ -114,6 +114,9 @@ fn create_gtbundle_squashfs(bundle_dir: &Path, output_path: &Path) -> Result<()>
     }
 
     let mut writer = FilesystemWriter::default();
+    // The root inode header inherits `NodeHeader::default()` (mode 0o000)
+    // unless we override it — same trap as the per-entry headers below.
+    writer.set_root_mode(0o755);
 
     // Walk the bundle directory and add all files
     add_directory_to_squashfs(&mut writer, bundle_dir, bundle_dir)?;
@@ -135,7 +138,6 @@ fn add_directory_to_squashfs(
     base_dir: &Path,
     current_dir: &Path,
 ) -> Result<()> {
-    use backhand::NodeHeader;
     use std::io::Cursor;
 
     let entries = fs::read_dir(current_dir)
@@ -150,24 +152,35 @@ fn add_directory_to_squashfs(
         let name = relative_path.to_string_lossy().to_string();
 
         if path.is_dir() {
-            // Add directory
             writer
-                .push_dir(&name, NodeHeader::default())
+                .push_dir(&name, dir_node_header())
                 .with_context(|| format!("failed to add directory: {}", name))?;
-            // Recurse
             add_directory_to_squashfs(writer, base_dir, &path)?;
         } else {
-            // Add file
             let content = fs::read(&path)
                 .with_context(|| format!("failed to read file: {}", path.display()))?;
             let cursor = Cursor::new(content);
             writer
-                .push_file(cursor, &name, NodeHeader::default())
+                .push_file(cursor, &name, file_node_header())
                 .with_context(|| format!("failed to add file: {}", name))?;
         }
     }
 
     Ok(())
+}
+
+// `NodeHeader::default()` zero-fills permissions, which yields squashfs
+// archives whose extracted directories have mode `0o000` and cannot be
+// `read_dir()`'d by `gtc start`. Stamp world-readable defaults so any
+// consumer can extract and start the bundle without a manual chmod.
+#[cfg(feature = "squashfs")]
+fn dir_node_header() -> backhand::NodeHeader {
+    backhand::NodeHeader::new(0o755, 0, 0, 0)
+}
+
+#[cfg(feature = "squashfs")]
+fn file_node_header() -> backhand::NodeHeader {
+    backhand::NodeHeader::new(0o644, 0, 0, 0)
 }
 
 /// Create a .gtbundle archive using ZIP format.
