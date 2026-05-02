@@ -579,7 +579,8 @@ pub fn read_existing_nav_links(bundle_path: &Path, tenant: &str) -> Option<Vec<V
                 .iter()
                 .map(|entry| {
                     let mut out = entry.as_object().cloned().unwrap_or_default();
-                    if let Some(tooltip) = out.remove("tooltip").and_then(|t| t.as_object().cloned())
+                    if let Some(tooltip) =
+                        out.remove("tooltip").and_then(|t| t.as_object().cloned())
                     {
                         for (sub_key, target_key) in [
                             ("eyebrow", "tooltip_eyebrow"),

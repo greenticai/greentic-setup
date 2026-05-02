@@ -466,20 +466,21 @@ async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Js
                 // form). Without this the legacy ghost dominates the prefill
                 // and silently overrides the user's table edits on the next
                 // sync.
+                // Currently we only know one legacy `_json` string key —
+                // `nav_links_json`. Open-coded rather than looping a single
+                // element. If we add more table questions later, swap to a
+                // const slice + for loop again.
                 if let Some(map) = cloned.as_object_mut() {
-                    for legacy_key in [
-                        "nav_links_json".to_string(),
-                    ] {
-                        let canonical_key = legacy_key.trim_end_matches("_json").to_string();
-                        if !map.contains_key(&canonical_key)
-                            && let Some(Value::String(raw)) = map.get(&legacy_key)
-                            && let Ok(parsed) = serde_json::from_str::<Value>(raw)
-                            && parsed.is_array()
-                        {
-                            map.insert(canonical_key, parsed);
-                        }
-                        map.remove(&legacy_key);
+                    let legacy_key = "nav_links_json";
+                    let canonical_key = "nav_links";
+                    if !map.contains_key(canonical_key)
+                        && let Some(Value::String(raw)) = map.get(legacy_key)
+                        && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+                        && parsed.is_array()
+                    {
+                        map.insert(canonical_key.to_string(), parsed);
                     }
+                    map.remove(legacy_key);
                 }
                 merged_answers.insert(pid.clone(), cloned);
             }
