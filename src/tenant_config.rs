@@ -384,11 +384,7 @@ fn sanitize_nav_link_array(arr: &[Value]) -> Vec<Value> {
             // instead of the flat columns.
             let nested_tooltip = obj.get("tooltip").and_then(|v| v.as_object());
             let tooltip_obj = if let Some(map) = nested_tooltip {
-                build_tooltip_obj(
-                    map.get("eyebrow"),
-                    map.get("title"),
-                    map.get("lede"),
-                )
+                build_tooltip_obj(map.get("eyebrow"), map.get("title"), map.get("lede"))
             } else {
                 build_tooltip_obj(
                     obj.get("tooltip_eyebrow"),
@@ -572,29 +568,28 @@ pub fn sync_nav_links_to_tenant_config(
     // 2. `nav_links_json` as a JSON string — legacy advanced-input answer
     //    that pre-dates the table wizard. Parsed, then sanitised.
     // 3. Neither present — leave the existing tenant config untouched.
-    let parsed_links: Vec<Value> = if let Some(arr) =
-        answers_obj.get("nav_links").and_then(Value::as_array)
-    {
-        sanitize_nav_link_array(arr)
-    } else if let Some(raw) = answers_obj
-        .get("nav_links_json")
-        .and_then(Value::as_str)
-        .map(str::trim)
-    {
-        if raw.is_empty() {
-            Vec::new()
-        } else {
-            let parsed: Value = serde_json::from_str(raw).with_context(|| {
-                format!("parse nav_links_json answer (expected JSON array): {raw}")
-            })?;
-            let Some(arr) = parsed.as_array() else {
-                anyhow::bail!("nav_links_json must be a JSON array, got: {raw}");
-            };
+    let parsed_links: Vec<Value> =
+        if let Some(arr) = answers_obj.get("nav_links").and_then(Value::as_array) {
             sanitize_nav_link_array(arr)
-        }
-    } else {
-        return Ok(false);
-    };
+        } else if let Some(raw) = answers_obj
+            .get("nav_links_json")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
+            if raw.is_empty() {
+                Vec::new()
+            } else {
+                let parsed: Value = serde_json::from_str(raw).with_context(|| {
+                    format!("parse nav_links_json answer (expected JSON array): {raw}")
+                })?;
+                let Some(arr) = parsed.as_array() else {
+                    anyhow::bail!("nav_links_json must be a JSON array, got: {raw}");
+                };
+                sanitize_nav_link_array(arr)
+            }
+        } else {
+            return Ok(false);
+        };
 
     let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
         return Ok(false);
