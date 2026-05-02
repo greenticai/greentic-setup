@@ -9,7 +9,7 @@ mod assets;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -43,6 +43,12 @@ struct UiState {
     /// When true the tenant/env came from an answers file and should not be
     /// overridden by bundle auto-detection.
     scope_from_answers: bool,
+    /// Where the on-disk artifact should be written back after a successful
+    /// setup. `Some(Archive)` means re-pack the extracted bundle dir into
+    /// a `.gtbundle`; `Some(Directory)` means copy the dir; `None` means
+    /// the user passed a directory and the working dir IS the artifact, so
+    /// no copy/repack is needed.
+    output_target: Option<crate::cli_helpers::SetupOutputTarget>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -159,6 +165,7 @@ pub async fn launch(
     locale: Option<&str>,
     prefill_answers: Option<JsonMap<String, Value>>,
     scope_from_answers: bool,
+    output_target: Option<crate::cli_helpers::SetupOutputTarget>,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -171,6 +178,7 @@ pub async fn launch(
         locale: locale.map(String::from),
         prefill_answers,
         scope_from_answers,
+        output_target,
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -645,7 +653,8 @@ async fn post_execute(
         let _ = crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel);
     }
 
-    let result = tokio::task::spawn_blocking(move || {
+    let bundle_path_for_repack = bundle_path.clone();
+    let mut result = tokio::task::spawn_blocking(move || {
         execute_setup(&bundle_path, &tenant, team.as_deref(), &env, answers)
     })
     .await
@@ -655,6 +664,68 @@ async fn post_execute(
         stderr: format!("Task panicked: {e}"),
         manual_steps: vec![],
     });
+
+    // After a successful UI setup, re-pack the extracted bundle dir back
+    // to its original `.gtbundle` archive (or copy it to a directory
+    // output) so the on-disk artifact reflects the answers the user just
+    // saved. Without this the simple-mode CLI did the write-back but the
+    // UI mode silently dropped it — see bin/greentic_setup.rs:run_ui_mode.
+    if result.success
+        && let Some(target) = state.output_target.clone()
+    {
+        let repack = tokio::task::spawn_blocking(move || -> Result<String, anyhow::Error> {
+            use crate::cli_helpers::{SetupOutputTarget, copy_dir_recursive};
+            use crate::gtbundle;
+            match target {
+                SetupOutputTarget::Archive(out) => {
+                    gtbundle::create_gtbundle(&bundle_path_for_repack, &out).with_context(
+                        || {
+                            format!(
+                                "failed to write configured .gtbundle archive to {}",
+                                out.display()
+                            )
+                        },
+                    )?;
+                    Ok(format!("Configured bundle written to: {}", out.display()))
+                }
+                SetupOutputTarget::Directory(out) => {
+                    if out.exists() {
+                        if out.is_dir() {
+                            std::fs::remove_dir_all(&out).with_context(|| {
+                                format!(
+                                    "failed to replace existing bundle directory {}",
+                                    out.display()
+                                )
+                            })?;
+                        } else {
+                            std::fs::remove_file(&out).with_context(|| {
+                                format!("failed to replace existing bundle file {}", out.display())
+                            })?;
+                        }
+                    }
+                    copy_dir_recursive(&bundle_path_for_repack, &out, false)
+                        .context("failed to write configured local bundle directory")?;
+                    Ok(format!("Configured bundle written to: {}", out.display()))
+                }
+            }
+        })
+        .await;
+        match repack {
+            Ok(Ok(msg)) => result.stdout.push_str(&format!("\n{msg}\n")),
+            Ok(Err(e)) => {
+                result.success = false;
+                result
+                    .stderr
+                    .push_str(&format!("\nWrite-back failed: {e:#}\n"));
+            }
+            Err(e) => {
+                result.success = false;
+                result
+                    .stderr
+                    .push_str(&format!("\nWrite-back panicked: {e}\n"));
+            }
+        }
+    }
 
     *state.result.lock().unwrap() = Some(result.clone());
     Json(result)
