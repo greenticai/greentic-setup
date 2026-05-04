@@ -322,6 +322,12 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
 
+    // Compute the write-back target up front so that after the UI session
+    // completes the extracted bundle dir gets re-packed (or copied) back
+    // to the user's original input — matches the behaviour of
+    // run_simple_setup which calls gtbundle::create_gtbundle directly.
+    let output_target = setup_output_target(&bundle_path)?;
+
     // Load answers from --answers file for UI pre-fill (values + scope).
     let (prefill_answers, answers_tenant, answers_team, answers_env) = if let Some(answers_path) =
         &cli.answers
@@ -375,6 +381,7 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         cli.locale.as_deref(),
         prefill_answers,
         scope_from_answers,
+        output_target,
     ))
 }
 
