@@ -80,6 +80,7 @@ pub fn resolve_bundle_source(path: &std::path::Path, i18n: &CliI18n) -> Result<P
 }
 
 /// Persistent output target for simple setup flows.
+#[derive(Clone)]
 pub enum SetupOutputTarget {
     Directory(PathBuf),
     Archive(PathBuf),

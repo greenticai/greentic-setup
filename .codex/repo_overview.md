@@ -63,6 +63,13 @@ Previously this logic was embedded in greentic-operator (~5,000 lines). This cra
 - `ReloadPlan` — generates `ReloadAction` list (load/unload/reload component, update routes, run resolver)
 - `diff_discoveries()`, `plan_reload()`
 
+### Tenant Config Sync (`src/tenant_config.rs`)
+- Synchronizes setup answers into the static webchat-gui tenant JSON at `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`
+- `sync_oauth_to_tenant_config()` — enables/disables OIDC providers and writes client IDs / redirect URIs (Google, Microsoft, GitHub, custom)
+- `sync_skin_to_tenant_config()` — writes the operator's skin choice into the `skin` field consumed by runtime-bootstrap.js's tenant→skin indirection
+- `sync_nav_links_to_tenant_config()` — writes parsed `nav_links_json` into the `nav_links` array
+- `resolve_or_scaffold_tenant_config()` — shared helper that creates `<tenant>.json` from `default.json` (rewriting `tenant_id`) when missing, so per-tenant fields actually reach the runtime instead of polluting the template
+
 ### Adaptive Card Setup (`src/card_setup.rs`)
 - `CardSetupSession` — multi-step card-based onboarding with TTL and answer accumulation
 - `SetupLinkConfig` — setup URL generation

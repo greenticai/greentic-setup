@@ -5,6 +5,7 @@
 use std::io::{self, Write as _};
 
 use anyhow::{Result, anyhow};
+use qa_spec::spec::question::ListSpec;
 use qa_spec::{FormSpec, QuestionSpec, QuestionType, VisibilityMode, resolve_visibility};
 use rpassword::prompt_password;
 use serde_json::{Map as JsonMap, Value};
@@ -67,8 +68,13 @@ pub fn prompt_form_spec_answers_with_existing(
         {
             continue;
         }
-        // In normal mode, skip optional missing questions.
-        if !advanced && !question.required {
+        // In normal mode, skip optional missing questions — except `List`
+        // (table) kinds. A table is a structural hand-off to the operator
+        // ("here's where nav-links / repeating data go") that doesn't make
+        // sense to silently hide based on the required flag, even when
+        // optional. They get the table; if they want to skip rows they
+        // answer "n" to "Add a row?" and move on.
+        if !advanced && !question.required && question.kind != QuestionType::List {
             continue;
         }
         if let Some(value) = ask_form_spec_question(question)? {
@@ -122,6 +128,16 @@ pub fn answer_satisfies_question(question: &QuestionSpec, value: &Value) -> bool
 
 /// Prompt for a single FormSpec question and return the answer.
 pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> {
+    // Table / repeating-row questions (kind: List) get a dedicated row loop
+    // — see `ask_list_question` for the prompt protocol. Falls through to
+    // the scalar path if the question is List-typed but missing its
+    // `list` schema (defensive: shouldn't happen with a well-formed spec).
+    if question.kind == QuestionType::List
+        && let Some(ref list) = question.list
+    {
+        return ask_list_question(question, list);
+    }
+
     // Print question header
     let marker = if question.required {
         " (required)"
@@ -186,6 +202,111 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
         }
 
         return Ok(Some(parse_typed_value(question.kind, &normalized)));
+    }
+}
+
+/// Prompt for a `QuestionType::List` (repeating-row) question. Loops
+/// "Add another?" / row-by-row prompts and returns a `Value::Array` of
+/// per-row JSON objects whose keys match the column field IDs.
+///
+/// Constraints:
+/// - `list.min_items` / `max_items` enforce row count bounds.
+/// - The outer question's `required` flag is honoured: when required and
+///   no rows were collected, we re-prompt instead of returning `None`.
+/// - Rows whose required columns are all empty are dropped silently
+///   (lets the operator type a blank line and "step out" mid-table).
+fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<Value>> {
+    let marker = if question.required {
+        " (required)"
+    } else {
+        " (optional)"
+    };
+    println!();
+    println!("  {}{marker}", question.title);
+    if let Some(ref desc) = question.description
+        && !desc.is_empty()
+    {
+        println!("  {desc}");
+    }
+
+    let max = list.max_items;
+    let min = list.min_items.unwrap_or(0);
+
+    let mut rows: Vec<Value> = Vec::new();
+    loop {
+        if let Some(cap) = max
+            && rows.len() >= cap
+        {
+            println!("  (max {} rows reached)", cap);
+            break;
+        }
+
+        // Ask whether to add another row.
+        let prompt = if rows.is_empty() {
+            "  > Add a row? [y/N] "
+        } else {
+            "  > Add another row? [y/N] "
+        };
+        let input = read_input(prompt, false)?;
+        let trimmed = input.trim().to_ascii_lowercase();
+        let yes = matches!(trimmed.as_str(), "y" | "yes" | "1" | "true");
+        if !yes {
+            if rows.len() < min {
+                println!(
+                    "  At least {min} row(s) required — got {}. Type 'y' to add another.",
+                    rows.len()
+                );
+                continue;
+            }
+            break;
+        }
+
+        // Prompt each column for the new row.
+        println!("  Row #{}:", rows.len() + 1);
+        let mut row_obj = JsonMap::new();
+        for column in &list.fields {
+            if let Some(value) = ask_form_spec_question(column)? {
+                row_obj.insert(column.id.clone(), value);
+            }
+        }
+
+        // Drop the row if every required column ended up empty — lets the
+        // operator back out by hitting Enter through every column.
+        let row_has_required_content = list.fields.iter().all(|c| {
+            !c.required
+                || row_obj
+                    .get(&c.id)
+                    .map(|v| !is_empty_answer(v))
+                    .unwrap_or(false)
+        });
+        if !row_has_required_content {
+            println!("  (row dropped — required columns were empty)");
+            continue;
+        }
+
+        rows.push(Value::Object(row_obj));
+    }
+
+    if rows.is_empty() {
+        if question.required {
+            println!("  This field is required — at least one row needed.");
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(Value::Array(rows)))
+}
+
+/// Treat an empty string, false bool, or null as "no answer" for the
+/// row-required check.
+fn is_empty_answer(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
     }
 }
 

@@ -9,7 +9,7 @@ mod assets;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -43,6 +43,12 @@ struct UiState {
     /// When true the tenant/env came from an answers file and should not be
     /// overridden by bundle auto-detection.
     scope_from_answers: bool,
+    /// Where the on-disk artifact should be written back after a successful
+    /// setup. `Some(Archive)` means re-pack the extracted bundle dir into
+    /// a `.gtbundle`; `Some(Directory)` means copy the dir; `None` means
+    /// the user passed a directory and the working dir IS the artifact, so
+    /// no copy/repack is needed.
+    output_target: Option<crate::cli_helpers::SetupOutputTarget>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -83,12 +89,49 @@ struct QuestionInfo {
     default_value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     saved_value: Option<String>,
+    /// Pre-populated rows for `kind: List` questions, hydrated on wizard
+    /// re-run from the bundle's existing tenant config (e.g. nav_links).
+    /// Each entry is a JSON object keyed by `column.id` whose value matches
+    /// the column kind (string for scalars, locale-keyed object for
+    /// multilingual cells).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saved_rows: Option<Vec<Value>>,
     help: Option<String>,
     choices: Option<Vec<String>>,
     visible_if: Option<VisibleIfInfo>,
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    /// Column schema for `kind: List` (table) questions. Each entry tells
+    /// the front-end how to render one cell per row. Absent for scalar
+    /// kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_columns: Option<Vec<ListColumnInfo>>,
+    /// Minimum row count for a `kind: List` question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_rows: Option<usize>,
+    /// Maximum row count for a `kind: List` question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_rows: Option<usize>,
+}
+
+/// Per-column metadata sent to the front-end so it can render one input
+/// per cell when the question kind is `List` (a.k.a. table).
+#[derive(Serialize, Clone)]
+struct ListColumnInfo {
+    id: String,
+    title: String,
+    kind: String,
+    required: bool,
+    help: Option<String>,
+    placeholder: Option<String>,
+    choices: Option<Vec<String>>,
+    default_value: Option<String>,
+    /// When true, the front-end renders a multi-locale cell — operator can
+    /// add per-locale translations via "+ Add language". Persisted as a
+    /// locale-keyed object instead of a plain string.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    multilingual: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -102,6 +145,10 @@ struct SetupQuestionExtras {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    /// Per-column metadata for `kind: table` questions. Maps column `key`
+    /// → multilingual flag. Used by the UI to render i18n-aware cells.
+    /// Empty for non-table questions.
+    column_multilingual: std::collections::HashMap<String, bool>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +206,7 @@ pub async fn launch(
     locale: Option<&str>,
     prefill_answers: Option<JsonMap<String, Value>>,
     scope_from_answers: bool,
+    output_target: Option<crate::cli_helpers::SetupOutputTarget>,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -171,6 +219,7 @@ pub async fn launch(
         locale: locale.map(String::from),
         prefill_answers,
         scope_from_answers,
+        output_target,
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -411,7 +460,29 @@ async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Js
             // Merge saved secrets with file-based answers
             let mut merged_answers = JsonMap::new();
             for (pid, file_ans) in &provider_answers {
-                merged_answers.insert(pid.clone(), file_ans.clone());
+                let mut cloned = file_ans.clone();
+                // Migrate legacy `<id>_json` string answers to their array
+                // equivalent (the new `kind: table` wizard writes the array
+                // form). Without this the legacy ghost dominates the prefill
+                // and silently overrides the user's table edits on the next
+                // sync.
+                // Currently we only know one legacy `_json` string key —
+                // `nav_links_json`. Open-coded rather than looping a single
+                // element. If we add more table questions later, swap to a
+                // const slice + for loop again.
+                if let Some(map) = cloned.as_object_mut() {
+                    let legacy_key = "nav_links_json";
+                    let canonical_key = "nav_links";
+                    if !map.contains_key(canonical_key)
+                        && let Some(Value::String(raw)) = map.get(legacy_key)
+                        && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+                        && parsed.is_array()
+                    {
+                        map.insert(canonical_key.to_string(), parsed);
+                    }
+                    map.remove(legacy_key);
+                }
+                merged_answers.insert(pid.clone(), cloned);
             }
             // Overlay saved secrets into answers
             for (pid, secrets) in &saved {
@@ -512,12 +583,19 @@ async fn get_providers(
         if let Ok(Some(spec)) = crate::setup_input::load_setup_spec(&provider.pack_path) {
             let mut map = std::collections::HashMap::new();
             for q in &spec.questions {
+                let mut column_multilingual = std::collections::HashMap::new();
+                for col in &q.columns {
+                    if col.multilingual {
+                        column_multilingual.insert(col.key.clone(), true);
+                    }
+                }
                 map.insert(
                     q.name.clone(),
                     SetupQuestionExtras {
                         placeholder: q.placeholder.clone(),
                         group: q.group.clone(),
                         docs_url: q.docs_url.clone(),
+                        column_multilingual,
                     },
                 );
             }
@@ -600,6 +678,22 @@ async fn get_providers(
                             }
                             info.group = ext.group.clone();
                             info.docs_url = ext.docs_url.clone();
+                            // Overlay per-column multilingual flags onto the
+                            // table-rendering metadata (qa-spec QuestionSpec
+                            // has no slot for this hint, so we carry it
+                            // out-of-band via SetupQuestionExtras).
+                            if let Some(ref mut cols) = info.list_columns {
+                                for col in cols.iter_mut() {
+                                    if ext
+                                        .column_multilingual
+                                        .get(&col.id)
+                                        .copied()
+                                        .unwrap_or(false)
+                                    {
+                                        col.multilingual = true;
+                                    }
+                                }
+                            }
                         }
                         // --answers prefill takes priority over saved secrets
                         if let Some(val) = answers
@@ -609,6 +703,50 @@ async fn get_providers(
                             info.saved_value = Some(val);
                         } else if let Some(val) = saved.and_then(|m| m.get(&q.id)) {
                             info.saved_value = Some(val.clone());
+                        }
+                        // Hydrate kind: List rows from --answers (if it
+                        // carries an array) or, for the webchat-gui
+                        // nav_links table, from the bundle's persisted
+                        // tenant.json so a wizard re-run pre-populates the
+                        // pills the operator just configured.
+                        if matches!(q.kind, qa_spec::QuestionType::List) {
+                            if let Some(arr) = answers
+                                .and_then(|m| m.get(&q.id))
+                                .and_then(Value::as_array)
+                                .filter(|a| !a.is_empty())
+                            {
+                                info.saved_rows = Some(arr.clone());
+                                eprintln!(
+                                    "[hydrate] {} {} → saved_rows from prefill: {} row(s)",
+                                    pfs.provider_id,
+                                    q.id,
+                                    arr.len()
+                                );
+                            } else if q.id == "nav_links"
+                                && pfs.provider_id.contains("webchat-gui")
+                            {
+                                match crate::tenant_config::read_existing_nav_links(
+                                    &state.bundle_path,
+                                    &state.tenant,
+                                ) {
+                                    Some(rows) => {
+                                        eprintln!(
+                                            "[hydrate] {} nav_links → saved_rows from tenant.json: {} row(s)",
+                                            pfs.provider_id,
+                                            rows.len()
+                                        );
+                                        info.saved_rows = Some(rows);
+                                    }
+                                    None => {
+                                        eprintln!(
+                                            "[hydrate] {} nav_links → tenant.json had no nav_links (bundle_path={}, tenant={})",
+                                            pfs.provider_id,
+                                            state.bundle_path.display(),
+                                            state.tenant
+                                        );
+                                    }
+                                }
+                            }
                         }
                         info
                     })
@@ -645,7 +783,8 @@ async fn post_execute(
         let _ = crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel);
     }
 
-    let result = tokio::task::spawn_blocking(move || {
+    let bundle_path_for_repack = bundle_path.clone();
+    let mut result = tokio::task::spawn_blocking(move || {
         execute_setup(&bundle_path, &tenant, team.as_deref(), &env, answers)
     })
     .await
@@ -655,6 +794,68 @@ async fn post_execute(
         stderr: format!("Task panicked: {e}"),
         manual_steps: vec![],
     });
+
+    // After a successful UI setup, re-pack the extracted bundle dir back
+    // to its original `.gtbundle` archive (or copy it to a directory
+    // output) so the on-disk artifact reflects the answers the user just
+    // saved. Without this the simple-mode CLI did the write-back but the
+    // UI mode silently dropped it — see bin/greentic_setup.rs:run_ui_mode.
+    if result.success
+        && let Some(target) = state.output_target.clone()
+    {
+        let repack = tokio::task::spawn_blocking(move || -> Result<String, anyhow::Error> {
+            use crate::cli_helpers::{SetupOutputTarget, copy_dir_recursive};
+            use crate::gtbundle;
+            match target {
+                SetupOutputTarget::Archive(out) => {
+                    gtbundle::create_gtbundle(&bundle_path_for_repack, &out).with_context(
+                        || {
+                            format!(
+                                "failed to write configured .gtbundle archive to {}",
+                                out.display()
+                            )
+                        },
+                    )?;
+                    Ok(format!("Configured bundle written to: {}", out.display()))
+                }
+                SetupOutputTarget::Directory(out) => {
+                    if out.exists() {
+                        if out.is_dir() {
+                            std::fs::remove_dir_all(&out).with_context(|| {
+                                format!(
+                                    "failed to replace existing bundle directory {}",
+                                    out.display()
+                                )
+                            })?;
+                        } else {
+                            std::fs::remove_file(&out).with_context(|| {
+                                format!("failed to replace existing bundle file {}", out.display())
+                            })?;
+                        }
+                    }
+                    copy_dir_recursive(&bundle_path_for_repack, &out, false)
+                        .context("failed to write configured local bundle directory")?;
+                    Ok(format!("Configured bundle written to: {}", out.display()))
+                }
+            }
+        })
+        .await;
+        match repack {
+            Ok(Ok(msg)) => result.stdout.push_str(&format!("\n{msg}\n")),
+            Ok(Err(e)) => {
+                result.success = false;
+                result
+                    .stderr
+                    .push_str(&format!("\nWrite-back failed: {e:#}\n"));
+            }
+            Err(e) => {
+                result.success = false;
+                result
+                    .stderr
+                    .push_str(&format!("\nWrite-back panicked: {e}\n"));
+            }
+        }
+    }
 
     *state.result.lock().unwrap() = Some(result.clone());
     Json(result)
@@ -1022,6 +1223,33 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         })
         .or_else(|| q.description.clone());
 
+    let (list_columns, min_rows, max_rows) = q
+        .list
+        .as_ref()
+        .map(|list| {
+            let cols: Vec<ListColumnInfo> = list
+                .fields
+                .iter()
+                .map(|c| ListColumnInfo {
+                    id: c.id.clone(),
+                    title: c.title.clone(),
+                    kind: format!("{:?}", c.kind),
+                    required: c.required,
+                    help: c.description.clone(),
+                    placeholder: None,
+                    choices: c.choices.clone(),
+                    default_value: c.default_value.clone(),
+                    // multilingual is set by the caller via overlay_setup_extras —
+                    // qa-spec QuestionSpec has no slot for it, so we leave it
+                    // false here and let the UI loop fix it up from
+                    // SetupQuestionExtras.column_multilingual.
+                    multilingual: false,
+                })
+                .collect();
+            (Some(cols), list.min_items, list.max_items)
+        })
+        .unwrap_or((None, None, None));
+
     QuestionInfo {
         id: q.id.clone(),
         title,
@@ -1030,12 +1258,16 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         secret: q.secret,
         default_value: q.default_value.clone(),
         saved_value: None,
+        saved_rows: None,
         help,
         choices: q.choices.clone(),
         visible_if,
         placeholder: None,
         group: None,
         docs_url: None,
+        list_columns,
+        min_rows,
+        max_rows,
     }
 }
 
