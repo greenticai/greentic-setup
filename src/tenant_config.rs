@@ -5,7 +5,7 @@
 //! to enable/disable OAuth providers and set client IDs. This ensures the
 //! webchat-gui runtime serves the correct auth config without manual editing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
@@ -49,17 +49,55 @@ const OIDC_PROVIDERS: &[OidcProviderDef] = &[
     },
 ];
 
+/// Resolve the target tenant config file, scaffolding `<tenant>.json` from
+/// `default.json` when it does not yet exist.
+///
+/// The webchat-gui SPA's runtime-bootstrap fetches `/config/tenants/<tenant>.json`
+/// directly via `originalFetch` (bypassing its own 404-fallback interceptor) when
+/// resolving skin / nav_links overrides. If we instead patched `default.json`
+/// here, those tenant-specific fields would never be picked up at runtime, *and*
+/// the template would be polluted with the wrong `tenant_id`. So when the
+/// tenant-specific file is missing, we copy `default.json` to `<tenant>.json`
+/// (rewriting `tenant_id`) and write into the new file.
+///
+/// Returns `Ok(None)` when neither `<tenant>.json` nor `default.json` exists —
+/// callers should treat that as a no-op.
+fn resolve_or_scaffold_tenant_config(bundle_path: &Path, tenant: &str) -> Result<Option<PathBuf>> {
+    let tenants_dir = bundle_path.join("assets/webchat-gui/config/tenants");
+    let tenant_path = tenants_dir.join(format!("{tenant}.json"));
+    if tenant_path.exists() {
+        return Ok(Some(tenant_path));
+    }
+
+    let default_path = tenants_dir.join("default.json");
+    if !default_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&default_path)
+        .with_context(|| format!("read default tenant config {}", default_path.display()))?;
+    let mut config: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse default tenant config {}", default_path.display()))?;
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert("tenant_id".to_string(), Value::String(tenant.to_string()));
+    }
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&tenant_path, output)
+        .with_context(|| format!("scaffold tenant config {}", tenant_path.display()))?;
+    Ok(Some(tenant_path))
+}
+
 /// Synchronize webchat-gui OAuth answers to the tenant config JSON.
 ///
 /// Only runs for `messaging-webchat-gui` providers. Updates the tenant config
-/// at `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`.
+/// at `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`, scaffolding
+/// the file from `default.json` when missing.
 pub fn sync_oauth_to_tenant_config(
     bundle_path: &Path,
     tenant: &str,
     provider_id: &str,
     answers: &Value,
 ) -> Result<bool> {
-    // Only apply to webchat-gui providers
     if !provider_id.contains("webchat-gui") {
         return Ok(false);
     }
@@ -69,34 +107,17 @@ pub fn sync_oauth_to_tenant_config(
         None => return Ok(false),
     };
 
-    // Check if OAuth is configured in answers
     let oauth_enabled = answers_obj
         .get("oauth_enabled")
         .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
         .unwrap_or(false);
 
-    // Find tenant config file
-    let config_path = bundle_path
-        .join("assets/webchat-gui/config/tenants")
-        .join(format!("{tenant}.json"));
-
-    if !config_path.exists() {
-        // Try default.json as fallback
-        let default_path = bundle_path.join("assets/webchat-gui/config/tenants/default.json");
-        if default_path.exists() {
-            return update_tenant_config(
-                &default_path,
-                tenant,
-                oauth_enabled,
-                answers_obj,
-                resolve_public_base_url(bundle_path, tenant, answers_obj)?,
-            );
-        }
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
         return Ok(false);
-    }
+    };
 
     update_tenant_config(
-        &config_path,
+        &target,
         tenant,
         oauth_enabled,
         answers_obj,
@@ -326,6 +347,121 @@ fn resolve_public_base_url(
     Ok(from_policy)
 }
 
+/// Sanitize a `nav_links` array (from either the table-wizard answer or a
+/// parsed `nav_links_json` string). Drops malformed entries silently —
+/// label or url missing/empty, label not a string or locale-keyed object —
+/// and normalises the on-disk shape to `{label, url, external?}`.
+fn sanitize_nav_link_array(arr: &[Value]) -> Vec<Value> {
+    arr.iter()
+        .filter_map(|entry| {
+            let obj = entry.as_object()?;
+            // `label` accepts either a plain string or a locale-keyed JSON
+            // object (e.g. `{"en":"Help","id":"Bantuan"}`).
+            let label_value = sanitize_i18n_text(obj.get("label")?)?;
+
+            let url = obj.get("url").and_then(Value::as_str).map(str::trim)?;
+            if url.is_empty() {
+                return None;
+            }
+
+            let mut clean = serde_json::Map::new();
+            clean.insert("label".to_string(), label_value);
+            clean.insert("url".to_string(), Value::String(url.to_string()));
+            if obj.get("external").and_then(Value::as_bool) == Some(true) {
+                clean.insert("external".to_string(), Value::Bool(true));
+            }
+            // Optional `num`: short prefix chip (e.g. "M5"). Same i18n
+            // resolution as label.
+            if let Some(num) = obj.get("num").and_then(sanitize_i18n_text_opt) {
+                clean.insert("num".to_string(), num);
+            }
+            // Tooltip is collected as three flat columns by the wizard
+            // (`tooltip_eyebrow`, `tooltip_title`, `tooltip_lede`); rebuild
+            // the nested `tooltip: { eyebrow?, title?, lede? }` object here
+            // so the runtime SPA's renderTopbarNav sees the canonical shape.
+            // Operators who hand-edit tenant.json can also pass `tooltip` as
+            // an already-nested object; if present, we sanitise that path
+            // instead of the flat columns.
+            let nested_tooltip = obj.get("tooltip").and_then(|v| v.as_object());
+            let tooltip_obj = if let Some(map) = nested_tooltip {
+                build_tooltip_obj(map.get("eyebrow"), map.get("title"), map.get("lede"))
+            } else {
+                build_tooltip_obj(
+                    obj.get("tooltip_eyebrow"),
+                    obj.get("tooltip_title"),
+                    obj.get("tooltip_lede"),
+                )
+            };
+            if let Some(t) = tooltip_obj {
+                clean.insert("tooltip".to_string(), t);
+            }
+            Some(Value::Object(clean))
+        })
+        .collect()
+}
+
+/// Sanitize an i18n-aware text value: accepts either a plain string or a
+/// locale-keyed object whose values are strings. Returns `None` when the
+/// input is missing, the wrong shape, or has only empty values.
+fn sanitize_i18n_text(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(Value::String(trimmed.to_string()))
+            }
+        }
+        Value::Object(map) => {
+            let mut clean = serde_json::Map::new();
+            for (locale, v) in map {
+                if let Some(s) = v.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        clean.insert(locale.clone(), Value::String(trimmed.to_string()));
+                    }
+                }
+            }
+            if clean.is_empty() {
+                None
+            } else {
+                Some(Value::Object(clean))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convenience: take an `Option<&Value>` and return `Option<Value>`.
+fn sanitize_i18n_text_opt(value: &Value) -> Option<Value> {
+    sanitize_i18n_text(value)
+}
+
+/// Build a tooltip object from optional eyebrow/title/lede inputs. Returns
+/// `None` if all three are empty (no tooltip → omit the field).
+fn build_tooltip_obj(
+    eyebrow: Option<&Value>,
+    title: Option<&Value>,
+    lede: Option<&Value>,
+) -> Option<Value> {
+    let mut clean = serde_json::Map::new();
+    if let Some(v) = eyebrow.and_then(sanitize_i18n_text_opt) {
+        clean.insert("eyebrow".to_string(), v);
+    }
+    if let Some(v) = title.and_then(sanitize_i18n_text_opt) {
+        clean.insert("title".to_string(), v);
+    }
+    if let Some(v) = lede.and_then(sanitize_i18n_text_opt) {
+        clean.insert("lede".to_string(), v);
+    }
+    if clean.is_empty() {
+        None
+    } else {
+        Some(Value::Object(clean))
+    }
+}
+
 fn is_placeholder_public_base_url(value: &str) -> bool {
     let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
     normalized.is_empty()
@@ -364,18 +500,9 @@ pub fn sync_skin_to_tenant_config(
         return Ok(false);
     };
 
-    let tenant_path = bundle_path
-        .join("assets/webchat-gui/config/tenants")
-        .join(format!("{tenant}.json"));
-    let target = if tenant_path.exists() {
-        tenant_path
-    } else {
-        bundle_path.join("assets/webchat-gui/config/tenants/default.json")
-    };
-
-    if !target.exists() {
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
         return Ok(false);
-    }
+    };
 
     let raw = std::fs::read_to_string(&target)
         .with_context(|| format!("read tenant config {}", target.display()))?;
@@ -403,10 +530,155 @@ pub fn sync_skin_to_tenant_config(
     Ok(true)
 }
 
+/// Sync the webchat-gui setup answer `nav_links_json` into the tenant config's
+/// `nav_links` array.
+///
+/// Operators enter the array as a JSON string in the wizard
+/// (e.g. `[{"label":"Module 5","url":"https://...","external":true}]`). This
+/// function parses that string, validates each entry has non-empty `label` and
+/// `url` strings (skipping malformed entries instead of failing), and writes
+/// the resulting array to `<bundle>/assets/webchat-gui/config/tenants/<tenant>.json`.
+///
+/// An empty answer (or one that parses to an empty array) clears any existing
+/// `nav_links` so removing all entries via the wizard hides the topbar nav at
+/// runtime.
+///
+/// The webchat-gui SPA's runtime-bootstrap reads this array and renders one
+/// anchor per entry between the brand block and the locale picker.
+/// Read the persisted `nav_links` array from `<bundle>/assets/webchat-gui/
+/// config/tenants/<tenant>.json` so the setup wizard can hydrate the table
+/// on a re-run. Falls back to `default.json` when no tenant-specific file
+/// exists. Returns `None` when neither file exists or `nav_links` is absent.
+pub fn read_existing_nav_links(bundle_path: &Path, tenant: &str) -> Option<Vec<Value>> {
+    let tenants_dir = bundle_path.join("assets/webchat-gui/config/tenants");
+    let candidates = [
+        tenants_dir.join(format!("{tenant}.json")),
+        tenants_dir.join("default.json"),
+    ];
+    for path in &candidates {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let value: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(arr) = value
+            .get("nav_links")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            // Flatten nested `tooltip` object into the flat
+            // `tooltip_eyebrow`/`tooltip_title`/`tooltip_lede` columns the
+            // wizard renders. The on-disk shape matches the runtime SPA's
+            // expectations; the wizard's column shape does not, so we
+            // translate here on hydration (and back to nested on write in
+            // sanitize_nav_link_array).
+            let flattened: Vec<Value> = arr
+                .iter()
+                .map(|entry| {
+                    let mut out = entry.as_object().cloned().unwrap_or_default();
+                    if let Some(tooltip) =
+                        out.remove("tooltip").and_then(|t| t.as_object().cloned())
+                    {
+                        for (sub_key, target_key) in [
+                            ("eyebrow", "tooltip_eyebrow"),
+                            ("title", "tooltip_title"),
+                            ("lede", "tooltip_lede"),
+                        ] {
+                            if let Some(v) = tooltip.get(sub_key) {
+                                out.insert(target_key.to_string(), v.clone());
+                            }
+                        }
+                    }
+                    Value::Object(out)
+                })
+                .collect();
+            return Some(flattened);
+        }
+    }
+    None
+}
+
+pub fn sync_nav_links_to_tenant_config(
+    bundle_path: &Path,
+    tenant: &str,
+    provider_id: &str,
+    answers: &Value,
+) -> Result<bool> {
+    if !provider_id.contains("webchat-gui") {
+        return Ok(false);
+    }
+
+    let answers_obj = match answers.as_object() {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+
+    // Three answer shapes are accepted, in priority order:
+    //
+    // 1. `nav_links` as a native array — produced by the new
+    //    `kind: table` wizard. Each row is already a JSON object with
+    //    `label`/`url`/`external` keys; we just sanitise.
+    // 2. `nav_links_json` as a JSON string — legacy advanced-input answer
+    //    that pre-dates the table wizard. Parsed, then sanitised.
+    // 3. Neither present — leave the existing tenant config untouched.
+    let parsed_links: Vec<Value> =
+        if let Some(arr) = answers_obj.get("nav_links").and_then(Value::as_array) {
+            sanitize_nav_link_array(arr)
+        } else if let Some(raw) = answers_obj
+            .get("nav_links_json")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
+            if raw.is_empty() {
+                Vec::new()
+            } else {
+                let parsed: Value = serde_json::from_str(raw).with_context(|| {
+                    format!("parse nav_links_json answer (expected JSON array): {raw}")
+                })?;
+                let Some(arr) = parsed.as_array() else {
+                    anyhow::bail!("nav_links_json must be a JSON array, got: {raw}");
+                };
+                sanitize_nav_link_array(arr)
+            }
+        } else {
+            return Ok(false);
+        };
+
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
+        return Ok(false);
+    };
+
+    let raw_config = std::fs::read_to_string(&target)
+        .with_context(|| format!("read tenant config {}", target.display()))?;
+    let mut config: Value = serde_json::from_str(&raw_config)
+        .with_context(|| format!("parse tenant config {}", target.display()))?;
+
+    let obj = match config.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(false),
+    };
+
+    let next = Value::Array(parsed_links);
+    if obj.get("nav_links") == Some(&next) {
+        return Ok(false);
+    }
+
+    obj.insert("nav_links".to_string(), next);
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&target, output)
+        .with_context(|| format!("write tenant config {}", target.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_placeholder_public_base_url, resolve_public_base_url, sync_skin_to_tenant_config,
+        is_placeholder_public_base_url, resolve_or_scaffold_tenant_config, resolve_public_base_url,
+        sync_nav_links_to_tenant_config, sync_oauth_to_tenant_config, sync_skin_to_tenant_config,
         update_tenant_config,
     };
     use serde_json::{Map, Value, json};
@@ -530,12 +802,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_skin_falls_back_to_default_json_when_tenant_missing() {
+    fn sync_skin_scaffolds_tenant_json_from_default_when_missing() {
         let temp = tempfile::tempdir().unwrap();
         let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
         std::fs::create_dir_all(&tenants_dir).unwrap();
         let default_file = tenants_dir.join("default.json");
-        std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
+        std::fs::write(
+            &default_file,
+            r#"{"tenant_id":"default","legacy_skin":"_template"}"#,
+        )
+        .unwrap();
 
         let answers = json!({ "skin": "3aigent" });
         let changed =
@@ -543,9 +819,33 @@ mod tests {
                 .unwrap();
         assert!(changed);
 
-        let updated: Value =
+        // demo.json was scaffolded with skin field and remapped tenant_id
+        let demo_file = tenants_dir.join("demo.json");
+        assert!(demo_file.exists(), "demo.json must be scaffolded");
+        let demo_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&demo_file).unwrap()).unwrap();
+        assert_eq!(demo_parsed["tenant_id"].as_str(), Some("demo"));
+        assert_eq!(demo_parsed["skin"].as_str(), Some("3aigent"));
+        assert_eq!(demo_parsed["legacy_skin"].as_str(), Some("_template"));
+
+        // default.json must be left untouched — runtime depends on it as a template
+        let default_after: Value =
             serde_json::from_str(&std::fs::read_to_string(&default_file).unwrap()).unwrap();
-        assert_eq!(updated["skin"].as_str(), Some("3aigent"));
+        assert_eq!(default_after["tenant_id"].as_str(), Some("default"));
+        assert!(default_after.get("skin").is_none());
+    }
+
+    #[test]
+    fn sync_skin_returns_false_when_no_tenant_or_default_config_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+
+        let answers = json!({ "skin": "3aigent" });
+        let changed =
+            sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(!changed);
     }
 
     #[test]
@@ -561,5 +861,294 @@ mod tests {
             sync_skin_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
                 .unwrap();
         assert!(!changed, "no-op when value already matches");
+    }
+
+    #[test]
+    fn sync_nav_links_skips_non_webchat_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers = json!({ "nav_links_json": r#"[{"label":"X","url":"/x"}]"# });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-slack", &answers)
+                .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn sync_nav_links_skips_when_answer_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        std::fs::write(tenants_dir.join("demo.json"), r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({});
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(!changed, "absent answer leaves config alone");
+    }
+
+    #[test]
+    fn sync_nav_links_accepts_native_array_from_table_wizard() {
+        // The new `kind: table` wizard writes the answer as a native JSON
+        // array (not a JSON-string-as-array) under the `nav_links` key.
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({
+            "nav_links": [
+                { "label": "Help", "url": "/help", "external": false },
+                { "label": "Docs", "url": "https://docs.example", "external": true },
+                // Whitespace-only label dropped silently.
+                { "label": "  ", "url": "/skipped" }
+            ]
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().expect("nav_links array");
+        assert_eq!(links.len(), 2, "third row dropped (label whitespace)");
+        assert_eq!(links[0]["label"].as_str(), Some("Help"));
+        assert_eq!(links[0]["url"].as_str(), Some("/help"));
+        assert!(links[0].get("external").is_none(), "external=false omitted");
+        assert_eq!(links[1]["label"].as_str(), Some("Docs"));
+        assert_eq!(links[1]["external"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn sync_nav_links_writes_array_to_tenant_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({
+            "nav_links_json": r#"[
+                { "label": "Module 5", "url": "https://example.com/m5", "external": true },
+                { "label": "Help",     "url": "/help" }
+            ]"#
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().expect("nav_links array");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0]["label"].as_str(), Some("Module 5"));
+        assert_eq!(links[0]["url"].as_str(), Some("https://example.com/m5"));
+        assert_eq!(links[0]["external"].as_bool(), Some(true));
+        assert_eq!(links[1]["label"].as_str(), Some("Help"));
+        assert_eq!(links[1]["url"].as_str(), Some("/help"));
+        // external defaults to absent (not false) when omitted
+        assert!(links[1].get("external").is_none());
+    }
+
+    #[test]
+    fn sync_nav_links_drops_malformed_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo"}"#).unwrap();
+
+        // Mix of valid + bad entries: missing url, empty label, non-object.
+        let answers = json!({
+            "nav_links_json": r#"[
+                { "label": "Good", "url": "/ok" },
+                { "label": "No URL" },
+                { "label": "", "url": "/blank" },
+                "not an object",
+                { "label": "Also good", "url": "https://x" }
+            ]"#
+        });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        let links = updated["nav_links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0]["label"].as_str(), Some("Good"));
+        assert_eq!(links[1]["label"].as_str(), Some("Also good"));
+    }
+
+    #[test]
+    fn sync_nav_links_clears_existing_when_answer_is_empty_array() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(
+            &tenant_file,
+            r#"{"tenant_id":"demo","nav_links":[{"label":"Old","url":"/old"}]}"#,
+        )
+        .unwrap();
+
+        let answers = json!({ "nav_links_json": "[]" });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tenant_file).unwrap()).unwrap();
+        assert!(updated["nav_links"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_nav_links_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(
+            &tenant_file,
+            r#"{"tenant_id":"demo","nav_links":[{"label":"X","url":"/x"}]}"#,
+        )
+        .unwrap();
+
+        let answers = json!({ "nav_links_json": r#"[{"label":"X","url":"/x"}]"# });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(!changed, "no-op when content already matches");
+    }
+
+    #[test]
+    fn sync_nav_links_returns_error_on_invalid_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        std::fs::write(tenants_dir.join("demo.json"), r#"{"tenant_id":"demo"}"#).unwrap();
+
+        let answers = json!({ "nav_links_json": "not valid json" });
+        let err =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap_err();
+        assert!(err.to_string().contains("parse nav_links_json"));
+    }
+
+    #[test]
+    fn sync_nav_links_scaffolds_tenant_json_from_default_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
+
+        let answers = json!({ "nav_links_json": r#"[{"label":"Help","url":"/help"}]"# });
+        let changed =
+            sync_nav_links_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let demo_file = tenants_dir.join("demo.json");
+        assert!(demo_file.exists());
+        let demo_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&demo_file).unwrap()).unwrap();
+        assert_eq!(demo_parsed["tenant_id"].as_str(), Some("demo"));
+        assert_eq!(demo_parsed["nav_links"][0]["label"].as_str(), Some("Help"));
+
+        let default_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&default_file).unwrap()).unwrap();
+        assert!(default_parsed.get("nav_links").is_none());
+    }
+
+    #[test]
+    fn sync_oauth_scaffolds_tenant_json_from_default_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(
+            &default_file,
+            serde_json::to_string_pretty(&json!({
+                "tenant_id": "default",
+                "auth": { "providers": [] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let answers = json!({
+            "oauth_enabled": true,
+            "oauth_enable_google": true,
+            "oauth_google_client_id": "client-xyz"
+        });
+        let changed =
+            sync_oauth_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+
+        let demo_file = tenants_dir.join("demo.json");
+        assert!(demo_file.exists());
+        let demo_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&demo_file).unwrap()).unwrap();
+        assert_eq!(demo_parsed["tenant_id"].as_str(), Some("demo"));
+        let provider = demo_parsed["auth"]["providers"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|p| p["id"] == "demo-google"))
+            .expect("demo-google provider was added");
+        assert_eq!(provider["enabled"].as_bool(), Some(true));
+        assert_eq!(provider["clientId"].as_str(), Some("client-xyz"));
+
+        // default.json must not be polluted
+        let default_parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&default_file).unwrap()).unwrap();
+        let default_providers = default_parsed["auth"]["providers"].as_array().unwrap();
+        assert!(default_providers.is_empty(), "default.json must stay empty");
+    }
+
+    #[test]
+    fn resolve_or_scaffold_returns_existing_tenant_file_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, r#"{"tenant_id":"demo","skin":"existing"}"#).unwrap();
+
+        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "demo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, tenant_file);
+
+        // File contents must be untouched
+        assert_eq!(
+            std::fs::read_to_string(&tenant_file).unwrap(),
+            r#"{"tenant_id":"demo","skin":"existing"}"#
+        );
+    }
+
+    #[test]
+    fn resolve_or_scaffold_returns_none_when_neither_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "demo").unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_or_scaffold_for_default_tenant_returns_default_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
+
+        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, default_file);
     }
 }

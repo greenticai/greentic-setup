@@ -1,9 +1,10 @@
 //! Conversion from legacy `setup.yaml` (`SetupSpec`) into `qa_spec::FormSpec`.
 
+use qa_spec::spec::question::ListSpec;
 use qa_spec::spec::{FormPresentation, ProgressPolicy};
 use qa_spec::{FormSpec, QuestionSpec, QuestionType};
 
-use crate::setup_input::{SetupQuestion, SetupSpec, SetupVisibleIf};
+use crate::setup_input::{SetupQuestion, SetupSpec, SetupTableColumn, SetupVisibleIf};
 use crate::setup_to_formspec::inference::{
     capitalize, extract_default_from_help, infer_default_for_id, infer_question_properties,
     strip_domain_prefix,
@@ -50,6 +51,13 @@ pub fn setup_spec_to_form_spec(spec: &SetupSpec, provider_id: &str) -> FormSpec 
 
 /// Convert a single setup question to a FormSpec question.
 fn convert_setup_question(q: &SetupQuestion, provider_id: &str) -> QuestionSpec {
+    // Table kind handles repeating-row data (e.g. nav_links) and bridges to
+    // qa-spec's existing `QuestionType::List` + `ListSpec.fields`. Each
+    // column becomes a nested QuestionSpec the wizard prompts per row.
+    if q.kind == "table" {
+        return convert_table_question(q, provider_id);
+    }
+
     let kind = match q.kind.as_str() {
         "boolean" => QuestionType::Boolean,
         "number" => QuestionType::Number,
@@ -155,6 +163,95 @@ fn convert_setup_question(q: &SetupQuestion, provider_id: &str) -> QuestionSpec 
     }
 }
 
+/// Build the QuestionSpec for a `kind: table` question. The runtime kind is
+/// `QuestionType::List`; per-row schema lives in `list.fields`.
+fn convert_table_question(q: &SetupQuestion, _provider_id: &str) -> QuestionSpec {
+    let fields: Vec<QuestionSpec> = q.columns.iter().map(convert_table_column).collect();
+
+    let visible_if = q.visible_if.as_ref().and_then(|v| match v {
+        SetupVisibleIf::Struct { field, eq } => {
+            if let Some(eq_val) = eq {
+                Some(qa_spec::Expr::Eq {
+                    left: Box::new(qa_spec::Expr::Answer {
+                        path: field.clone(),
+                    }),
+                    right: Box::new(qa_spec::Expr::Literal {
+                        value: serde_json::Value::String(eq_val.clone()),
+                    }),
+                })
+            } else {
+                Some(qa_spec::Expr::Answer {
+                    path: field.clone(),
+                })
+            }
+        }
+        SetupVisibleIf::Expr(_) => None,
+    });
+
+    QuestionSpec {
+        id: q.name.clone(),
+        kind: QuestionType::List,
+        title: q.title.clone().unwrap_or_else(|| q.name.clone()),
+        title_i18n: None,
+        description: q.help.clone(),
+        description_i18n: None,
+        required: q.required,
+        choices: None,
+        default_value: None,
+        secret: false,
+        visible_if,
+        constraint: None,
+        list: Some(ListSpec {
+            min_items: q.min_rows.map(usize::from),
+            max_items: q.max_rows.map(usize::from),
+            fields,
+        }),
+        computed: None,
+        policy: Default::default(),
+        computed_overridable: false,
+    }
+}
+
+/// Build a per-row QuestionSpec for a single table column. Nested tables are
+/// not supported — `kind: table` on a column collapses to `string`.
+fn convert_table_column(col: &SetupTableColumn) -> QuestionSpec {
+    let kind = match col.kind.as_str() {
+        "boolean" => QuestionType::Boolean,
+        "number" => QuestionType::Number,
+        "choice" | "enum" => QuestionType::Enum,
+        _ => QuestionType::String,
+    };
+    let choices = if col.choices.is_empty() {
+        None
+    } else {
+        Some(col.choices.clone())
+    };
+    let default_value = col.default.as_ref().map(|v| match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    });
+    QuestionSpec {
+        id: col.key.clone(),
+        kind,
+        title: col.title.clone().unwrap_or_else(|| col.key.clone()),
+        title_i18n: None,
+        description: col.help.clone(),
+        description_i18n: None,
+        required: col.required,
+        choices,
+        default_value,
+        secret: false,
+        visible_if: None,
+        constraint: None,
+        list: None,
+        computed: None,
+        policy: Default::default(),
+        computed_overridable: false,
+    }
+}
+
 /// Parse a placeholder string of the form `"a | b | c"` into a list of choices.
 ///
 /// Returns `Some(choices)` only when the placeholder is *clearly* enumerating
@@ -178,7 +275,80 @@ fn parse_placeholder_choices(placeholder: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::convert_setup_question;
     use super::parse_placeholder_choices;
+    use crate::setup_input::{SetupQuestion, SetupTableColumn};
+    use qa_spec::QuestionType;
+
+    #[test]
+    fn table_kind_bridges_to_list_with_per_column_fields() {
+        let q = SetupQuestion {
+            name: "nav_links".into(),
+            kind: "table".into(),
+            title: Some("Top-menu nav links".into()),
+            help: Some("Click + Add to add a row".into()),
+            required: false,
+            min_rows: Some(0),
+            max_rows: Some(8),
+            columns: vec![
+                SetupTableColumn {
+                    key: "label".into(),
+                    title: Some("Label".into()),
+                    kind: "string".into(),
+                    required: true,
+                    placeholder: Some("Help".into()),
+                    ..Default::default()
+                },
+                SetupTableColumn {
+                    key: "url".into(),
+                    title: Some("URL".into()),
+                    kind: "string".into(),
+                    required: true,
+                    placeholder: Some("/help".into()),
+                    ..Default::default()
+                },
+                SetupTableColumn {
+                    key: "external".into(),
+                    title: Some("Open in new tab".into()),
+                    kind: "boolean".into(),
+                    required: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let spec = convert_setup_question(&q, "messaging-webchat-gui");
+        assert_eq!(spec.id, "nav_links");
+        assert_eq!(spec.kind, QuestionType::List);
+        assert_eq!(spec.title, "Top-menu nav links");
+        let list = spec.list.expect("list spec must be set for table kind");
+        assert_eq!(list.min_items, Some(0));
+        assert_eq!(list.max_items, Some(8));
+        assert_eq!(list.fields.len(), 3);
+
+        // First column: required string
+        assert_eq!(list.fields[0].id, "label");
+        assert_eq!(list.fields[0].kind, QuestionType::String);
+        assert!(list.fields[0].required);
+
+        // Third column: boolean
+        assert_eq!(list.fields[2].id, "external");
+        assert_eq!(list.fields[2].kind, QuestionType::Boolean);
+        assert!(!list.fields[2].required);
+    }
+
+    #[test]
+    fn non_table_kind_keeps_existing_string_path() {
+        let q = SetupQuestion {
+            name: "skin".into(),
+            kind: "string".into(),
+            title: Some("Skin".into()),
+            ..Default::default()
+        };
+        let spec = convert_setup_question(&q, "messaging-webchat-gui");
+        assert_eq!(spec.kind, QuestionType::String);
+        assert!(spec.list.is_none());
+    }
 
     #[test]
     fn parses_two_choices_with_spaces() {
