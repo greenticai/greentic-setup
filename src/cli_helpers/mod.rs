@@ -275,13 +275,19 @@ pub fn complete_loaded_answers_with_prompts(
     }
 
     // ── Confirm environment variable placeholders ────────────────────────────
-    let env_placeholders = collect_env_var_placeholders(&loaded);
-    if !env_placeholders.is_empty() {
-        let resolved_env_vars = confirm_env_var_placeholders(&env_placeholders)?;
+    // Skip in non-interactive mode: leave any unresolved `${VAR}` placeholders
+    // in place. `answer_satisfies_question` accepts placeholder strings as
+    // valid runtime-resolved values, and `ensure_required_setup_answers_present`
+    // will fail-fast downstream if anything truly required is missing.
+    if !non_interactive {
+        let env_placeholders = collect_env_var_placeholders(&loaded);
+        if !env_placeholders.is_empty() {
+            let resolved_env_vars = confirm_env_var_placeholders(&env_placeholders)?;
 
-        // Apply resolved env vars to the loaded answers
-        if !resolved_env_vars.is_empty() {
-            apply_resolved_env_vars(&mut loaded, &resolved_env_vars);
+            // Apply resolved env vars to the loaded answers
+            if !resolved_env_vars.is_empty() {
+                apply_resolved_env_vars(&mut loaded, &resolved_env_vars);
+            }
         }
     }
 
@@ -325,11 +331,19 @@ pub fn complete_loaded_answers_with_prompts(
     };
 
     // Prompt for shared questions (like public_base_url) once at the start
-    // Pass existing values so already-answered questions are skipped
-    let shared_answers = if let Some(ref result) = shared_result {
-        if !result.shared_questions.is_empty() {
-            let existing = serde_json::Value::Object(existing_shared_values);
-            wizard::prompt_shared_questions(result, advanced, &existing)?
+    // Pass existing values so already-answered questions are skipped.
+    // Skip entirely in non-interactive mode: the loaded answers file is
+    // expected to provide everything required, and the engine's
+    // `ensure_required_setup_answers_present()` will fail-fast downstream
+    // if anything required is missing.
+    let shared_answers = if !non_interactive {
+        if let Some(ref result) = shared_result {
+            if !result.shared_questions.is_empty() {
+                let existing = serde_json::Value::Object(existing_shared_values);
+                wizard::prompt_shared_questions(result, advanced, &existing)?
+            } else {
+                serde_json::Value::Object(serde_json::Map::new())
+            }
         } else {
             serde_json::Value::Object(serde_json::Map::new())
         }
@@ -345,6 +359,14 @@ pub fn complete_loaded_answers_with_prompts(
             .get(provider_id)
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        // In non-interactive mode, never prompt. Preserve whatever was loaded
+        // from the answers file as-is; downstream validation fails fast on
+        // missing required fields.
+        if non_interactive {
+            loaded.setup_answers.insert(provider_id.clone(), existing);
+            continue;
+        }
 
         // Merge shared answers with existing answers.
         // Shared answers (user just entered) take precedence over existing values.
