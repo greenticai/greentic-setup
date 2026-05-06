@@ -1,6 +1,13 @@
+bin = [
+    { name = "greentic-setup", path = "src/bin/greentic_setup.rs" },
+]
+bench = [
+    { name = "perf", harness = false },
+]
+
 [package]
 name = "greentic-setup"
-version = "0.6.0-dev.1"
+version = "1.1.0-dev.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -8,53 +15,124 @@ description = "End-to-end bundle setup engine for the Greentic platform — pack
 repository = "https://github.com/greenticai/greentic-setup"
 homepage = "https://github.com/greenticai/greentic-setup"
 readme = "README.md"
-keywords = ["greentic", "setup", "bundle", "qa", "secrets"]
-categories = ["command-line-utilities", "config"]
+keywords = [
+    "greentic",
+    "setup",
+    "bundle",
+    "qa",
+    "secrets",
+]
+categories = [
+    "command-line-utilities",
+    "config",
+]
 
 [features]
-default = ["oci", "squashfs", "ui"]
-ui = ["axum", "open"]
-oci = ["greentic-distributor-client"]
-squashfs = ["backhand"]
+default = [
+    "oci",
+    "squashfs",
+    "ui",
+]
+ui = [
+    "axum",
+    "open",
+]
+oci = [
+    "greentic-distributor-client",
+]
+squashfs = [
+    "backhand",
+]
 
 [dependencies]
 aes-gcm-siv = "0.11"
 anyhow = "1"
-backhand = { version = "0.25", optional = true }
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
-greentic-distributor-client = { version = "0.5", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
-greentic-i18n = "0.5"
-greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
-greentic-types = { version = "0.5", features = ["serde"] }
+greentic-i18n = ">=1.1.0-dev, <1.2.0-0"
 hmac = "0.13"
-qa-spec = "0.5"
+qa-spec = ">=1.1.0-dev, <1.2.0-0"
 regex = "1"
 dialoguer = "0.12"
 rpassword = "7"
 rand = "0.10"
-serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"
 serde_json = "1"
-serde_yaml_bw = { package = "serde_yaml_gtc", version = "2.5.2" }
 sha2 = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
-axum = { version = "0.8", optional = true }
-open = { version = "5", optional = true }
 tar = "0.4"
-ureq = { version = "3", features = ["json"] }
 tracing = "0.1"
 url = "2"
-zip = { version = "8", default-features = false, features = ["deflate"] }
 
-[[bin]]
-name = "greentic-setup"
-path = "src/bin/greentic_setup.rs"
+[dependencies.backhand]
+version = "0.25"
+optional = true
+
+[dependencies.clap]
+version = "4"
+features = [
+    "derive",
+]
+
+[dependencies.greentic-distributor-client]
+version = ">=1.1.0-dev, <1.2.0-0"
+default-features = false
+features = [
+    "dist-client",
+    "pack-fetch",
+]
+optional = true
+
+[dependencies.greentic-secrets-lib]
+version = ">=1.1.0-dev, <1.2.0-0"
+features = [
+    "providers-dev",
+]
+
+[dependencies.greentic-types]
+version = ">=1.1.0-dev, <1.2.0-0"
+features = [
+    "serde",
+]
+
+[dependencies.serde]
+version = "1"
+features = [
+    "derive",
+]
+
+[dependencies.serde_yaml_bw]
+package = "serde_yaml_gtc"
+version = "2.5.2"
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "net",
+]
+
+[dependencies.axum]
+version = "0.8"
+optional = true
+
+[dependencies.open]
+version = "5"
+optional = true
+
+[dependencies.ureq]
+version = "3"
+features = [
+    "json",
+]
+
+[dependencies.zip]
+version = "8"
+default-features = false
+features = [
+    "deflate",
+]
 
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.8"
-
-[[bench]]
-name = "perf"
-harness = false
