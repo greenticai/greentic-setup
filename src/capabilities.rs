@@ -450,4 +450,213 @@ mod tests {
         let result = find_replacement_pack("test.gtpack", &bundle, "messaging");
         assert!(result.is_none());
     }
+
+    #[test]
+    fn find_replacement_from_messaging_providers_build_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let project_root = root.path().join("workspace");
+        let bundle = project_root.join("bundle");
+        std::fs::create_dir_all(bundle.join("providers").join("messaging")).unwrap();
+        write_test_gtpack(
+            &bundle
+                .join("providers")
+                .join("messaging")
+                .join("messaging-test.gtpack"),
+            false,
+        );
+
+        // greentic-messaging-providers/target/packs at workspace root
+        let build_dir = project_root
+            .join("greentic-messaging-providers")
+            .join("target")
+            .join("packs");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        write_test_gtpack(&build_dir.join("messaging-test.gtpack"), true);
+
+        let replacement = find_replacement_pack("messaging-test.gtpack", &bundle, "messaging")
+            .expect("replacement should be found in build output");
+        assert!(replacement.ends_with("messaging-test.gtpack"));
+    }
+
+    #[test]
+    fn validate_and_upgrade_packs_reports_zero_for_empty_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = validate_and_upgrade_packs(dir.path()).unwrap();
+        assert_eq!(report.checked, 0);
+        assert!(report.upgraded.is_empty());
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn validate_and_upgrade_packs_skips_packs_with_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = dir.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&providers).unwrap();
+        write_test_gtpack(&providers.join("good.gtpack"), true);
+
+        let report = validate_and_upgrade_packs(dir.path()).unwrap();
+        assert_eq!(report.checked, 1);
+        assert!(report.upgraded.is_empty());
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn validate_and_upgrade_packs_warns_when_no_replacement_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = dir.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&providers).unwrap();
+        write_test_gtpack(&providers.join("legacy.gtpack"), false);
+
+        let report = validate_and_upgrade_packs(dir.path()).unwrap();
+        assert_eq!(report.checked, 1);
+        assert!(report.upgraded.is_empty());
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].message.contains("legacy.gtpack"));
+    }
+
+    #[test]
+    fn validate_and_upgrade_packs_upgrades_from_sibling_bundle() {
+        let root = tempfile::tempdir().unwrap();
+
+        // Bundle A: legacy pack without capabilities
+        let bundle_a = root.path().join("bundle-a");
+        let providers_a = bundle_a.join("providers").join("messaging");
+        std::fs::create_dir_all(&providers_a).unwrap();
+        let pack_a = providers_a.join("messaging-test.gtpack");
+        write_test_gtpack(&pack_a, false);
+
+        // Bundle B: same pack name with capabilities
+        let bundle_b = root.path().join("bundle-b");
+        let providers_b = bundle_b.join("providers").join("messaging");
+        std::fs::create_dir_all(&providers_b).unwrap();
+        write_test_gtpack(&providers_b.join("messaging-test.gtpack"), true);
+
+        let report = validate_and_upgrade_packs(&bundle_a).unwrap();
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.upgraded.len(), 1);
+        assert!(report.warnings.is_empty());
+        // Backup file was written next to the original pack.
+        assert!(pack_a.with_extension("gtpack.bak").exists());
+        // Original pack now has capabilities.
+        assert!(has_capabilities_extension(&pack_a));
+    }
+
+    /// Write a gtpack with explicit `capabilities` and `dependencies` arrays.
+    fn write_pack_with_capabilities_and_deps(
+        path: &Path,
+        pack_id: &str,
+        capabilities: &[&str],
+        dependencies: &[(&str, &[&str])],
+    ) {
+        let mut map = BTreeMap::new();
+        map.insert(
+            CV::Text("schema_version".into()),
+            CV::Text("pack-v1".into()),
+        );
+        map.insert(CV::Text("pack_id".into()), CV::Text(pack_id.into()));
+        map.insert(CV::Text("version".into()), CV::Text("0.1.0".into()));
+        map.insert(CV::Text("kind".into()), CV::Text("provider".into()));
+
+        let cap_array: Vec<CV> = capabilities
+            .iter()
+            .map(|name| {
+                let mut cap = BTreeMap::new();
+                cap.insert(CV::Text("name".into()), CV::Text((*name).into()));
+                CV::Map(cap)
+            })
+            .collect();
+        map.insert(CV::Text("capabilities".into()), CV::Array(cap_array));
+
+        let dep_array: Vec<CV> = dependencies
+            .iter()
+            .map(|(dep_pack_id, required)| {
+                let mut dep = BTreeMap::new();
+                dep.insert(CV::Text("pack_id".into()), CV::Text((*dep_pack_id).into()));
+                dep.insert(
+                    CV::Text("required_capabilities".into()),
+                    CV::Array(
+                        required
+                            .iter()
+                            .map(|name| CV::Text((*name).into()))
+                            .collect(),
+                    ),
+                );
+                CV::Map(dep)
+            })
+            .collect();
+        map.insert(CV::Text("dependencies".into()), CV::Array(dep_array));
+
+        let bytes = serde_cbor::to_vec(&CV::Map(map)).expect("encode cbor");
+        let file = File::create(path).expect("create file");
+        let mut zip = ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start file");
+        zip.write_all(&bytes).expect("write manifest");
+        zip.finish().expect("finish zip");
+    }
+
+    #[test]
+    fn validate_dependency_capabilities_marks_satisfied_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = dir.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&providers).unwrap();
+
+        // Provider A offers `cap.A`. Provider B requires `cap.A` (satisfied)
+        // and `cap.MISSING` (not provided by anyone).
+        write_pack_with_capabilities_and_deps(
+            &providers.join("provider-a.gtpack"),
+            "provider-a",
+            &["cap.A"],
+            &[],
+        );
+        write_pack_with_capabilities_and_deps(
+            &providers.join("provider-b.gtpack"),
+            "provider-b",
+            &[],
+            &[("provider-z", &["cap.A", "cap.MISSING"])],
+        );
+
+        let report = validate_dependency_capabilities(dir.path()).unwrap();
+        assert!(
+            report
+                .satisfied
+                .iter()
+                .any(|s| s.capability == "cap.A" && s.provided_by == "provider-a")
+        );
+        assert!(report.missing.iter().any(|m| m.capability == "cap.MISSING"));
+    }
+
+    #[test]
+    fn validate_dependency_capabilities_skips_dependency_present_in_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = dir.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&providers).unwrap();
+
+        // Pack X declares a dependency on pack-id "provider-y" — and provider-y
+        // is present in the bundle. The dep should be skipped entirely.
+        write_pack_with_capabilities_and_deps(
+            &providers.join("provider-x.gtpack"),
+            "provider-x",
+            &[],
+            &[("provider-y", &["whatever.cap"])],
+        );
+        write_pack_with_capabilities_and_deps(
+            &providers.join("provider-y.gtpack"),
+            "provider-y",
+            &[],
+            &[],
+        );
+
+        let report = validate_dependency_capabilities(dir.path()).unwrap();
+        assert!(report.satisfied.is_empty());
+        assert!(report.missing.is_empty());
+    }
+
+    #[test]
+    fn validate_dependency_capabilities_returns_empty_for_empty_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = validate_dependency_capabilities(dir.path()).unwrap();
+        assert!(report.satisfied.is_empty());
+        assert!(report.missing.is_empty());
+    }
 }
