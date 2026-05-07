@@ -355,6 +355,13 @@ async fn resolve_distributor_reference_async(reference: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn parse_local_path() {
@@ -411,6 +418,21 @@ mod tests {
     }
 
     #[test]
+    fn percent_decode_preserves_invalid_sequences() {
+        let decoded = percent_decode("path%2G%tail%");
+        assert_eq!(decoded, "path%2G%tail%");
+    }
+
+    #[test]
+    fn as_str_preserves_local_and_file_uri_sources() {
+        let local = BundleSource::parse("./bundle").unwrap();
+        assert_eq!(local.as_str(), "./bundle");
+
+        let file_uri = BundleSource::parse("file:///tmp/test%20bundle").unwrap();
+        assert_eq!(file_uri.as_str(), "file:///tmp/test bundle");
+    }
+
+    #[test]
     fn is_local_checks() {
         let local = BundleSource::parse("./bundle").unwrap();
         assert!(local.is_local());
@@ -441,5 +463,128 @@ mod tests {
             assert_eq!(parsed.as_str(), raw);
             assert!(parsed.is_remote());
         }
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn registry_basic_auth_uses_generic_oci_credentials_first() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("OCI_USERNAME", "oci-user");
+            std::env::set_var("OCI_PASSWORD", "oci-pass");
+            std::env::remove_var("GHCR_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_USER");
+            std::env::remove_var("GITHUB_ACTOR");
+            std::env::remove_var("USER");
+        }
+
+        let creds = registry_basic_auth_for_reference("ghcr.io/greentic/example-pack:latest");
+        assert_eq!(
+            creds,
+            Some(("oci-user".to_string(), "oci-pass".to_string()))
+        );
+
+        unsafe {
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+        }
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn registry_basic_auth_builds_ghcr_credentials_from_github_env() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+            std::env::set_var("GITHUB_TOKEN", "gh-token");
+            std::env::set_var("GITHUB_ACTOR", "octocat");
+            std::env::remove_var("GHCR_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_USER");
+            std::env::remove_var("USER");
+        }
+
+        let creds = registry_basic_auth_for_reference("ghcr.io/greentic/example-pack:latest");
+        assert_eq!(creds, Some(("octocat".to_string(), "gh-token".to_string())));
+
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GITHUB_ACTOR");
+        }
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn registry_basic_auth_returns_none_without_matching_env() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+            std::env::remove_var("GHCR_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_USER");
+            std::env::remove_var("GITHUB_ACTOR");
+            std::env::remove_var("USER");
+        }
+
+        assert_eq!(
+            registry_basic_auth_for_reference("example.com/greentic/example-pack:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_local_dir_returns_relative_path_when_it_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let relative = bundle.strip_prefix(std::env::current_dir().unwrap()).ok();
+
+        if let Some(relative) = relative {
+            let source = BundleSource::LocalDir(relative.to_path_buf());
+            assert_eq!(source.resolve().unwrap(), relative);
+            return;
+        }
+
+        let source = BundleSource::LocalDir(bundle.clone());
+        assert_eq!(source.resolve().unwrap(), bundle);
+    }
+
+    #[test]
+    fn resolve_file_uri_returns_existing_absolute_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+
+        let source = BundleSource::FileUri(bundle.clone());
+        assert_eq!(source.resolve().unwrap(), bundle);
+    }
+
+    #[tokio::test]
+    async fn resolve_async_supports_local_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+
+        let local = BundleSource::LocalDir(bundle.clone());
+        assert_eq!(local.resolve_async().await.unwrap(), bundle);
+
+        let file_uri = BundleSource::FileUri(bundle.clone());
+        assert_eq!(file_uri.resolve_async().await.unwrap(), bundle);
+    }
+
+    #[test]
+    fn resolve_missing_local_path_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let source = BundleSource::LocalDir(missing.clone());
+
+        let error = source.resolve().unwrap_err().to_string();
+        assert!(error.contains("bundle path does not exist"));
+        assert!(error.contains(&missing.display().to_string()));
     }
 }
