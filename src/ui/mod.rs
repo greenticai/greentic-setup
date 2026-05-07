@@ -179,6 +179,7 @@ struct ScopeResponse {
     team: Option<String>,
     env: String,
     detected_tenant: Option<String>,
+    cloud_deploy: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -355,12 +356,32 @@ async fn get_scope(State(state): State<std::sync::Arc<UiState>>) -> Json<ScopeRe
         cli_tenant.clone()
     };
 
+    let cloud_deploy = prefill_has_cloud_deployment_targets(state.prefill_answers.as_ref());
+
     Json(ScopeResponse {
         tenant: effective_tenant,
         team: state.team.clone(),
         env: cli_env.clone(),
         detected_tenant,
+        cloud_deploy,
     })
+}
+
+fn prefill_has_cloud_deployment_targets(prefill: Option<&JsonMap<String, Value>>) -> bool {
+    prefill
+        .and_then(|answers| answers.get("platform_setup"))
+        .and_then(|value| value.as_object())
+        .and_then(|platform_setup| platform_setup.get("deployment_targets"))
+        .and_then(|value| value.as_array())
+        .map(|targets| {
+            targets.iter().any(|target| {
+                target
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| matches!(target, "aws" | "gcp" | "azure"))
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Detect tenant from the bundle's `tenants/` directory.
@@ -1273,7 +1294,7 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 
 #[cfg(test)]
 mod tests {
-    use super::persist_ui_draft;
+    use super::{persist_ui_draft, prefill_has_cloud_deployment_targets};
     use crate::secrets::open_dev_store;
     use greentic_secrets_lib::SecretsStore;
     use serde_json::{Map as JsonMap, Value, json};
@@ -1348,5 +1369,30 @@ mod tests {
             String::from_utf8(store.get(&alias_uri).await.expect("alias")).expect("alias utf8");
         assert_eq!(base_value, "test-weather-key");
         assert_eq!(alias_value, "test-weather-key");
+    }
+
+    #[test]
+    fn detects_cloud_deploy_targets_in_prefill_answers() {
+        let cloud_prefill = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "platform_setup": {
+                "deployment_targets": [
+                    { "target": "runtime" },
+                    { "target": "aws" }
+                ]
+            }
+        }))
+        .expect("cloud prefill");
+        assert!(prefill_has_cloud_deployment_targets(Some(&cloud_prefill)));
+
+        let local_prefill = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "platform_setup": {
+                "deployment_targets": [
+                    { "target": "runtime" },
+                    { "target": "single-vm" }
+                ]
+            }
+        }))
+        .expect("local prefill");
+        assert!(!prefill_has_cloud_deployment_targets(Some(&local_prefill)));
     }
 }

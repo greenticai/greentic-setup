@@ -86,7 +86,7 @@
       tenant: tenant || "demo",
       env: env || "dev",
       team: team || "",
-      tunnel: "cloudflared",
+      tunnel: state.cloudDeploy ? "off" : "cloudflared",
       answers: answers,
       sharedAnswers: {},
       providersDone: {},
@@ -103,6 +103,7 @@
     providerForms: {},
     bundlePath: "",
     detectedTenant: null,
+    cloudDeploy: false,
     // multi-scope
     scopes: [],
     currentScopeIdx: -1,
@@ -231,6 +232,7 @@
         var existingData = results[0];
         var scopeData = results[1];
         state.detectedTenant = scopeData.detected_tenant || null;
+        state.cloudDeploy = !!scopeData.cloud_deploy;
 
         var existingScopes = existingData.scopes || [];
         if (existingScopes.length > 0) {
@@ -558,7 +560,8 @@
       scope.tenant = tenant;
       scope.env = document.getElementById("f-scope-env").value;
       scope.team = document.getElementById("f-scope-team").value.trim();
-      state.phase = "tunnel";
+      scope.tunnel = state.cloudDeploy ? "off" : scope.tunnel;
+      state.phase = state.cloudDeploy ? "providers" : "tunnel";
       render();
     });
   }
@@ -704,7 +707,7 @@
     });
 
     document.getElementById("btn-back-scope").addEventListener("click", function () {
-      state.phase = "tunnel";
+      state.phase = state.cloudDeploy ? "scope-edit" : "tunnel";
       render();
     });
   }
