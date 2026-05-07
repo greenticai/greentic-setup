@@ -353,12 +353,13 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         if let Some(tunnel) = loaded.platform_setup.tunnel.as_ref() {
             let _ = greentic_setup::platform_setup::persist_tunnel_artifact(&bundle_dir, tunnel);
         }
-        (
-            Some(loaded.setup_answers),
-            loaded.tenant,
-            loaded.team,
-            loaded.env,
-        )
+        let mut prefill = loaded.setup_answers;
+        prefill.insert(
+            "platform_setup".to_string(),
+            serde_json::to_value(&loaded.platform_setup)
+                .context("failed to serialize platform setup answers for UI prefill")?,
+        );
+        (Some(prefill), loaded.tenant, loaded.team, loaded.env)
     } else {
         (None, None, None, None)
     };
