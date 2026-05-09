@@ -16,6 +16,7 @@ pub mod cli_i18n;
 pub mod config_envelope;
 pub mod deployment_targets;
 pub mod discovery;
+pub mod doctor;
 pub mod engine;
 pub mod flow;
 pub mod gtbundle;

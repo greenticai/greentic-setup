@@ -86,9 +86,40 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Diagnose bundle setup inputs and generated setup outputs
+    Doctor(DoctorArgs),
     /// Bundle lifecycle management (advanced)
     #[command(subcommand)]
     Bundle(BundleCommand),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DoctorArgs {
+    /// Bundle path (.gtbundle file or directory)
+    #[arg(value_name = "BUNDLE")]
+    pub bundle: PathBuf,
+    /// Emit stable machine-readable JSON
+    #[arg(long = "json")]
+    pub json: bool,
+    /// Treat warnings as command failures
+    #[arg(long = "strict")]
+    pub strict: bool,
+    /// Include fix hints in human-readable output
+    #[arg(long = "fix-hints")]
+    pub fix_hints: bool,
+    /// Limit checks to one stage
+    #[arg(long = "stage", value_enum)]
+    pub stage: Option<DoctorStageArg>,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorStageArg {
+    Setup,
+    Cache,
+    Locks,
+    Answers,
+    Runtime,
+    Routes,
 }
 
 #[derive(Subcommand, Debug, Clone)]

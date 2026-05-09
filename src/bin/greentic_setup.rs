@@ -68,6 +68,7 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Some(Command::Doctor(args)) => cli_commands::doctor(args, i18n),
         Some(Command::Bundle(cmd)) => match cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
             BundleCommand::Add(args) => cli_commands::add(args, i18n),
@@ -452,6 +453,30 @@ mod tests {
                 );
             }
             other => panic!("expected bundle setup subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_parses_as_top_level_subcommand() {
+        let cli = Cli::parse_from([
+            "greentic-setup",
+            "doctor",
+            "./demo",
+            "--json",
+            "--stage",
+            "locks",
+        ]);
+
+        match cli.command {
+            Some(Command::Doctor(args)) => {
+                assert_eq!(args.bundle, std::path::PathBuf::from("./demo"));
+                assert!(args.json);
+                assert_eq!(
+                    args.stage,
+                    Some(greentic_setup::cli_args::DoctorStageArg::Locks)
+                );
+            }
+            other => panic!("expected doctor subcommand, got {other:?}"),
         }
     }
 }
