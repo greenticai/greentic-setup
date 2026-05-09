@@ -289,7 +289,7 @@ impl DoctorContext {
     fn check_bundle_reference_path(&mut self, reference: &str, key: &str, manifest_path: &Path) {
         if reference.contains('\\')
             || reference.contains("..")
-            || Path::new(reference).is_absolute()
+            || !is_remote_reference(reference) && Path::new(reference).is_absolute()
         {
             self.push(
                 "setup.bundle_manifest.reference_path",
@@ -304,7 +304,10 @@ impl DoctorContext {
             .file(manifest_path.display().to_string())
             .finish();
         }
-        if reference.contains(":latest") || reference.ends_with("@latest") {
+        if reference.contains(":latest")
+            || reference.ends_with("@latest")
+            || reference.contains("/latest/")
+        {
             self.push(
                 "setup.bundle_manifest.latest_ref",
                 DiagnosticSeverity::Warn,
@@ -315,6 +318,26 @@ impl DoctorContext {
             .actual(reference.to_string())
             .file(manifest_path.display().to_string())
             .finish();
+        }
+        if is_remote_reference(reference) {
+            if materialized_pack_candidates(&self.bundle, reference)
+                .iter()
+                .any(|path| path.exists())
+            {
+                return;
+            }
+            self.push(
+                "setup.bundle_manifest.remote_materialized",
+                DiagnosticSeverity::Warn,
+                "setup",
+                "bundle manifest uses a remote pack reference but no matching local pack artifact was found",
+            )
+            .expected("resolved .gtpack copied into packs/ or providers/<domain>/")
+            .actual(reference.to_string())
+            .fix_hint("rerun setup or resolve the remote pack before starting the bundle")
+            .file(manifest_path.display().to_string())
+            .finish();
+            return;
         }
         let path = self.bundle.join(reference);
         if !path.exists() {
@@ -500,8 +523,15 @@ impl DoctorContext {
                         }
                     }
                 }
-                Some(None) => self
-                    .push(
+                Some(None) => {
+                    if is_stable_reference(reference)
+                        && materialized_pack_candidates(&self.bundle, reference)
+                            .iter()
+                            .any(|path| path.exists())
+                    {
+                        continue;
+                    }
+                    self.push(
                         "setup.lock.digest_present",
                         DiagnosticSeverity::Warn,
                         "lock",
@@ -510,7 +540,8 @@ impl DoctorContext {
                     .file(lock_path.display().to_string())
                     .pack(reference.clone())
                     .fix_hint("rerun setup with a resolver that records content digests")
-                    .finish(),
+                    .finish();
+                }
                 None => self
                     .push(
                         "setup.lock.reference_present",
@@ -590,10 +621,19 @@ impl DoctorContext {
             };
             if let Some(spec) = form_spec {
                 if let Some(answer_map) = answers.as_object() {
+                    let tunnel_supplies_public_base_url =
+                        tunnel_supplies_public_base_url(&self.bundle);
                     for question in spec.questions.iter().filter(|q| q.required) {
+                        if question.id == "public_base_url" && tunnel_supplies_public_base_url {
+                            continue;
+                        }
                         let missing = answer_map
                             .get(&question.id)
-                            .is_none_or(|value| value.is_null() || value.as_str() == Some(""));
+                            .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+                            && question
+                                .default_value
+                                .as_ref()
+                                .is_none_or(|value| value.trim().is_empty());
                         if missing {
                             self.push(
                                 "setup.answers.required",
@@ -737,6 +777,9 @@ impl DoctorContext {
 
     fn check_resolved_manifests(&mut self) {
         for (tenant, team, gmap) in discover_gmap_targets(&self.bundle) {
+            if is_forbidden_only_gmap(&gmap) {
+                continue;
+            }
             let filename = bundle::resolved_manifest_filename(&tenant, team.as_deref());
             let path = self.bundle.join("resolved").join(filename);
             if !path.exists() {
@@ -904,6 +947,72 @@ fn lock_reference_map(lock: &JsonValue) -> BTreeMap<String, Option<String>> {
         }
     }
     refs
+}
+
+fn is_remote_reference(reference: &str) -> bool {
+    reference.starts_with("http://")
+        || reference.starts_with("https://")
+        || reference.starts_with("oci://")
+}
+
+fn is_stable_reference(reference: &str) -> bool {
+    reference.ends_with(":stable")
+}
+
+fn materialized_pack_candidates(bundle: &Path, reference: &str) -> Vec<PathBuf> {
+    if reference.starts_with("oci://") {
+        let Some(pack_id) = reference
+            .rsplit('/')
+            .next()
+            .and_then(|value| value.split(':').next())
+            .filter(|value| !value.is_empty())
+        else {
+            return Vec::new();
+        };
+        let filename = format!("{pack_id}.gtpack");
+        return vec![
+            bundle.join("packs").join(&filename),
+            bundle
+                .join("providers")
+                .join(crate::engine::domain_from_provider_id(pack_id))
+                .join(&filename),
+        ];
+    }
+
+    let Some(filename) = reference
+        .rsplit('/')
+        .next()
+        .filter(|value| value.ends_with(".gtpack"))
+    else {
+        return Vec::new();
+    };
+    vec![
+        bundle.join("packs").join(filename),
+        bundle.join("providers").join("messaging").join(filename),
+        bundle.join("providers").join("events").join(filename),
+        bundle.join("providers").join("oauth").join(filename),
+        bundle.join("providers").join("secrets").join(filename),
+        bundle.join("providers").join("state").join(filename),
+    ]
+}
+
+fn tunnel_supplies_public_base_url(bundle: &Path) -> bool {
+    platform_setup::load_tunnel_artifact(bundle)
+        .ok()
+        .flatten()
+        .and_then(|answers| answers.mode)
+        .is_some_and(|mode| matches!(mode.as_str(), "cloudflared" | "ngrok"))
+}
+
+fn is_forbidden_only_gmap(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|raw| {
+            raw.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .all(|line| line == "_ = forbidden")
+        })
+        .unwrap_or(false)
 }
 
 fn yaml_get<'a>(map: &'a serde_yaml_bw::Mapping, key: &str) -> Option<&'a serde_yaml_bw::Value> {

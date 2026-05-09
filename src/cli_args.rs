@@ -90,7 +90,7 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Bundle lifecycle management (advanced)
     #[command(subcommand)]
-    Bundle(BundleCommand),
+    Bundle(Box<BundleCommand>),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -107,6 +107,9 @@ pub struct DoctorArgs {
     /// Include fix hints in human-readable output
     #[arg(long = "fix-hints")]
     pub fix_hints: bool,
+    /// Show informational diagnostics in human-readable output
+    #[arg(long = "show-info")]
+    pub show_info: bool,
     /// Limit checks to one stage
     #[arg(long = "stage", value_enum)]
     pub stage: Option<DoctorStageArg>,

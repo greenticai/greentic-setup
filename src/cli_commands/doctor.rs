@@ -20,7 +20,7 @@ pub fn doctor(args: DoctorArgs, _i18n: &CliI18n) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_human_report(&report, args.fix_hints);
+        print_human_report(&report, args.fix_hints, args.show_info);
     }
 
     if report.error_count > 0 || args.strict && report.warn_count > 0 {
@@ -29,7 +29,7 @@ pub fn doctor(args: DoctorArgs, _i18n: &CliI18n) -> Result<()> {
     Ok(())
 }
 
-fn print_human_report(report: &crate::doctor::DoctorReport, fix_hints: bool) {
+fn print_human_report(report: &crate::doctor::DoctorReport, fix_hints: bool, show_info: bool) {
     println!("greentic-setup doctor");
     println!("bundle: {}", report.bundle);
     println!(
@@ -39,6 +39,9 @@ fn print_human_report(report: &crate::doctor::DoctorReport, fix_hints: bool) {
     println!();
 
     for diagnostic in &report.diagnostics {
+        if diagnostic.severity == DiagnosticSeverity::Info && !show_info {
+            continue;
+        }
         let marker = match diagnostic.severity {
             DiagnosticSeverity::Error => "ERROR",
             DiagnosticSeverity::Warn => "WARN",
