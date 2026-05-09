@@ -1074,6 +1074,21 @@ mod tests {
     use super::*;
     use crate::bundle;
 
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn ids(report: &DoctorReport) -> BTreeSet<&str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.check_id.as_str())
+            .collect()
+    }
+
     #[test]
     fn missing_bundle_reports_error() {
         let report = run_doctor(Path::new("/definitely/missing/greentic-bundle"), None);
@@ -1095,5 +1110,209 @@ mod tests {
                 .iter()
                 .any(|d| d.check_id == "setup.bundle.marker")
         );
+    }
+
+    #[test]
+    fn file_and_unmarked_directory_are_rejected_before_stage_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("bundle.gtbundle");
+        write(&file, "not a directory");
+        let report = run_doctor(&file, Some(DoctorStage::Cache));
+        assert_eq!(report.status, "error");
+        assert!(ids(&report).contains("setup.bundle.directory"));
+
+        let dir = temp.path().join("plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = run_doctor(&dir, Some(DoctorStage::Cache));
+        assert!(ids(&report).contains("setup.bundle.marker"));
+        assert_eq!(report.error_count, 1);
+        assert_eq!(report.warn_count, 0);
+    }
+
+    #[test]
+    fn setup_stage_reports_manifest_parse_schema_and_reference_issues() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(
+            &root.join(BUNDLE_WORKSPACE_MARKER),
+            "app_packs:\n  - ../bad.gtpack\n",
+        );
+        let report = run_doctor(&root, Some(DoctorStage::Setup));
+        let check_ids = ids(&report);
+        assert!(check_ids.contains("setup.bundle_manifest.schema_version"));
+        assert!(check_ids.contains("setup.bundle_manifest.reference_path"));
+        assert!(check_ids.contains("setup.bundle_manifest.reference_exists"));
+        assert!(check_ids.contains("setup.pack_discovery.empty"));
+
+        write(&root.join(BUNDLE_WORKSPACE_MARKER), ":\n");
+        let report = run_doctor(&root, Some(DoctorStage::Setup));
+        assert!(ids(&report).contains("setup.bundle_manifest.parse"));
+
+        write(&root.join(BUNDLE_WORKSPACE_MARKER), "- not-an-object\n");
+        let report = run_doctor(&root, Some(DoctorStage::Setup));
+        assert!(ids(&report).contains("setup.bundle_manifest.schema"));
+    }
+
+    #[test]
+    fn setup_stage_reports_remote_latest_registry_and_missing_materialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(
+            &root.join(BUNDLE_WORKSPACE_MARKER),
+            r#"
+schema_version: 1
+app_packs:
+  - oci://example.com/apps/chat:latest
+"#,
+        );
+        write(&root.join("providers/providers.json"), "{");
+
+        let report = run_doctor(&root, Some(DoctorStage::Setup));
+        let check_ids = ids(&report);
+        assert!(check_ids.contains("setup.bundle_manifest.latest_ref"));
+        assert!(check_ids.contains("setup.bundle_manifest.remote_materialized"));
+        assert!(check_ids.contains("setup.provider_registry.parse"));
+    }
+
+    #[test]
+    fn lock_stage_reports_parse_format_digest_missing_and_stale_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(
+            &root.join(BUNDLE_WORKSPACE_MARKER),
+            "schema_version: 1\napp_packs:\n  - packs/app.gtpack\n",
+        );
+        let report = run_doctor(&root, Some(DoctorStage::Locks));
+        assert!(ids(&report).contains("setup.lock.present"));
+
+        write(&root.join(BUNDLE_LOCK_FILE), "{");
+        let report = run_doctor(&root, Some(DoctorStage::Locks));
+        assert!(ids(&report).contains("setup.lock.parse"));
+
+        write(
+            &root.join(BUNDLE_LOCK_FILE),
+            r#"{
+  "build_format_version": "unexpected",
+  "app_packs": [
+    {"reference": "packs/app.gtpack"},
+    {"reference": "packs/stale.gtpack", "digest": "sha256:stale"}
+  ]
+}"#,
+        );
+        let report = run_doctor(&root, Some(DoctorStage::Locks));
+        let check_ids = ids(&report);
+        assert!(check_ids.contains("setup.lock.format_version"));
+        assert!(check_ids.contains("setup.lock.digest_present"));
+        assert!(check_ids.contains("setup.lock.stale_reference"));
+    }
+
+    #[test]
+    fn lock_stage_reports_digest_mismatch_and_reference_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(
+            &root.join(BUNDLE_WORKSPACE_MARKER),
+            "schema_version: 1\napp_packs:\n  - packs/app.gtpack\n  - packs/missing.gtpack\n",
+        );
+        write(&root.join("packs/app.gtpack"), "actual bytes");
+        write(
+            &root.join(BUNDLE_LOCK_FILE),
+            r#"{
+  "build_format_version": "bundle-lock-v1",
+  "app_packs": [
+    {"reference": "packs/app.gtpack", "digest": "sha256:not-the-digest"}
+  ]
+}"#,
+        );
+
+        let report = run_doctor(&root, Some(DoctorStage::Locks));
+        let check_ids = ids(&report);
+        assert!(check_ids.contains("setup.lock.digest_match"));
+        assert!(check_ids.contains("setup.lock.reference_present"));
+    }
+
+    #[test]
+    fn route_stage_reports_missing_and_malformed_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root.join(BUNDLE_WORKSPACE_MARKER), "schema_version: 1\n");
+        write(&root.join("tenants/demo/tenant.gmap"), "/ = app");
+        write(
+            &root.join("tenants/demo/teams/ops/team.gmap"),
+            "_ = forbidden\n",
+        );
+
+        let report = run_doctor(&root, Some(DoctorStage::Routes));
+        let check_ids = ids(&report);
+        assert!(check_ids.contains("setup.routes.static_routes_present"));
+        assert!(check_ids.contains("setup.routes.resolved_manifest_present"));
+
+        write(&root.join("state/config/platform/static-routes.json"), "{");
+        write(&root.join(".greentic/tunnel.json"), "{");
+        let resolved = root
+            .join("resolved")
+            .join(bundle::resolved_manifest_filename("demo", None));
+        write(&resolved, "# Resolved manifest placeholder");
+        let report = run_doctor(&root, Some(DoctorStage::Routes));
+        let check_ids = ids(&report);
+        assert!(check_ids.contains("setup.routes.static_routes_parse"));
+        assert!(check_ids.contains("setup.routes.tunnel_parse"));
+        assert!(check_ids.contains("setup.routes.resolved_manifest_placeholder"));
+    }
+
+    #[test]
+    fn cache_and_runtime_stages_report_informational_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root.join(BUNDLE_WORKSPACE_MARKER), "schema_version: 1\n");
+
+        let cache = run_doctor(&root, Some(DoctorStage::Cache));
+        assert!(ids(&cache).contains("setup.cache.model"));
+        assert_eq!(cache.status, "ok");
+
+        let runtime = run_doctor(&root, Some(DoctorStage::Runtime));
+        assert!(ids(&runtime).contains("setup.runtime.state_present"));
+        assert_eq!(runtime.status, "ok");
+    }
+
+    #[test]
+    fn helper_functions_parse_references_and_gmaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(
+            &root.join(BUNDLE_WORKSPACE_MARKER),
+            "schema_version: 1\napp_packs:\n  - packs/app.gtpack\nextension_providers:\n  - oci://example.com/providers/messaging-slack:stable\n",
+        );
+        let refs = workspace_refs(root).unwrap();
+        assert!(refs.contains("packs/app.gtpack"));
+        assert!(refs.contains("oci://example.com/providers/messaging-slack:stable"));
+
+        let candidates =
+            materialized_pack_candidates(root, "oci://example.com/providers/messaging-slack:1.0.0");
+        assert!(
+            candidates
+                .iter()
+                .any(|p| p.ends_with("providers/messaging/messaging-slack.gtpack"))
+        );
+        assert!(materialized_pack_candidates(root, "not-a-pack").is_empty());
+        assert!(is_remote_reference("https://example.com/app.gtpack"));
+        assert!(is_stable_reference("oci://example.com/app:stable"));
+
+        write(
+            &root.join("tenants/demo/tenant.gmap"),
+            "_ = forbidden\n# comment\n",
+        );
+        write(&root.join("tenants/demo/teams/ops/team.gmap"), "/ = app\n");
+        assert!(is_forbidden_only_gmap(
+            &root.join("tenants/demo/tenant.gmap")
+        ));
+        let targets = discover_gmap_targets(root);
+        assert_eq!(targets.len(), 2);
     }
 }
