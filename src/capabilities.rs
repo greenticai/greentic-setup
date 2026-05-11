@@ -542,6 +542,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_and_upgrade_packs_reports_zero_for_empty_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = validate_and_upgrade_packs(dir.path()).unwrap();
+        assert_eq!(report.checked, 0);
+        assert!(report.upgraded.is_empty());
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn validate_and_upgrade_packs_skips_packs_with_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = dir.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&providers).unwrap();
+        write_test_gtpack(&providers.join("good.gtpack"), true);
+
+        let report = validate_and_upgrade_packs(dir.path()).unwrap();
+        assert_eq!(report.checked, 1);
+        assert!(report.upgraded.is_empty());
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
     fn validate_and_upgrade_packs_warns_when_no_replacement_exists() {
         let root = tempfile::tempdir().unwrap();
         let bundle = root.path().join("bundle");
@@ -682,5 +704,47 @@ mod tests {
         assert_eq!(report.missing.len(), 1);
         assert_eq!(report.missing[0].capability, "cap.missing");
         assert_eq!(report.missing[0].required_by, "provider-b");
+    }
+
+    #[test]
+    fn validate_dependency_capabilities_skips_dependency_present_in_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let providers = root
+            .path()
+            .join("bundle")
+            .join("providers")
+            .join("messaging");
+        std::fs::create_dir_all(&providers).unwrap();
+
+        // Pack X declares a dependency on pack-id "provider-y" — and provider-y
+        // is present in the bundle. The dep should be skipped entirely.
+        write_test_gtpack_manifest(
+            &providers.join("provider-x.gtpack"),
+            "provider-x",
+            true,
+            &[],
+            &[("provider-y", &["whatever.cap"])],
+            true,
+        );
+        write_test_gtpack_manifest(
+            &providers.join("provider-y.gtpack"),
+            "provider-y",
+            true,
+            &[],
+            &[],
+            true,
+        );
+
+        let report = validate_dependency_capabilities(&root.path().join("bundle")).unwrap();
+        assert!(report.satisfied.is_empty());
+        assert!(report.missing.is_empty());
+    }
+
+    #[test]
+    fn validate_dependency_capabilities_returns_empty_for_empty_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = validate_dependency_capabilities(dir.path()).unwrap();
+        assert!(report.satisfied.is_empty());
+        assert!(report.missing.is_empty());
     }
 }

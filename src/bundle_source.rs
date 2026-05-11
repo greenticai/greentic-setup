@@ -465,6 +465,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_trims_whitespace() {
+        let source = BundleSource::parse("   ./bundle  ").unwrap();
+        if let BundleSource::LocalDir(path) = source {
+            assert_eq!(path, PathBuf::from("./bundle"));
+        } else {
+            panic!("expected LocalDir variant");
+        }
+    }
+
+    #[test]
+    fn as_str_local_dir_returns_path() {
+        let source = BundleSource::LocalDir(PathBuf::from("/tmp/example"));
+        assert_eq!(source.as_str(), "/tmp/example");
+    }
+
+    #[test]
+    fn as_str_file_uri_prepends_scheme() {
+        let source = BundleSource::FileUri(PathBuf::from("/tmp/example"));
+        assert_eq!(source.as_str(), "file:///tmp/example");
+    }
+
+    #[test]
+    fn local_dir_is_not_remote_under_oci_feature() {
+        #[cfg(feature = "oci")]
+        {
+            let local = BundleSource::parse("./bundle").unwrap();
+            assert!(!local.is_remote());
+        }
+    }
+
+    #[test]
+    fn percent_decode_passes_through_invalid_escapes() {
+        // %ZZ is not valid hex — the literal '%' and following characters are kept.
+        let decoded = percent_decode("foo%ZZbar");
+        assert_eq!(decoded, "foo%ZZbar");
+    }
+
+    #[test]
+    fn percent_decode_handles_trailing_percent() {
+        let decoded = percent_decode("trailing%");
+        assert_eq!(decoded, "trailing%");
+    }
+
+    #[test]
+    fn percent_decode_handles_short_trailing_percent() {
+        let decoded = percent_decode("short%2");
+        // Only one hex char — should be treated as literal.
+        assert_eq!(decoded, "short%2");
+    }
+
+    #[cfg(not(feature = "oci"))]
+    #[test]
+    fn unsupported_protocol_errors_without_oci_feature() {
+        for raw in ["oci://x/y:1", "repo://x/y", "store://abc"] {
+            let err = BundleSource::parse(raw).unwrap_err();
+            assert!(err.to_string().contains("not supported"));
+        }
+    }
+
     #[cfg(feature = "oci")]
     #[test]
     fn registry_basic_auth_uses_generic_oci_credentials_first() {

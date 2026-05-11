@@ -68,7 +68,8 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Bundle(cmd)) => match cmd {
+        Some(Command::Doctor(args)) => cli_commands::doctor(args, i18n),
+        Some(Command::Bundle(cmd)) => match *cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
             BundleCommand::Add(args) => cli_commands::add(args, i18n),
             BundleCommand::Setup(mut args) => {
@@ -353,12 +354,13 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         if let Some(tunnel) = loaded.platform_setup.tunnel.as_ref() {
             let _ = greentic_setup::platform_setup::persist_tunnel_artifact(&bundle_dir, tunnel);
         }
-        (
-            Some(loaded.setup_answers),
-            loaded.tenant,
-            loaded.team,
-            loaded.env,
-        )
+        let mut prefill = loaded.setup_answers;
+        prefill.insert(
+            "platform_setup".to_string(),
+            serde_json::to_value(&loaded.platform_setup)
+                .context("failed to serialize platform setup answers for UI prefill")?,
+        );
+        (Some(prefill), loaded.tenant, loaded.team, loaded.env)
     } else {
         (None, None, None, None)
     };
@@ -403,13 +405,16 @@ mod tests {
         ]);
 
         match cli.command {
-            Some(Command::Bundle(BundleCommand::Build(args))) => {
-                assert_eq!(
-                    args.bundle.as_deref(),
-                    Some(std::path::Path::new("./demo-bundle"))
-                );
-                assert_eq!(args.out, std::path::PathBuf::from("/tmp/demo.gtbundle"));
-            }
+            Some(Command::Bundle(cmd)) => match *cmd {
+                BundleCommand::Build(args) => {
+                    assert_eq!(
+                        args.bundle.as_deref(),
+                        Some(std::path::Path::new("./demo-bundle"))
+                    );
+                    assert_eq!(args.out, std::path::PathBuf::from("/tmp/demo.gtbundle"));
+                }
+                other => panic!("expected bundle build subcommand, got {other:?}"),
+            },
             other => panic!("expected bundle build subcommand, got {other:?}"),
         }
     }
@@ -444,13 +449,41 @@ mod tests {
 
         assert!(cli.non_interactive);
         match cli.command {
-            Some(Command::Bundle(BundleCommand::Setup(args))) => {
+            Some(Command::Bundle(cmd)) => match *cmd {
+                BundleCommand::Setup(args) => {
+                    assert_eq!(
+                        args.answers.as_deref(),
+                        Some(std::path::Path::new("answers.json"))
+                    );
+                }
+                other => panic!("expected bundle setup subcommand, got {other:?}"),
+            },
+            other => panic!("expected bundle setup subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_parses_as_top_level_subcommand() {
+        let cli = Cli::parse_from([
+            "greentic-setup",
+            "doctor",
+            "./demo",
+            "--json",
+            "--stage",
+            "locks",
+        ]);
+
+        match cli.command {
+            Some(Command::Doctor(args)) => {
+                assert_eq!(args.bundle, std::path::PathBuf::from("./demo"));
+                assert!(args.json);
+                assert!(!args.show_info);
                 assert_eq!(
-                    args.answers.as_deref(),
-                    Some(std::path::Path::new("answers.json"))
+                    args.stage,
+                    Some(greentic_setup::cli_args::DoctorStageArg::Locks)
                 );
             }
-            other => panic!("expected bundle setup subcommand, got {other:?}"),
+            other => panic!("expected doctor subcommand, got {other:?}"),
         }
     }
 }

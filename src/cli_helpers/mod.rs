@@ -10,10 +10,11 @@ use anyhow::Result;
 use qa_spec::{VisibilityMode, resolve_visibility};
 use serde_json::Value;
 
+use crate::deployment_targets::DeploymentTargetRecord;
 use crate::discovery;
 use crate::engine::LoadedAnswers;
 use crate::platform_setup::{
-    PlatformSetupAnswers, StaticRoutesPolicy, load_effective_static_routes_defaults,
+    PlatformSetupAnswers, StaticRoutesPolicy, TunnelAnswers, load_effective_static_routes_defaults,
     prompt_static_routes_policy, prompt_static_routes_policy_with_answers,
 };
 use crate::qa::wizard;
@@ -109,6 +110,18 @@ fn detect_tenant_from_bundle(bundle_dir: &std::path::Path) -> Option<String> {
     }
 }
 
+fn has_cloud_deployment_target(targets: &[DeploymentTargetRecord]) -> bool {
+    targets
+        .iter()
+        .any(|record| matches!(record.target.as_str(), "aws" | "gcp" | "azure"))
+}
+
+fn default_no_tunnel_answers() -> TunnelAnswers {
+    TunnelAnswers {
+        mode: Some("off".to_string()),
+    }
+}
+
 /// Run interactive wizard for all discovered packs in the bundle.
 pub fn run_interactive_wizard(
     bundle_path: &Path,
@@ -128,7 +141,9 @@ pub fn run_interactive_wizard(
         crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
 
     // Prompt for tunnel mode when no deployer packs are present (local dev).
-    let tunnel = if deployer_candidates.is_empty() {
+    let tunnel = if has_cloud_deployment_target(&deployment_targets) {
+        Some(default_no_tunnel_answers())
+    } else if deployer_candidates.is_empty() {
         Some(crate::platform_setup::prompt_tunnel_mode(None)?)
     } else {
         None
@@ -269,7 +284,11 @@ pub fn complete_loaded_answers_with_prompts(
         loaded.platform_setup.deployment_targets =
             crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
     }
-    if deployer_candidates.is_empty() && loaded.platform_setup.tunnel.is_none() && !non_interactive
+    if has_cloud_deployment_target(&loaded.platform_setup.deployment_targets) {
+        loaded.platform_setup.tunnel = Some(default_no_tunnel_answers());
+    } else if deployer_candidates.is_empty()
+        && loaded.platform_setup.tunnel.is_none()
+        && !non_interactive
     {
         loaded.platform_setup.tunnel = Some(crate::platform_setup::prompt_tunnel_mode(None)?);
     }
@@ -474,7 +493,11 @@ pub fn ensure_required_setup_answers_present(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_setup_scope, resolve_setup_scope_with_bundle};
+    use super::{
+        default_no_tunnel_answers, has_cloud_deployment_target, resolve_setup_scope,
+        resolve_setup_scope_with_bundle,
+    };
+    use crate::deployment_targets::DeploymentTargetRecord;
     use crate::engine::LoadedAnswers;
 
     #[test]
@@ -531,5 +554,38 @@ mod tests {
         assert_eq!(tenant, "demo");
         assert_eq!(team, None);
         assert_eq!(env, "dev");
+    }
+
+    #[test]
+    fn detects_cloud_deployment_targets() {
+        assert!(has_cloud_deployment_target(&[
+            DeploymentTargetRecord {
+                target: "aws".to_string(),
+                provider_pack: None,
+                default: None,
+            },
+            DeploymentTargetRecord {
+                target: "runtime".to_string(),
+                provider_pack: None,
+                default: None,
+            },
+        ]));
+        assert!(!has_cloud_deployment_target(&[
+            DeploymentTargetRecord {
+                target: "runtime".to_string(),
+                provider_pack: None,
+                default: None,
+            },
+            DeploymentTargetRecord {
+                target: "single-vm".to_string(),
+                provider_pack: None,
+                default: None,
+            },
+        ]));
+    }
+
+    #[test]
+    fn default_no_tunnel_answers_for_cloud_sets_off_mode() {
+        assert_eq!(default_no_tunnel_answers().mode.as_deref(), Some("off"));
     }
 }
