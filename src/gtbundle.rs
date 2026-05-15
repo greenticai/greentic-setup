@@ -17,7 +17,7 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use zip::write::SimpleFileOptions;
@@ -92,11 +92,77 @@ pub fn create_gtbundle_with_format(
     output_path: &Path,
     format: BundleFormat,
 ) -> Result<()> {
+    // Phase 0 secret-leak hotfix: refuse to archive any dev-store file or
+    // directory tree that would leak plaintext secrets into the .gtbundle.
+    // See plans/next-gen-deployment.md P0.1.
+    if bundle_dir.is_dir() {
+        assert_no_dev_secret_paths(bundle_dir)?;
+    }
     match format {
         #[cfg(feature = "squashfs")]
         BundleFormat::SquashFs => create_gtbundle_squashfs(bundle_dir, output_path),
         BundleFormat::Zip => create_gtbundle_zip(bundle_dir, output_path),
     }
+}
+
+// Phase 0 secret-leak hotfix denylist. Walks the source bundle tree and bails
+// loud if any path matches `.greentic/dev/`, `.greentic/state/dev/`, or a
+// `.dev.secrets.env` filename — the dev-store paths declared in
+// `greentic-setup/src/secrets.rs:STORE_RELATIVE / STORE_STATE_RELATIVE`.
+fn assert_no_dev_secret_paths(bundle_dir: &Path) -> Result<()> {
+    check_tree(bundle_dir, bundle_dir)
+}
+
+fn check_tree(root: &Path, current: &Path) -> Result<()> {
+    let entries = fs::read_dir(current)
+        .with_context(|| format!("walk for dev-secret denylist: {}", current.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "read entry for dev-secret denylist in {}",
+                current.display()
+            )
+        })?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        if let Some(reason) = dev_secret_match(relative) {
+            bail!(
+                "refusing to archive dev-secret path {} ({reason}); fix the bundle source rather than shipping it",
+                relative.display()
+            );
+        }
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("file type for {}", path.display()))?;
+        if file_type.is_dir() {
+            check_tree(root, &path)?;
+        }
+    }
+    Ok(())
+}
+
+fn dev_secret_match(relative: &Path) -> Option<&'static str> {
+    let parts: Vec<&str> = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    for window in parts.windows(2) {
+        if window[0] == ".greentic" && window[1] == "dev" {
+            return Some(".greentic/dev/ tree");
+        }
+    }
+    for window in parts.windows(3) {
+        if window[0] == ".greentic" && window[1] == "state" && window[2] == "dev" {
+            return Some(".greentic/state/dev/ tree");
+        }
+    }
+    if parts.last().copied() == Some(".dev.secrets.env") {
+        return Some(".dev.secrets.env file");
+    }
+    None
 }
 
 /// Create a .gtbundle archive using SquashFS format.
@@ -563,5 +629,100 @@ mod tests {
 
         let result = detect_bundle_format(&file_path);
         assert!(result.is_err());
+    }
+
+    // Phase 0 secret-leak hotfix regression tests for the denylist.
+    // See plans/next-gen-deployment.md P0.1.
+
+    #[test]
+    fn dev_secret_match_detects_dev_directory() {
+        assert_eq!(
+            dev_secret_match(Path::new(".greentic/dev/whatever.bin")),
+            Some(".greentic/dev/ tree")
+        );
+    }
+
+    #[test]
+    fn dev_secret_match_detects_state_dev_directory() {
+        assert_eq!(
+            dev_secret_match(Path::new(".greentic/state/dev/something")),
+            Some(".greentic/state/dev/ tree")
+        );
+    }
+
+    #[test]
+    fn dev_secret_match_detects_stray_dev_secrets_env_filename() {
+        assert_eq!(
+            dev_secret_match(Path::new("packs/.dev.secrets.env")),
+            Some(".dev.secrets.env file")
+        );
+    }
+
+    #[test]
+    fn dev_secret_match_passes_through_safe_paths() {
+        assert_eq!(dev_secret_match(Path::new("packs/pack-a.gtpack")), None);
+        assert_eq!(
+            dev_secret_match(Path::new("state/setup/provider-a.json")),
+            None
+        );
+    }
+
+    #[test]
+    fn create_gtbundle_zip_refuses_dev_secret_directory() {
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("bundle");
+        create_test_bundle(&bundle_dir);
+        fs::create_dir_all(bundle_dir.join(".greentic/dev")).unwrap();
+        fs::write(
+            bundle_dir.join(".greentic/dev/.dev.secrets.env"),
+            "GTC_TOKEN=leaked",
+        )
+        .unwrap();
+
+        let gtbundle_path = temp.path().join("denylist.gtbundle");
+        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
+            .expect_err("denylist must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to archive"),
+            "expected denylist bail; got: {msg}"
+        );
+        assert!(
+            !gtbundle_path.exists(),
+            "denylisted build must not produce artifact"
+        );
+    }
+
+    #[cfg(feature = "squashfs")]
+    #[test]
+    fn create_gtbundle_squashfs_refuses_dev_secret_directory() {
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("bundle");
+        create_test_bundle(&bundle_dir);
+        fs::create_dir_all(bundle_dir.join(".greentic/state/dev")).unwrap();
+        fs::write(
+            bundle_dir.join(".greentic/state/dev/.dev.secrets.env"),
+            "GTC_TOKEN=leaked",
+        )
+        .unwrap();
+
+        let gtbundle_path = temp.path().join("denylist.gtbundle");
+        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::SquashFs)
+            .expect_err("denylist must bail");
+        assert!(format!("{err:#}").contains(".greentic/state/dev"));
+        assert!(!gtbundle_path.exists());
+    }
+
+    #[test]
+    fn create_gtbundle_refuses_stray_dev_secrets_env_filename() {
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("bundle");
+        create_test_bundle(&bundle_dir);
+        fs::write(bundle_dir.join("packs/.dev.secrets.env"), "X=Y").unwrap();
+
+        let gtbundle_path = temp.path().join("stray.gtbundle");
+        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
+            .expect_err("denylist must bail");
+        assert!(format!("{err:#}").contains(".dev.secrets.env"));
     }
 }
