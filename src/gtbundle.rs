@@ -92,12 +92,13 @@ pub fn create_gtbundle_with_format(
     output_path: &Path,
     format: BundleFormat,
 ) -> Result<()> {
-    // Phase 0 secret-leak hotfix: refuse to archive any dev-store file or
-    // directory tree that would leak plaintext secrets into the .gtbundle.
+    // Phase 0 secret-leak hotfix is enforced inline by the per-format writer
+    // walkers (add_directory_to_squashfs / add_directory_to_zip): they skip
+    // dev-store paths (.greentic/dev/, .greentic/state/dev/, .dev.secrets.env)
+    // and bail on any symlink. Doing it in the same walk that reads bytes
+    // closes the preflight-vs-writer TOCTOU window that Codex's adversarial
+    // review flagged on the earlier denylist approach.
     // See plans/next-gen-deployment.md P0.1.
-    if bundle_dir.is_dir() {
-        assert_no_dev_secret_paths(bundle_dir)?;
-    }
     match format {
         #[cfg(feature = "squashfs")]
         BundleFormat::SquashFs => create_gtbundle_squashfs(bundle_dir, output_path),
@@ -105,56 +106,15 @@ pub fn create_gtbundle_with_format(
     }
 }
 
-// Phase 0 secret-leak hotfix denylist. Walks the source bundle tree and bails
-// loud if any path matches `.greentic/dev/`, `.greentic/state/dev/`, or a
-// `.dev.secrets.env` filename — the dev-store paths declared in
-// `greentic-setup/src/secrets.rs:STORE_RELATIVE / STORE_STATE_RELATIVE`.
-fn assert_no_dev_secret_paths(bundle_dir: &Path) -> Result<()> {
-    check_tree(bundle_dir, bundle_dir)
-}
-
-fn check_tree(root: &Path, current: &Path) -> Result<()> {
-    let entries = fs::read_dir(current)
-        .with_context(|| format!("walk for dev-secret denylist: {}", current.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| {
-            format!(
-                "read entry for dev-secret denylist in {}",
-                current.display()
-            )
-        })?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        if let Some(reason) = dev_secret_match(relative) {
-            bail!(
-                "refusing to archive dev-secret path {} ({reason}); fix the bundle source rather than shipping it",
-                relative.display()
-            );
-        }
-        // `entry.file_type()` does NOT follow symlinks; the legacy archive
-        // walkers in create_gtbundle_squashfs / create_gtbundle_zip use
-        // `path.is_dir()` and `fs::read(&path)` which both DO follow them, so
-        // a benign-looking symlink target could otherwise leak target bytes
-        // into the archive. The legacy writers do not preserve symlinks today
-        // (they unconditionally dereference), so refusing them outright is
-        // both safer and closer to current observable behavior. Phase B may
-        // revisit if a legitimate symlink use case appears.
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("file type for {}", path.display()))?;
-        if file_type.is_symlink() {
-            bail!(
-                "refusing to archive symlink {} (symlinks are not supported by gtbundle writers and may bypass the dev-secret denylist by dereferencing through to a leaked target)",
-                relative.display()
-            );
-        }
-        if file_type.is_dir() {
-            check_tree(root, &path)?;
-        }
-    }
-    Ok(())
-}
-
+// Phase 0 secret-leak hotfix matcher. Used by the writer walkers below to
+// skip dev-store paths from the archive — `.greentic/dev/`,
+// `.greentic/state/dev/`, and any `.dev.secrets.env` file. These are the
+// dev-store paths declared in `greentic-setup/src/secrets.rs:STORE_RELATIVE
+// / STORE_STATE_RELATIVE`. Skipping (vs. bailing) lets the normal setup
+// flow round-trip: ApplyPackSetup writes the dev store under the bundle
+// root, the post-setup repack call here ignores those paths instead of
+// erroring out, and the secrets stay on disk for runtime use until Phase B
+// migrates the in-memory map to SecretRef.
 fn dev_secret_match(relative: &Path) -> Option<&'static str> {
     let parts: Vec<&str> = relative
         .components()
@@ -198,17 +158,20 @@ fn create_gtbundle_squashfs(bundle_dir: &Path, output_path: &Path) -> Result<()>
     // unless we override it — same trap as the per-entry headers below.
     writer.set_root_mode(0o755);
 
-    // Walk the bundle directory and add all files
-    add_directory_to_squashfs(&mut writer, bundle_dir, bundle_dir)?;
+    let result = (|| -> Result<()> {
+        add_directory_to_squashfs(&mut writer, bundle_dir, bundle_dir)?;
+        let mut output = File::create(output_path)
+            .with_context(|| format!("failed to create archive: {}", output_path.display()))?;
+        writer
+            .write(&mut output)
+            .context("failed to write squashfs archive")?;
+        Ok(())
+    })();
 
-    // Write the filesystem
-    let mut output = File::create(output_path)
-        .with_context(|| format!("failed to create archive: {}", output_path.display()))?;
-    writer
-        .write(&mut output)
-        .context("failed to write squashfs archive")?;
-
-    Ok(())
+    if result.is_err() {
+        let _ = fs::remove_file(output_path);
+    }
+    result
 }
 
 /// Add a directory and its contents to a SquashFS filesystem.
@@ -231,7 +194,27 @@ fn add_directory_to_squashfs(
             .context("failed to compute relative path")?;
         let name = relative_path.to_string_lossy().to_string();
 
-        if path.is_dir() {
+        // Phase 0 P0.1: skip dev-store paths in the same walk that reads
+        // bytes (no separate preflight, no TOCTOU window).
+        if dev_secret_match(relative_path).is_some() {
+            continue;
+        }
+
+        // Phase 0 P0.1: reject symlinks. `entry.file_type()` does NOT follow
+        // them; `path.is_dir()` and `fs::read(&path)` below DO follow. A
+        // benign-looking symlink whose target is a dev-secret path would
+        // otherwise leak target bytes under the symlink's safe name.
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("file type for {}", path.display()))?;
+        if file_type.is_symlink() {
+            bail!(
+                "refusing to archive symlink {} (symlinks are not supported by gtbundle writers and may bypass the dev-secret skip by dereferencing through to a leaked target)",
+                relative_path.display()
+            );
+        }
+
+        if file_type.is_dir() {
             writer
                 .push_dir(&name, dir_node_header())
                 .with_context(|| format!("failed to add directory: {}", name))?;
@@ -282,12 +265,16 @@ fn create_gtbundle_zip(bundle_dir: &Path, output_path: &Path) -> Result<()> {
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o644);
 
-    // Walk the bundle directory and add all files
-    add_directory_to_zip(&mut zip, bundle_dir, bundle_dir, options)?;
+    let result = (|| -> Result<()> {
+        add_directory_to_zip(&mut zip, bundle_dir, bundle_dir, options)?;
+        zip.finish().context("failed to finalize archive")?;
+        Ok(())
+    })();
 
-    zip.finish().context("failed to finalize archive")?;
-
-    Ok(())
+    if result.is_err() {
+        let _ = fs::remove_file(output_path);
+    }
+    result
 }
 
 /// Extract a .gtbundle archive to a directory.
@@ -488,7 +475,27 @@ fn add_directory_to_zip<W: Write + std::io::Seek>(
             .context("failed to compute relative path")?;
         let name = relative_path.to_string_lossy();
 
-        if path.is_dir() {
+        // Phase 0 P0.1: skip dev-store paths in the same walk that reads
+        // bytes (no separate preflight, no TOCTOU window).
+        if dev_secret_match(relative_path).is_some() {
+            continue;
+        }
+
+        // Phase 0 P0.1: reject symlinks. `entry.file_type()` does NOT follow
+        // them; `path.is_dir()` and `File::open(&path)` below DO follow. A
+        // benign-looking symlink whose target is a dev-secret path would
+        // otherwise leak target bytes under the symlink's safe name.
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("file type for {}", path.display()))?;
+        if file_type.is_symlink() {
+            bail!(
+                "refusing to archive symlink {} (symlinks are not supported by gtbundle writers and may bypass the dev-secret skip by dereferencing through to a leaked target)",
+                relative_path.display()
+            );
+        }
+
+        if file_type.is_dir() {
             // Add directory entry
             zip.add_directory(format!("{}/", name), options)?;
             // Recurse
@@ -645,8 +652,38 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Phase 0 secret-leak hotfix regression tests for the denylist.
+    // Phase 0 secret-leak hotfix regression tests.
     // See plans/next-gen-deployment.md P0.1.
+    //
+    // Codex adversarial review on PR #109 caught that the original bail-on-detect
+    // approach broke the normal setup→repack flow (ApplyPackSetup writes
+    // .greentic/dev/.dev.secrets.env under the bundle root, then create_gtbundle
+    // bailed). The current implementation skips dev-store paths during the
+    // archive walk instead: the dev store stays on disk for runtime use, but
+    // the .gtbundle artifact never contains it.
+
+    fn extracted_paths(bundle_path: &Path) -> Vec<String> {
+        let temp = tempdir().unwrap();
+        extract_gtbundle(bundle_path, temp.path()).expect("extract");
+        let mut paths = Vec::new();
+        collect_paths(temp.path(), temp.path(), &mut paths);
+        paths.sort();
+        paths
+    }
+
+    fn collect_paths(root: &Path, current: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap();
+            out.push(rel.to_string_lossy().to_string());
+            if path.is_dir() {
+                collect_paths(root, &path, out);
+            }
+        }
+    }
 
     #[test]
     fn dev_secret_match_detects_dev_directory() {
@@ -681,63 +718,169 @@ mod tests {
         );
     }
 
+    fn assert_no_dev_secret_paths_in_archive(archived: &[String]) {
+        for path in archived {
+            assert!(
+                !path.starts_with(".greentic/dev") && !path.contains("/.greentic/dev"),
+                ".greentic/dev tree leaked into archive: {path}"
+            );
+            assert!(
+                !path.starts_with(".greentic/state/dev") && !path.contains("/.greentic/state/dev"),
+                ".greentic/state/dev tree leaked into archive: {path}"
+            );
+            assert!(
+                !path.ends_with(".dev.secrets.env"),
+                ".dev.secrets.env file leaked into archive: {path}"
+            );
+        }
+    }
+
     #[test]
-    fn create_gtbundle_zip_refuses_dev_secret_directory() {
+    fn create_gtbundle_zip_skips_dev_secret_directory() {
         let temp = tempdir().unwrap();
         let bundle_dir = temp.path().join("bundle");
         create_test_bundle(&bundle_dir);
         fs::create_dir_all(bundle_dir.join(".greentic/dev")).unwrap();
-        fs::write(
-            bundle_dir.join(".greentic/dev/.dev.secrets.env"),
-            "GTC_TOKEN=leaked",
-        )
-        .unwrap();
+        let leaked = "GTC_TOKEN=must-not-leak";
+        fs::write(bundle_dir.join(".greentic/dev/.dev.secrets.env"), leaked).unwrap();
 
-        let gtbundle_path = temp.path().join("denylist.gtbundle");
-        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
-            .expect_err("denylist must bail");
-        let msg = format!("{err:#}");
+        let gtbundle_path = temp.path().join("clean.gtbundle");
+        create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
+            .expect("repack must succeed after dev-store seeding");
+        assert!(gtbundle_path.exists(), "artifact must be produced");
+
+        let archived = extracted_paths(&gtbundle_path);
+        assert_no_dev_secret_paths_in_archive(&archived);
+        let raw = fs::read(&gtbundle_path).unwrap();
         assert!(
-            msg.contains("refusing to archive"),
-            "expected denylist bail; got: {msg}"
+            !raw.windows(leaked.len())
+                .any(|window| window == leaked.as_bytes()),
+            "raw archive bytes must not contain dev-secret content"
         );
-        assert!(
-            !gtbundle_path.exists(),
-            "denylisted build must not produce artifact"
-        );
+        // Source on disk is untouched — runtime still has its dev store.
+        assert!(bundle_dir.join(".greentic/dev/.dev.secrets.env").exists());
     }
 
     #[cfg(feature = "squashfs")]
     #[test]
-    fn create_gtbundle_squashfs_refuses_dev_secret_directory() {
+    fn create_gtbundle_squashfs_skips_state_dev_directory() {
         let temp = tempdir().unwrap();
         let bundle_dir = temp.path().join("bundle");
         create_test_bundle(&bundle_dir);
         fs::create_dir_all(bundle_dir.join(".greentic/state/dev")).unwrap();
+        let leaked = "GTC_TOKEN=must-not-leak-state";
         fs::write(
             bundle_dir.join(".greentic/state/dev/.dev.secrets.env"),
-            "GTC_TOKEN=leaked",
+            leaked,
         )
         .unwrap();
 
-        let gtbundle_path = temp.path().join("denylist.gtbundle");
-        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::SquashFs)
-            .expect_err("denylist must bail");
-        assert!(format!("{err:#}").contains(".greentic/state/dev"));
-        assert!(!gtbundle_path.exists());
+        let gtbundle_path = temp.path().join("clean.gtbundle");
+        create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::SquashFs)
+            .expect("repack must succeed after state-dev seeding");
+        assert!(gtbundle_path.exists());
+
+        let archived = extracted_paths(&gtbundle_path);
+        assert_no_dev_secret_paths_in_archive(&archived);
+        let raw = fs::read(&gtbundle_path).unwrap();
+        assert!(
+            !raw.windows(leaked.len())
+                .any(|window| window == leaked.as_bytes())
+        );
     }
 
     #[test]
-    fn create_gtbundle_refuses_stray_dev_secrets_env_filename() {
+    fn create_gtbundle_skips_stray_dev_secrets_env_filename() {
         let temp = tempdir().unwrap();
         let bundle_dir = temp.path().join("bundle");
         create_test_bundle(&bundle_dir);
-        fs::write(bundle_dir.join("packs/.dev.secrets.env"), "X=Y").unwrap();
+        let leaked = "STRAY_TOKEN=must-not-ship";
+        fs::write(bundle_dir.join("packs/.dev.secrets.env"), leaked).unwrap();
 
         let gtbundle_path = temp.path().join("stray.gtbundle");
-        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
-            .expect_err("denylist must bail");
-        assert!(format!("{err:#}").contains(".dev.secrets.env"));
+        create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
+            .expect("repack must succeed when stray dev-secrets file present");
+
+        let archived = extracted_paths(&gtbundle_path);
+        assert_no_dev_secret_paths_in_archive(&archived);
+        let raw = fs::read(&gtbundle_path).unwrap();
+        assert!(
+            !raw.windows(leaked.len())
+                .any(|window| window == leaked.as_bytes())
+        );
+    }
+
+    // Phase 0 P0.1: simulate the executors.rs:209-219 + bin/greentic_setup.rs:294
+    // flow. ApplyPackSetup writes .greentic/dev/.dev.secrets.env under the
+    // bundle root, then run_simple_setup calls create_gtbundle on the same
+    // bundle dir. The previous bail-on-detect implementation broke this; the
+    // skip-in-walker implementation must round-trip cleanly.
+    #[test]
+    fn post_setup_repack_round_trips_when_dev_store_present() {
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("bundle");
+        create_test_bundle(&bundle_dir);
+
+        // Step 1: ApplyPackSetup analogue — seed both possible dev-store paths
+        // and a state/config/*/setup-answers.json with non-secret data that
+        // MUST be preserved (the secret leak in this file is Phase B's job).
+        fs::create_dir_all(bundle_dir.join(".greentic/dev")).unwrap();
+        fs::write(
+            bundle_dir.join(".greentic/dev/.dev.secrets.env"),
+            "BOT_TOKEN=leaked-via-dev-store",
+        )
+        .unwrap();
+        fs::create_dir_all(bundle_dir.join(".greentic/state/dev")).unwrap();
+        fs::write(
+            bundle_dir.join(".greentic/state/dev/.dev.secrets.env"),
+            "ALT_TOKEN=leaked-via-state-dev",
+        )
+        .unwrap();
+        fs::create_dir_all(bundle_dir.join("state/config/messaging-telegram")).unwrap();
+        fs::write(
+            bundle_dir.join("state/config/messaging-telegram/setup-answers.json"),
+            r#"{"name":"my-bot","region":"eu-west-1"}"#,
+        )
+        .unwrap();
+
+        // Step 2: run_simple_setup analogue — repack the same dir.
+        let gtbundle_path = temp.path().join("configured.gtbundle");
+        create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
+            .expect("post-setup repack must succeed");
+        assert!(gtbundle_path.exists());
+
+        // Step 3: extracted bundle contains exactly the right paths.
+        let archived = extracted_paths(&gtbundle_path);
+        assert!(
+            !archived.iter().any(|p| p.starts_with(".greentic/dev")
+                || p.starts_with(".greentic/state/dev")
+                || p.ends_with(".dev.secrets.env")),
+            "archive must not contain any dev-store path, got: {archived:?}"
+        );
+        assert!(
+            archived
+                .iter()
+                .any(|p| p == "state/config/messaging-telegram/setup-answers.json"),
+            "non-secret setup-answers.json must round-trip (secret leak is Phase B), got: {archived:?}"
+        );
+
+        // Step 4: raw bytes contain neither leaked token.
+        let raw = fs::read(&gtbundle_path).unwrap();
+        for forbidden in ["leaked-via-dev-store", "leaked-via-state-dev"] {
+            assert!(
+                !raw.windows(forbidden.len())
+                    .any(|window| window == forbidden.as_bytes()),
+                "raw archive bytes must not contain {forbidden}"
+            );
+        }
+
+        // Step 5: source on disk untouched — runtime can still read its store.
+        assert!(bundle_dir.join(".greentic/dev/.dev.secrets.env").exists());
+        assert!(
+            bundle_dir
+                .join(".greentic/state/dev/.dev.secrets.env")
+                .exists()
+        );
     }
 
     // Phase 0 P0.1 symlink-bypass regression tests.
