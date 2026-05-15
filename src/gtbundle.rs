@@ -131,9 +131,23 @@ fn check_tree(root: &Path, current: &Path) -> Result<()> {
                 relative.display()
             );
         }
+        // `entry.file_type()` does NOT follow symlinks; the legacy archive
+        // walkers in create_gtbundle_squashfs / create_gtbundle_zip use
+        // `path.is_dir()` and `fs::read(&path)` which both DO follow them, so
+        // a benign-looking symlink target could otherwise leak target bytes
+        // into the archive. The legacy writers do not preserve symlinks today
+        // (they unconditionally dereference), so refusing them outright is
+        // both safer and closer to current observable behavior. Phase B may
+        // revisit if a legitimate symlink use case appears.
         let file_type = entry
             .file_type()
             .with_context(|| format!("file type for {}", path.display()))?;
+        if file_type.is_symlink() {
+            bail!(
+                "refusing to archive symlink {} (symlinks are not supported by gtbundle writers and may bypass the dev-secret denylist by dereferencing through to a leaked target)",
+                relative.display()
+            );
+        }
         if file_type.is_dir() {
             check_tree(root, &path)?;
         }
@@ -724,5 +738,82 @@ mod tests {
         let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
             .expect_err("denylist must bail");
         assert!(format!("{err:#}").contains(".dev.secrets.env"));
+    }
+
+    // Phase 0 P0.1 symlink-bypass regression tests.
+    //
+    // The denylist must refuse symlinks because the legacy archive walkers in
+    // this file unconditionally dereference them: `path.is_dir()` follows
+    // symlinks, and the else branch reads target bytes via `fs::read` /
+    // `File::open`. Without this guard, a benign-looking symlink whose target
+    // is `.greentic/dev/.dev.secrets.env` would ship target bytes into the
+    // archive under the symlink's safe-looking name.
+
+    #[cfg(unix)]
+    fn make_symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("create symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_gtbundle_zip_refuses_file_symlink_targeting_dev_secret() {
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("bundle");
+        create_test_bundle(&bundle_dir);
+        // Plant the secret OUTSIDE the bundle source — proves the leak is via
+        // dereference, not via a deny-listed path inside the source tree.
+        let secret_path = temp.path().join("external.dev.secrets.env");
+        fs::write(&secret_path, "GTC_TOKEN=must-not-leak").unwrap();
+        make_symlink(&secret_path, &bundle_dir.join("packs/seed.env"));
+
+        let gtbundle_path = temp.path().join("symlink.gtbundle");
+        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
+            .expect_err("symlink must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to archive symlink"),
+            "expected symlink refusal; got: {msg}"
+        );
+        assert!(
+            !gtbundle_path.exists(),
+            "denylisted build must not produce artifact"
+        );
+    }
+
+    #[cfg(all(unix, feature = "squashfs"))]
+    #[test]
+    fn create_gtbundle_squashfs_refuses_directory_symlink_targeting_dev_dir() {
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("bundle");
+        create_test_bundle(&bundle_dir);
+        let external_dev = temp.path().join("external-dev");
+        fs::create_dir_all(&external_dev).unwrap();
+        fs::write(external_dev.join(".dev.secrets.env"), "GTC_TOKEN=leaked").unwrap();
+        make_symlink(&external_dev, &bundle_dir.join("packs/seed-dir"));
+
+        let gtbundle_path = temp.path().join("symlink-dir.gtbundle");
+        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::SquashFs)
+            .expect_err("directory symlink must be refused");
+        assert!(format!("{err:#}").contains("refusing to archive symlink"));
+        assert!(!gtbundle_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_gtbundle_refuses_benign_looking_symlink() {
+        // Even a symlink with no obviously deny-listed target must be refused:
+        // we cannot inspect the target safely against all attack shapes, and
+        // the legacy writers do not preserve symlinks anyway.
+        let temp = tempdir().unwrap();
+        let bundle_dir = temp.path().join("bundle");
+        create_test_bundle(&bundle_dir);
+        let benign_target = temp.path().join("benign.txt");
+        fs::write(&benign_target, "benign content").unwrap();
+        make_symlink(&benign_target, &bundle_dir.join("packs/link.txt"));
+
+        let gtbundle_path = temp.path().join("any-symlink.gtbundle");
+        let err = create_gtbundle_with_format(&bundle_dir, &gtbundle_path, BundleFormat::Zip)
+            .expect_err("any symlink must be refused");
+        assert!(format!("{err:#}").contains("refusing to archive symlink"));
     }
 }
