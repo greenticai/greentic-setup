@@ -3,6 +3,7 @@
 //! Each executor handles a specific `SetupStepKind`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use anyhow::Context;
 use serde_json::Value;
@@ -13,6 +14,31 @@ use crate::{bundle, bundle_source::BundleSource, discovery};
 
 use super::plan_builders::compute_simple_hash;
 use super::types::SetupConfig;
+
+// DEPRECATED (Phase B / B12a): once-per-process deprecation warnings for the
+// plaintext non-secret config sinks. See callers below.
+static WARN_SETUP_ANSWERS: Once = Once::new();
+static WARN_CONFIG_ENVELOPE: Once = Once::new();
+
+fn warn_setup_answers_deprecated() {
+    WARN_SETUP_ANSWERS.call_once(|| {
+        tracing::warn!(
+            target: "greentic_setup::deprecated",
+            "writing state/config/<provider>/setup-answers.json — deprecated sink, \
+             migrate to pack-config.v1 + secrets backend (Phase B / B12a)"
+        );
+    });
+}
+
+fn warn_config_envelope_deprecated() {
+    WARN_CONFIG_ENVELOPE.call_once(|| {
+        tracing::warn!(
+            target: "greentic_setup::deprecated",
+            ".providers/<provider>/config.envelope.cbor — deprecated sink, \
+             migrate to pack-config.v1 (Phase B / B12a)"
+        );
+    });
+}
 
 /// Execute the CreateBundle step.
 pub fn execute_create_bundle(
@@ -170,6 +196,13 @@ pub fn execute_apply_pack_setup(
         let config_dir = bundle_path.join("state").join("config").join(provider_id);
         std::fs::create_dir_all(&config_dir)?;
 
+        // DEPRECATED (Phase B / B12a): `setup-answers.json` is a transitional sink kept
+        // alive for runtime compatibility until `pack-config.v1` exists. Secret values
+        // are already redacted by P0.1; non-secret keys still ship plaintext here so
+        // downstream readers in greentic-start (runner_host, messaging_app,
+        // ingress_dispatch) keep working. Migrate readers to the secrets backend in
+        // B12a, then stop writing this file.
+        warn_setup_answers_deprecated();
         let config_path = config_dir.join("setup-answers.json");
         let content =
             serde_json::to_string_pretty(answers).context("failed to serialize setup answers")?;
@@ -233,7 +266,13 @@ pub fn execute_apply_pack_setup(
 
         // Materialize a provider config envelope so runtime/provider ingest
         // paths can read setup-applied config, not just raw setup answers.
+        //
+        // DEPRECATED (Phase B / B12a): `config.envelope.cbor` carries plaintext
+        // non-secret config in a CBOR envelope. Same compatibility contract as
+        // `setup-answers.json` above. Migrate to `pack-config.v1` before stopping
+        // the write.
         if let Some(pack_path) = pack_path {
+            warn_config_envelope_deprecated();
             crate::config_envelope::write_provider_config_envelope(
                 &bundle_path.join(".providers"),
                 provider_id,

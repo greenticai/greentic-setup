@@ -2,6 +2,17 @@
 //!
 //! Writes provider configuration to disk as a CBOR envelope containing the
 //! config payload, component metadata, and contract hashes for drift detection.
+//!
+//! # DEPRECATED (Phase B / B12a)
+//!
+//! `config.envelope.cbor` is a transitional on-disk sink kept alive for runtime
+//! compatibility until `pack-config.v1` ships. Secret values are already
+//! redacted upstream by P0.1; non-secret config still rides in this envelope so
+//! greentic-start and greentic-operator readers keep working.
+//!
+//! Migration target: route non-secret config through `pack-config.v1` and route
+//! secret values through the env's secrets backend (B12a). After both move,
+//! this writer should be deleted.
 
 use std::fs::File;
 use std::io::Read as _;
