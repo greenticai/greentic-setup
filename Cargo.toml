@@ -23,6 +23,7 @@ anyhow = "1"
 backhand = { version = "0.25", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+greentic-deployer = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false }
 greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 greentic-secrets-lib = { version = ">=1.1.0-dev, <1.2.0-0", features = ["providers-dev"] }
 greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }

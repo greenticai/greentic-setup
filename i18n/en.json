@@ -24,6 +24,7 @@
   "cli.bundle.setup.use_emit_answers": "Or use --emit-answers <file> to generate answers template.",
   "cli.bundle.setup.dry_run": "[dry-run] Would setup provider: {}",
   "cli.bundle.setup.complete": "Provider setup complete: {}",
+  "cli.bundle.setup.env_bootstrap_created": "Bootstrapped `local` environment with default capability bindings at {}.",
   "cli.bundle.setup.emit_written": "Answers template written to: {}",
   "cli.bundle.setup.emit_usage": "Edit and use with: greentic-setup bundle setup --answers {}",
   "cli.bundle.update.updating": "Updating provider configuration...",
