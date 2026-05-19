@@ -55,8 +55,9 @@ pub struct Cli {
     #[arg(long = "team", global = true)]
     pub team: Option<String>,
 
-    /// Environment (dev/staging/prod)
-    #[arg(long = "env", short = 'e', default_value = "dev", global = true)]
+    /// Environment (defaults to `local`; legacy `dev` remapped via the A4b
+    /// compat alias with a once-per-process warning until removal).
+    #[arg(long = "env", short = 'e', default_value = "local", global = true)]
     pub env: String,
 
     /// UI locale (BCP-47 tag, e.g., en, ja, id)
@@ -169,8 +170,9 @@ pub struct BundleAddArgs {
     /// Team identifier
     #[arg(long = "team")]
     pub team: Option<String>,
-    /// Environment (dev/staging/prod)
-    #[arg(long = "env", short = 'e', default_value = "dev")]
+    /// Environment (defaults to `local`; legacy `dev` remapped via the A4b
+    /// compat alias with a once-per-process warning until removal).
+    #[arg(long = "env", short = 'e', default_value = "local")]
     pub env: String,
     /// Dry run (don't actually add)
     #[arg(long = "dry-run")]
@@ -197,8 +199,9 @@ pub struct BundleSetupArgs {
     /// Team identifier
     #[arg(long = "team")]
     pub team: Option<String>,
-    /// Environment (dev/staging/prod)
-    #[arg(long = "env", short = 'e', default_value = "dev")]
+    /// Environment (defaults to `local`; legacy `dev` remapped via the A4b
+    /// compat alias with a once-per-process warning until removal).
+    #[arg(long = "env", short = 'e', default_value = "local")]
     pub env: String,
     /// Filter by domain (messaging/events/secrets/oauth/all)
     #[arg(long = "domain", short = 'd', default_value = "all")]
