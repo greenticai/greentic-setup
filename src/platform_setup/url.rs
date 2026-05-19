@@ -37,8 +37,12 @@ pub fn normalize_public_base_url(value: &str, env: &str) -> Result<String> {
     if url.fragment().is_some() {
         bail!("public_base_url must not include a fragment");
     }
-    if env != "dev" && url.scheme() == "http" {
-        bail!("public_base_url may only use http for localhost/loopback origins in dev");
+    // Plain HTTP is allowed for the local/dev developer workflow only. The
+    // A4b compat alias remaps `dev` → `local` at the resolve-env boundary,
+    // but explicit `--env dev` callers may still reach this code path
+    // before the alias is invoked, so both names are accepted here.
+    if env != crate::LEGACY_ENV_ID && env != crate::DEFAULT_ENV_ID && url.scheme() == "http" {
+        bail!("public_base_url may only use http for localhost/loopback origins in dev/local");
     }
 
     let mut normalized = url.to_string();

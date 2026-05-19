@@ -53,7 +53,10 @@ pub fn resolve_setup_scope(
     } else {
         team
     };
-    let env = if env == "dev" {
+    // Both the legacy default (`dev`) and the new A4b default (`local`)
+    // are treated as the "no explicit CLI value — use the bundle answers'
+    // env if any" sentinel. Explicit non-default values stay verbatim.
+    let env = if env == crate::LEGACY_ENV_ID || env == crate::DEFAULT_ENV_ID {
         loaded.env.clone().unwrap_or(env)
     } else {
         env
@@ -554,6 +557,27 @@ mod tests {
         assert_eq!(tenant, "demo");
         assert_eq!(team, None);
         assert_eq!(env, "dev");
+    }
+
+    #[test]
+    fn resolve_setup_scope_treats_local_default_like_dev_default() {
+        // A4b widening: both `dev` (legacy default) and `local` (new
+        // default) act as "no explicit CLI value — use loaded.env if any".
+        let loaded = crate::engine::LoadedAnswers {
+            tenant: Some("acme".to_string()),
+            team: None,
+            env: Some("prod".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_setup_scope("demo".to_string(), None, "local".to_string(), &loaded);
+        assert_eq!(resolved.2, "prod");
+    }
+
+    #[test]
+    fn resolve_setup_scope_local_default_with_no_loaded_env_stays_local() {
+        let loaded = crate::engine::LoadedAnswers::default();
+        let resolved = resolve_setup_scope("demo".to_string(), None, "local".to_string(), &loaded);
+        assert_eq!(resolved.2, "local");
     }
 
     #[test]
