@@ -122,6 +122,11 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         )
     };
 
+    // A10 follow-up: canonicalize env through `resolve_env` so the A4b
+    // `dev` → `local` compat alias fires on the primary binary entry
+    // (the subcommand path was already fixed by greentic-setup#114).
+    env = greentic_setup::resolve_env(Some(&env));
+
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
 
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
@@ -343,7 +348,7 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         let loader_engine = SetupEngine::new(SetupConfig {
             tenant: cli.tenant.clone(),
             team: cli.team.clone(),
-            env: cli.env.clone(),
+            env: greentic_setup::resolve_env(Some(&cli.env)),
             offline: false,
             verbose: false,
         });
@@ -371,7 +376,9 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         answers_tenant.is_some() || answers_team.is_some() || answers_env.is_some();
     let tenant = answers_tenant.unwrap_or_else(|| cli.tenant.clone());
     let team = answers_team.or_else(|| cli.team.clone());
-    let env = answers_env.unwrap_or_else(|| cli.env.clone());
+    // A10 follow-up: canonicalize the resolved env (whether from answers
+    // metadata or CLI) so the A4b `dev` → `local` compat alias fires.
+    let env = greentic_setup::resolve_env(Some(&answers_env.unwrap_or_else(|| cli.env.clone())));
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(greentic_setup::ui::launch(
