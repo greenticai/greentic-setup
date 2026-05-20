@@ -14,7 +14,7 @@ use crate::cli_i18n::CliI18n;
 use crate::engine::{LoadedAnswers, SetupConfig, SetupRequest};
 use crate::plan::TenantSelection;
 use crate::platform_setup::StaticRoutesPolicy;
-use crate::{SetupEngine, SetupMode, bundle};
+use crate::{SetupEngine, SetupMode, bundle, resolve_env};
 
 /// Run the setup command.
 pub fn setup(args: BundleSetupArgs, i18n: &CliI18n) -> Result<()> {
@@ -47,6 +47,11 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         skip_secrets_init,
         best_effort,
     } = args;
+
+    // A10: thread the env_id through the wizard surface as the canonical
+    // env id. resolve_env applies the A4b `dev` → `local` compat alias so
+    // a user passing `--env dev` doesn't slip past as a raw legacy string.
+    let cli_env = resolve_env(Some(&cli_env));
 
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
 
