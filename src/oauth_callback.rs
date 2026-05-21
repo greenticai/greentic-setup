@@ -267,12 +267,8 @@ mod tests {
     use zip::write::{FileOptions, ZipWriter};
 
     fn write_provider_pack(path: &Path) -> anyhow::Result<()> {
-        let file = std::fs::File::create(path)?;
-        let mut writer = ZipWriter::new(file);
-        let options: FileOptions<'_, ()> =
-            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        writer.start_file("pack.manifest.json", options)?;
-        writer.write_all(
+        write_provider_pack_with_manifest(
+            path,
             json!({
                 "pack_id": "messaging-example",
                 "extensions": {
@@ -281,12 +277,74 @@ mod tests {
                         "secret_keys": ["EXAMPLE_TOKEN"]
                     }
                 }
-            })
-            .to_string()
-            .as_bytes(),
-        )?;
+            }),
+        )
+    }
+
+    fn write_provider_pack_with_manifest(
+        path: &Path,
+        manifest: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options)?;
+        writer.write_all(manifest.to_string().as_bytes())?;
         writer.finish()?;
         Ok(())
+    }
+
+    fn persist_provider_answers(
+        bundle: &Path,
+        provider_id: &str,
+        answers: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let dir = bundle.join("state/config").join(provider_id);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("setup-answers.json"), answers.to_string())?;
+        Ok(())
+    }
+
+    fn signed_state(bundle: &Path, action_id: &str) -> anyhow::Result<String> {
+        let key = crate::setup_actions::load_or_create_signing_key(bundle)?;
+        let state_payload = crate::setup_actions::OAuthStatePayload {
+            provider_id: "messaging-example".into(),
+            tenant: "demo".into(),
+            team: "default".into(),
+            action_id: action_id.into(),
+            nonce: "nonce".into(),
+            expires_at: crate::setup_actions::current_epoch_secs() + 60,
+        };
+        crate::setup_actions::sign_oauth_state(&state_payload, &key)
+    }
+
+    fn persist_action(
+        bundle: &Path,
+        action_id: &str,
+        status: crate::setup_actions::SetupActionStatus,
+        callback_path: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let state = signed_state(bundle, action_id)?;
+        let mut actions = crate::setup_actions::extract_setup_actions(
+            "messaging-example",
+            "demo",
+            Some("default"),
+            &json!({
+                "setup_actions": [{
+                    "id": action_id,
+                    "kind": "oauth_install_button",
+                    "label": "Add",
+                    "authorize_url": "https://example.com/auth",
+                    "callback_path": callback_path,
+                    "state": state,
+                    "status": status
+                }]
+            }),
+        )?;
+        actions[0].status = status;
+        crate::setup_actions::persist_setup_actions(bundle, &actions)?;
+        Ok(state)
     }
 
     #[tokio::test]
@@ -296,31 +354,12 @@ mod tests {
         std::fs::create_dir_all(bundle.join("providers/messaging"))?;
         write_provider_pack(&bundle.join("providers/messaging/messaging-example.gtpack"))?;
 
-        let key = crate::setup_actions::load_or_create_signing_key(bundle)?;
-        let state_payload = crate::setup_actions::OAuthStatePayload {
-            provider_id: "messaging-example".into(),
-            tenant: "demo".into(),
-            team: "default".into(),
-            action_id: "install".into(),
-            nonce: "nonce".into(),
-            expires_at: crate::setup_actions::current_epoch_secs() + 60,
-        };
-        let state = crate::setup_actions::sign_oauth_state(&state_payload, &key)?;
-        let actions = crate::setup_actions::extract_setup_actions(
-            "messaging-example",
-            "demo",
-            Some("default"),
-            &json!({
-                "setup_actions": [{
-                    "id": "install",
-                    "kind": "oauth_install_button",
-                    "label": "Add",
-                    "authorize_url": "https://example.com/auth",
-                    "state": state
-                }]
-            }),
+        let state = persist_action(
+            bundle,
+            "install",
+            crate::setup_actions::SetupActionStatus::Pending,
+            None,
         )?;
-        crate::setup_actions::persist_setup_actions(bundle, &actions)?;
 
         let report = complete_oauth_callback_with_token_response(
             bundle,
@@ -358,6 +397,205 @@ mod tests {
         );
         let bytes = store.get(&uri).await?;
         assert_eq!(String::from_utf8(bytes)?, "token-value");
+        Ok(())
+    }
+
+    #[test]
+    fn load_provider_oauth_metadata_reports_missing_provider_and_extension() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        std::fs::create_dir_all(bundle.join("providers/messaging"))?;
+        write_provider_pack_with_manifest(
+            &bundle.join("providers/messaging/messaging-example.gtpack"),
+            json!({"pack_id": "messaging-example"}),
+        )?;
+
+        let missing_provider =
+            load_provider_oauth_metadata(bundle, "messaging-missing", "messaging.oauth.v1")
+                .unwrap_err()
+                .to_string();
+        assert!(missing_provider.contains("provider not found"));
+
+        let missing_extension =
+            load_provider_oauth_metadata(bundle, "messaging-example", "messaging.oauth.v1")
+                .unwrap_err()
+                .to_string();
+        assert!(missing_extension.contains("missing OAuth metadata"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_public_base_url_prefers_provider_answer() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        persist_provider_answers(
+            bundle,
+            "messaging-example",
+            json!({"public_base_url": "https://provider.example.com"}),
+        )?;
+
+        let resolved =
+            resolve_public_base_url(bundle, "demo", Some("default"), "messaging-example")?;
+        assert_eq!(resolved, "https://provider.example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_public_base_url_uses_static_routes_and_runtime_fallback() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        crate::platform_setup::persist_static_routes_artifact(
+            bundle,
+            &crate::platform_setup::StaticRoutesPolicy {
+                public_base_url: Some("https://static.example.com".into()),
+                ..crate::platform_setup::StaticRoutesPolicy::default()
+            },
+        )?;
+        let resolved =
+            resolve_public_base_url(bundle, "demo", Some("default"), "messaging-example")?;
+        assert_eq!(resolved, "https://static.example.com");
+
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        let runtime_dir = bundle.join("state/runtime/demo.default");
+        std::fs::create_dir_all(&runtime_dir)?;
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            json!({"public_base_url": "https://runtime.example.com"}).to_string(),
+        )?;
+        let resolved =
+            resolve_public_base_url(bundle, "demo", Some("default"), "messaging-example")?;
+        assert_eq!(resolved, "https://runtime.example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_public_base_url_errors_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let err =
+            resolve_public_base_url(temp.path(), "demo", Some("default"), "messaging-example")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("requires a public_base_url"));
+    }
+
+    #[test]
+    fn setup_answer_helpers_handle_missing_file_and_nonempty_aliases() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let empty = load_provider_setup_answers(temp.path(), "messaging-example")?;
+        assert_eq!(empty, Value::Object(JsonMap::new()));
+
+        let answers = json!({"client_id": "  ", "oauth_client_id": "client"});
+        assert_eq!(
+            first_nonempty(&answers, &["client_id", "oauth_client_id"]).as_deref(),
+            Some("client")
+        );
+        assert_eq!(ensure_leading_slash("oauth/callback"), "/oauth/callback");
+        assert_eq!(ensure_leading_slash("/oauth/callback"), "/oauth/callback");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_empty_code_missing_action_and_completed_action() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        let state = signed_state(bundle, "missing")?;
+        let err = complete_oauth_callback_with_token_response(
+            bundle,
+            "dev",
+            &OAuthCallbackInput {
+                code: " ".into(),
+                state: state.clone(),
+            },
+            &json!({"access_token": "token"}),
+            "messaging.oauth.v1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing code"));
+
+        let err = complete_oauth_callback_with_token_response(
+            bundle,
+            "dev",
+            &OAuthCallbackInput {
+                code: "code".into(),
+                state,
+            },
+            &json!({"access_token": "token"}),
+            "messaging.oauth.v1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("setup action not found"));
+
+        std::fs::create_dir_all(bundle.join("providers/messaging"))?;
+        write_provider_pack(&bundle.join("providers/messaging/messaging-example.gtpack"))?;
+        let state = persist_action(
+            bundle,
+            "install",
+            crate::setup_actions::SetupActionStatus::Complete,
+            None,
+        )?;
+        let err = complete_oauth_callback_with_token_response(
+            bundle,
+            "dev",
+            &OAuthCallbackInput {
+                code: "code".into(),
+                state,
+            },
+            &json!({"access_token": "token"}),
+            "messaging.oauth.v1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not pending"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_callback_validates_before_network_exchange() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        std::fs::create_dir_all(bundle.join("providers/messaging"))?;
+        write_provider_pack(&bundle.join("providers/messaging/messaging-example.gtpack"))?;
+        let state = persist_action(
+            bundle,
+            "install",
+            crate::setup_actions::SetupActionStatus::Pending,
+            None,
+        )?;
+
+        let err = complete_oauth_callback(
+            bundle,
+            "dev",
+            &OAuthCallbackInput {
+                code: " ".into(),
+                state: state.clone(),
+            },
+            "messaging.oauth.v1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing code"));
+
+        let err = complete_oauth_callback(
+            bundle,
+            "dev",
+            &OAuthCallbackInput {
+                code: "code".into(),
+                state,
+            },
+            "messaging.oauth.v1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("callback path is missing"));
         Ok(())
     }
 }
