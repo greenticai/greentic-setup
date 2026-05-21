@@ -14,6 +14,11 @@ use crate::{bundle, bundle_source::BundleSource, discovery};
 use super::plan_builders::compute_simple_hash;
 use super::types::SetupConfig;
 
+pub struct ApplyPackSetupReport {
+    pub provider_updates: usize,
+    pub pending_setup_actions: Vec<crate::setup_actions::SetupAction>,
+}
+
 /// Execute the CreateBundle step.
 pub fn execute_create_bundle(
     bundle_path: &Path,
@@ -146,8 +151,9 @@ pub fn execute_apply_pack_setup(
     bundle_path: &Path,
     metadata: &SetupPlanMetadata,
     config: &SetupConfig,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<ApplyPackSetupReport> {
     let mut count = 0;
+    let mut pending_setup_actions = Vec::new();
 
     if !metadata.providers_remove.is_empty() {
         count += execute_remove_provider_artifacts(bundle_path, &metadata.providers_remove)?;
@@ -166,13 +172,26 @@ pub fn execute_apply_pack_setup(
 
     // Persist setup answers to local config files and dev secrets store
     for (provider_id, answers) in &metadata.setup_answers {
+        let mut setup_actions = crate::setup_actions::extract_setup_actions(
+            provider_id,
+            &config.tenant,
+            config.team.as_deref(),
+            answers,
+        )?;
+        if !setup_actions.is_empty() {
+            crate::setup_actions::sign_pending_oauth_actions(bundle_path, &mut setup_actions)?;
+            crate::setup_actions::persist_setup_actions(bundle_path, &setup_actions)?;
+            pending_setup_actions.extend(setup_actions.clone());
+        }
+        let persisted_answers = crate::setup_actions::strip_setup_actions(answers);
+
         // Write answers to provider config directory
         let config_dir = bundle_path.join("state").join("config").join(provider_id);
         std::fs::create_dir_all(&config_dir)?;
 
         let config_path = config_dir.join("setup-answers.json");
-        let content =
-            serde_json::to_string_pretty(answers).context("failed to serialize setup answers")?;
+        let content = serde_json::to_string_pretty(&persisted_answers)
+            .context("failed to serialize setup answers")?;
         std::fs::write(&config_path, content).with_context(|| {
             format!(
                 "failed to write setup answers to: {}",
@@ -201,7 +220,7 @@ pub fn execute_apply_pack_setup(
                 "_example_key",
             );
             println!("  [secrets] URI pattern: {example_uri}");
-            if let Some(config_map) = answers.as_object() {
+            if let Some(config_map) = persisted_answers.as_object() {
                 let keys: Vec<&String> = config_map.keys().collect();
                 println!("  [secrets] answer keys: {keys:?}");
             }
@@ -214,7 +233,7 @@ pub fn execute_apply_pack_setup(
             &config.tenant,
             config.team.as_deref(),
             provider_id,
-            answers,
+            &persisted_answers,
             pack_path,
         ))?;
         if config.verbose {
@@ -238,7 +257,7 @@ pub fn execute_apply_pack_setup(
                 &bundle_path.join(".providers"),
                 provider_id,
                 "setup-input",
-                answers,
+                &persisted_answers,
                 pack_path,
                 false,
             )
@@ -260,7 +279,7 @@ pub fn execute_apply_pack_setup(
             bundle_path,
             &config.tenant,
             provider_id,
-            answers,
+            &persisted_answers,
         ) {
             Ok(true) => {
                 if config.verbose {
@@ -278,7 +297,7 @@ pub fn execute_apply_pack_setup(
             bundle_path,
             &config.tenant,
             provider_id,
-            answers,
+            &persisted_answers,
         ) {
             Ok(true) => {
                 if config.verbose {
@@ -304,7 +323,7 @@ pub fn execute_apply_pack_setup(
             bundle_path,
             &config.tenant,
             provider_id,
-            answers,
+            &persisted_answers,
         ) {
             Ok(true) => {
                 if config.verbose {
@@ -320,7 +339,7 @@ pub fn execute_apply_pack_setup(
         // Register webhooks if the provider needs one (e.g. Telegram, Slack, Webex)
         if let Some(result) = crate::webhook::register_webhook(
             provider_id,
-            answers,
+            &persisted_answers,
             &config.tenant,
             config.team.as_deref(),
         ) {
@@ -354,7 +373,10 @@ pub fn execute_apply_pack_setup(
     let team = config.team.as_deref().unwrap_or("default");
     crate::webhook::print_post_setup_instructions(&provider_configs, &config.tenant, team);
 
-    Ok(count)
+    Ok(ApplyPackSetupReport {
+        provider_updates: count,
+        pending_setup_actions,
+    })
 }
 
 fn compute_file_digest(path: &Path) -> anyhow::Result<String> {

@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use serde::Serialize;
 use serde_cbor::Value as CborValue;
 use zip::result::ZipError;
@@ -237,6 +238,32 @@ pub fn read_pack_meta(path: &Path) -> anyhow::Result<Option<DiscoveredPackMeta>>
     })
 }
 
+/// Read a top-level manifest extension value by key from a `.gtpack`.
+pub fn read_pack_extension(
+    path: &Path,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let file = std::fs::File::open(path)?;
+    match zip::ZipArchive::new(file) {
+        Ok(mut archive) => {
+            if let Some(value) = read_manifest_extension_cbor(&mut archive, extension_key)? {
+                return Ok(Some(value));
+            }
+            if let Some(value) =
+                read_manifest_extension_json(&mut archive, "pack.manifest.json", extension_key)?
+            {
+                return Ok(Some(value));
+            }
+        }
+        Err(_) => {
+            if let Some(value) = read_manifest_extension_cbor_from_tar(path, extension_key)? {
+                return Ok(Some(value));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -290,6 +317,24 @@ fn read_manifest_cbor(
     extract_pack_meta_from_cbor(&value)
 }
 
+fn read_manifest_extension_cbor(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut file = match archive.by_name("manifest.cbor") {
+        Ok(file) => file,
+        Err(ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let value: CborValue = serde_cbor::from_slice(&bytes)?;
+    let CborValue::Map(map) = &value else {
+        return Ok(None);
+    };
+    Ok(map_get(map, extension_key).map(cbor_to_json))
+}
+
 fn read_manifest_json(
     archive: &mut zip::ZipArchive<std::fs::File>,
     name: &str,
@@ -330,6 +375,27 @@ fn read_manifest_json(
     Ok(None)
 }
 
+fn read_manifest_extension_json(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut file = match archive.by_name(name) {
+        Ok(file) => file,
+        Err(ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut file, &mut contents)?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents)?;
+    Ok(parsed.get(extension_key).cloned().or_else(|| {
+        parsed
+            .get("extensions")
+            .and_then(|extensions| extensions.get(extension_key))
+            .cloned()
+    }))
+}
+
 fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<PackMeta>> {
     let file = std::fs::File::open(path)?;
     let mut archive = tar::Archive::new(file);
@@ -342,6 +408,28 @@ fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<PackMeta>> 
         std::io::Read::read_to_end(&mut entry, &mut bytes)?;
         let value: CborValue = serde_cbor::from_slice(&bytes)?;
         return extract_pack_meta_from_cbor(&value);
+    }
+    Ok(None)
+}
+
+fn read_manifest_extension_cbor_from_tar(
+    path: &Path,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_ref() != Path::new("manifest.cbor") {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+        let value: CborValue = serde_cbor::from_slice(&bytes)?;
+        let CborValue::Map(map) = &value else {
+            return Ok(None);
+        };
+        return Ok(map_get(map, extension_key).map(cbor_to_json));
     }
     Ok(None)
 }
@@ -430,6 +518,40 @@ fn map_get<'a>(
     })
 }
 
+fn cbor_to_json(value: &CborValue) -> serde_json::Value {
+    match value {
+        CborValue::Null => serde_json::Value::Null,
+        CborValue::Bool(v) => serde_json::Value::Bool(*v),
+        CborValue::Integer(v) => i64::try_from(*v)
+            .map(serde_json::Number::from)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|_| serde_json::Value::String(v.to_string())),
+        CborValue::Float(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        CborValue::Bytes(bytes) => {
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        CborValue::Text(text) => serde_json::Value::String(text.clone()),
+        CborValue::Array(values) => {
+            serde_json::Value::Array(values.iter().map(cbor_to_json).collect())
+        }
+        CborValue::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (key, value) in map {
+                let key = match key {
+                    CborValue::Text(text) => text.clone(),
+                    CborValue::Integer(value) => value.to_string(),
+                    other => serde_json::to_string(&cbor_to_json(other)).unwrap_or_default(),
+                };
+                obj.insert(key, cbor_to_json(value));
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn missing_cbor_error(path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
         "demo packs must be CBOR-only (.gtpack must contain manifest.cbor). \
@@ -462,6 +584,17 @@ mod tests {
         Ok(())
     }
 
+    fn write_test_pack_manifest(path: &Path, manifest: serde_json::Value) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options)?;
+        writer.write_all(manifest.to_string().as_bytes())?;
+        writer.finish()?;
+        Ok(())
+    }
+
     #[test]
     fn discover_includes_app_packs_in_setup_targets() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -490,6 +623,27 @@ mod tests {
         assert_eq!(discovered.app_packs[0].provider_id, "weather-app");
         assert_eq!(discovered.app_packs[0].domain, "app");
         assert_eq!(discovered.app_packs[0].kind, DetectedPackKind::App);
+        Ok(())
+    }
+
+    #[test]
+    fn read_pack_extension_reads_json_manifest_extension() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let pack = temp.path().join("messaging-example.gtpack");
+        write_test_pack_manifest(
+            &pack,
+            serde_json::json!({
+                "pack_id": "messaging-example",
+                "extensions": {
+                    "messaging.oauth.v1": {
+                        "token_url": "https://example.com/token",
+                        "secret_keys": ["EXAMPLE_TOKEN"]
+                    }
+                }
+            }),
+        )?;
+        let extension = read_pack_extension(&pack, "messaging.oauth.v1")?.unwrap();
+        assert_eq!(extension["token_url"], "https://example.com/token");
         Ok(())
     }
 }

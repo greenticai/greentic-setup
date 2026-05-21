@@ -198,9 +198,10 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         return Ok(());
     }
 
-    engine
+    let report = engine
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
+    print_pending_setup_actions(&report.pending_setup_actions);
 
     let done_key = match mode {
         SetupMode::Update => "cli.bundle.update.complete",
@@ -209,4 +210,33 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     println!("\n{}", i18n.tf(done_key, &[&provider_display]));
 
     Ok(())
+}
+
+fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
+    let visible_actions: Vec<_> = actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind,
+                crate::setup_actions::SetupActionKind::OauthInstallButton
+            ) && action.status == crate::setup_actions::SetupActionStatus::Pending
+        })
+        .collect();
+    if visible_actions.is_empty() {
+        return;
+    }
+
+    println!();
+    for action in visible_actions {
+        println!("{}:", action.label);
+        if let Some(url) = action.authorize_url.as_deref() {
+            println!("{url}");
+        }
+        if action.callback_path.is_some() {
+            println!(
+                "After completing the OAuth flow, re-run setup if the callback was not handled automatically."
+            );
+        }
+        println!();
+    }
 }

@@ -1500,6 +1500,17 @@
       });
       html += '</div>';
     }
+    if (r && r.pending_setup_actions && r.pending_setup_actions.length > 0) {
+      html += '<div class="output-section"><h4 class="output-title">Setup actions</h4>';
+      r.pending_setup_actions.forEach(function (action) {
+        if (action.kind !== "oauth_install_button" || !action.authorize_url) return;
+        html += '<div class="setup-action">';
+        html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.authorize_url) + '">' + esc(action.label || "Open") + '</a>';
+        html += '<div class="setup-action-url">' + esc(action.authorize_url) + '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
     if (r && r.stdout) html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.output")) + '</h4><pre class="output-pre">' + esc(r.stdout) + '</pre></div>';
     if (r && r.stderr) html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.log")) + '</h4><pre class="output-pre stderr">' + esc(r.stderr) + '</pre></div>';
 
