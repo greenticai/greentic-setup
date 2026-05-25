@@ -40,16 +40,25 @@ fn resolve_secret_answer_keys(pack_path: &Path, provider_id: &str) -> Option<BTr
     Some(secret_ids)
 }
 
-/// Match an answer key (post-normalization) against the secret-marked set,
-/// mirroring the suffix logic in `qa::persist::seed_secret_requirement_aliases`.
-/// Either exact equality or a tail-match counts so that pack-declared
-/// requirement keys like `webex_bot_token` correctly redact an answer
-/// supplied as `bot_token`.
+/// Match an answer key (post-normalization) against the secret-marked set.
+///
+/// This MUST mirror `qa::persist::seed_secret_requirement_aliases` exactly
+/// (`canonical_req_key.ends_with(&norm_cfg)`), so that the set of answers
+/// redacted from disk is identical to the set persisted to the dev secrets
+/// store as secrets. If redaction were narrower than seeding, a key the
+/// persist path treats as a secret would stay as plaintext on disk — a leak.
+///
+/// Match when the answer key's canonical form equals a secret key, or a
+/// secret key ends with it (forward direction only — so requirement
+/// `webex_bot_token` is satisfied by answer `bot_token`). The earlier
+/// version ALSO matched the reverse direction (`norm.ends_with(secret)`),
+/// which the persist path does not do; that over-matched (answer `bot_token`
+/// wrongly redacted for an unrelated secret `token`) and is dropped here.
 fn is_secret_answer_key(answer_key: &str, secret_keys: &BTreeSet<String>) -> bool {
     let norm = crate::secret_name::canonical_secret_name(answer_key);
     secret_keys
         .iter()
-        .any(|secret| secret == &norm || secret.ends_with(&norm) || norm.ends_with(secret))
+        .any(|secret| secret == &norm || secret.ends_with(&norm))
 }
 
 /// Drop secret-marked answer values entirely (B12a). Used for the on-disk
@@ -100,6 +109,35 @@ fn redact_secret_answer_values_to_uri_refs(
         }
     }
     Value::Object(filtered)
+}
+
+/// Decide the secret-key set for redaction, applying the B12a fail-closed
+/// contract.
+///
+/// `resolved` carries a load-bearing `Option`:
+///   - `Some(set)` — the pack HAS classifiable metadata. An empty set means
+///     the pack legitimately declares zero secrets; proceed (write every
+///     answer as non-secret). This is NOT a failure.
+///   - `None` — no pack / no classifiable metadata at all. With non-empty
+///     answers we cannot tell which are secret, so fail closed rather than
+///     risk writing plaintext. With empty answers there's nothing to leak,
+///     so proceed with an empty set.
+fn secret_keys_or_fail_closed(
+    resolved: Option<BTreeSet<String>>,
+    answers: &Value,
+    provider_id: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    match resolved {
+        Some(set) => Ok(set),
+        None if answers_have_content(answers) => anyhow::bail!(
+            "B12a: refusing to write setup-answers for `{provider_id}` — the pack ships no \
+             classifiable setup metadata (no setup.yaml / qa/*.json / secret-requirements), so \
+             we can't tell which answers are secrets and won't risk writing plaintext. \
+             Install/repair the pack with a setup.yaml (`secret: true` flags) or an \
+             `assets/secret-requirements.json`, or pass an explicit pack ref, then retry.",
+        ),
+        None => Ok(BTreeSet::new()),
+    }
 }
 
 /// Return true if `answers` is a JSON object with at least one non-null
@@ -285,36 +323,18 @@ pub fn execute_apply_pack_setup(
         // B12a fail-closed contract: resolve the secret-marked answer key
         // set from the pack's `pack_to_form_spec` (the union of setup.yaml /
         // qa/*.json `secret: true` questions and `secret-requirements.json`
-        // entries). If we can't resolve the metadata AND the operator
-        // supplied non-empty answers, refuse to write the transitional
-        // plaintext sinks — a missing pack or unparseable form spec MUST
-        // NOT silently downgrade B12a redaction to a no-op.
-        let secret_keys: BTreeSet<String> = match pack_path {
-            Some(pp) => resolve_secret_answer_keys(pp, provider_id).unwrap_or_default(),
-            None => {
-                if answers_have_content(answers) {
-                    anyhow::bail!(
-                        "B12a: refusing to write setup-answers for `{provider_id}` because the \
-                         pack is not discoverable on disk — we can't classify secret-marked \
-                         questions without the form spec. Re-run discovery, install the pack, \
-                         or pass an explicit pack ref before retrying setup.",
-                    );
-                }
-                BTreeSet::new()
-            }
-        };
-        if pack_path.is_some() && secret_keys.is_empty() && answers_have_content(answers) {
-            // Pack was found but it shipped no form spec and no secret
-            // requirements. We can't tell which keys are secrets, so we'd
-            // be writing plaintext-or-nothing — defer to fail-closed.
-            anyhow::bail!(
-                "B12a: refusing to write setup-answers for `{provider_id}` because the pack \
-                 ships no form spec (setup.yaml / qa/*.json) and no secret-requirements \
-                 metadata — we can't classify which answers are secrets. Add a setup.yaml \
-                 with `secret: true` flags or an `assets/secret-requirements.json` to the \
-                 pack and retry.",
-            );
-        }
+        // entries). The `Option` is load-bearing:
+        //   - `Some(set)` — the pack HAS a form spec. An empty set means the
+        //     pack legitimately declares zero secrets (e.g. only model/url
+        //     config); we proceed and write every answer as non-secret.
+        //   - `None` — the pack ships NO classifiable metadata at all (no
+        //     setup.yaml, no qa/*.json, no secret-requirements). We cannot
+        //     tell which answers are secret, so with non-empty answers we
+        //     fail closed rather than silently writing plaintext.
+        // A missing pack path is the same "can't classify" situation.
+        let resolved_secret_keys: Option<BTreeSet<String>> =
+            pack_path.and_then(|pp| resolve_secret_answer_keys(pp, provider_id));
+        let secret_keys = secret_keys_or_fail_closed(resolved_secret_keys, answers, provider_id)?;
         let answers_for_disk = strip_secret_answer_keys(answers, &secret_keys);
         let envelope_answers = redact_secret_answer_values_to_uri_refs(
             answers,
@@ -952,7 +972,8 @@ mod tests {
     fn is_secret_answer_key_matches_aliases_via_canonical_suffix() {
         // Mirrors `qa::persist::seed_secret_requirement_aliases` (Codex
         // F3): a `webex_bot_token` requirement is satisfied by an answer
-        // key `bot_token`, so redaction must match it too.
+        // key `bot_token`, so redaction must match it too (forward direction:
+        // secret key ends with answer key).
         let secret_keys = secret_keys_for(&["webex_bot_token"]);
         assert!(is_secret_answer_key("bot_token", &secret_keys));
         assert!(is_secret_answer_key("BOT_TOKEN", &secret_keys));
@@ -960,6 +981,33 @@ mod tests {
         // Non-aliases must not match.
         assert!(!is_secret_answer_key("model", &secret_keys));
         assert!(!is_secret_answer_key("bot_url", &secret_keys));
+    }
+
+    #[test]
+    fn is_secret_answer_key_does_not_over_match_reverse_direction() {
+        // xhigh review C4: the previous symmetric `norm.ends_with(secret)`
+        // direction over-matched. A pack whose ONLY secret is the short key
+        // `token` must NOT cause an unrelated longer answer `bot_token` to be
+        // redacted — `seed_secret_requirement_aliases` would not seed it
+        // either (it matches `requirement.ends_with(answer)`, not the
+        // reverse), so redaction must stay consistent and leave it alone.
+        let secret_keys = secret_keys_for(&["token"]);
+        assert!(is_secret_answer_key("token", &secret_keys));
+        assert!(
+            !is_secret_answer_key("bot_token", &secret_keys),
+            "answer key longer than the secret key must not match (reverse direction removed)",
+        );
+        assert!(!is_secret_answer_key("refresh_token", &secret_keys));
+    }
+
+    #[test]
+    fn is_secret_answer_key_punctuation_only_key_does_not_match_unrelated_secret() {
+        // `canonical_secret_name` maps empty/punctuation-only keys to the
+        // sentinel "secret"; it must not collide with an unrelated secret
+        // key like `api_key`.
+        let secret_keys = secret_keys_for(&["api_key"]);
+        assert!(!is_secret_answer_key("", &secret_keys));
+        assert!(!is_secret_answer_key("---", &secret_keys));
     }
 
     #[test]
@@ -989,6 +1037,33 @@ mod tests {
         );
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(!json.contains("T0K3N-MUST-NOT-LEAK"));
+    }
+
+    #[test]
+    fn secret_keys_fail_closed_distinguishes_none_from_empty_set() {
+        let content = serde_json::json!({"model": "gpt-4o"});
+        let empty = serde_json::json!({});
+
+        // xhigh review C3: a pack WITH a form spec that declares zero secrets
+        // resolves to Some(empty) and MUST proceed (write all answers as
+        // non-secret) — not bail.
+        let r = secret_keys_or_fail_closed(Some(BTreeSet::new()), &content, "p").unwrap();
+        assert!(r.is_empty(), "Some(empty) proceeds with no redaction");
+
+        // Some(nonempty) passes the set through.
+        let set = secret_keys_for(&["api_key"]);
+        let r = secret_keys_or_fail_closed(Some(set.clone()), &content, "p").unwrap();
+        assert_eq!(r, set);
+
+        // None + content => fail closed (can't classify, won't risk plaintext).
+        assert!(secret_keys_or_fail_closed(None, &content, "p").is_err());
+
+        // None + empty answers => nothing to leak, proceed.
+        assert!(
+            secret_keys_or_fail_closed(None, &empty, "p")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
