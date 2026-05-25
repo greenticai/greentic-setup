@@ -2,8 +2,8 @@
 //!
 //! Each executor handles a specific `SetupStepKind`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 
 use anyhow::Context;
 use serde_json::Value;
@@ -15,29 +15,40 @@ use crate::{bundle, bundle_source::BundleSource, discovery};
 use super::plan_builders::compute_simple_hash;
 use super::types::SetupConfig;
 
-// DEPRECATED (Phase B / B12a): once-per-process deprecation warnings for the
-// plaintext non-secret config sinks. See callers below.
-static WARN_SETUP_ANSWERS: Once = Once::new();
-static WARN_CONFIG_ENVELOPE: Once = Once::new();
-
-fn warn_setup_answers_deprecated() {
-    WARN_SETUP_ANSWERS.call_once(|| {
-        tracing::warn!(
-            target: "greentic_setup::deprecated",
-            "writing state/config/<provider>/setup-answers.json — deprecated sink, \
-             migrate to pack-config.v1 + secrets backend (Phase B / B12a)"
-        );
-    });
-}
-
-fn warn_config_envelope_deprecated() {
-    WARN_CONFIG_ENVELOPE.call_once(|| {
-        tracing::warn!(
-            target: "greentic_setup::deprecated",
-            ".providers/<provider>/config.envelope.cbor — deprecated sink, \
-             migrate to pack-config.v1 (Phase B / B12a)"
-        );
-    });
+/// Replace secret-marked answer values with canonical `secrets://` URI
+/// references so the on-disk artifacts (`setup-answers.json` and
+/// `config.envelope.cbor`) carry zero plaintext secret values (B12a). The
+/// canonical URI matches what `qa::persist::persist_all_config_as_secrets`
+/// writes to the dev secrets store, so any consumer can dereference the
+/// reference via `SecretsManager`.
+///
+/// Returns the original `answers` value (clone) when no secret keys are
+/// known (e.g. `secret_keys` is empty or the pack didn't ship
+/// `secret-requirements.json`), or when `answers` isn't a JSON object.
+fn redact_secret_answer_values_to_uri_refs(
+    answers: &Value,
+    secret_keys: &BTreeSet<String>,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+) -> Value {
+    let Some(map) = answers.as_object() else {
+        return answers.clone();
+    };
+    if secret_keys.is_empty() {
+        return answers.clone();
+    }
+    let mut filtered = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        if secret_keys.contains(&key.to_ascii_lowercase()) {
+            let uri = crate::canonical_secret_uri(env, tenant, team, provider_id, key);
+            filtered.insert(key.clone(), Value::String(uri));
+        } else {
+            filtered.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(filtered)
 }
 
 /// Execute the CreateBundle step.
@@ -196,16 +207,48 @@ pub fn execute_apply_pack_setup(
         let config_dir = bundle_path.join("state").join("config").join(provider_id);
         std::fs::create_dir_all(&config_dir)?;
 
-        // DEPRECATED (Phase B / B12a): `setup-answers.json` is a transitional sink kept
-        // alive for runtime compatibility until `pack-config.v1` exists. Secret values
-        // are already redacted by P0.1; non-secret keys still ship plaintext here so
-        // downstream readers in greentic-start (runner_host, messaging_app,
-        // ingress_dispatch) keep working. Migrate readers to the secrets backend in
-        // B12a, then stop writing this file.
-        warn_setup_answers_deprecated();
+        // Resolve the pack path early so we can both discover secret-marked
+        // keys (to redact plaintext from the on-disk artifacts — B12a) and
+        // pass it to the envelope writer + secrets-persist path.
+        let pack_path = discovered.as_ref().and_then(|d| {
+            d.find_setup_target(provider_id)
+                .map(|p| p.pack_path.as_path())
+        });
+        let env = crate::resolve_env(Some(&config.env));
+
+        // B12a: identify secret-marked keys so we can redact their values
+        // (replace plaintext with the canonical `secrets://` URI reference)
+        // before writing the answers to disk. The full plaintext answers
+        // continue to flow into the dev secrets store via
+        // `persist_all_config_as_secrets` below — the secrets backend
+        // remains the canonical source for runtime reads.
+        let secret_keys: BTreeSet<String> = match pack_path {
+            Some(pp) => match crate::secrets::load_secret_keys_from_pack(pp) {
+                Ok(keys) => keys.into_iter().map(|k| k.to_ascii_lowercase()).collect(),
+                Err(err) => {
+                    tracing::warn!(
+                        provider_id,
+                        pack_path = %pp.display(),
+                        error = %err,
+                        "could not load secret-requirements; writing setup answers without B12a redaction",
+                    );
+                    BTreeSet::new()
+                }
+            },
+            None => BTreeSet::new(),
+        };
+        let redacted_answers = redact_secret_answer_values_to_uri_refs(
+            answers,
+            &secret_keys,
+            &env,
+            &config.tenant,
+            config.team.as_deref(),
+            provider_id,
+        );
+
         let config_path = config_dir.join("setup-answers.json");
-        let content =
-            serde_json::to_string_pretty(answers).context("failed to serialize setup answers")?;
+        let content = serde_json::to_string_pretty(&redacted_answers)
+            .context("failed to serialize setup answers")?;
         std::fs::write(&config_path, content).with_context(|| {
             format!(
                 "failed to write setup answers to: {}",
@@ -213,13 +256,6 @@ pub fn execute_apply_pack_setup(
             )
         })?;
 
-        // Persist all answer values to the dev secrets store so that
-        // WASM components can read them via the secrets API at runtime.
-        let pack_path = discovered.as_ref().and_then(|d| {
-            d.find_setup_target(provider_id)
-                .map(|p| p.pack_path.as_path())
-        });
-        let env = crate::resolve_env(Some(&config.env));
         if config.verbose {
             let team_display = config.team.as_deref().unwrap_or("(none)");
             println!(
@@ -265,19 +301,15 @@ pub fn execute_apply_pack_setup(
         }
 
         // Materialize a provider config envelope so runtime/provider ingest
-        // paths can read setup-applied config, not just raw setup answers.
-        //
-        // DEPRECATED (Phase B / B12a): `config.envelope.cbor` carries plaintext
-        // non-secret config in a CBOR envelope. Same compatibility contract as
-        // `setup-answers.json` above. Migrate to `pack-config.v1` before stopping
-        // the write.
+        // paths can read setup-applied config. After B12a the envelope carries
+        // `secrets://` URI references for secret-marked keys (matching the
+        // canonical URIs in the dev secrets store) instead of plaintext.
         if let Some(pack_path) = pack_path {
-            warn_config_envelope_deprecated();
             crate::config_envelope::write_provider_config_envelope(
                 &bundle_path.join(".providers"),
                 provider_id,
                 "setup-input",
-                answers,
+                &redacted_answers,
                 pack_path,
                 false,
             )
@@ -749,6 +781,106 @@ mod tests {
         assert!(
             !canonical_pack.exists(),
             "must not auto-install canonical-named duplicate when pack_id already present"
+        );
+    }
+
+    #[test]
+    fn redacts_secret_marked_answers_to_canonical_uri_references() {
+        let mut secret_keys = BTreeSet::new();
+        secret_keys.insert("api_key".to_string());
+        secret_keys.insert("oauth_client_secret".to_string());
+
+        let answers = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "api_key": "sk-PLAINTEXT-MUST-NOT-LEAK",
+            "oauth_client_secret": "PLAINTEXT-OAUTH-SECRET",
+            "non_secret_url": "https://api.openai.com/v1"
+        });
+
+        let redacted = redact_secret_answer_values_to_uri_refs(
+            &answers,
+            &secret_keys,
+            "dev",
+            "demo",
+            Some("default"),
+            "openai-llm",
+        );
+
+        let map = redacted.as_object().expect("object");
+        assert_eq!(map["model"].as_str(), Some("gpt-4o-mini"));
+        assert_eq!(
+            map["non_secret_url"].as_str(),
+            Some("https://api.openai.com/v1")
+        );
+        // `canonical_secret_uri` collapses the literal "default" team into
+        // the wildcard segment `_` (see `canonical_team` in lib.rs).
+        assert_eq!(
+            map["api_key"].as_str(),
+            Some("secrets://dev/demo/_/openai-llm/api_key"),
+            "secret value must be replaced with canonical secrets:// URI",
+        );
+        assert_eq!(
+            map["oauth_client_secret"].as_str(),
+            Some("secrets://dev/demo/_/openai-llm/oauth_client_secret"),
+        );
+
+        // Defense in depth: serialized output must contain zero of the
+        // plaintext fragments.
+        let json = serde_json::to_string(&redacted).expect("serialize");
+        assert!(
+            !json.contains("PLAINTEXT-MUST-NOT-LEAK"),
+            "api_key plaintext leaked into JSON: {json}",
+        );
+        assert!(
+            !json.contains("PLAINTEXT-OAUTH-SECRET"),
+            "oauth_client_secret plaintext leaked into JSON: {json}",
+        );
+    }
+
+    #[test]
+    fn redact_helper_passes_through_when_no_secret_keys() {
+        let secret_keys: BTreeSet<String> = BTreeSet::new();
+        let answers = serde_json::json!({"api_key": "value"});
+        let redacted = redact_secret_answer_values_to_uri_refs(
+            &answers,
+            &secret_keys,
+            "dev",
+            "demo",
+            None,
+            "openai",
+        );
+        assert_eq!(redacted, answers, "no-op when no secret keys known");
+    }
+
+    #[test]
+    fn redact_helper_matches_keys_case_insensitively() {
+        let mut secret_keys = BTreeSet::new();
+        // The pack's secret-requirements may list lowercased keys; the
+        // operator's answers may use the form's original case. The helper
+        // bridges them by lowercasing the answer key at match time.
+        secret_keys.insert("api_key".to_string());
+        let answers = serde_json::json!({"API_KEY": "sk-PLAINTEXT"});
+
+        let redacted = redact_secret_answer_values_to_uri_refs(
+            &answers,
+            &secret_keys,
+            "dev",
+            "demo",
+            None,
+            "openai",
+        );
+        // The on-disk map preserves the original answer key (`API_KEY`),
+        // but the URI value uses the canonical lowercased key — matching
+        // what `canonical_secret_uri` writes for the dev secrets store
+        // entry, so a downstream consumer can dereference correctly.
+        assert_eq!(
+            redacted["API_KEY"].as_str(),
+            Some("secrets://dev/demo/_/openai/api_key"),
+        );
+        assert!(
+            !serde_json::to_string(&redacted)
+                .unwrap()
+                .contains("sk-PLAINTEXT"),
         );
     }
 }
