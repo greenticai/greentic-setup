@@ -526,6 +526,125 @@ setup_answers:
     }
 
     #[test]
+    fn execute_apply_pack_setup_persists_pack_declared_setup_actions() {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        let providers_dir = bundle_root.join("providers/messaging");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        let pack_path = providers_dir.join("messaging-slack.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options).unwrap();
+        writer
+            .write_all(
+                json!({
+                    "pack_id": "messaging-slack",
+                    "display_name": "Slack"
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.start_file("assets/setup.yaml", options).unwrap();
+        writer
+            .write_all(
+                br#"
+title: Slack
+questions: []
+setup_actions:
+  - id: add_to_slack
+    label: Add to Slack
+    kind: oauth_install_button
+    provider_id: slack
+    authorize_url: https://slack.example/install
+"#,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let request = empty_request(bundle_root.clone());
+        let plan = engine.plan(SetupMode::Create, &request, false).unwrap();
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.kind == crate::plan::SetupStepKind::ApplyPackSetup),
+            "pack-declared setup actions should schedule ApplyPackSetup"
+        );
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        assert_eq!(report.pending_setup_actions.len(), 1);
+        assert_eq!(report.pending_setup_actions[0].id, "add_to_slack");
+        assert_eq!(report.pending_setup_actions[0].label, "Add to Slack");
+        assert_eq!(
+            report.pending_setup_actions[0].provider_id,
+            "messaging-slack"
+        );
+        let action_path = crate::setup_actions::setup_actions_state_path(
+            &bundle_root,
+            "demo",
+            "default",
+            "messaging-slack",
+        );
+        assert!(action_path.exists());
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_hydrates_oauth_install_url_from_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request.setup_answers.insert(
+            "messaging-example".into(),
+            json!({
+                "slack_client_id": "client-123",
+                "setup_actions": [{
+                    "id": "install",
+                    "kind": "oauth_install_button",
+                    "label": "Add",
+                    "authorize_url": "https://slack.com/oauth/v2/authorize",
+                    "client_id_field": "slack_client_id",
+                    "scopes": ["chat:write", "channels:read"]
+                }]
+            }),
+        );
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        let url = report.pending_setup_actions[0]
+            .authorize_url
+            .as_deref()
+            .unwrap();
+        assert!(url.contains("client_id=client-123"), "{url}");
+        assert!(
+            url.contains("scope=chat%3Awrite%2Cchannels%3Aread"),
+            "{url}"
+        );
+    }
+
+    #[test]
     fn execute_create_persists_platform_metadata_without_provider_steps() {
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");

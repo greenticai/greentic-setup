@@ -1502,12 +1502,28 @@
     }
     if (r && r.pending_setup_actions && r.pending_setup_actions.length > 0) {
       html += '<div class="output-section"><h4 class="output-title">Setup actions</h4>';
-      r.pending_setup_actions.forEach(function (action) {
-        if (action.kind !== "oauth_install_button" || !action.authorize_url) return;
+      r.pending_setup_actions.forEach(function (action, idx) {
+        if (action.kind === "oauth_install_button" && action.authorize_url) {
         html += '<div class="setup-action">';
         html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.authorize_url) + '">' + esc(action.label || "Open") + '</a>';
         html += '<div class="setup-action-url">' + esc(action.authorize_url) + '</div>';
         html += '</div>';
+          return;
+        }
+        if (action.kind === "oauth_device_code") {
+          var report = action.device_report || null;
+          html += '<div class="setup-action">';
+          html += '<button class="btn btn-primary setup-action-btn btn-oauth-device-start" data-action-idx="' + idx + '">' + esc(action.label || "Connect") + '</button>';
+          if (report) {
+            html += '<div class="setup-action-url">' + esc(report.verification_uri) + '</div>';
+            html += '<div class="setup-action-code">' + esc(report.user_code) + '</div>';
+            html += '<button class="btn btn-secondary btn-oauth-device-poll" data-session-id="' + esc(report.session_id) + '">Finish</button>';
+          }
+          if (action.device_error) {
+            html += '<div class="setup-action-error">' + esc(action.device_error) + '</div>';
+          }
+          html += '</div>';
+        }
       });
       html += '</div>';
     }
@@ -1525,6 +1541,68 @@
     app.innerHTML = html;
     document.getElementById("btn-back-dash").addEventListener("click", function () { state.phase = "dashboard"; render(); });
     document.getElementById("btn-close").addEventListener("click", shutdown);
+    Array.prototype.forEach.call(document.querySelectorAll(".btn-oauth-device-start"), function (btn) {
+      btn.addEventListener("click", function () { startOAuthDeviceAction(Number(btn.getAttribute("data-action-idx"))); });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".btn-oauth-device-poll"), function (btn) {
+      btn.addEventListener("click", function () { pollOAuthDeviceAction(btn.getAttribute("data-session-id")); });
+    });
+  }
+
+  function startOAuthDeviceAction(idx) {
+    var actions = state.result && state.result.pending_setup_actions;
+    if (!actions || !actions[idx]) return;
+    var action = actions[idx];
+    fetch("/api/oauth-device/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: action.provider_id,
+        tenant: action.tenant,
+        team: action.team || null,
+        action_id: action.id,
+      }),
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res.ok) {
+        action.device_report = res.report;
+        action.device_error = null;
+      } else {
+        action.device_error = res.error || "Device login failed";
+      }
+      render();
+    })
+    .catch(function (err) {
+      action.device_error = err.message;
+      render();
+    });
+  }
+
+  function pollOAuthDeviceAction(sessionId) {
+    fetch("/api/oauth-device/poll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!res.ok) {
+        alert(res.error || "Device login failed");
+        return;
+      }
+      var report = res.report || {};
+      if (report.status === "complete") {
+        state.result.stdout = (state.result.stdout || "") + "\nOAuth device-code setup complete.";
+        state.result.pending_setup_actions = (state.result.pending_setup_actions || []).filter(function (action) {
+          return !(action.device_report && action.device_report.session_id === sessionId);
+        });
+      } else if (report.message) {
+        alert(report.message);
+      }
+      render();
+    })
+    .catch(function (err) { alert(err.message); });
   }
 
   // ── Export ──

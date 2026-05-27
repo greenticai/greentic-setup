@@ -257,6 +257,8 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/providers", get(get_providers))
         .route("/api/draft", post(post_draft))
         .route("/api/execute", post(post_execute))
+        .route("/api/oauth-device/start", post(post_oauth_device_start))
+        .route("/api/oauth-device/poll", post(post_oauth_device_poll))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
         .route("/oauth/callback/{provider}", get(get_oauth_callback))
@@ -1048,6 +1050,37 @@ async fn get_oauth_callback(
             axum::http::StatusCode::BAD_REQUEST,
             format!("OAuth setup failed: {err}"),
         ),
+    }
+}
+
+async fn post_oauth_device_start(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<crate::oauth_device::OAuthDeviceStartInput>,
+) -> Json<Value> {
+    match crate::oauth_device::start_oauth_device_code(
+        &state.bundle_path,
+        &req,
+        crate::oauth_device::DEFAULT_EXTENSION_KEY,
+    ) {
+        Ok(report) => Json(serde_json::json!({ "ok": true, "report": report })),
+        Err(err) => Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
+    }
+}
+
+async fn post_oauth_device_poll(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<crate::oauth_device::OAuthDevicePollInput>,
+) -> Json<Value> {
+    match crate::oauth_device::poll_oauth_device_code(
+        &state.bundle_path,
+        &state.env,
+        &req,
+        crate::oauth_device::DEFAULT_EXTENSION_KEY,
+    )
+    .await
+    {
+        Ok(report) => Json(serde_json::json!({ "ok": true, "report": report })),
+        Err(err) => Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
     }
 }
 

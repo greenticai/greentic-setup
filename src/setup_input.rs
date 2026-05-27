@@ -78,6 +78,8 @@ pub struct SetupSpec {
     pub description: Option<String>,
     #[serde(default)]
     pub questions: Vec<SetupQuestion>,
+    #[serde(default)]
+    pub setup_actions: Vec<Value>,
 }
 
 /// A single setup question definition.
@@ -571,6 +573,25 @@ mod tests {
         assert_eq!(spec.questions.len(), 1);
         assert_eq!(spec.questions[0].name, "public_base_url");
         assert!(spec.questions[0].required);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_setup_yaml_setup_actions() -> anyhow::Result<()> {
+        let yaml = r#"
+provider_id: slack
+questions: []
+setup_actions:
+  - id: add_to_slack
+    label: Add to Slack
+    kind: oauth_install_button
+"#;
+        let (_dir, pack_path) = create_test_pack(yaml)?;
+        let spec = load_setup_spec(&pack_path)?.expect("expected spec");
+        assert!(spec.questions.is_empty());
+        assert_eq!(spec.setup_actions.len(), 1);
+        assert_eq!(spec.setup_actions[0]["id"], json!("add_to_slack"));
+        assert_eq!(spec.setup_actions[0]["kind"], json!("oauth_install_button"));
         Ok(())
     }
 

@@ -2,6 +2,7 @@
 //!
 //! Each executor handles a specific `SetupStepKind`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -170,14 +171,29 @@ pub fn execute_apply_pack_setup(
         None
     };
 
+    let provider_ids = setup_provider_ids(metadata, discovered.as_ref());
+
     // Persist setup answers to local config files and dev secrets store
-    for (provider_id, answers) in &metadata.setup_answers {
+    for provider_id in provider_ids {
+        let empty_answers = Value::Object(serde_json::Map::new());
+        let answers = metadata
+            .setup_answers
+            .get(&provider_id)
+            .unwrap_or(&empty_answers);
         let mut setup_actions = crate::setup_actions::extract_setup_actions(
-            provider_id,
+            &provider_id,
             &config.tenant,
             config.team.as_deref(),
             answers,
         )?;
+        hydrate_oauth_install_actions(&mut setup_actions, answers);
+        setup_actions.extend(extract_pack_setup_actions(
+            discovered.as_ref(),
+            &provider_id,
+            &config.tenant,
+            config.team.as_deref(),
+            answers,
+        )?);
         if !setup_actions.is_empty() {
             crate::setup_actions::sign_pending_oauth_actions(bundle_path, &mut setup_actions)?;
             crate::setup_actions::persist_setup_actions(bundle_path, &setup_actions)?;
@@ -186,7 +202,7 @@ pub fn execute_apply_pack_setup(
         let persisted_answers = crate::setup_actions::strip_setup_actions(answers);
 
         // Write answers to provider config directory
-        let config_dir = bundle_path.join("state").join("config").join(provider_id);
+        let config_dir = bundle_path.join("state").join("config").join(&provider_id);
         std::fs::create_dir_all(&config_dir)?;
 
         let config_path = config_dir.join("setup-answers.json");
@@ -202,7 +218,7 @@ pub fn execute_apply_pack_setup(
         // Persist all answer values to the dev secrets store so that
         // WASM components can read them via the secrets API at runtime.
         let pack_path = discovered.as_ref().and_then(|d| {
-            d.find_setup_target(provider_id)
+            d.find_setup_target(&provider_id)
                 .map(|p| p.pack_path.as_path())
         });
         let env = crate::resolve_env(Some(&config.env));
@@ -216,7 +232,7 @@ pub fn execute_apply_pack_setup(
                 &env,
                 &config.tenant,
                 config.team.as_deref(),
-                provider_id,
+                &provider_id,
                 "_example_key",
             );
             println!("  [secrets] URI pattern: {example_uri}");
@@ -232,7 +248,7 @@ pub fn execute_apply_pack_setup(
             &env,
             &config.tenant,
             config.team.as_deref(),
-            provider_id,
+            &provider_id,
             &persisted_answers,
             pack_path,
         ))?;
@@ -255,7 +271,7 @@ pub fn execute_apply_pack_setup(
         if let Some(pack_path) = pack_path {
             crate::config_envelope::write_provider_config_envelope(
                 &bundle_path.join(".providers"),
-                provider_id,
+                &provider_id,
                 "setup-input",
                 &persisted_answers,
                 pack_path,
@@ -278,7 +294,7 @@ pub fn execute_apply_pack_setup(
         match crate::tenant_config::sync_oauth_to_tenant_config(
             bundle_path,
             &config.tenant,
-            provider_id,
+            &provider_id,
             &persisted_answers,
         ) {
             Ok(true) => {
@@ -296,7 +312,7 @@ pub fn execute_apply_pack_setup(
         match crate::tenant_config::sync_skin_to_tenant_config(
             bundle_path,
             &config.tenant,
-            provider_id,
+            &provider_id,
             &persisted_answers,
         ) {
             Ok(true) => {
@@ -322,7 +338,7 @@ pub fn execute_apply_pack_setup(
         match crate::tenant_config::sync_nav_links_to_tenant_config(
             bundle_path,
             &config.tenant,
-            provider_id,
+            &provider_id,
             &persisted_answers,
         ) {
             Ok(true) => {
@@ -338,7 +354,7 @@ pub fn execute_apply_pack_setup(
 
         // Register webhooks if the provider needs one (e.g. Telegram, Slack, Webex)
         if let Some(result) = crate::webhook::register_webhook(
-            provider_id,
+            &provider_id,
             &persisted_answers,
             &config.tenant,
             config.team.as_deref(),
@@ -376,6 +392,117 @@ pub fn execute_apply_pack_setup(
     Ok(ApplyPackSetupReport {
         provider_updates: count,
         pending_setup_actions,
+    })
+}
+
+fn setup_provider_ids(
+    metadata: &SetupPlanMetadata,
+    discovered: Option<&crate::discovery::DiscoveryResult>,
+) -> BTreeSet<String> {
+    let mut provider_ids: BTreeSet<String> = metadata.setup_answers.keys().cloned().collect();
+    if let Some(discovered) = discovered {
+        for provider in discovered.setup_targets() {
+            if let Ok(Some(spec)) = crate::setup_input::load_setup_spec(&provider.pack_path)
+                && !spec.setup_actions.is_empty()
+            {
+                provider_ids.insert(provider.provider_id.clone());
+            }
+        }
+    }
+    provider_ids
+}
+
+fn extract_pack_setup_actions(
+    discovered: Option<&crate::discovery::DiscoveryResult>,
+    provider_id: &str,
+    tenant: &str,
+    team: Option<&str>,
+    answers: &Value,
+) -> anyhow::Result<Vec<crate::setup_actions::SetupAction>> {
+    let Some(provider) = discovered.and_then(|d| d.find_setup_target(provider_id)) else {
+        return Ok(Vec::new());
+    };
+    let Some(spec) = crate::setup_input::load_setup_spec(&provider.pack_path)? else {
+        return Ok(Vec::new());
+    };
+    if spec.setup_actions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let setup_actions = spec
+        .setup_actions
+        .into_iter()
+        .map(|mut action| {
+            if let Some(obj) = action.as_object_mut() {
+                obj.remove("provider_id");
+                obj.remove("tenant");
+                obj.remove("team");
+            }
+            action
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({ "setup_actions": setup_actions });
+    let mut actions =
+        crate::setup_actions::extract_setup_actions(provider_id, tenant, team, &value)?;
+    hydrate_oauth_install_actions(&mut actions, answers);
+    Ok(actions)
+}
+
+fn hydrate_oauth_install_actions(
+    actions: &mut [crate::setup_actions::SetupAction],
+    answers: &Value,
+) {
+    for action in actions {
+        if action.kind != crate::setup_actions::SetupActionKind::OauthInstallButton {
+            continue;
+        }
+        let client_id = client_id_for_action(action, answers);
+        let Some(authorize_url) = action.authorize_url.as_mut() else {
+            continue;
+        };
+        let Ok(mut parsed) = url::Url::parse(authorize_url) else {
+            continue;
+        };
+        if !parsed.query_pairs().any(|(key, _)| key == "client_id")
+            && let Some(client_id) = client_id
+        {
+            parsed
+                .query_pairs_mut()
+                .append_pair("client_id", &client_id);
+        }
+        if !parsed.query_pairs().any(|(key, _)| key == "scope")
+            && let Some(scopes) = action.extra.get("scopes").and_then(Value::as_array)
+        {
+            let scope = scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !scope.is_empty() {
+                parsed.query_pairs_mut().append_pair("scope", &scope);
+            }
+        }
+        *authorize_url = parsed.to_string();
+    }
+}
+
+fn client_id_for_action(
+    action: &crate::setup_actions::SetupAction,
+    answers: &Value,
+) -> Option<String> {
+    let obj = answers.as_object()?;
+    let mut keys = Vec::new();
+    if let Some(field) = action.extra.get("client_id_field").and_then(Value::as_str) {
+        keys.push(field);
+    }
+    keys.extend(["client_id", "oauth_client_id"]);
+    keys.into_iter().find_map(|key| {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
     })
 }
 

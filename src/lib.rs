@@ -21,6 +21,7 @@ pub mod engine;
 pub mod flow;
 pub mod gtbundle;
 pub mod oauth_callback;
+pub mod oauth_device;
 pub mod plan;
 pub mod platform_setup;
 pub mod reload;

@@ -1,5 +1,9 @@
 //! Setup and update commands for bundle configuration.
 
+use std::io::{self, Write};
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 
 use crate::cli_args::*;
@@ -159,9 +163,9 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     };
 
     let engine = SetupEngine::new(SetupConfig {
-        tenant,
-        team,
-        env,
+        tenant: tenant.clone(),
+        team: team.clone(),
+        env: env.clone(),
         offline: false,
         verbose: true,
     });
@@ -202,6 +206,9 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
     print_pending_setup_actions(&report.pending_setup_actions);
+    if !non_interactive {
+        execute_pending_oauth_device_actions(&bundle_dir, &env, &report.pending_setup_actions)?;
+    }
 
     let done_key = match mode {
         SetupMode::Update => "cli.bundle.update.complete",
@@ -219,6 +226,7 @@ fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
             matches!(
                 action.kind,
                 crate::setup_actions::SetupActionKind::OauthInstallButton
+                    | crate::setup_actions::SetupActionKind::OauthDeviceCode
             ) && action.status == crate::setup_actions::SetupActionStatus::Pending
         })
         .collect();
@@ -231,6 +239,11 @@ fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
         println!("{}:", action.label);
         if let Some(url) = action.authorize_url.as_deref() {
             println!("{url}");
+        } else if matches!(
+            action.kind,
+            crate::setup_actions::SetupActionKind::OauthDeviceCode
+        ) {
+            println!("Run interactive setup UI to start device-code login for this action.");
         }
         if action.callback_path.is_some() {
             println!(
@@ -239,4 +252,78 @@ fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
         }
         println!();
     }
+}
+
+fn execute_pending_oauth_device_actions(
+    bundle_dir: &std::path::Path,
+    env: &str,
+    actions: &[crate::setup_actions::SetupAction],
+) -> Result<()> {
+    for action in actions {
+        if action.kind != crate::setup_actions::SetupActionKind::OauthDeviceCode
+            || action.status != crate::setup_actions::SetupActionStatus::Pending
+        {
+            continue;
+        }
+        println!("Starting {}...", action.label);
+        let start = crate::oauth_device::start_oauth_device_code(
+            bundle_dir,
+            &crate::oauth_device::OAuthDeviceStartInput {
+                provider_id: action.provider_id.clone(),
+                tenant: action.tenant.clone(),
+                team: action.team.clone(),
+                action_id: action.id.clone(),
+            },
+            crate::oauth_device::DEFAULT_EXTENSION_KEY,
+        )?;
+        println!("Open {}", start.verification_uri);
+        println!("Enter code: {}", start.user_code);
+        print!("Press Enter after approving, or wait while setup polls...");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+
+        let runtime =
+            tokio::runtime::Runtime::new().context("failed to create OAuth polling runtime")?;
+        let mut interval = start.interval.max(1);
+        loop {
+            let report = runtime.block_on(crate::oauth_device::poll_oauth_device_code(
+                bundle_dir,
+                env,
+                &crate::oauth_device::OAuthDevicePollInput {
+                    session_id: start.session_id.clone(),
+                },
+                crate::oauth_device::DEFAULT_EXTENSION_KEY,
+            ))?;
+            match report.status {
+                crate::oauth_device::OAuthDevicePollStatus::Complete => {
+                    println!("OAuth device-code setup complete for {}.", action.label);
+                    break;
+                }
+                crate::oauth_device::OAuthDevicePollStatus::Pending
+                | crate::oauth_device::OAuthDevicePollStatus::SlowDown => {
+                    interval = report.interval.unwrap_or(interval).max(1);
+                    if crate::setup_actions::current_epoch_secs() >= start.expires_at {
+                        bail!("OAuth device code expired before authorization completed");
+                    }
+                    thread::sleep(Duration::from_secs(interval.min(30)));
+                }
+                crate::oauth_device::OAuthDevicePollStatus::Failed => {
+                    if !report.checklist.is_empty() {
+                        println!("Checklist:");
+                        for item in &report.checklist {
+                            println!("- {item}");
+                        }
+                    }
+                    bail!(
+                        "{}",
+                        report
+                            .message
+                            .unwrap_or_else(|| "OAuth device-code setup failed".to_string())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }

@@ -221,6 +221,15 @@ select{cursor:pointer;appearance:none;
   max-width:100%;font-size:.75rem;font-family:var(--mono);color:#d4d4d8;
   overflow-wrap:anywhere;line-height:1.5;
 }
+.setup-action-code{
+  font-family:var(--mono);font-size:1rem;font-weight:700;letter-spacing:0;
+  color:var(--text);background:rgba(255,255,255,.06);
+  border:1px solid var(--card-border);border-radius:calc(var(--radius) - 2px);
+  padding:.45rem .65rem;
+}
+.setup-action-error{
+  color:#fca5a5;font-size:.8125rem;line-height:1.5;
+}
 
 /* ── Import drop zone ── */
 .import-zone{
