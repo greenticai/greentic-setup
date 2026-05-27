@@ -162,9 +162,7 @@ pub fn discover_with_options(
                     // Fall back to the first `.gtpack` inside.
                     match std::fs::read_dir(&entry_path)?
                         .filter_map(|e| e.ok())
-                        .find(|e| {
-                            e.path().extension().and_then(|x| x.to_str()) == Some("gtpack")
-                        })
+                        .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gtpack"))
                         .map(|e| e.path())
                     {
                         Some(found) => found,
@@ -676,9 +674,7 @@ mod tests {
         // dev secrets store at runtime.
         let temp = tempfile::tempdir()?;
         let root = temp.path();
-        let wrapper = root
-            .join("providers")
-            .join("messaging-webchat-gui.gtpack");
+        let wrapper = root.join("providers").join("messaging-webchat-gui.gtpack");
         std::fs::create_dir_all(&wrapper)?;
         let inner = wrapper.join("messaging-webchat-gui.gtpack");
         write_test_pack(&inner, "messaging-webchat-gui", "WebChat GUI")?;
@@ -693,7 +689,11 @@ mod tests {
         // (setup_to_formspec::pack_to_form_spec, load_setup_spec) can open it
         // with `File::open` + `ZipArchive::new`.
         assert_eq!(provider.pack_path, inner);
-        assert!(discovered.find_setup_target("messaging-webchat-gui").is_some());
+        assert!(
+            discovered
+                .find_setup_target("messaging-webchat-gui")
+                .is_some()
+        );
         Ok(())
     }
 
@@ -728,7 +728,11 @@ mod tests {
             .iter()
             .filter(|p| p.provider_id == "messaging-telegram")
             .collect();
-        assert_eq!(matching.len(), 1, "expected exactly one entry, got {matching:?}");
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one entry, got {matching:?}"
+        );
         Ok(())
     }
 
