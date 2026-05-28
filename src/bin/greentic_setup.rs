@@ -20,17 +20,20 @@
 //! - `bundle list` - List packs/flows in a bundle
 //! - `bundle status` - Show bundle status
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::fs;
+use std::io::{self, Write};
+use std::thread;
+use std::time::Duration;
 
 use greentic_setup::cli_args::{BundleCommand, Cli, Command};
 use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
     SetupOutputTarget, complete_loaded_answers_with_prompts, copy_dir_recursive,
-    ensure_deployment_targets_present, ensure_required_setup_answers_present, prompt_setup_params,
-    resolve_bundle_source, resolve_setup_scope_with_bundle, run_interactive_wizard,
-    setup_output_target,
+    ensure_deployment_targets_present, ensure_required_setup_answers_present,
+    maybe_start_cli_setup_tunnel, prompt_setup_params, resolve_bundle_source,
+    resolve_setup_scope_with_bundle, run_interactive_wizard, setup_output_target,
 };
 use greentic_setup::cli_i18n::CliI18n;
 use greentic_setup::engine::{LoadedAnswers, SetupConfig, SetupRequest};
@@ -176,7 +179,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!();
 
-    let loaded_answers = if cli.answers.is_some() {
+    let mut loaded_answers = if cli.answers.is_some() {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
             &tenant,
@@ -192,6 +195,32 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     if cli.answers.is_some() {
         ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
     }
+
+    let is_dry_run = cli.dry_run || cli.emit_answers.is_some();
+    let mut no_ui_oauth_server = if !is_dry_run {
+        Some(
+            greentic_setup::no_ui_oauth::start_callback_server(&bundle_dir, &env)
+                .context("failed to start no-UI OAuth callback server")?,
+        )
+    } else {
+        None
+    };
+    let _setup_tunnel = if !is_dry_run {
+        let local_base_url = no_ui_oauth_server
+            .as_ref()
+            .map(|server| server.local_base_url.as_str())
+            .unwrap_or("http://127.0.0.1:1");
+        let tunnel = maybe_start_cli_setup_tunnel(&mut loaded_answers, local_base_url)
+            .context("failed to start setup tunnel")?;
+        if let Some(tunnel) = tunnel.as_ref() {
+            println!("Setup tunnel public_base_url: {}", tunnel.public_base_url);
+        } else {
+            no_ui_oauth_server = None;
+        }
+        tunnel
+    } else {
+        None
+    };
     if cli.non_interactive {
         ensure_required_setup_answers_present(&bundle_dir, &loaded_answers)
             .context("Missing required answers in --non-interactive mode")?;
@@ -199,6 +228,9 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
 
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
+        bundle_name: greentic_setup::bundle::read_bundle_name(&bundle_dir)
+            .ok()
+            .flatten(),
         tenants: vec![TenantSelection {
             tenant: tenant.clone(),
             team: team.clone(),
@@ -223,7 +255,6 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         verbose: true,
     });
 
-    let is_dry_run = cli.dry_run || cli.emit_answers.is_some();
     let plan = engine
         .plan(SetupMode::Create, &request, is_dry_run)
         .context(i18n.t("cli.error.failed_build_plan"))?;
@@ -262,9 +293,14 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         return Ok(());
     }
 
-    engine
+    let report = engine
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
+    print_pending_setup_actions(&report.pending_setup_actions);
+    wait_for_pending_oauth_callbacks(no_ui_oauth_server, &report.pending_setup_actions)?;
+    if !cli.non_interactive {
+        execute_pending_oauth_device_actions(&bundle_dir, &env, &report.pending_setup_actions)?;
+    }
 
     if let Some(output_target) = setup_output_target(&bundle_path)? {
         match output_target {
@@ -307,6 +343,257 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn print_pending_setup_actions(actions: &[greentic_setup::setup_actions::SetupAction]) {
+    let visible_actions: Vec<_> = actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind,
+                greentic_setup::setup_actions::SetupActionKind::OauthInstallButton
+            ) && action.status == greentic_setup::setup_actions::SetupActionStatus::Pending
+        })
+        .collect();
+    if visible_actions.is_empty() {
+        return;
+    }
+
+    println!();
+    for action in visible_actions {
+        if let Some(url) = action.authorize_url.as_deref() {
+            println!("{url}");
+        }
+        if action.callback_path.is_some() {
+            println!(
+                "After completing the OAuth flow, re-run setup if the callback was not handled automatically."
+            );
+        }
+        println!();
+    }
+}
+
+fn wait_for_pending_oauth_callbacks(
+    server: Option<greentic_setup::no_ui_oauth::NoUiOAuthCallbackServer>,
+    actions: &[greentic_setup::setup_actions::SetupAction],
+) -> Result<()> {
+    let pending = greentic_setup::no_ui_oauth::pending_oauth_install_actions(actions);
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let Some(server) = server else {
+        return Ok(());
+    };
+    println!("Waiting for OAuth callback...");
+    let message = server.wait_for_callback()?;
+    println!("{message}");
+    Ok(())
+}
+
+fn execute_pending_oauth_device_actions(
+    bundle_dir: &std::path::Path,
+    env: &str,
+    actions: &[greentic_setup::setup_actions::SetupAction],
+) -> Result<()> {
+    for action in actions {
+        if action.kind != greentic_setup::setup_actions::SetupActionKind::OauthDeviceCode
+            || action.status != greentic_setup::setup_actions::SetupActionStatus::Pending
+        {
+            continue;
+        }
+
+        println!("Starting {}...", action.label);
+        let start = greentic_setup::oauth_device::start_oauth_device_code(
+            bundle_dir,
+            &greentic_setup::oauth_device::OAuthDeviceStartInput {
+                provider_id: action.provider_id.clone(),
+                tenant: action.tenant.clone(),
+                team: action.team.clone(),
+                action_id: action.id.clone(),
+            },
+            greentic_setup::oauth_device::DEFAULT_EXTENSION_KEY,
+        )?;
+
+        println!();
+        println!("{}:", action.label);
+        let instructions = device_action_instructions(action);
+        if instructions.is_empty() {
+            println!("Copy this code: {}", start.user_code);
+            println!(
+                "{}: {}",
+                device_action_authorize_label(action),
+                start.verification_uri
+            );
+            println!("Return here and verify when authorization is complete.");
+        } else {
+            for instruction in instructions {
+                println!(
+                    "{}",
+                    render_device_instruction(action, &start, &instruction)
+                );
+            }
+        }
+        println!();
+        println!("Code: {}", start.user_code);
+        println!(
+            "{}: {}",
+            device_action_authorize_label(action),
+            start.verification_uri
+        );
+        println!();
+        print!("Press Enter to {}...", device_action_finalize_label(action));
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+
+        let runtime =
+            tokio::runtime::Runtime::new().context("failed to create OAuth polling runtime")?;
+        let mut interval = start.interval.max(1);
+        loop {
+            let report = runtime.block_on(greentic_setup::oauth_device::poll_oauth_device_code(
+                bundle_dir,
+                env,
+                &greentic_setup::oauth_device::OAuthDevicePollInput {
+                    session_id: start.session_id.clone(),
+                },
+                greentic_setup::oauth_device::DEFAULT_EXTENSION_KEY,
+            ))?;
+            match report.status {
+                greentic_setup::oauth_device::OAuthDevicePollStatus::Complete => {
+                    if let Some(message) = device_action_success_message(action) {
+                        println!("{message}");
+                    } else {
+                        println!("OAuth device-code setup complete for {}.", action.label);
+                    }
+                    if !report.persisted_keys.is_empty() {
+                        println!("Persisted keys: {}", report.persisted_keys.join(", "));
+                    }
+                    break;
+                }
+                greentic_setup::oauth_device::OAuthDevicePollStatus::Pending
+                | greentic_setup::oauth_device::OAuthDevicePollStatus::SlowDown => {
+                    interval = report.interval.unwrap_or(interval).max(1);
+                    if greentic_setup::setup_actions::current_epoch_secs() >= start.expires_at {
+                        bail!("OAuth device code expired before authorization completed");
+                    }
+                    if let Some(message) = report.message {
+                        println!("{message}");
+                    } else {
+                        println!("Authorization is not complete yet; checking again shortly.");
+                    }
+                    thread::sleep(Duration::from_secs(interval.min(30)));
+                }
+                greentic_setup::oauth_device::OAuthDevicePollStatus::Failed => {
+                    if !report.checklist.is_empty() {
+                        println!("Checklist:");
+                        for item in &report.checklist {
+                            println!("- {item}");
+                        }
+                    }
+                    bail!(
+                        "{}",
+                        report
+                            .message
+                            .unwrap_or_else(|| "OAuth device-code setup failed".to_string())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn device_action_instructions(action: &greentic_setup::setup_actions::SetupAction) -> Vec<String> {
+    for key in [
+        "instructions_after_start",
+        "approval_steps",
+        "device_code_steps",
+        "steps",
+    ] {
+        if let Some(value) = action.extra.get(key)
+            && let Some(items) = string_list_value(value)
+            && !items.is_empty()
+        {
+            return items;
+        }
+    }
+    Vec::new()
+}
+
+fn string_list_value(value: &serde_json::Value) -> Option<Vec<String>> {
+    if let Some(items) = value.as_array() {
+        return Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+        );
+    }
+    value.as_str().map(|item| vec![item.to_string()])
+}
+
+fn action_extra_string(
+    action: &greentic_setup::setup_actions::SetupAction,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| action.extra.get(*key))
+        .find_map(|value| value.as_str().map(str::to_string))
+}
+
+fn device_action_authorize_label(action: &greentic_setup::setup_actions::SetupAction) -> String {
+    action_extra_string(
+        action,
+        &[
+            "authorize_label",
+            "verification_label",
+            "open_label",
+            "start_label",
+        ],
+    )
+    .unwrap_or_else(|| "Open verification page".to_string())
+}
+
+fn device_action_finalize_label(action: &greentic_setup::setup_actions::SetupAction) -> String {
+    action_extra_string(
+        action,
+        &[
+            "finalize_label",
+            "verify_label",
+            "complete_label",
+            "poll_label",
+        ],
+    )
+    .unwrap_or_else(|| "verify setup".to_string())
+}
+
+fn device_action_success_message(
+    action: &greentic_setup::setup_actions::SetupAction,
+) -> Option<String> {
+    action_extra_string(
+        action,
+        &["success_message", "complete_message", "verified_message"],
+    )
+}
+
+fn render_device_instruction(
+    action: &greentic_setup::setup_actions::SetupAction,
+    start: &greentic_setup::oauth_device::OAuthDeviceStartReport,
+    template: &str,
+) -> String {
+    template
+        .replace("{user_code}", &start.user_code)
+        .replace("{code}", &start.user_code)
+        .replace("{verification_uri}", &start.verification_uri)
+        .replace("{verification_url}", &start.verification_uri)
+        .replace("{label}", &action.label)
+        .replace("{action_label}", &action.label)
+        .replace("{authorize_label}", &device_action_authorize_label(action))
+        .replace(
+            "{verification_label}",
+            &device_action_authorize_label(action),
+        )
+        .replace("{finalize_label}", &device_action_finalize_label(action))
 }
 
 /// Launch the web-based setup UI.

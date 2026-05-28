@@ -63,8 +63,9 @@
       });
   }
 
-  // Questions auto-injected by the operator (e.g. tunnel URL auto-detection).
-  var HIDDEN_QUESTION_IDS = ["public_base_url"];
+  // Questions intentionally hidden from the GUI. Keep public_base_url visible:
+  // setup-time OAuth/webhook registration may need a real HTTPS origin.
+  var HIDDEN_QUESTION_IDS = [];
   function filterHiddenQuestions(questions) {
     return questions.filter(function (q) { return HIDDEN_QUESTION_IDS.indexOf(q.id) === -1; });
   }
@@ -114,6 +115,22 @@
 
   /** Get the scope currently being edited. */
   function cs() { return state.scopes[state.currentScopeIdx]; }
+
+  function providerEnabled(scope, providerId) {
+    var answers = scope.answers[providerId] || {};
+    var value = answers.enabled;
+    if (value === undefined || value === null || value === "") return true;
+    if (typeof value === "boolean") return value;
+    return !/^(false|0|no|off|disabled)$/i.test(String(value).trim());
+  }
+
+  function setProviderEnabled(scope, providerId, enabled) {
+    var answers = scope.answers[providerId] || {};
+    answers.enabled = !!enabled;
+    scope.answers[providerId] = answers;
+    if (!enabled) scope.providersDone[providerId] = true;
+    else delete scope.providersDone[providerId];
+  }
 
   function buildPersistableAnswers(scope) {
     var answers = {};
@@ -236,6 +253,9 @@
 
         var existingScopes = existingData.scopes || [];
         if (existingScopes.length > 0) {
+          existingScopes.sort(function (a, b) {
+            return scopeMatches(a, scopeData) ? -1 : (scopeMatches(b, scopeData) ? 1 : 0);
+          });
           // Restore previously configured scopes
           state.scopes = existingScopes.map(function (es) {
             var s = makeScope(es.tenant || "demo", es.env || "dev", es.team || "");
@@ -251,6 +271,7 @@
             }
             return s;
           });
+          state.currentScopeIdx = Math.max(0, state.scopes.findIndex(function (s) { return scopeMatches(s, scopeData); }));
           state.phase = "dashboard";
         } else if (state.scopes.length === 0) {
           // No existing config — create fresh scope and go to edit
@@ -490,6 +511,18 @@
     return s;
   }
 
+  function scopeMatches(scope, expected) {
+    if (!scope || !expected) return false;
+    return (scope.tenant || "demo") === (expected.tenant || "demo") &&
+      (scope.env || "dev") === (expected.env || "dev") &&
+      normalizeTeam(scope.team) === normalizeTeam(expected.team);
+  }
+
+  function normalizeTeam(team) {
+    var value = (team || "").trim();
+    return value === "" || value === "default" ? "" : value;
+  }
+
   // ── Scope edit ──
 
   function renderScopeEdit() {
@@ -635,7 +668,9 @@
 
   function renderProviders() {
     var scope = cs();
-    var allDone = state.providers.every(function (p) { return scope.providersDone[p.provider_id]; });
+    var allDone = state.providers.every(function (p) {
+      return !providerEnabled(scope, p.provider_id) || scope.providersDone[p.provider_id];
+    });
 
     var html =
       '<div class="fade-in">' +
@@ -650,18 +685,23 @@
         '<div class="provider-list">';
 
     state.providers.forEach(function (p, idx) {
+      var enabled = providerEnabled(scope, p.provider_id);
       var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
       var displayName = formatProviderName(p);
       html +=
-        '<div class="provider-card clickable" data-prov-idx="' + idx + '">' +
+        '<div class="provider-card clickable' + (!enabled ? ' disabled' : '') + '" data-prov-idx="' + idx + '">' +
           '<div class="prov-icon">' + esc(displayName.charAt(0)) + '</div>' +
           '<div>' +
             '<div class="prov-name">' + esc(displayName) + '</div>' +
-            '<div class="prov-domain">' + esc(p.domain) + ' &middot; ' + qCount + ' ' + esc(t("ui.questions")) + '</div>' +
+            '<div class="prov-domain">' + esc(p.domain) + ' &middot; ' + (enabled ? qCount + ' ' + esc(t("ui.questions")) : 'disabled') + '</div>' +
           '</div>' +
-          '<span class="prov-badge ' + (done ? 'done' : 'pending') + '">' + (done ? esc(t("ui.done")) : esc(t("ui.pending"))) + '</span>' +
+          '<label class="provider-enable" data-provider-enable-wrap title="Enable provider">' +
+            '<input type="checkbox" data-provider-enable="' + esc(p.provider_id) + '"' + (enabled ? ' checked' : '') + ' />' +
+            '<span></span>' +
+          '</label>' +
+          '<span class="prov-badge ' + (!enabled ? 'disabled' : (done ? 'done' : 'pending')) + '">' + (!enabled ? 'disabled' : (done ? esc(t("ui.done")) : esc(t("ui.pending")))) + '</span>' +
         '</div>';
     });
 
@@ -702,6 +742,19 @@
         var idx = parseInt(card.getAttribute("data-prov-idx"), 10);
         state.currentProvider = idx;
         state.phase = "provider-form";
+        render();
+      });
+    });
+
+    document.querySelectorAll('[data-provider-enable-wrap]').forEach(function (wrap) {
+      wrap.addEventListener("click", function (e) { e.stopPropagation(); });
+    });
+    document.querySelectorAll('[data-provider-enable]').forEach(function (input) {
+      input.addEventListener("click", function (e) { e.stopPropagation(); });
+      input.addEventListener("change", function (e) {
+        e.stopPropagation();
+        setProviderEnabled(scope, input.getAttribute("data-provider-enable"), input.checked);
+        scheduleDraftSave();
         render();
       });
     });
@@ -1334,6 +1387,10 @@
     var scope = cs();
     var p = state.providers[state.currentProvider];
     var form = state.providerForms[p.provider_id];
+    if (!providerEnabled(scope, p.provider_id)) {
+      renderDisabledProvider(p);
+      return;
+    }
     if (!form || form.questions.length === 0) {
       scope.providersDone[p.provider_id] = true;
       advanceProvider();
@@ -1349,6 +1406,56 @@
       scope.providersDone[p.provider_id] = true;
       advanceProvider();
     }, backFn);
+  }
+
+  function renderDisabledProvider(p) {
+    var scope = cs();
+    var backFn = function () {
+      if (state.currentProvider > 0) { state.currentProvider--; state.phase = "provider-form"; }
+      else if (state.sharedQuestions.length > 0) { state.phase = "shared"; }
+      else { state.phase = "providers"; }
+      render();
+    };
+    var name = formatProviderName(p);
+    var html =
+      '<div class="fade-in">' +
+        '<div class="step-header">' +
+          '<button class="btn btn-ghost btn-sm btn-back" id="btn-back">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+            ' ' + esc(t("ui.back")) +
+          '</button>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="card-header">' +
+            '<h2 class="card-title">' + esc(name) + '</h2>' +
+            '<p class="card-desc">This provider is disabled. Its inputs, setup actions, OAuth buttons, and webhook steps will be skipped.</p>' +
+          '</div>' +
+          '<div class="card-content">' +
+            '<div class="field-row provider-disabled-row">' +
+              '<label class="field-label" for="provider-enabled-toggle">Enable provider</label>' +
+              '<label class="switch"><input type="checkbox" id="provider-enabled-toggle" /><span class="switch-slider"></span></label>' +
+            '</div>' +
+          '</div>' +
+          '<div class="card-footer">' +
+            '<button class="btn-secondary" id="btn-prev">' + esc(t("ui.back")) + '</button>' +
+            '<button class="btn btn-primary" id="btn-submit">' + esc(t("ui.continue")) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    app.innerHTML = html;
+    document.getElementById("provider-enabled-toggle").addEventListener("change", function (e) {
+      setProviderEnabled(scope, p.provider_id, e.target.checked);
+      persistDraftNow().finally(function () {
+        state.phase = "provider-form";
+        render();
+      });
+    });
+    document.getElementById("btn-back").addEventListener("click", backFn);
+    document.getElementById("btn-prev").addEventListener("click", backFn);
+    document.getElementById("btn-submit").addEventListener("click", function () {
+      scope.providersDone[p.provider_id] = true;
+      persistDraftNow().finally(advanceProvider);
+    });
   }
 
   function advanceProvider() {
@@ -1502,12 +1609,58 @@
     }
     if (r && r.pending_setup_actions && r.pending_setup_actions.length > 0) {
       html += '<div class="output-section"><h4 class="output-title">Setup actions</h4>';
-      r.pending_setup_actions.forEach(function (action) {
-        if (action.kind !== "oauth_install_button" || !action.authorize_url) return;
+      r.pending_setup_actions.forEach(function (action, idx) {
+        if (action.kind === "oauth_install_button" && action.authorize_url) {
         html += '<div class="setup-action">';
         html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.authorize_url) + '">' + esc(action.label || "Open") + '</a>';
-        html += '<div class="setup-action-url">' + esc(action.authorize_url) + '</div>';
         html += '</div>';
+          return;
+        }
+        if (action.kind === "oauth_device_code") {
+          var report = action.device_report || null;
+          var poll = action.device_poll || null;
+          var checklist = [].concat(action.checklist || [], report && report.checklist ? report.checklist : [], poll && poll.checklist ? poll.checklist : []);
+          var verifyUrl = report && (report.verification_uri_complete || report.verification_uri);
+          var beforeText = action.instructions_before_start || action.start_instructions || action.instructions || "";
+          var afterSteps = deviceActionInstructionSteps(action, report);
+          html += '<div class="setup-action">';
+          html += '<div class="setup-action-heading">' + esc(action.label || "Connect") + '</div>';
+          if (!report) {
+            if (beforeText) html += '<div class="setup-action-help">' + esc(beforeText) + '</div>';
+            if (action.device_starting) {
+              html += '<div class="setup-action-status">' + esc(action.starting_label || "Starting...") + '</div>';
+            } else if (action.device_error || action.auto_start === false) {
+              html += '<button class="btn btn-primary setup-action-btn btn-oauth-device-start" data-action-idx="' + idx + '">' + esc(action.start_label || action.label || "Start") + '</button>';
+            }
+          } else {
+            if (afterSteps.length > 0) {
+              html += '<ol class="setup-action-steps">';
+              afterSteps.forEach(function (step) {
+                html += '<li>' + renderDeviceInstructionStep(step, action, report) + '</li>';
+              });
+              html += '</ol>';
+            }
+            html += '<div class="setup-action-code-row">';
+            html += '<div class="setup-action-code">' + esc(report.user_code) + '</div>';
+            html += '<button class="btn btn-secondary btn-oauth-device-copy" data-session-id="' + esc(report.session_id) + '" data-code="' + esc(report.user_code) + '">' + esc(action.copy_label || "Copy code") + '</button>';
+            html += '</div>';
+            html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(verifyUrl) + '">' + esc(deviceActionVerificationLabel(action)) + '</a>';
+            html += '<div class="setup-action-url">' + esc(report.verification_uri) + '</div>';
+            html += '<button class="btn btn-secondary btn-oauth-device-poll" data-session-id="' + esc(report.session_id) + '">' + esc(deviceActionFinalizeLabel(action)) + '</button>';
+          }
+          if (checklist.length > 0) {
+            html += '<details class="setup-action-details"><summary>' + esc(action.requirements_label || "Provider requirements") + '</summary><ul class="setup-action-checklist">';
+            checklist.forEach(function (item) { html += '<li>' + esc(item) + '</li>'; });
+            html += '</ul></details>';
+          }
+          if (action.device_status) {
+            html += '<div class="setup-action-status">' + esc(action.device_status) + '</div>';
+          }
+          if (action.device_error) {
+            html += '<div class="setup-action-error">' + esc(action.device_error) + '</div>';
+          }
+          html += '</div>';
+        }
       });
       html += '</div>';
     }
@@ -1525,6 +1678,230 @@
     app.innerHTML = html;
     document.getElementById("btn-back-dash").addEventListener("click", function () { state.phase = "dashboard"; render(); });
     document.getElementById("btn-close").addEventListener("click", shutdown);
+    Array.prototype.forEach.call(document.querySelectorAll(".btn-oauth-device-start"), function (btn) {
+      btn.addEventListener("click", function () { startOAuthDeviceAction(Number(btn.getAttribute("data-action-idx"))); });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".btn-oauth-device-poll"), function (btn) {
+      btn.addEventListener("click", function () { pollOAuthDeviceAction(btn.getAttribute("data-session-id")); });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".btn-oauth-device-copy"), function (btn) {
+      btn.addEventListener("click", function () { copyOAuthDeviceCode(btn.getAttribute("data-code"), btn.getAttribute("data-session-id")); });
+    });
+    autoStartOAuthDeviceActions();
+  }
+
+  function startOAuthDeviceAction(idx) {
+    var actions = state.result && state.result.pending_setup_actions;
+    if (!actions || !actions[idx]) return;
+    var action = actions[idx];
+    if (action.device_starting) return;
+    action.device_starting = true;
+    action.device_status = null;
+    action.device_error = null;
+    render();
+    fetch("/api/oauth-device/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: action.provider_id,
+        tenant: action.tenant,
+        team: action.team || null,
+        action_id: action.id,
+      }),
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res.ok) {
+        action.device_report = res.report;
+        action.device_error = null;
+        action.device_poll = null;
+        action.device_status = action.ready_message || null;
+      } else {
+        action.device_error = res.error || "Device login failed";
+        action.device_status = null;
+      }
+      action.device_starting = false;
+      render();
+    })
+    .catch(function (err) {
+      action.device_error = err.message;
+      action.device_status = null;
+      action.device_starting = false;
+      render();
+    });
+  }
+
+  function autoStartOAuthDeviceActions() {
+    var actions = state.result && state.result.pending_setup_actions;
+    if (!actions) return;
+    actions.forEach(function (action, idx) {
+      if (
+        action.kind === "oauth_device_code" &&
+        action.auto_start !== false &&
+        !action.device_report &&
+        !action.device_starting &&
+        !action.device_error
+      ) {
+        setTimeout(function () { startOAuthDeviceAction(idx); }, 0);
+      }
+    });
+  }
+
+  function pollOAuthDeviceAction(sessionId) {
+    var action = findOAuthDeviceActionBySession(sessionId);
+    if (action) {
+      action.device_status = "Checking authorization status...";
+      action.device_error = null;
+      render();
+    }
+    fetch("/api/oauth-device/poll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      action = action || findOAuthDeviceActionBySession(sessionId);
+      if (!res.ok) {
+        if (action) {
+          action.device_error = res.error || "Device login failed";
+          action.device_status = null;
+          render();
+        } else {
+          alert(res.error || "Device login failed");
+        }
+        return;
+      }
+      var report = res.report || {};
+      if (action) {
+        action.device_poll = report;
+        action.device_error = null;
+      }
+      if (report.status === "complete") {
+        var keys = report.persisted_keys || [];
+        var completeMessage = deviceActionCompleteMessage(action, keys);
+        state.result.stdout = (state.result.stdout || "") + "\n" + completeMessage;
+        state.result.pending_setup_actions = (state.result.pending_setup_actions || []).filter(function (action) {
+          return !(action.device_report && action.device_report.session_id === sessionId);
+        });
+      } else if (action) {
+        if (report.status === "pending") {
+          action.device_status = report.message || "Authorization is still pending.";
+        } else if (report.status === "slow_down") {
+          action.device_status = report.message || "The provider asked setup to slow down. Wait a moment, then check again.";
+        } else {
+          action.device_error = report.message || "Device login failed.";
+          action.device_status = null;
+        }
+      }
+      render();
+    })
+    .catch(function (err) {
+      action = action || findOAuthDeviceActionBySession(sessionId);
+      if (action) {
+        action.device_error = err.message;
+        action.device_status = null;
+        render();
+      } else {
+        alert(err.message);
+      }
+    });
+  }
+
+  function findOAuthDeviceActionBySession(sessionId) {
+    var actions = state.result && state.result.pending_setup_actions;
+    if (!actions) return null;
+    for (var i = 0; i < actions.length; i++) {
+      if (actions[i].device_report && actions[i].device_report.session_id === sessionId) return actions[i];
+    }
+    return null;
+  }
+
+  function copyOAuthDeviceCode(code, sessionId) {
+    if (!code) return;
+    var action = findOAuthDeviceActionBySession(sessionId);
+    copyTextToClipboard(code).then(function () {
+      if (action) {
+        action.device_status = action.copy_success_message || "Code copied.";
+        action.device_error = null;
+        render();
+      }
+    }).catch(function (err) {
+      if (action) {
+        action.device_error = err.message || "Could not copy code.";
+        render();
+      }
+    });
+  }
+
+  function copyTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      var input = document.createElement("textarea");
+      input.value = text;
+      input.setAttribute("readonly", "");
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      input.style.top = "0";
+      document.body.appendChild(input);
+      input.focus();
+      input.select();
+      try {
+        if (document.execCommand("copy")) resolve();
+        else reject(new Error("Could not copy code."));
+      } catch (err) {
+        reject(err);
+      } finally {
+        document.body.removeChild(input);
+      }
+    });
+  }
+
+  function deviceActionInstructionSteps(action, report) {
+    var configured = action.instructions_after_start || action.approval_steps || action.device_code_steps || action.steps;
+    if (typeof configured === "string") {
+      configured = configured.split(/\r?\n/).map(function (line) { return line.replace(/^\s*\d+[\).\s-]*/, "").trim(); }).filter(Boolean);
+    }
+    if (Array.isArray(configured) && configured.length > 0) return configured;
+    return [];
+  }
+
+  function renderDeviceInstructionStep(step, action, report) {
+    var text = typeof step === "string" ? step : String(step || "");
+    var label = action.label || "Open verification page";
+    var verificationLabel = deviceActionVerificationLabel(action);
+    var finalizeLabel = deviceActionFinalizeLabel(action);
+    return esc(text)
+      .replace(/\{user_code\}/g, '<span class="setup-action-code-inline">' + esc(report.user_code) + '</span>')
+      .replace(/\{code\}/g, '<span class="setup-action-code-inline">' + esc(report.user_code) + '</span>')
+      .replace(/\{label\}/g, '<strong>' + esc(label) + '</strong>')
+      .replace(/\{action_label\}/g, '<strong>' + esc(label) + '</strong>')
+      .replace(/\{verification_label\}/g, '<strong>' + esc(verificationLabel) + '</strong>')
+      .replace(/\{authorize_label\}/g, '<strong>' + esc(verificationLabel) + '</strong>')
+      .replace(/\{finalize_label\}/g, '<strong>' + esc(finalizeLabel) + '</strong>')
+      .replace(/\{verification_uri\}/g, esc(report.verification_uri || "verification page"))
+      .replace(/\{verification_url\}/g, esc(report.verification_uri || "verification page"));
+  }
+
+  function deviceActionVerificationLabel(action) {
+    return action.verification_label || action.authorize_label || action.open_label || action.label || "Open";
+  }
+
+  function deviceActionFinalizeLabel(action) {
+    return action.finalize_label || action.complete_label || action.poll_label || action.label || "Check status";
+  }
+
+  function deviceActionCompleteMessage(action, keys) {
+    var message = action.success_message || action.complete_message || action.verified_message;
+    if (!message) {
+      message = "OAuth device-code setup complete" + (keys.length ? " ({persisted_keys})" : "") + ".";
+    }
+    return message
+      .replace(/\{persisted_keys\}/g, keys.join(", "))
+      .replace(/\{label\}/g, action.label || "")
+      .replace(/\{action_label\}/g, action.label || "");
   }
 
   // ── Export ──

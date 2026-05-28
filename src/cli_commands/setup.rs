@@ -1,12 +1,16 @@
 //! Setup and update commands for bundle configuration.
 
+use std::io::{self, Write};
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 
 use crate::cli_args::*;
 use crate::cli_helpers::{
     complete_loaded_answers_with_prompts, ensure_deployment_targets_present,
-    ensure_required_setup_answers_present, resolve_bundle_dir, resolve_setup_scope,
-    run_interactive_wizard,
+    ensure_required_setup_answers_present, maybe_start_cli_setup_tunnel, resolve_bundle_dir,
+    resolve_setup_scope, run_interactive_wizard,
 };
 use crate::cli_i18n::CliI18n;
 use crate::engine::{LoadedAnswers, SetupConfig, SetupRequest};
@@ -110,7 +114,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!("{}", i18n.tf("cli.bundle.setup.domain", &[&domain]));
 
-    let loaded_answers = if answers.is_some() {
+    let mut loaded_answers = if answers.is_some() {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
             &tenant,
@@ -125,6 +129,34 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     };
     if non_interactive {
         ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
+    }
+
+    let is_dry_run = dry_run || emit_answers.is_some();
+    let mut no_ui_oauth_server = if !is_dry_run {
+        Some(
+            crate::no_ui_oauth::start_callback_server(&bundle_dir, &env)
+                .context("failed to start no-UI OAuth callback server")?,
+        )
+    } else {
+        None
+    };
+    let _setup_tunnel = if !is_dry_run {
+        let local_base_url = no_ui_oauth_server
+            .as_ref()
+            .map(|server| server.local_base_url.as_str())
+            .unwrap_or("http://127.0.0.1:1");
+        let tunnel = maybe_start_cli_setup_tunnel(&mut loaded_answers, local_base_url)
+            .context("failed to start setup tunnel")?;
+        if let Some(tunnel) = tunnel.as_ref() {
+            println!("Setup tunnel public_base_url: {}", tunnel.public_base_url);
+        } else {
+            no_ui_oauth_server = None;
+        }
+        tunnel
+    } else {
+        None
+    };
+    if non_interactive {
         ensure_required_setup_answers_present(&bundle_dir, &loaded_answers)
             .context("Missing required answers in --non-interactive mode")?;
     }
@@ -133,6 +165,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
 
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
+        bundle_name: crate::bundle::read_bundle_name(&bundle_dir).ok().flatten(),
         providers,
         tenants: vec![TenantSelection {
             tenant: tenant.clone(),
@@ -145,6 +178,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         )
         .context(i18n.t("cli.error.failed_read_answers"))?,
         deployment_targets: loaded_answers.platform_setup.deployment_targets,
+        tunnel: loaded_answers.platform_setup.tunnel,
         setup_answers: loaded_answers.setup_answers,
         domain_filter: if domain == "all" {
             None
@@ -159,15 +193,15 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     };
 
     let engine = SetupEngine::new(SetupConfig {
-        tenant,
-        team,
-        env,
+        tenant: tenant.clone(),
+        team: team.clone(),
+        env: env.clone(),
         offline: false,
         verbose: true,
     });
 
     let plan = engine
-        .plan(mode, &request, dry_run || emit_answers.is_some())
+        .plan(mode, &request, is_dry_run)
         .context(i18n.t("cli.error.failed_build_plan"))?;
 
     engine.print_plan(&plan);
@@ -202,6 +236,10 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
     print_pending_setup_actions(&report.pending_setup_actions);
+    wait_for_pending_oauth_callbacks(no_ui_oauth_server, &report.pending_setup_actions)?;
+    if !non_interactive {
+        execute_pending_oauth_device_actions(&bundle_dir, &env, &report.pending_setup_actions)?;
+    }
 
     let done_key = match mode {
         SetupMode::Update => "cli.bundle.update.complete",
@@ -228,7 +266,6 @@ fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
 
     println!();
     for action in visible_actions {
-        println!("{}:", action.label);
         if let Some(url) = action.authorize_url.as_deref() {
             println!("{url}");
         }
@@ -239,4 +276,95 @@ fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
         }
         println!();
     }
+}
+
+fn wait_for_pending_oauth_callbacks(
+    server: Option<crate::no_ui_oauth::NoUiOAuthCallbackServer>,
+    actions: &[crate::setup_actions::SetupAction],
+) -> Result<()> {
+    let pending = crate::no_ui_oauth::pending_oauth_install_actions(actions);
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let Some(server) = server else {
+        return Ok(());
+    };
+    println!("Waiting for OAuth callback...");
+    let message = server.wait_for_callback()?;
+    println!("{message}");
+    Ok(())
+}
+
+fn execute_pending_oauth_device_actions(
+    bundle_dir: &std::path::Path,
+    env: &str,
+    actions: &[crate::setup_actions::SetupAction],
+) -> Result<()> {
+    for action in actions {
+        if action.kind != crate::setup_actions::SetupActionKind::OauthDeviceCode
+            || action.status != crate::setup_actions::SetupActionStatus::Pending
+        {
+            continue;
+        }
+        println!("Starting {}...", action.label);
+        let start = crate::oauth_device::start_oauth_device_code(
+            bundle_dir,
+            &crate::oauth_device::OAuthDeviceStartInput {
+                provider_id: action.provider_id.clone(),
+                tenant: action.tenant.clone(),
+                team: action.team.clone(),
+                action_id: action.id.clone(),
+            },
+            crate::oauth_device::DEFAULT_EXTENSION_KEY,
+        )?;
+        println!("Open {}", start.verification_uri);
+        println!("Enter code: {}", start.user_code);
+        print!("Press Enter after approving, or wait while setup polls...");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+
+        let runtime =
+            tokio::runtime::Runtime::new().context("failed to create OAuth polling runtime")?;
+        let mut interval = start.interval.max(1);
+        loop {
+            let report = runtime.block_on(crate::oauth_device::poll_oauth_device_code(
+                bundle_dir,
+                env,
+                &crate::oauth_device::OAuthDevicePollInput {
+                    session_id: start.session_id.clone(),
+                },
+                crate::oauth_device::DEFAULT_EXTENSION_KEY,
+            ))?;
+            match report.status {
+                crate::oauth_device::OAuthDevicePollStatus::Complete => {
+                    println!("OAuth device-code setup complete for {}.", action.label);
+                    break;
+                }
+                crate::oauth_device::OAuthDevicePollStatus::Pending
+                | crate::oauth_device::OAuthDevicePollStatus::SlowDown => {
+                    interval = report.interval.unwrap_or(interval).max(1);
+                    if crate::setup_actions::current_epoch_secs() >= start.expires_at {
+                        bail!("OAuth device code expired before authorization completed");
+                    }
+                    thread::sleep(Duration::from_secs(interval.min(30)));
+                }
+                crate::oauth_device::OAuthDevicePollStatus::Failed => {
+                    if !report.checklist.is_empty() {
+                        println!("Checklist:");
+                        for item in &report.checklist {
+                            println!("- {item}");
+                        }
+                    }
+                    bail!(
+                        "{}",
+                        report
+                            .message
+                            .unwrap_or_else(|| "OAuth device-code setup failed".to_string())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }

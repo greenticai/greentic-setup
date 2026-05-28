@@ -1,7 +1,7 @@
-//! Post-setup instructions for messaging providers.
+//! Legacy post-setup instruction printer.
 //!
-//! Some providers (e.g. Teams, WhatsApp) cannot be fully automated and require
-//! the user to complete additional steps in external portals.
+//! Provider-specific setup guidance should come from provider packs through
+//! setup actions or pack metadata, not from hardcoded setup-side branches.
 
 use serde_json::Value;
 
@@ -14,126 +14,18 @@ pub struct ProviderInstruction {
 
 /// Collect post-setup instructions for providers that need manual intervention.
 ///
-/// Returns structured data that can be displayed in terminal or UI.
+/// This intentionally returns no hardcoded provider guidance. Packs should
+/// declare setup actions and instruction metadata themselves.
 pub fn collect_post_setup_instructions(
     providers: &[(String, Value)],
     tenant: &str,
     team: &str,
 ) -> Vec<ProviderInstruction> {
-    let mut instructions: Vec<(&str, Vec<String>)> = Vec::new();
-
-    for (provider_id, config) in providers {
-        let provider_short = provider_id
-            .strip_prefix("messaging-")
-            .unwrap_or(provider_id);
-
-        let public_base_url = config
-            .get("public_base_url")
-            .and_then(Value::as_str)
-            .unwrap_or("<your-public-url>");
-
-        match provider_short {
-            "teams" => {
-                let webhook_url = format!(
-                    "{}/v1/messaging/ingress/{}/{}/{}",
-                    public_base_url.trim_end_matches('/'),
-                    provider_id,
-                    tenant,
-                    team,
-                );
-                instructions.push(("Microsoft Teams", vec![
-                    "1. Go to Azure Portal → Bot Services → your bot".into(),
-                    format!("2. Set Messaging Endpoint to: {webhook_url}"),
-                    "3. Ensure the App ID and Password match your answers file".into(),
-                    "4. Grant API permissions (delegated): Channel.ReadBasic.All, ChannelMessage.Send, Team.ReadBasic.All, ChatMessage.Send".into(),
-                    "5. If using Graph API: complete OAuth flow to obtain a refresh token".into(),
-                    "   → See: docs/guides/providers/guide-teams-setup.md".into(),
-                ]));
-            }
-            "whatsapp" => {
-                let webhook_url = format!(
-                    "{}/v1/messaging/ingress/{}/{}/{}",
-                    public_base_url.trim_end_matches('/'),
-                    provider_id,
-                    tenant,
-                    team,
-                );
-                instructions.push((
-                    "WhatsApp",
-                    vec![
-                        "1. Go to Meta Developer Portal → WhatsApp → Configuration".into(),
-                        format!("2. Set Webhook URL to: {webhook_url}"),
-                        "3. Set Verify Token to match your config (if configured)".into(),
-                        "4. Subscribe to webhook fields: messages".into(),
-                    ],
-                ));
-            }
-            "webex" => {
-                // Webex webhooks are auto-registered, but mention bot creation
-                // Check both webex_bot_token (canonical from WEBEX_BOT_TOKEN) and bot_token (QA field)
-                let webex_token = config.get("webex_bot_token");
-                let bot_token = config.get("bot_token");
-                eprintln!(
-                    "  [debug] webex instruction check: webex_bot_token={:?} bot_token={:?}",
-                    webex_token.map(|v| if v.as_str().map(|s| s.len()).unwrap_or(0) > 10 {
-                        "***"
-                    } else {
-                        "empty"
-                    }),
-                    bot_token.map(|v| if v.as_str().map(|s| s.len()).unwrap_or(0) > 10 {
-                        "***"
-                    } else {
-                        "empty"
-                    })
-                );
-                let has_token = webex_token
-                    .or(bot_token)
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty());
-                if !has_token {
-                    instructions.push((
-                        "Webex",
-                        vec![
-                            "1. Create a Webex Bot at: https://developer.webex.com/my-apps/new/bot"
-                                .into(),
-                            "2. Copy the bot access token into your answers file as 'webex_bot_token'"
-                                .into(),
-                            "3. Re-run setup to register webhooks automatically".into(),
-                        ],
-                    ));
-                }
-            }
-            "slack" => {
-                // Slack manifest is auto-updated, but mention app creation
-                let has_app_id = config
-                    .get("slack_app_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty());
-                if !has_app_id {
-                    instructions.push(("Slack", vec![
-                        "1. Create a Slack App at: https://api.slack.com/apps".into(),
-                        "2. Add 'slack_app_id' and 'slack_configuration_token' to your answers file".into(),
-                        "3. Re-run setup to update the app manifest automatically".into(),
-                    ]));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    instructions
-        .into_iter()
-        .map(|(name, steps)| ProviderInstruction {
-            provider_name: name.to_string(),
-            steps,
-        })
-        .collect()
+    let _ = (providers, tenant, team);
+    Vec::new()
 }
 
 /// Print post-setup instructions for providers that need manual intervention.
-///
-/// Some providers (e.g. Teams, WhatsApp) cannot be fully automated and require
-/// the user to complete additional steps in external portals.
 pub fn print_post_setup_instructions(providers: &[(String, Value)], tenant: &str, team: &str) {
     let instructions = collect_post_setup_instructions(providers, tenant, team);
 
@@ -154,4 +46,41 @@ pub fn print_post_setup_instructions(providers: &[(String, Value)], tenant: &str
     }
     println!();
     println!("──────────────────────────────────────────────────────────");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_post_setup_instructions;
+    use serde_json::json;
+
+    #[test]
+    fn slack_does_not_emit_legacy_manual_app_creation_steps() {
+        let providers = vec![(
+            "messaging-slack".to_string(),
+            json!({
+                "public_base_url": "https://setup.trycloudflare.com",
+                "slack_configuration_access_token": "xoxe-access",
+                "slack_configuration_refresh_token": "xoxe-refresh"
+            }),
+        )];
+
+        let instructions = collect_post_setup_instructions(&providers, "demo", "default");
+
+        assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn teams_does_not_emit_hardcoded_manual_steps() {
+        let providers = vec![(
+            "messaging-teams".to_string(),
+            json!({
+                "public_base_url": "https://setup.trycloudflare.com",
+                "client_id": "public-client-id"
+            }),
+        )];
+
+        let instructions = collect_post_setup_instructions(&providers, "demo", "default");
+
+        assert!(instructions.is_empty());
+    }
 }

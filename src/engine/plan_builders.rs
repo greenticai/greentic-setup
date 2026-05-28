@@ -20,6 +20,7 @@ pub fn apply_create(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
 
     let pack_refs = dedup_sorted(&request.pack_refs);
     let tenants = normalize_tenants(&request.tenants);
+    let pack_setup_action_count = pack_setup_action_provider_count(&request.bundle);
 
     let mut steps = Vec::new();
     if !pack_refs.is_empty() {
@@ -56,7 +57,7 @@ pub fn apply_create(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             "Apply pack-declared setup outputs through internal setup hooks",
             [("status", "planned".to_string())],
         ));
-    } else if !request.setup_answers.is_empty() {
+    } else if !request.setup_answers.is_empty() || pack_setup_action_count > 0 {
         // No new packs to fetch, but answers were provided for existing packs
         steps.push(step(
             SetupStepKind::ValidateCapabilities,
@@ -66,7 +67,14 @@ pub fn apply_create(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
         steps.push(step(
             SetupStepKind::ApplyPackSetup,
             "Apply setup answers to existing bundle packs",
-            [("providers", request.setup_answers.len().to_string())],
+            [(
+                "providers",
+                request
+                    .setup_answers
+                    .len()
+                    .max(pack_setup_action_count)
+                    .to_string(),
+            )],
         ));
     } else {
         steps.push(step(
@@ -507,6 +515,22 @@ pub fn build_metadata_with_ops(
     let mut meta = build_metadata(request, pack_refs, tenants);
     meta.update_ops = ops;
     meta
+}
+
+fn pack_setup_action_provider_count(bundle: &std::path::Path) -> usize {
+    let Ok(discovered) = crate::discovery::discover(bundle) else {
+        return 0;
+    };
+    discovered
+        .setup_targets()
+        .into_iter()
+        .filter(|provider| {
+            crate::setup_input::load_setup_spec(&provider.pack_path)
+                .ok()
+                .flatten()
+                .is_some_and(|spec| !spec.setup_actions.is_empty())
+        })
+        .count()
 }
 
 /// Compute a simple hash for a string (used for digest placeholders).

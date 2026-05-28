@@ -28,6 +28,7 @@ mod tests {
         SetupSpec {
             title: Some("Telegram Setup".to_string()),
             description: None,
+            setup_actions: vec![],
             questions: vec![
                 SetupQuestion {
                     name: "enabled".to_string(),
@@ -134,6 +135,7 @@ mod tests {
         let spec = SetupSpec {
             title: None,
             description: None,
+            setup_actions: vec![],
             questions: vec![],
         };
         let form = setup_spec_to_form_spec(&spec, "messaging-dummy");
@@ -370,6 +372,7 @@ mod tests {
         let spec = SetupSpec {
             title: None,
             description: None,
+            setup_actions: vec![],
             questions: vec![SetupQuestion {
                 name: "api_base_url".to_string(),
                 kind: "string".to_string(),

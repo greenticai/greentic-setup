@@ -18,6 +18,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[serde(rename_all = "snake_case")]
 pub enum SetupActionKind {
     OauthInstallButton,
+    OauthDeviceCode,
     OpenUrl,
     CopySecret,
     ManualStep,
@@ -381,6 +382,7 @@ fn parse_setup_action(
         .as_str()
     {
         "oauth_install_button" => SetupActionKind::OauthInstallButton,
+        "oauth_device_code" => SetupActionKind::OauthDeviceCode,
         "open_url" => SetupActionKind::OpenUrl,
         "copy_secret" => SetupActionKind::CopySecret,
         "manual_step" => SetupActionKind::ManualStep,
@@ -475,6 +477,22 @@ mod tests {
         assert_eq!(actions[0].provider_id, "messaging-example");
         assert_eq!(actions[0].tenant, "demo");
         assert_eq!(actions[0].team.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn extract_setup_actions_supports_oauth_device_code() {
+        let value = json!({
+            "setup_actions": [{
+                "id": "connect",
+                "kind": "oauth_device_code",
+                "label": "Connect"
+            }]
+        });
+        let actions =
+            extract_setup_actions("messaging-teams", "demo", Some("default"), &value).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, SetupActionKind::OauthDeviceCode);
+        assert_eq!(actions[0].provider_id, "messaging-teams");
     }
 
     #[test]

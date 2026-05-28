@@ -400,7 +400,13 @@ fn read_manifest_extension_cbor(
     let CborValue::Map(map) = &value else {
         return Ok(None);
     };
-    Ok(map_get(map, extension_key).map(cbor_to_json))
+    if let Some(value) = map_get(map, extension_key) {
+        return Ok(Some(cbor_to_json(value)));
+    }
+    let Some(CborValue::Map(extensions)) = map_get(map, "extensions") else {
+        return Ok(None);
+    };
+    Ok(map_get(extensions, extension_key).map(cbor_to_json))
 }
 
 fn read_manifest_json(
@@ -785,6 +791,36 @@ mod tests {
         )?;
         let extension = read_pack_extension(&pack, "messaging.oauth.v1")?.unwrap();
         assert_eq!(extension["token_url"], "https://example.com/token");
+        Ok(())
+    }
+
+    #[test]
+    fn read_pack_extension_reads_cbor_manifest_extensions_map() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let pack = temp.path().join("messaging-example.gtpack");
+        let file = std::fs::File::create(&pack)?;
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("manifest.cbor", options)?;
+        let manifest = serde_cbor::value::to_value(serde_json::json!({
+            "pack_id": "messaging-example",
+            "extensions": {
+                "messaging.oauth.v1": {
+                    "inline": {
+                        "token_url": "https://example.com/token"
+                    }
+                }
+            }
+        }))?;
+        writer.write_all(&serde_cbor::to_vec(&manifest)?)?;
+        writer.finish()?;
+
+        let extension = read_pack_extension(&pack, "messaging.oauth.v1")?.unwrap();
+        assert_eq!(
+            extension["inline"]["token_url"],
+            "https://example.com/token"
+        );
         Ok(())
     }
 }
