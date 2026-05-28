@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "0.5.14"
+version = "0.5.15"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -20,11 +20,13 @@ squashfs = ["backhand"]
 [dependencies]
 aes-gcm-siv = "0.11"
 anyhow = "1"
+async-trait = "0.1"
 backhand = { version = "0.25", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 greentic-distributor-client = { version = "0.5", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 greentic-i18n-lib = "0.5"
+greentic-runner-host = { version = "0.5", default-features = false }
 greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
 greentic-types = { version = "0.5", features = ["serde"] }
 hmac = "0.13"

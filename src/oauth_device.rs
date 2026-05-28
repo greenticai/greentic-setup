@@ -159,7 +159,8 @@ pub fn load_provider_device_metadata(
         .ok_or_else(|| anyhow!("provider not found for OAuth device-code setup: {provider_id}"))?;
     let raw = crate::discovery::read_pack_extension(&provider.pack_path, extension_key)?
         .ok_or_else(|| anyhow!("provider missing OAuth device-code metadata: {extension_key}"))?;
-    serde_json::from_value(raw).context("failed to parse provider OAuth device-code metadata")
+    let metadata = raw.get("inline").cloned().unwrap_or(raw);
+    serde_json::from_value(metadata).context("failed to parse provider OAuth device-code metadata")
 }
 
 pub fn device_code_request_form<'a>(
@@ -681,6 +682,9 @@ fn value_to_string(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
+    use std::path::Path;
+    use zip::write::{FileOptions, ZipWriter};
 
     fn metadata() -> OAuthDeviceMetadata {
         OAuthDeviceMetadata {
@@ -693,6 +697,20 @@ mod tests {
             ]),
             ..Default::default()
         }
+    }
+
+    fn write_provider_pack_with_manifest(
+        path: &Path,
+        manifest: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options)?;
+        writer.write_all(manifest.to_string().as_bytes())?;
+        writer.finish()?;
+        Ok(())
     }
 
     #[test]
@@ -742,6 +760,43 @@ mod tests {
     }
 
     #[test]
+    fn load_provider_device_metadata_accepts_inline_extension_wrapper() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        std::fs::create_dir_all(bundle.join("providers/messaging"))?;
+        write_provider_pack_with_manifest(
+            &bundle.join("providers/messaging/messaging-example.gtpack"),
+            json!({
+                "pack_id": "messaging-example",
+                "extensions": {
+                    "messaging.oauth_device_code.v1": {
+                        "kind": "messaging.oauth_device_code.v1",
+                        "version": "1",
+                        "inline": {
+                            "device_code_url": "https://login.example/devicecode",
+                            "token_url": "https://login.example/token",
+                            "verification_uri": "https://login.example/device",
+                            "client_id_config_key": "client_id",
+                            "scopes": ["User.Read"]
+                        }
+                    }
+                }
+            }),
+        )?;
+
+        let metadata = load_provider_device_metadata(
+            bundle,
+            "messaging-example",
+            "messaging.oauth_device_code.v1",
+        )?;
+
+        assert_eq!(metadata.device_code_url, "https://login.example/devicecode");
+        assert_eq!(metadata.token_url, "https://login.example/token");
+        assert_eq!(metadata.scopes, vec!["User.Read"]);
+        Ok(())
+    }
+
+    #[test]
     fn start_report_excludes_raw_device_code() {
         let temp = tempfile::tempdir().unwrap();
         let input = OAuthDeviceStartInput {
@@ -769,6 +824,171 @@ mod tests {
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(serialized.contains("ABCD-EFGH"));
         assert!(!serialized.contains("raw-device-code"));
+    }
+
+    #[test]
+    fn start_report_uses_response_verification_url_and_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = OAuthDeviceStartInput {
+            provider_id: "messaging-teams".into(),
+            tenant: "demo".into(),
+            team: Some("".into()),
+            action_id: "connect".into(),
+        };
+
+        let report = start_oauth_device_code_with_response(
+            temp.path(),
+            &input,
+            &metadata(),
+            "client-123",
+            &json!({
+                "device_code": "raw-device-code",
+                "user_code": "ABCD-EFGH",
+                "verification_url": "https://login.example/verify",
+                "verification_uri_complete": "https://login.example/verify?code=ABCD-EFGH",
+                "interval": 0
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(report.team, "default");
+        assert_eq!(report.interval, 1);
+        assert_eq!(report.verification_uri, "https://login.example/verify");
+        assert_eq!(
+            report.verification_uri_complete.as_deref(),
+            Some("https://login.example/verify?code=ABCD-EFGH")
+        );
+    }
+
+    #[test]
+    fn start_report_rejects_missing_device_code_or_verification_uri() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = OAuthDeviceStartInput {
+            provider_id: "messaging-teams".into(),
+            tenant: "demo".into(),
+            team: None,
+            action_id: "connect".into(),
+        };
+
+        let missing_device_code = start_oauth_device_code_with_response(
+            temp.path(),
+            &input,
+            &metadata(),
+            "client-123",
+            &json!({
+                "device_code": "",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://login.example/verify"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_device_code.contains("missing device_code"));
+
+        let missing_verification_uri = start_oauth_device_code_with_response(
+            temp.path(),
+            &input,
+            &metadata(),
+            "client-123",
+            &json!({
+                "device_code": "raw-device-code",
+                "user_code": "ABCD-EFGH"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_verification_uri.contains("missing verification URI"));
+    }
+
+    #[test]
+    fn poll_error_states_are_provider_neutral() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut metadata = metadata();
+        metadata.error_checklist = vec!["Try again".into()];
+        let session = OAuthDeviceSessionState {
+            session_id: "session-1".into(),
+            provider_id: "messaging-teams".into(),
+            tenant: "demo".into(),
+            team: "default".into(),
+            action_id: "connect".into(),
+            device_code: "device-code".into(),
+            client_id: "client-123".into(),
+            interval: 5,
+            expires_at: crate::setup_actions::current_epoch_secs() + 900,
+            created_at: crate::setup_actions::current_epoch_secs(),
+        };
+        save_session(temp.path(), &session).unwrap();
+
+        let pending = handle_poll_error(
+            temp.path(),
+            &session,
+            &metadata,
+            "authorization_pending",
+            &json!({"error_description": "not ready"}),
+        )
+        .unwrap();
+        assert_eq!(pending.status, OAuthDevicePollStatus::Pending);
+        assert_eq!(pending.message.as_deref(), Some("not ready"));
+        assert_eq!(pending.interval, Some(5));
+
+        let slow_down =
+            handle_poll_error(temp.path(), &session, &metadata, "slow_down", &json!({})).unwrap();
+        assert_eq!(slow_down.status, OAuthDevicePollStatus::SlowDown);
+        assert_eq!(slow_down.interval, Some(10));
+        assert_eq!(load_session(temp.path(), "session-1").unwrap().interval, 10);
+
+        let failed = handle_poll_error(
+            temp.path(),
+            &session,
+            &metadata,
+            "authorization_declined",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(failed.status, OAuthDevicePollStatus::Failed);
+        assert_eq!(failed.checklist, vec!["Try again"]);
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("OAuth device-code polling failed: authorization_declined")
+        );
+    }
+
+    #[test]
+    fn token_response_maps_config_scalars_and_rejects_empty_mapping() {
+        let mut metadata = metadata();
+        metadata.secrets_out.clear();
+        metadata.config_out = BTreeMap::from([
+            ("expires_in".into(), "token_expires_in".into()),
+            ("enabled".into(), "token_enabled".into()),
+            ("client_id".into(), "client_id_copy".into()),
+        ]);
+
+        let mapped = map_device_token_response(
+            &metadata,
+            "client-123",
+            &json!({"expires_in": 3600, "enabled": true}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapped.get("token_expires_in").map(String::as_str),
+            Some("3600")
+        );
+        assert_eq!(
+            mapped.get("token_enabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            mapped.get("client_id_copy").map(String::as_str),
+            Some("client-123")
+        );
+
+        let mut empty_metadata = metadata;
+        empty_metadata.config_out.clear();
+        let error = map_device_token_response(&empty_metadata, "client-123", &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not contain mappable values"));
     }
 
     #[test]
@@ -841,5 +1061,48 @@ mod tests {
             values.get("channel_id").map(String::as_str),
             Some("channel-1")
         );
+    }
+
+    #[test]
+    fn discovery_reports_missing_requirements_and_bad_selects() {
+        let mut metadata = metadata();
+        metadata.post_login_discovery = vec![DiscoveryStep {
+            id: "channels".into(),
+            method: "GET".into(),
+            url: None,
+            url_template: Some("https://graph.example/teams/{team_id}/channels".into()),
+            requires: vec!["team_id".into()],
+            save: BTreeMap::new(),
+            select: None,
+        }];
+        let error =
+            execute_post_login_discovery_with_responses(&metadata, &BTreeMap::new(), |_, _| 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("requires missing value team_id"));
+
+        let step = DiscoveryStep {
+            id: "teams".into(),
+            method: "GET".into(),
+            url: Some("https://graph.example/joinedTeams".into()),
+            url_template: None,
+            requires: Vec::new(),
+            save: BTreeMap::new(),
+            select: Some(DiscoverySelect {
+                from: "value".into(),
+                label: "displayName".into(),
+                value: "id".into(),
+                save_as: "team_id".into(),
+            }),
+        };
+        let error = apply_discovery_step(&step, &json!({"value": []}), |_| 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("returned no selectable items"));
+
+        let error = apply_discovery_step(&step, &json!({"value": [{"displayName": "One"}]}), |_| 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("selected item missing value"));
     }
 }
