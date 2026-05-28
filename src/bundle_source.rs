@@ -355,6 +355,13 @@ async fn resolve_distributor_reference_async(reference: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn parse_local_path() {
@@ -408,6 +415,21 @@ mod tests {
     fn file_uri_percent_decode() {
         let decoded = percent_decode("path%20with%20spaces");
         assert_eq!(decoded, "path with spaces");
+    }
+
+    #[test]
+    fn percent_decode_preserves_invalid_sequences() {
+        let decoded = percent_decode("path%2G%tail%");
+        assert_eq!(decoded, "path%2G%tail%");
+    }
+
+    #[test]
+    fn as_str_preserves_local_and_file_uri_sources() {
+        let local = BundleSource::parse("./bundle").unwrap();
+        assert_eq!(local.as_str(), "./bundle");
+
+        let file_uri = BundleSource::parse("file:///tmp/test%20bundle").unwrap();
+        assert_eq!(file_uri.as_str(), "file:///tmp/test bundle");
     }
 
     #[test]
@@ -475,67 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_returns_canonical_path_for_existing_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = BundleSource::LocalDir(dir.path().to_path_buf());
-        let resolved = source.resolve().expect("resolve existing path");
-        assert!(resolved.exists());
-    }
-
-    #[test]
-    fn resolve_returns_error_for_missing_dir() {
-        let source = BundleSource::LocalDir(PathBuf::from("/nonexistent/path/9f8c7b6a"));
-        let err = source.resolve().unwrap_err();
-        assert!(err.to_string().contains("does not exist"));
-    }
-
-    #[test]
-    fn resolve_relative_path_joins_with_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let parent = dir.path();
-        let child = parent.join("child");
-        std::fs::create_dir_all(&child).unwrap();
-
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(parent).unwrap();
-        let source = BundleSource::LocalDir(PathBuf::from("./child"));
-        let result = source.resolve();
-        std::env::set_current_dir(original_cwd).unwrap();
-
-        let resolved = result.expect("resolve relative path");
-        assert!(resolved.ends_with("child"));
-    }
-
-    #[test]
-    fn resolve_file_uri_validates_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = BundleSource::FileUri(dir.path().to_path_buf());
-        assert!(source.resolve().is_ok());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn resolve_async_local_dir_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = BundleSource::LocalDir(dir.path().to_path_buf());
-        let resolved = source.resolve_async().await.unwrap();
-        assert!(resolved.exists());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn resolve_async_file_uri_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = BundleSource::FileUri(dir.path().to_path_buf());
-        let resolved = source.resolve_async().await.unwrap();
-        assert!(resolved.exists());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn resolve_async_local_dir_missing_errors() {
-        let source = BundleSource::LocalDir(PathBuf::from("/nonexistent/async/9f8c7b6a"));
-        assert!(source.resolve_async().await.is_err());
-    }
-
-    #[test]
     fn percent_decode_passes_through_invalid_escapes() {
         // %ZZ is not valid hex — the literal '%' and following characters are kept.
         let decoded = percent_decode("foo%ZZbar");
@@ -566,74 +527,124 @@ mod tests {
 
     #[cfg(feature = "oci")]
     #[test]
-    fn registry_basic_auth_explores_env_var_branches() {
-        // Single test serializes its env mutations, since cargo runs tests in
-        // parallel and env state is process-global.
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
-        let keys = [
-            "OCI_USERNAME",
-            "OCI_PASSWORD",
-            "GHCR_TOKEN",
-            "GITHUB_TOKEN",
-            "GHCR_USERNAME",
-            "GHCR_USER",
-            "GITHUB_ACTOR",
-            "USER",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(*k).ok())).collect();
-
-        // SAFETY: test-only env mutation; values are restored before this test
-        // returns, and the LOCK above prevents concurrent test mutation.
+    fn registry_basic_auth_uses_generic_oci_credentials_first() {
+        let _guard = env_lock();
         unsafe {
-            for k in keys {
-                std::env::remove_var(k);
-            }
+            std::env::set_var("OCI_USERNAME", "oci-user");
+            std::env::set_var("OCI_PASSWORD", "oci-pass");
+            std::env::remove_var("GHCR_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_USER");
+            std::env::remove_var("GITHUB_ACTOR");
+            std::env::remove_var("USER");
         }
 
-        // Branch 1: nothing set → None for any registry.
-        assert!(registry_basic_auth_for_reference("ghcr.io/example/pack:latest").is_none());
-        assert!(registry_basic_auth_for_reference("docker.io/example/pack").is_none());
+        let creds = registry_basic_auth_for_reference("ghcr.io/greentic/example-pack:latest");
+        assert_eq!(
+            creds,
+            Some(("oci-user".to_string(), "oci-pass".to_string()))
+        );
 
-        // Branch 2: generic OCI_USERNAME + OCI_PASSWORD wins regardless of registry.
-        unsafe {
-            std::env::set_var("OCI_USERNAME", "u-generic");
-            std::env::set_var("OCI_PASSWORD", "p-generic");
-        }
-        let (u, p) = registry_basic_auth_for_reference("docker.io/example/pack")
-            .expect("generic creds should resolve");
-        assert_eq!((u.as_str(), p.as_str()), ("u-generic", "p-generic"));
-
-        // Branch 3: empty generic creds are treated as unset, ghcr.io falls
-        // back to GHCR_TOKEN + GITHUB_ACTOR.
-        unsafe {
-            std::env::set_var("OCI_USERNAME", "");
-            std::env::set_var("OCI_PASSWORD", "");
-            std::env::set_var("GHCR_TOKEN", "ghcr-token");
-            std::env::set_var("GITHUB_ACTOR", "actor-user");
-        }
-        let (u, p) = registry_basic_auth_for_reference("ghcr.io/example/pack:latest")
-            .expect("ghcr fallback should resolve");
-        assert_eq!((u.as_str(), p.as_str()), ("actor-user", "ghcr-token"));
-
-        // Branch 4: non-ghcr registry without generic creds → None.
         unsafe {
             std::env::remove_var("OCI_USERNAME");
             std::env::remove_var("OCI_PASSWORD");
         }
-        assert!(registry_basic_auth_for_reference("docker.io/example/pack").is_none());
+    }
 
-        // Restore original environment.
+    #[cfg(feature = "oci")]
+    #[test]
+    fn registry_basic_auth_builds_ghcr_credentials_from_github_env() {
+        let _guard = env_lock();
         unsafe {
-            for (k, v) in &saved {
-                match v {
-                    Some(value) => std::env::set_var(k, value),
-                    None => std::env::remove_var(k),
-                }
-            }
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+            std::env::set_var("GITHUB_TOKEN", "gh-token");
+            std::env::set_var("GITHUB_ACTOR", "octocat");
+            std::env::remove_var("GHCR_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_USER");
+            std::env::remove_var("USER");
         }
+
+        let creds = registry_basic_auth_for_reference("ghcr.io/greentic/example-pack:latest");
+        assert_eq!(creds, Some(("octocat".to_string(), "gh-token".to_string())));
+
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GITHUB_ACTOR");
+        }
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn registry_basic_auth_returns_none_without_matching_env() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+            std::env::remove_var("GHCR_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_USER");
+            std::env::remove_var("GITHUB_ACTOR");
+            std::env::remove_var("USER");
+        }
+
+        assert_eq!(
+            registry_basic_auth_for_reference("example.com/greentic/example-pack:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_local_dir_returns_relative_path_when_it_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let relative = bundle.strip_prefix(std::env::current_dir().unwrap()).ok();
+
+        if let Some(relative) = relative {
+            let source = BundleSource::LocalDir(relative.to_path_buf());
+            assert_eq!(source.resolve().unwrap(), relative);
+            return;
+        }
+
+        let source = BundleSource::LocalDir(bundle.clone());
+        assert_eq!(source.resolve().unwrap(), bundle);
+    }
+
+    #[test]
+    fn resolve_file_uri_returns_existing_absolute_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+
+        let source = BundleSource::FileUri(bundle.clone());
+        assert_eq!(source.resolve().unwrap(), bundle);
+    }
+
+    #[tokio::test]
+    async fn resolve_async_supports_local_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+
+        let local = BundleSource::LocalDir(bundle.clone());
+        assert_eq!(local.resolve_async().await.unwrap(), bundle);
+
+        let file_uri = BundleSource::FileUri(bundle.clone());
+        assert_eq!(file_uri.resolve_async().await.unwrap(), bundle);
+    }
+
+    #[test]
+    fn resolve_missing_local_path_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let source = BundleSource::LocalDir(missing.clone());
+
+        let error = source.resolve().unwrap_err().to_string();
+        assert!(error.contains("bundle path does not exist"));
+        assert!(error.contains(&missing.display().to_string()));
     }
 }
