@@ -210,6 +210,17 @@ select{cursor:pointer;appearance:none;
   max-height:300px;overflow-y:auto;color:#d4d4d8;line-height:1.6;
 }
 .output-pre.stderr{color:#fca5a5}
+.setup-action{
+  display:flex;flex-direction:column;align-items:flex-start;gap:.5rem;
+  padding:.75rem 1rem;margin-bottom:.75rem;
+  background:var(--primary-muted);border:1px solid rgba(37,195,158,.25);
+  border-radius:calc(var(--radius) - 2px);
+}
+.setup-action-btn{text-decoration:none}
+.setup-action-url{
+  max-width:100%;font-size:.75rem;font-family:var(--mono);color:#d4d4d8;
+  overflow-wrap:anywhere;line-height:1.5;
+}
 
 /* ── Import drop zone ── */
 .import-zone{

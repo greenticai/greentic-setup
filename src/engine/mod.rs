@@ -81,6 +81,7 @@ impl SetupEngine {
             resolved_packs: Vec::new(),
             resolved_manifests: Vec::new(),
             provider_updates: 0,
+            pending_setup_actions: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -129,8 +130,12 @@ impl SetupEngine {
                     }
                 }
                 SetupStepKind::ApplyPackSetup => {
-                    let count = execute_apply_pack_setup(bundle, &plan.metadata, &self.config)?;
-                    report.provider_updates += count;
+                    let setup_report =
+                        execute_apply_pack_setup(bundle, &plan.metadata, &self.config)?;
+                    report.provider_updates += setup_report.provider_updates;
+                    report
+                        .pending_setup_actions
+                        .extend(setup_report.pending_setup_actions);
                     if self.config.verbose {
                         println!("  [done] {}", step.description);
                     }
@@ -471,6 +476,53 @@ setup_answers:
         let stored: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(artifact).unwrap()).unwrap();
         assert_eq!(stored["public_web_enabled"], json!(true));
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_persists_setup_actions_and_strips_provider_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request.setup_answers.insert(
+            "messaging-example".into(),
+            json!({
+                "bot_token": "secret",
+                "setup_actions": [{
+                    "id": "install",
+                    "kind": "oauth_install_button",
+                    "label": "Add to Example",
+                    "authorize_url": "https://example.com/oauth"
+                }]
+            }),
+        );
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        assert_eq!(report.provider_updates, 1);
+        assert_eq!(report.pending_setup_actions.len(), 1);
+        let action_path = crate::setup_actions::setup_actions_state_path(
+            &bundle_root,
+            "demo",
+            "default",
+            "messaging-example",
+        );
+        assert!(action_path.exists());
+
+        let setup_answers_path =
+            bundle_root.join("state/config/messaging-example/setup-answers.json");
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(setup_answers_path).unwrap()).unwrap();
+        assert!(stored.get("setup_actions").is_none());
+        assert_eq!(stored["bot_token"], json!("secret"));
     }
 
     #[test]

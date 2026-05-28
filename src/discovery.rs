@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use serde::Serialize;
 use serde_cbor::Value as CborValue;
 use zip::result::ZipError;
@@ -107,31 +108,90 @@ pub fn discover_with_options(
             if path.extension().and_then(|ext| ext.to_str()) != Some("gtpack") {
                 continue;
             }
-
-            let (provider_id, display_name, id_source) = if options.cbor_only {
-                match read_pack_meta_cbor_only(&path)? {
-                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
-                    None => return Err(missing_cbor_error(&path)),
-                }
-            } else {
-                match read_pack_meta_from_manifest(&path)? {
-                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
-                    None => {
-                        let stem = path
-                            .file_stem()
-                            .and_then(|v| v.to_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        (stem, None, ProviderIdSource::Filename)
-                    }
-                }
-            };
-
+            let (provider_id, display_name, id_source) =
+                read_pack_identity(&path, options.cbor_only)?;
             providers.push(DetectedProvider {
                 provider_id,
                 display_name,
                 domain: domain.to_string(),
                 pack_path: path,
+                id_source,
+                kind: DetectedPackKind::Provider,
+            });
+        }
+    }
+
+    // Extension providers land at `providers/<name>.gtpack[/inner.gtpack]`
+    // (depth 1), outside the DOMAIN_DIRS subdirs. Catch them here.
+    let providers_root = root.join("providers");
+    if providers_root.exists() {
+        let known_subdirs: std::collections::HashSet<&str> = DOMAIN_DIRS
+            .iter()
+            .filter_map(|(_, dir)| {
+                std::path::Path::new(dir)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+            })
+            .collect();
+        for entry in std::fs::read_dir(&providers_root)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let name_str = entry_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+
+            // Accept both `providers/<name>.gtpack` (file) and the wrapper
+            // dir shape `providers/<name>.gtpack/<inner>.gtpack`.
+            let pack_path = if entry.file_type()?.is_file() {
+                if entry_path.extension().and_then(|e| e.to_str()) != Some("gtpack") {
+                    continue;
+                }
+                entry_path.clone()
+            } else if entry.file_type()?.is_dir() {
+                if known_subdirs.contains(name_str) {
+                    continue;
+                }
+                if !name_str.ends_with(".gtpack") {
+                    continue;
+                }
+                let inner = entry_path.join(name_str);
+                if inner.is_file() {
+                    inner
+                } else {
+                    // Fall back to the first `.gtpack` inside.
+                    match std::fs::read_dir(&entry_path)?
+                        .filter_map(|e| e.ok())
+                        .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gtpack"))
+                        .map(|e| e.path())
+                    {
+                        Some(found) => found,
+                        None => continue,
+                    }
+                }
+            } else {
+                continue;
+            };
+
+            let (provider_id, display_name, id_source) =
+                read_pack_identity(&pack_path, options.cbor_only)?;
+
+            // Skip if DOMAIN_DIRS already picked up the same provider.
+            if providers.iter().any(|p| p.provider_id == provider_id) {
+                continue;
+            }
+            let domain = crate::cli_helpers::detect_domain_from_filename(
+                pack_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default(),
+            )
+            .to_string();
+            providers.push(DetectedProvider {
+                provider_id,
+                display_name,
+                domain,
+                pack_path,
                 id_source,
                 kind: DetectedPackKind::Provider,
             });
@@ -150,26 +210,8 @@ pub fn discover_with_options(
             if path.extension().and_then(|ext| ext.to_str()) != Some("gtpack") {
                 continue;
             }
-
-            let (provider_id, display_name, id_source) = if options.cbor_only {
-                match read_pack_meta_cbor_only(&path)? {
-                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
-                    None => return Err(missing_cbor_error(&path)),
-                }
-            } else {
-                match read_pack_meta_from_manifest(&path)? {
-                    Some(meta) => (meta.pack_id, meta.display_name, ProviderIdSource::Manifest),
-                    None => {
-                        let stem = path
-                            .file_stem()
-                            .and_then(|v| v.to_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        (stem, None, ProviderIdSource::Filename)
-                    }
-                }
-            };
-
+            let (provider_id, display_name, id_source) =
+                read_pack_identity(&path, options.cbor_only)?;
             app_packs.push(DetectedProvider {
                 provider_id,
                 display_name,
@@ -227,6 +269,33 @@ impl DiscoveryResult {
     }
 }
 
+/// Resolve `(provider_id, display_name, id_source)` for a `.gtpack` file,
+/// using the manifest when available and falling back to the filename stem.
+/// Honours `cbor_only` mode, which requires the manifest-derived metadata.
+fn read_pack_identity(
+    path: &Path,
+    cbor_only: bool,
+) -> anyhow::Result<(String, Option<String>, ProviderIdSource)> {
+    if cbor_only {
+        match read_pack_meta_cbor_only(path)? {
+            Some(meta) => Ok((meta.pack_id, meta.display_name, ProviderIdSource::Manifest)),
+            None => Err(missing_cbor_error(path)),
+        }
+    } else {
+        match read_pack_meta_from_manifest(path)? {
+            Some(meta) => Ok((meta.pack_id, meta.display_name, ProviderIdSource::Manifest)),
+            None => {
+                let stem = path
+                    .file_stem()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                Ok((stem, None, ProviderIdSource::Filename))
+            }
+        }
+    }
+}
+
 /// Read the pack ID and display name from a `.gtpack` manifest when available.
 pub fn read_pack_meta(path: &Path) -> anyhow::Result<Option<DiscoveredPackMeta>> {
     read_pack_meta_from_manifest(path).map(|meta| {
@@ -235,6 +304,32 @@ pub fn read_pack_meta(path: &Path) -> anyhow::Result<Option<DiscoveredPackMeta>>
             display_name: meta.display_name,
         })
     })
+}
+
+/// Read a top-level manifest extension value by key from a `.gtpack`.
+pub fn read_pack_extension(
+    path: &Path,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let file = std::fs::File::open(path)?;
+    match zip::ZipArchive::new(file) {
+        Ok(mut archive) => {
+            if let Some(value) = read_manifest_extension_cbor(&mut archive, extension_key)? {
+                return Ok(Some(value));
+            }
+            if let Some(value) =
+                read_manifest_extension_json(&mut archive, "pack.manifest.json", extension_key)?
+            {
+                return Ok(Some(value));
+            }
+        }
+        Err(_) => {
+            if let Some(value) = read_manifest_extension_cbor_from_tar(path, extension_key)? {
+                return Ok(Some(value));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
@@ -290,6 +385,24 @@ fn read_manifest_cbor(
     extract_pack_meta_from_cbor(&value)
 }
 
+fn read_manifest_extension_cbor(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut file = match archive.by_name("manifest.cbor") {
+        Ok(file) => file,
+        Err(ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let value: CborValue = serde_cbor::from_slice(&bytes)?;
+    let CborValue::Map(map) = &value else {
+        return Ok(None);
+    };
+    Ok(map_get(map, extension_key).map(cbor_to_json))
+}
+
 fn read_manifest_json(
     archive: &mut zip::ZipArchive<std::fs::File>,
     name: &str,
@@ -330,6 +443,27 @@ fn read_manifest_json(
     Ok(None)
 }
 
+fn read_manifest_extension_json(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut file = match archive.by_name(name) {
+        Ok(file) => file,
+        Err(ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut file, &mut contents)?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents)?;
+    Ok(parsed.get(extension_key).cloned().or_else(|| {
+        parsed
+            .get("extensions")
+            .and_then(|extensions| extensions.get(extension_key))
+            .cloned()
+    }))
+}
+
 fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<PackMeta>> {
     let file = std::fs::File::open(path)?;
     let mut archive = tar::Archive::new(file);
@@ -342,6 +476,28 @@ fn read_manifest_cbor_from_tar(path: &Path) -> anyhow::Result<Option<PackMeta>> 
         std::io::Read::read_to_end(&mut entry, &mut bytes)?;
         let value: CborValue = serde_cbor::from_slice(&bytes)?;
         return extract_pack_meta_from_cbor(&value);
+    }
+    Ok(None)
+}
+
+fn read_manifest_extension_cbor_from_tar(
+    path: &Path,
+    extension_key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_ref() != Path::new("manifest.cbor") {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+        let value: CborValue = serde_cbor::from_slice(&bytes)?;
+        let CborValue::Map(map) = &value else {
+            return Ok(None);
+        };
+        return Ok(map_get(map, extension_key).map(cbor_to_json));
     }
     Ok(None)
 }
@@ -430,6 +586,40 @@ fn map_get<'a>(
     })
 }
 
+fn cbor_to_json(value: &CborValue) -> serde_json::Value {
+    match value {
+        CborValue::Null => serde_json::Value::Null,
+        CborValue::Bool(v) => serde_json::Value::Bool(*v),
+        CborValue::Integer(v) => i64::try_from(*v)
+            .map(serde_json::Number::from)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|_| serde_json::Value::String(v.to_string())),
+        CborValue::Float(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        CborValue::Bytes(bytes) => {
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        CborValue::Text(text) => serde_json::Value::String(text.clone()),
+        CborValue::Array(values) => {
+            serde_json::Value::Array(values.iter().map(cbor_to_json).collect())
+        }
+        CborValue::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (key, value) in map {
+                let key = match key {
+                    CborValue::Text(text) => text.clone(),
+                    CborValue::Integer(value) => value.to_string(),
+                    other => serde_json::to_string(&cbor_to_json(other)).unwrap_or_default(),
+                };
+                obj.insert(key, cbor_to_json(value));
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn missing_cbor_error(path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
         "demo packs must be CBOR-only (.gtpack must contain manifest.cbor). \
@@ -462,6 +652,90 @@ mod tests {
         Ok(())
     }
 
+    fn write_test_pack_manifest(path: &Path, manifest: serde_json::Value) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options)?;
+        writer.write_all(manifest.to_string().as_bytes())?;
+        writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn discover_picks_up_extension_provider_in_wrapper_dir() -> anyhow::Result<()> {
+        // Layout the bundle wizard produces for extension providers (declared
+        // via `extension_provider_entries`): a directory under `providers/`
+        // ending in `.gtpack` that contains the actual `.gtpack` file inside.
+        // Before this fix the depth-1 directory was invisible to discovery,
+        // which silently dropped the provider's setup-answers page and
+        // prevented secrets like `jwt_signing_key` from ever reaching the
+        // dev secrets store at runtime.
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let wrapper = root.join("providers").join("messaging-webchat-gui.gtpack");
+        std::fs::create_dir_all(&wrapper)?;
+        let inner = wrapper.join("messaging-webchat-gui.gtpack");
+        write_test_pack(&inner, "messaging-webchat-gui", "WebChat GUI")?;
+
+        let discovered = discover(root)?;
+        assert_eq!(discovered.providers.len(), 1);
+        let provider = &discovered.providers[0];
+        assert_eq!(provider.provider_id, "messaging-webchat-gui");
+        assert_eq!(provider.domain, "messaging");
+        assert_eq!(provider.kind, DetectedPackKind::Provider);
+        // pack_path must resolve to the inner zip so downstream consumers
+        // (setup_to_formspec::pack_to_form_spec, load_setup_spec) can open it
+        // with `File::open` + `ZipArchive::new`.
+        assert_eq!(provider.pack_path, inner);
+        assert!(
+            discovered
+                .find_setup_target("messaging-webchat-gui")
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discover_does_not_double_count_when_pack_lives_in_both_locations() -> anyhow::Result<()> {
+        // Defensive: if a pack happens to be installed both under the canonical
+        // `providers/<domain>/` dir AND as a wrapper dir at depth 1, we should
+        // pick exactly one (the DOMAIN_DIRS pass wins because it runs first).
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("providers/messaging"))?;
+        write_test_pack(
+            &root
+                .join("providers/messaging")
+                .join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+            "Telegram",
+        )?;
+        let wrapper = root.join("providers").join("messaging-telegram.gtpack");
+        std::fs::create_dir_all(&wrapper)?;
+        write_test_pack(
+            &wrapper.join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+            "Telegram",
+        )?;
+
+        let discovered = discover(root)?;
+        // Either path is acceptable for the de-duped entry; we just must not
+        // see the same provider twice.
+        let matching: Vec<_> = discovered
+            .providers
+            .iter()
+            .filter(|p| p.provider_id == "messaging-telegram")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one entry, got {matching:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn discover_includes_app_packs_in_setup_targets() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -490,6 +764,27 @@ mod tests {
         assert_eq!(discovered.app_packs[0].provider_id, "weather-app");
         assert_eq!(discovered.app_packs[0].domain, "app");
         assert_eq!(discovered.app_packs[0].kind, DetectedPackKind::App);
+        Ok(())
+    }
+
+    #[test]
+    fn read_pack_extension_reads_json_manifest_extension() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let pack = temp.path().join("messaging-example.gtpack");
+        write_test_pack_manifest(
+            &pack,
+            serde_json::json!({
+                "pack_id": "messaging-example",
+                "extensions": {
+                    "messaging.oauth.v1": {
+                        "token_url": "https://example.com/token",
+                        "secret_keys": ["EXAMPLE_TOKEN"]
+                    }
+                }
+            }),
+        )?;
+        let extension = read_pack_extension(&pack, "messaging.oauth.v1")?.unwrap();
+        assert_eq!(extension["token_url"], "https://example.com/token");
         Ok(())
     }
 }

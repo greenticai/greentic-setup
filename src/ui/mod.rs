@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -188,6 +188,8 @@ struct ExecutionResult {
     stdout: String,
     stderr: String,
     manual_steps: Vec<crate::webhook::ProviderInstruction>,
+    #[serde(default)]
+    pending_setup_actions: Vec<crate::setup_actions::SetupAction>,
 }
 
 // ── Public API ──
@@ -257,6 +259,7 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/execute", post(post_execute))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
+        .route("/oauth/callback/{provider}", get(get_oauth_callback))
         .route("/api/shutdown", post(post_shutdown))
         .with_state(state)
 }
@@ -814,6 +817,7 @@ async fn post_execute(
         stdout: String::new(),
         stderr: format!("Task panicked: {e}"),
         manual_steps: vec![],
+        pending_setup_actions: vec![],
     });
 
     // After a successful UI setup, re-pack the extracted bundle dir back
@@ -1010,6 +1014,43 @@ async fn post_decrypt(Json(req): Json<DecryptRequest>) -> Json<Value> {
     }
 }
 
+async fn get_oauth_callback(
+    State(state): State<std::sync::Arc<UiState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let code = query.get("code").cloned().unwrap_or_default();
+    let oauth_state = query.get("state").cloned().unwrap_or_default();
+    if code.is_empty() || oauth_state.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "OAuth callback missing code or state".to_string(),
+        );
+    }
+    match crate::oauth_callback::complete_oauth_callback(
+        &state.bundle_path,
+        &state.env,
+        &crate::oauth_callback::OAuthCallbackInput {
+            code,
+            state: oauth_state,
+        },
+        "messaging.oauth.v1",
+    )
+    .await
+    {
+        Ok(report) => (
+            axum::http::StatusCode::OK,
+            format!(
+                "OAuth setup complete for {} ({}/{})",
+                report.provider_id, report.tenant, report.team
+            ),
+        ),
+        Err(err) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("OAuth setup failed: {err}"),
+        ),
+    }
+}
+
 async fn post_shutdown(State(state): State<std::sync::Arc<UiState>>) {
     let _ = state.shutdown_tx.send(());
 }
@@ -1039,6 +1080,7 @@ fn execute_setup(
                 stdout: String::new(),
                 stderr: format!("Failed to normalize static routes: {e}"),
                 manual_steps: vec![],
+                pending_setup_actions: vec![],
             };
         }
     };
@@ -1075,6 +1117,7 @@ fn execute_setup(
                 stdout: String::new(),
                 stderr: format!("Failed to build plan: {e}"),
                 manual_steps: vec![],
+                pending_setup_actions: vec![],
             };
         }
     };
@@ -1105,6 +1148,7 @@ fn execute_setup(
                 ),
                 stderr: String::new(),
                 manual_steps,
+                pending_setup_actions: report.pending_setup_actions,
             }
         }
         Err(e) => ExecutionResult {
@@ -1112,6 +1156,7 @@ fn execute_setup(
             stdout,
             stderr: format!("Execution failed: {e}"),
             manual_steps: vec![],
+            pending_setup_actions: vec![],
         },
     }
 }

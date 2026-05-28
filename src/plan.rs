@@ -224,6 +224,8 @@ pub struct SetupExecutionReport {
     pub resolved_packs: Vec<ResolvedPackInfo>,
     pub resolved_manifests: Vec<PathBuf>,
     pub provider_updates: usize,
+    #[serde(default)]
+    pub pending_setup_actions: Vec<crate::setup_actions::SetupAction>,
     pub warnings: Vec<String>,
 }
 
