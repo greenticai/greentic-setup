@@ -62,6 +62,12 @@ pub struct DiscoverySelect {
     pub label: String,
     pub value: String,
     pub save_as: String,
+    #[serde(default)]
+    pub label_save_as: Option<String>,
+    #[serde(default)]
+    pub default_label: Option<String>,
+    #[serde(default)]
+    pub default_filter: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,7 +166,11 @@ pub fn load_provider_device_metadata(
     let raw = crate::discovery::read_pack_extension(&provider.pack_path, extension_key)?
         .ok_or_else(|| anyhow!("provider missing OAuth device-code metadata: {extension_key}"))?;
     let metadata = raw.get("inline").cloned().unwrap_or(raw);
-    serde_json::from_value(metadata).context("failed to parse provider OAuth device-code metadata")
+    let mut metadata: OAuthDeviceMetadata = serde_json::from_value(metadata)
+        .context("failed to parse provider OAuth device-code metadata")?;
+    let bundle_name = crate::bundle::read_bundle_name(bundle_root).ok().flatten();
+    apply_bundle_name_templates(&mut metadata, bundle_name.as_deref());
+    Ok(metadata)
 }
 
 pub fn device_code_request_form<'a>(
@@ -579,7 +589,7 @@ where
                 step.id
             );
         }
-        let index = select_index(items).min(items.len() - 1);
+        let index = select_index_with_default(select, items, &mut select_index);
         let item = &items[index];
         let value = get_json_path(item, &select.value)
             .and_then(value_to_string)
@@ -590,8 +600,93 @@ where
                 )
             })?;
         saved.insert(select.save_as.clone(), value);
+        if let Some(label) = get_json_path(item, &select.label).and_then(value_to_string) {
+            saved.insert(discovery_label_save_key(select), label);
+        }
     }
     Ok(saved)
+}
+
+fn select_index_with_default<F>(
+    select: &DiscoverySelect,
+    items: &[Value],
+    select_index: &mut F,
+) -> usize
+where
+    F: FnMut(&[Value]) -> usize,
+{
+    if let Some(index) = preferred_discovery_item_index(select, items) {
+        return index;
+    }
+    select_index(items).min(items.len() - 1)
+}
+
+fn preferred_discovery_item_index(select: &DiscoverySelect, items: &[Value]) -> Option<usize> {
+    if let Some(default_label) = select
+        .default_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let default_label = default_label.to_ascii_lowercase();
+        if let Some(index) = items.iter().position(|item| {
+            get_json_path(item, &select.label)
+                .and_then(value_to_string)
+                .is_some_and(|label| label.trim().eq_ignore_ascii_case(&default_label))
+        }) {
+            return Some(index);
+        }
+    }
+
+    let filter = select
+        .default_filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_ascii_lowercase();
+    items.iter().position(|item| {
+        get_json_path(item, &select.label)
+            .and_then(value_to_string)
+            .is_some_and(|label| label.to_ascii_lowercase().contains(&filter))
+    })
+}
+
+fn discovery_label_save_key(select: &DiscoverySelect) -> String {
+    select
+        .label_save_as
+        .clone()
+        .unwrap_or_else(|| inferred_label_save_key(&select.save_as))
+}
+
+fn inferred_label_save_key(save_as: &str) -> String {
+    save_as
+        .strip_suffix("_id")
+        .map(|prefix| format!("{prefix}_name"))
+        .unwrap_or_else(|| format!("{save_as}_label"))
+}
+
+fn apply_bundle_name_templates(metadata: &mut OAuthDeviceMetadata, bundle_name: Option<&str>) {
+    let Some(bundle_name) = bundle_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    for step in &mut metadata.post_login_discovery {
+        let Some(select) = step.select.as_mut() else {
+            continue;
+        };
+        if let Some(value) = select.default_label.as_mut() {
+            *value = render_bundle_name_template(value, bundle_name);
+        }
+        if let Some(value) = select.default_filter.as_mut() {
+            *value = render_bundle_name_template(value, bundle_name);
+        }
+    }
+}
+
+fn render_bundle_name_template(template: &str, bundle_name: &str) -> String {
+    template
+        .replace("{{ bundle_name }}", bundle_name)
+        .replace("{{bundle_name}}", bundle_name)
+        .replace("{bundle_name}", bundle_name)
 }
 
 fn resolve_discovery_url(
@@ -818,6 +913,7 @@ mod tests {
     fn load_provider_device_metadata_accepts_inline_extension_wrapper() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let bundle = temp.path();
+        crate::bundle::create_demo_bundle_structure(bundle, Some("Acme Support"))?;
         std::fs::create_dir_all(bundle.join("providers/messaging"))?;
         write_provider_pack_with_manifest(
             &bundle.join("providers/messaging/messaging-example.gtpack"),
@@ -832,7 +928,18 @@ mod tests {
                             "token_url": "https://login.example/token",
                             "verification_uri": "https://login.example/device",
                             "client_id_config_key": "client_id",
-                            "scopes": ["User.Read"]
+                            "scopes": ["User.Read"],
+                            "post_login_discovery": [{
+                                "id": "rooms",
+                                "url": "https://api.example/rooms",
+                                "select": {
+                                    "from": "value",
+                                    "label": "displayName",
+                                    "value": "id",
+                                    "save_as": "room_id",
+                                    "default_filter": "{{ bundle_name }}"
+                                }
+                            }]
                         }
                     }
                 }
@@ -848,6 +955,13 @@ mod tests {
         assert_eq!(metadata.device_code_url, "https://login.example/devicecode");
         assert_eq!(metadata.token_url, "https://login.example/token");
         assert_eq!(metadata.scopes, vec!["User.Read"]);
+        assert_eq!(
+            metadata.post_login_discovery[0]
+                .select
+                .as_ref()
+                .and_then(|select| select.default_filter.as_deref()),
+            Some("Acme Support")
+        );
         Ok(())
     }
 
@@ -1106,7 +1220,9 @@ mod tests {
         metadata.config_out = BTreeMap::from([
             ("tenant_id".into(), "tenant_id".into()),
             ("team_id".into(), "team_id".into()),
+            ("team_name".into(), "team_name".into()),
             ("channel_id".into(), "channel_id".into()),
+            ("channel_name".into(), "channel_name".into()),
         ]);
 
         let report = poll_oauth_device_code_with_token_response(
@@ -1119,7 +1235,9 @@ mod tests {
                 "access_token": "access-123",
                 "tenant_id": "tenant-123",
                 "team_id": "team-123",
-                "channel_id": "channel-123"
+                "team_name": "Support",
+                "channel_id": "channel-123",
+                "channel_name": "Greentic"
             }),
         )
         .await
@@ -1132,7 +1250,9 @@ mod tests {
         assert_eq!(answers["public_base_url"], json!("https://tunnel.example"));
         assert_eq!(answers["tenant_id"], json!("tenant-123"));
         assert_eq!(answers["team_id"], json!("team-123"));
+        assert_eq!(answers["team_name"], json!("Support"));
         assert_eq!(answers["channel_id"], json!("channel-123"));
+        assert_eq!(answers["channel_name"], json!("Greentic"));
         assert!(answers.get("MS_GRAPH_REFRESH_TOKEN").is_none());
         assert!(answers.get("MS_GRAPH_ACCESS_TOKEN").is_none());
 
@@ -1173,6 +1293,9 @@ mod tests {
                     label: "displayName".into(),
                     value: "id".into(),
                     save_as: "team_id".into(),
+                    label_save_as: None,
+                    default_label: None,
+                    default_filter: None,
                 }),
             },
             DiscoveryStep {
@@ -1187,6 +1310,9 @@ mod tests {
                     label: "displayName".into(),
                     value: "id".into(),
                     save_as: "channel_id".into(),
+                    label_save_as: None,
+                    default_label: Some("Ops".into()),
+                    default_filter: None,
                 }),
             },
         ];
@@ -1214,10 +1340,12 @@ mod tests {
             .unwrap();
         assert_eq!(values.get("user_id").map(String::as_str), Some("user-1"));
         assert_eq!(values.get("team_id").map(String::as_str), Some("team-2"));
+        assert_eq!(values.get("team_name").map(String::as_str), Some("Two"));
         assert_eq!(
             values.get("channel_id").map(String::as_str),
-            Some("channel-1")
+            Some("channel-2")
         );
+        assert_eq!(values.get("channel_name").map(String::as_str), Some("Ops"));
     }
 
     #[test]
@@ -1250,6 +1378,9 @@ mod tests {
                 label: "displayName".into(),
                 value: "id".into(),
                 save_as: "team_id".into(),
+                label_save_as: None,
+                default_label: None,
+                default_filter: None,
             }),
         };
         let error = apply_discovery_step(&step, &json!({"value": []}), |_| 0)

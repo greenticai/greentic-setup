@@ -25,6 +25,10 @@ This directory contains the maintained documents for `greentic-setup`.
 - [extension-pack-ingress-http.md](./extension-pack-ingress-http.md)
   Human-readable explanation of HTTP ingress and `public_base_url`.
 
+- [oauth-device-setup.md](./oauth-device-setup.md)
+  Metadata conventions for device-code setup, discovery selection, and
+  provider-specific interaction instructions.
+
 - [mtls-setup.md](./mtls-setup.md)
   mTLS certificate setup guidance.
 
