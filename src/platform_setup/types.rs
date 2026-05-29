@@ -12,7 +12,7 @@ pub(crate) const SURFACE_ENABLED: &str = "enabled";
 pub(crate) const SURFACE_DISABLED: &str = "disabled";
 
 /// Platform-level setup answers containing static routes, deployment targets,
-/// and tunnel configuration.
+/// tunnel, and telemetry configuration.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlatformSetupAnswers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -21,6 +21,27 @@ pub struct PlatformSetupAnswers {
     pub deployment_targets: Vec<DeploymentTargetRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelAnswers>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryAnswers>,
+}
+
+/// Telemetry export configuration captured during setup. Persisted to
+/// `state/config/platform/telemetry.json` and consumed by `greentic-start`
+/// when installing the tracing subscriber. Absence is fully backwards
+/// compatible — the runtime falls back to the legacy file-appender-only
+/// behavior.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetryAnswers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exporter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Tunnel configuration for local development.

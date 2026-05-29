@@ -1475,6 +1475,7 @@ mod tests {
             deployment_targets: Vec::new(),
             setup_answers: serde_json::Map::new(),
             tunnel: None,
+            telemetry: None,
         }
     }
 

@@ -11,7 +11,7 @@ use crate::plan::{
     AccessChangeSelection, PackDefaultSelection, PackRemoveSelection, RemoveTarget,
     TenantSelection, UpdateOp,
 };
-use crate::platform_setup::{PlatformSetupAnswers, StaticRoutesPolicy};
+use crate::platform_setup::{PlatformSetupAnswers, StaticRoutesPolicy, TelemetryAnswers};
 
 /// Loaded answers from a JSON/YAML file.
 #[derive(Clone, Debug, Default)]
@@ -41,6 +41,7 @@ pub struct SetupRequest {
     pub static_routes: StaticRoutesPolicy,
     pub deployment_targets: Vec<crate::deployment_targets::DeploymentTargetRecord>,
     pub tunnel: Option<crate::platform_setup::TunnelAnswers>,
+    pub telemetry: Option<TelemetryAnswers>,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
     /// Filter by provider domain (messaging, events, secrets, oauth).
     pub domain_filter: Option<String>,

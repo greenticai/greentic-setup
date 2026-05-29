@@ -14,7 +14,9 @@ use std::path::Path;
 use anyhow::anyhow;
 
 use crate::plan::*;
-use crate::platform_setup::{persist_static_routes_artifact, persist_tunnel_artifact};
+use crate::platform_setup::{
+    persist_static_routes_artifact, persist_telemetry_artifact, persist_tunnel_artifact,
+};
 
 // Re-export types and functions for public API
 pub use answers::{emit_answers, encrypt_secret_answers, load_answers, prompt_secret_answers};
@@ -183,6 +185,9 @@ impl SetupEngine {
         );
         if let Some(tunnel) = plan.metadata.tunnel.as_ref() {
             let _ = persist_tunnel_artifact(bundle, tunnel);
+        }
+        if let Some(telemetry) = plan.metadata.telemetry.as_ref() {
+            let _ = persist_telemetry_artifact(bundle, telemetry);
         }
 
         Ok(report)
