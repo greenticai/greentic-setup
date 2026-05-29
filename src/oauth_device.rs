@@ -344,6 +344,7 @@ async fn poll_oauth_device_code_with_token_response(
         None,
     )
     .await?;
+    persist_device_config_outputs(bundle_root, &session.provider_id, metadata, &mapped)?;
     crate::setup_actions::mark_setup_action_complete(
         bundle_root,
         &session.tenant,
@@ -444,6 +445,55 @@ pub fn map_device_token_response(
         bail!("OAuth device-code token response did not contain mappable values");
     }
     Ok(mapped)
+}
+
+fn persist_device_config_outputs(
+    bundle_root: &Path,
+    provider_id: &str,
+    metadata: &OAuthDeviceMetadata,
+    mapped: &BTreeMap<String, String>,
+) -> Result<()> {
+    let secret_output_keys: std::collections::BTreeSet<&str> =
+        metadata.secrets_out.values().map(String::as_str).collect();
+    let config_outputs: JsonMap<String, Value> = mapped
+        .iter()
+        .filter(|(key, _)| !secret_output_keys.contains(key.as_str()))
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    if config_outputs.is_empty() {
+        return Ok(());
+    }
+
+    let path = provider_setup_answers_path(bundle_root, provider_id);
+    let mut answers = load_provider_setup_answers(bundle_root, provider_id)?;
+    let Some(answer_map) = answers.as_object_mut() else {
+        bail!(
+            "provider setup answers must be a JSON object: {}",
+            path.display()
+        );
+    };
+    for (key, value) in config_outputs {
+        answer_map.insert(key, value);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string_pretty(&answers)?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    let verified = load_provider_setup_answers(bundle_root, provider_id)?;
+    for (key, value) in mapped {
+        if secret_output_keys.contains(key.as_str()) {
+            continue;
+        }
+        let actual = verified.get(key).and_then(Value::as_str);
+        if actual != Some(value.as_str()) {
+            bail!("failed to verify persisted device-code config output {key}");
+        }
+    }
+    Ok(())
 }
 
 pub fn execute_post_login_discovery(
@@ -612,17 +662,21 @@ fn poll_error_message(error: &str, response: &Value) -> String {
 }
 
 fn load_provider_setup_answers(bundle_root: &Path, provider_id: &str) -> Result<Value> {
-    let path = bundle_root
-        .join("state")
-        .join("config")
-        .join(provider_id)
-        .join("setup-answers.json");
+    let path = provider_setup_answers_path(bundle_root, provider_id);
     if !path.exists() {
         return Ok(Value::Object(JsonMap::new()));
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn provider_setup_answers_path(bundle_root: &Path, provider_id: &str) -> PathBuf {
+    bundle_root
+        .join("state")
+        .join("config")
+        .join(provider_id)
+        .join("setup-answers.json")
 }
 
 fn save_session(bundle_root: &Path, state: &OAuthDeviceSessionState) -> Result<()> {
@@ -681,6 +735,7 @@ fn value_to_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greentic_secrets_lib::SecretsStore;
     use serde_json::json;
     use std::io::Write;
     use std::path::Path;
@@ -989,6 +1044,108 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("did not contain mappable values"));
+    }
+
+    #[tokio::test]
+    async fn poll_persists_device_outputs_to_runtime_config_and_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path();
+        let provider_id = "messaging-teams";
+        let tenant = "demo";
+        let team = "default";
+        let action_id = "teams-device-code";
+        let config_dir = bundle.join("state/config").join(provider_id);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("setup-answers.json"),
+            serde_json::to_string_pretty(&json!({
+                "client_id": "client-123",
+                "public_base_url": "https://tunnel.example"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::setup_actions::persist_setup_actions(
+            bundle,
+            &[crate::setup_actions::SetupAction {
+                id: action_id.into(),
+                kind: crate::setup_actions::SetupActionKind::OauthDeviceCode,
+                label: "Connect Teams".into(),
+                provider_id: provider_id.into(),
+                tenant: tenant.into(),
+                team: Some(team.into()),
+                authorize_url: None,
+                callback_path: None,
+                state: None,
+                status: crate::setup_actions::SetupActionStatus::Pending,
+                created_at: None,
+                completed_at: None,
+                extra: JsonMap::new(),
+            }],
+        )
+        .unwrap();
+
+        let session = OAuthDeviceSessionState {
+            session_id: "session-1".into(),
+            provider_id: provider_id.into(),
+            tenant: tenant.into(),
+            team: team.into(),
+            action_id: action_id.into(),
+            device_code: "device-code".into(),
+            client_id: "client-123".into(),
+            interval: 5,
+            expires_at: crate::setup_actions::current_epoch_secs() + 900,
+            created_at: crate::setup_actions::current_epoch_secs(),
+        };
+        save_session(bundle, &session).unwrap();
+
+        let mut metadata = metadata();
+        metadata
+            .secrets_out
+            .insert("access_token".into(), "MS_GRAPH_ACCESS_TOKEN".into());
+        metadata.config_out = BTreeMap::from([
+            ("tenant_id".into(), "tenant_id".into()),
+            ("team_id".into(), "team_id".into()),
+            ("channel_id".into(), "channel_id".into()),
+        ]);
+
+        let report = poll_oauth_device_code_with_token_response(
+            bundle,
+            "dev",
+            &session,
+            &metadata,
+            &json!({
+                "refresh_token": "refresh-123",
+                "access_token": "access-123",
+                "tenant_id": "tenant-123",
+                "team_id": "team-123",
+                "channel_id": "channel-123"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.status, OAuthDevicePollStatus::Complete);
+
+        let answers = load_provider_setup_answers(bundle, provider_id).unwrap();
+        assert_eq!(answers["client_id"], json!("client-123"));
+        assert_eq!(answers["public_base_url"], json!("https://tunnel.example"));
+        assert_eq!(answers["tenant_id"], json!("tenant-123"));
+        assert_eq!(answers["team_id"], json!("team-123"));
+        assert_eq!(answers["channel_id"], json!("channel-123"));
+        assert!(answers.get("MS_GRAPH_REFRESH_TOKEN").is_none());
+        assert!(answers.get("MS_GRAPH_ACCESS_TOKEN").is_none());
+
+        let store = crate::secrets::open_dev_store(bundle).unwrap();
+        let refresh_uri = crate::canonical_secret_uri(
+            "dev",
+            tenant,
+            Some(team),
+            provider_id,
+            "MS_GRAPH_REFRESH_TOKEN",
+        );
+        let refresh = String::from_utf8(store.get(&refresh_uri).await.unwrap()).unwrap();
+        assert_eq!(refresh, "refresh-123");
     }
 
     #[test]
