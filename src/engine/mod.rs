@@ -23,7 +23,7 @@ pub use executors::{
     execute_apply_pack_setup, execute_build_flow_index, execute_copy_resolved_manifests,
     execute_create_bundle, execute_remove_provider_artifacts, execute_resolve_packs,
     execute_validate_bundle, execute_write_gmap_rules, find_provider_pack_source,
-    get_pack_target_dir,
+    get_pack_target_dir, invoke_setup_component_operation,
 };
 pub use plan_builders::{
     apply_create, apply_remove, apply_update, build_metadata, build_metadata_with_ops,
