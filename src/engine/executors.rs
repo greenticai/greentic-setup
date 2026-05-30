@@ -794,6 +794,21 @@ fn invoke_registration_operation(
     invoke_wasm_registration_component(bundle_path, pack_path, component_ref, op, request, config)
 }
 
+pub fn invoke_setup_component_operation(
+    bundle_path: &Path,
+    pack_path: &Path,
+    component_ref: &str,
+    op: &str,
+    request: &Value,
+    config: &SetupConfig,
+) -> anyhow::Result<Value> {
+    let registration = serde_json::json!({
+        "component_ref": component_ref,
+        "op": op,
+    });
+    invoke_registration_operation(bundle_path, pack_path, &registration, request, config)
+}
+
 #[derive(Debug, Default)]
 struct SetupRegistrationSecrets {
     values: Mutex<BTreeMap<String, Vec<u8>>>,

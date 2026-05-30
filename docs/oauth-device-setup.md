@@ -2,6 +2,31 @@
 
 Providers can use `messaging.oauth_device_code.v1` metadata to complete setup after a device-code login. The setup runner maps token response fields through `secrets_out` and `config_out`, then writes secret outputs to the dev secrets store and non-secret config outputs to `state/config/<provider>/setup-answers.json`.
 
+## Finalization Provisioning
+
+OAuth device-code setup can run a provider finalization operation before marking the setup action complete. Declare it under a setup mode as provisioning metadata:
+
+```json
+{
+  "setup_modes": {
+    "channel": {
+      "provisioning": {
+        "resource": {
+          "component_ref": "messaging-provider-example",
+          "op": "apply-answers",
+          "output_keys": {
+            "resource_id": "resource_id",
+            "resource_name": "resource_name"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+When `op` is `apply-answers`, the setup runner merges existing setup answers, mapped token outputs, discovery outputs, and raw token fields into the provider request. The provider result must not return `ok:false`; otherwise the setup action remains pending. Returned `config` values are persisted, with secret token fields kept out of `setup-answers.json`.
+
 ## Discovery Selection
 
 `post_login_discovery` steps can fetch provider resources after login and select an item from a returned array.

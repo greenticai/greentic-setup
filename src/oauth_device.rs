@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map as JsonMap, Value};
+use serde_json::{Map as JsonMap, Value, json};
 
 use crate::setup_actions::{SetupActionKind, SetupActionStatus};
 
@@ -36,7 +36,25 @@ pub struct OAuthDeviceMetadata {
     #[serde(default)]
     pub post_login_discovery: Vec<DiscoveryStep>,
     #[serde(default)]
+    pub setup_modes: BTreeMap<String, OAuthDeviceSetupMode>,
+    #[serde(default)]
     pub error_checklist: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthDeviceSetupMode {
+    #[serde(default)]
+    pub provisioning: BTreeMap<String, OAuthDeviceProvisioning>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthDeviceProvisioning {
+    #[serde(default)]
+    pub component_ref: String,
+    #[serde(default)]
+    pub op: String,
+    #[serde(default)]
+    pub output_keys: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,7 +372,11 @@ async fn poll_oauth_device_code_with_token_response(
         None,
     )
     .await?;
-    persist_device_config_outputs(bundle_root, &session.provider_id, metadata, &mapped)?;
+    let final_mapped =
+        finalize_provider_apply_answers(bundle_root, env, session, metadata, response, &mapped)
+            .await?;
+    let final_mapped = final_mapped.as_ref().unwrap_or(&mapped);
+    persist_device_config_outputs(bundle_root, &session.provider_id, metadata, final_mapped)?;
     crate::setup_actions::mark_setup_action_complete(
         bundle_root,
         &session.tenant,
@@ -367,10 +389,195 @@ async fn poll_oauth_device_code_with_token_response(
     Ok(OAuthDevicePollReport {
         status: OAuthDevicePollStatus::Complete,
         message: None,
-        persisted_keys: mapped.keys().cloned().collect(),
+        persisted_keys: final_mapped.keys().cloned().collect(),
         checklist: Vec::new(),
         interval: None,
     })
+}
+
+async fn finalize_provider_apply_answers(
+    bundle_root: &Path,
+    env: &str,
+    session: &OAuthDeviceSessionState,
+    metadata: &OAuthDeviceMetadata,
+    response: &Value,
+    mapped: &BTreeMap<String, String>,
+) -> Result<Option<BTreeMap<String, String>>> {
+    let Some(provisioning) = apply_answers_provisioning(metadata) else {
+        return Ok(None);
+    };
+    let discovered = crate::discovery::discover(bundle_root)
+        .context("failed to discover providers for OAuth device-code apply-answers")?;
+    let provider = discovered
+        .find_setup_target(&session.provider_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "provider not found for OAuth device-code apply-answers: {}",
+                session.provider_id
+            )
+        })?;
+    let answers = load_provider_setup_answers(bundle_root, &session.provider_id)?;
+    let request =
+        json_apply_answers_request(&answers, metadata, response, &session.client_id, mapped)?;
+    let config = crate::engine::SetupConfig {
+        tenant: session.tenant.clone(),
+        team: Some(session.team.clone()),
+        env: env.to_string(),
+        offline: false,
+        verbose: false,
+    };
+    let pack_path = provider.pack_path.clone();
+    let component_ref = provisioning.component_ref.clone();
+    let op = provisioning.op.clone();
+    let bundle_root_owned = bundle_root.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::engine::invoke_setup_component_operation(
+            &bundle_root_owned,
+            &pack_path,
+            &component_ref,
+            &op,
+            &request,
+            &config,
+        )
+    })
+    .await
+    .context("OAuth device-code apply-answers task failed")?
+    .with_context(|| {
+        format!(
+            "OAuth device-code apply-answers failed for {}",
+            session.provider_id
+        )
+    })?;
+    let Some(config) = apply_answers_result_config(&result)? else {
+        return Ok(None);
+    };
+    crate::qa::persist::persist_all_config_as_secrets(
+        bundle_root,
+        env,
+        &session.tenant,
+        Some(&session.team),
+        &session.provider_id,
+        &config,
+        Some(&provider.pack_path),
+    )
+    .await?;
+    Ok(Some(map_config_object(&config)))
+}
+
+fn apply_answers_provisioning(metadata: &OAuthDeviceMetadata) -> Option<&OAuthDeviceProvisioning> {
+    metadata
+        .setup_modes
+        .values()
+        .flat_map(|mode| mode.provisioning.values())
+        .find(|provisioning| {
+            provisioning.op == "apply-answers" && !provisioning.component_ref.trim().is_empty()
+        })
+}
+
+fn json_apply_answers_request(
+    existing_answers: &Value,
+    metadata: &OAuthDeviceMetadata,
+    response: &Value,
+    client_id: &str,
+    mapped: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let mut answers = existing_answers.as_object().cloned().unwrap_or_default();
+    for (key, value) in mapped {
+        answers.insert(key.clone(), Value::String(value.clone()));
+    }
+    for response_key in metadata
+        .secrets_out
+        .keys()
+        .chain(metadata.config_out.keys())
+    {
+        let value = if response_key == "client_id" {
+            Some(client_id.to_string())
+        } else {
+            oauth_response_value(response, response_key)
+        };
+        if let Some(value) = value {
+            answers.insert(response_key.clone(), Value::String(value));
+        }
+    }
+    Ok(json!({
+        "mode": "setup",
+        "answers": Value::Object(answers)
+    }))
+}
+
+fn apply_answers_result_config(result: &Value) -> Result<Option<Value>> {
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let message = result
+            .get("error")
+            .or_else(|| result.get("message"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("provider apply-answers returned ok:false");
+        bail!("OAuth device-code apply-answers failed: {message}");
+    }
+    Ok(result.get("config").cloned().or_else(|| {
+        result
+            .as_object()
+            .is_some_and(|object| !object.contains_key("ok"))
+            .then(|| result.clone())
+    }))
+}
+
+fn map_config_object(config: &Value) -> BTreeMap<String, String> {
+    config
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(key, value)| value_to_string(value).map(|value| (key.clone(), value)))
+        .collect()
+}
+
+fn oauth_response_value(response: &Value, key: &str) -> Option<String> {
+    response
+        .get(key)
+        .and_then(value_to_string)
+        .or_else(|| oauth_token_claim_value(response, key))
+}
+
+fn oauth_token_claim_value(response: &Value, key: &str) -> Option<String> {
+    for token_key in ["id_token", "access_token"] {
+        let Some(token) = response
+            .get(token_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(claims) = decode_unverified_jwt_claims(token) else {
+            continue;
+        };
+        if let Some(value) = claims.get(key).and_then(value_to_string) {
+            return Some(value);
+        }
+        for alias in oauth_claim_aliases(key) {
+            if let Some(value) = claims.get(alias).and_then(value_to_string) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn oauth_claim_aliases(key: &str) -> &'static [&'static str] {
+    match key {
+        "tenant_id" => &["tid"],
+        "user_id" => &["oid", "sub"],
+        _ => &[],
+    }
+}
+
+fn decode_unverified_jwt_claims(token: &str) -> Option<Value> {
+    let claims = token.split('.').nth(1)?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, claims).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn handle_poll_error(
@@ -435,7 +642,7 @@ pub fn map_device_token_response(
         let value = if response_key == "client_id" {
             Some(client_id.to_string())
         } else {
-            response.get(response_key).and_then(value_to_string)
+            oauth_response_value(response, response_key)
         };
         if let Some(value) = value {
             mapped.insert(output_key.clone(), value);
@@ -445,7 +652,7 @@ pub fn map_device_token_response(
         let value = if response_key == "client_id" {
             Some(client_id.to_string())
         } else {
-            response.get(response_key).and_then(value_to_string)
+            oauth_response_value(response, response_key)
         };
         if let Some(value) = value {
             mapped.insert(output_key.clone(), value);
@@ -463,11 +670,9 @@ fn persist_device_config_outputs(
     metadata: &OAuthDeviceMetadata,
     mapped: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let secret_output_keys: std::collections::BTreeSet<&str> =
-        metadata.secrets_out.values().map(String::as_str).collect();
     let config_outputs: JsonMap<String, Value> = mapped
         .iter()
-        .filter(|(key, _)| !secret_output_keys.contains(key.as_str()))
+        .filter(|(key, _)| !is_sensitive_device_output_key(metadata, key))
         .map(|(key, value)| (key.clone(), Value::String(value.clone())))
         .collect();
     if config_outputs.is_empty() {
@@ -495,7 +700,7 @@ fn persist_device_config_outputs(
 
     let verified = load_provider_setup_answers(bundle_root, provider_id)?;
     for (key, value) in mapped {
-        if secret_output_keys.contains(key.as_str()) {
+        if is_sensitive_device_output_key(metadata, key) {
             continue;
         }
         let actual = verified.get(key).and_then(Value::as_str);
@@ -504,6 +709,18 @@ fn persist_device_config_outputs(
         }
     }
     Ok(())
+}
+
+fn is_sensitive_device_output_key(metadata: &OAuthDeviceMetadata, key: &str) -> bool {
+    metadata.secrets_out.values().any(|value| value == key)
+        || metadata
+            .secrets_out
+            .keys()
+            .any(|value| value == key && value != "client_id")
+        || matches!(
+            key.to_ascii_lowercase().as_str(),
+            "access_token" | "refresh_token" | "client_secret" | "ms_bot_app_password"
+        )
 }
 
 pub fn execute_post_login_discovery(
@@ -888,16 +1105,166 @@ mod tests {
         }
     }
 
+    fn metadata_with_apply_answers() -> OAuthDeviceMetadata {
+        let mut metadata = metadata();
+        metadata
+            .secrets_out
+            .insert("access_token".into(), "MS_GRAPH_ACCESS_TOKEN".into());
+        metadata.config_out = BTreeMap::from([
+            ("tenant_id".into(), "tenant_id".into()),
+            ("user_id".into(), "user_id".into()),
+            ("team_id".into(), "team_id".into()),
+            ("team_name".into(), "team_name".into()),
+            ("channel_id".into(), "channel_id".into()),
+            ("channel_name".into(), "channel_name".into()),
+            ("desired_channel_name".into(), "desired_channel_name".into()),
+        ]);
+        metadata.setup_modes = BTreeMap::from([(
+            "graph_channel".into(),
+            OAuthDeviceSetupMode {
+                provisioning: BTreeMap::from([(
+                    "teams_channel".into(),
+                    OAuthDeviceProvisioning {
+                        component_ref: "provision".into(),
+                        op: "apply-answers".into(),
+                        output_keys: BTreeMap::from([
+                            ("channel_id".into(), "channel_id".into()),
+                            ("channel_name".into(), "channel_name".into()),
+                        ]),
+                    },
+                )]),
+            },
+        )]);
+        metadata
+    }
+
+    fn unsigned_jwt_claims(claims: Value) -> String {
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"alg":"none"}"#,
+        );
+        let claims = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            claims.to_string(),
+        );
+        format!("{header}.{claims}.")
+    }
+
+    fn setup_pending_oauth_action(
+        bundle: &Path,
+        provider_id: &str,
+        tenant: &str,
+        team: &str,
+        action_id: &str,
+    ) {
+        crate::setup_actions::persist_setup_actions(
+            bundle,
+            &[crate::setup_actions::SetupAction {
+                id: action_id.into(),
+                kind: crate::setup_actions::SetupActionKind::OauthDeviceCode,
+                label: "Connect Teams".into(),
+                provider_id: provider_id.into(),
+                tenant: tenant.into(),
+                team: Some(team.into()),
+                authorize_url: None,
+                callback_path: None,
+                state: None,
+                status: crate::setup_actions::SetupActionStatus::Pending,
+                created_at: None,
+                completed_at: None,
+                extra: JsonMap::new(),
+            }],
+        )
+        .unwrap();
+    }
+
+    fn session_state(
+        provider_id: &str,
+        tenant: &str,
+        team: &str,
+        action_id: &str,
+    ) -> OAuthDeviceSessionState {
+        OAuthDeviceSessionState {
+            session_id: "session-1".into(),
+            provider_id: provider_id.into(),
+            tenant: tenant.into(),
+            team: team.into(),
+            action_id: action_id.into(),
+            device_code: "device-code".into(),
+            client_id: "client-123".into(),
+            interval: 5,
+            expires_at: crate::setup_actions::current_epoch_secs() + 900,
+            created_at: crate::setup_actions::current_epoch_secs(),
+        }
+    }
+
+    fn write_setup_answers(bundle: &Path, provider_id: &str, answers: Value) {
+        let config_dir = bundle.join("state/config").join(provider_id);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("setup-answers.json"),
+            serde_json::to_string_pretty(&answers).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_mock_provider_pack(
+        bundle: &Path,
+        provider_id: &str,
+        result: Value,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(bundle.join("providers/messaging"))?;
+        write_provider_pack_with_files(
+            &bundle
+                .join("providers/messaging")
+                .join(format!("{provider_id}.gtpack")),
+            json!({
+                "pack_id": provider_id,
+                "extensions": {}
+            }),
+            [(
+                "components/provision.json",
+                json!({
+                    "operations": {
+                        "apply-answers": {
+                            "result": result
+                        }
+                    }
+                }),
+            )],
+        )
+    }
+
     fn write_provider_pack_with_manifest(
         path: &Path,
         manifest: serde_json::Value,
     ) -> anyhow::Result<()> {
+        write_provider_pack_with_files(
+            path,
+            manifest,
+            std::iter::empty::<(&str, serde_json::Value)>(),
+        )
+    }
+
+    fn write_provider_pack_with_files<I, P>(
+        path: &Path,
+        manifest: serde_json::Value,
+        files: I,
+    ) -> anyhow::Result<()>
+    where
+        I: IntoIterator<Item = (P, serde_json::Value)>,
+        P: AsRef<str>,
+    {
         let file = std::fs::File::create(path)?;
         let mut writer = ZipWriter::new(file);
         let options: FileOptions<'_, ()> =
             FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         writer.start_file("pack.manifest.json", options)?;
         writer.write_all(manifest.to_string().as_bytes())?;
+        for (file_path, value) in files {
+            writer.start_file(file_path.as_ref(), options)?;
+            writer.write_all(value.to_string().as_bytes())?;
+        }
         writer.finish()?;
         Ok(())
     }
@@ -1199,6 +1566,34 @@ mod tests {
         assert!(error.contains("did not contain mappable values"));
     }
 
+    #[test]
+    fn token_response_maps_oidc_claim_aliases() {
+        let mut metadata = metadata();
+        metadata.secrets_out.clear();
+        metadata.config_out = BTreeMap::from([
+            ("tenant_id".into(), "tenant_id".into()),
+            ("user_id".into(), "user_id".into()),
+        ]);
+
+        let mapped = map_device_token_response(
+            &metadata,
+            "client-123",
+            &json!({
+                "id_token": unsigned_jwt_claims(json!({
+                    "tid": "tenant-123",
+                    "oid": "user-123"
+                }))
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapped.get("tenant_id").map(String::as_str),
+            Some("tenant-123")
+        );
+        assert_eq!(mapped.get("user_id").map(String::as_str), Some("user-123"));
+    }
+
     #[tokio::test]
     async fn poll_persists_device_outputs_to_runtime_config_and_secrets() {
         let temp = tempfile::tempdir().unwrap();
@@ -1305,6 +1700,207 @@ mod tests {
         );
         let refresh = String::from_utf8(store.get(&refresh_uri).await.unwrap()).unwrap();
         assert_eq!(refresh, "refresh-123");
+    }
+
+    #[tokio::test]
+    async fn poll_invokes_apply_answers_before_completing_and_persists_provider_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path();
+        let provider_id = "messaging-teams";
+        let tenant = "demo";
+        let team = "default";
+        let action_id = "teams-device-code";
+        write_setup_answers(
+            bundle,
+            provider_id,
+            json!({
+                "client_id": "client-123",
+                "public_base_url": "https://tunnel.example",
+                "desired_channel_name": "hr onboarding"
+            }),
+        );
+        setup_pending_oauth_action(bundle, provider_id, tenant, team, action_id);
+        write_mock_provider_pack(
+            bundle,
+            provider_id,
+            json!({
+                "ok": true,
+                "config": {
+                    "client_id": "client-123",
+                    "user_id": "user-123",
+                    "tenant_id": "tenant-123",
+                    "team_id": "team-123",
+                    "team_name": "Greentic AI Ltd",
+                    "channel_id": "hr-channel-123",
+                    "channel_name": "hr onboarding",
+                    "desired_channel_name": "hr onboarding",
+                    "refresh_token": "refresh-123",
+                    "access_token": "access-123"
+                }
+            }),
+        )
+        .unwrap();
+
+        let session = session_state(provider_id, tenant, team, action_id);
+        save_session(bundle, &session).unwrap();
+        let report = poll_oauth_device_code_with_token_response(
+            bundle,
+            "dev",
+            &session,
+            &metadata_with_apply_answers(),
+            &json!({
+                "refresh_token": "refresh-123",
+                "access_token": "access-123",
+                "id_token": unsigned_jwt_claims(json!({"tid": "tenant-123"})),
+                "user_id": "user-123",
+                "team_id": "team-123",
+                "team_name": "Greentic AI Ltd",
+                "channel_id": "general-channel-123",
+                "channel_name": "General"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.status, OAuthDevicePollStatus::Complete);
+        let action =
+            crate::setup_actions::load_setup_action(bundle, tenant, team, provider_id, action_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            action.status,
+            crate::setup_actions::SetupActionStatus::Complete
+        );
+
+        let answers = load_provider_setup_answers(bundle, provider_id).unwrap();
+        assert_eq!(answers["client_id"], json!("client-123"));
+        assert_eq!(answers["user_id"], json!("user-123"));
+        assert_eq!(answers["team_id"], json!("team-123"));
+        assert_eq!(answers["team_name"], json!("Greentic AI Ltd"));
+        assert_eq!(answers["channel_id"], json!("hr-channel-123"));
+        assert_eq!(answers["channel_name"], json!("hr onboarding"));
+        assert_eq!(answers["desired_channel_name"], json!("hr onboarding"));
+        assert!(answers.get("refresh_token").is_none());
+        assert!(answers.get("access_token").is_none());
+        assert!(answers.get("MS_GRAPH_REFRESH_TOKEN").is_none());
+        assert!(answers.get("MS_GRAPH_ACCESS_TOKEN").is_none());
+
+        let store = crate::secrets::open_dev_store(bundle).unwrap();
+        let refresh_uri = crate::canonical_secret_uri(
+            "dev",
+            tenant,
+            Some(team),
+            provider_id,
+            "MS_GRAPH_REFRESH_TOKEN",
+        );
+        let access_uri = crate::canonical_secret_uri(
+            "dev",
+            tenant,
+            Some(team),
+            provider_id,
+            "MS_GRAPH_ACCESS_TOKEN",
+        );
+        let refresh = String::from_utf8(store.get(&refresh_uri).await.unwrap()).unwrap();
+        let access = String::from_utf8(store.get(&access_uri).await.unwrap()).unwrap();
+        assert_eq!(refresh, "refresh-123");
+        assert_eq!(access, "access-123");
+    }
+
+    #[tokio::test]
+    async fn poll_does_not_complete_when_apply_answers_returns_not_ok() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path();
+        let provider_id = "messaging-teams";
+        let tenant = "demo";
+        let team = "default";
+        let action_id = "teams-device-code";
+        write_setup_answers(
+            bundle,
+            provider_id,
+            json!({
+                "client_id": "client-123",
+                "desired_channel_name": "hr onboarding"
+            }),
+        );
+        setup_pending_oauth_action(bundle, provider_id, tenant, team, action_id);
+        write_mock_provider_pack(
+            bundle,
+            provider_id,
+            json!({
+                "ok": false,
+                "error": "cannot create channel"
+            }),
+        )
+        .unwrap();
+
+        let session = session_state(provider_id, tenant, team, action_id);
+        save_session(bundle, &session).unwrap();
+        let error = poll_oauth_device_code_with_token_response(
+            bundle,
+            "dev",
+            &session,
+            &metadata_with_apply_answers(),
+            &json!({
+                "refresh_token": "refresh-123",
+                "access_token": "access-123",
+                "tenant_id": "tenant-123",
+                "user_id": "user-123",
+                "team_id": "team-123",
+                "team_name": "Greentic AI Ltd",
+                "channel_id": "general-channel-123",
+                "channel_name": "General"
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("cannot create channel"));
+        let action =
+            crate::setup_actions::load_setup_action(bundle, tenant, team, provider_id, action_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            action.status,
+            crate::setup_actions::SetupActionStatus::Pending
+        );
+    }
+
+    #[test]
+    fn apply_answers_request_includes_existing_answers_discovery_and_raw_tokens() {
+        let request = json_apply_answers_request(
+            &json!({
+                "client_id": "client-123",
+                "desired_channel_name": "hr onboarding"
+            }),
+            &metadata_with_apply_answers(),
+            &json!({
+                "refresh_token": "refresh-123",
+                "access_token": "access-123",
+                "tenant_id": "tenant-123",
+                "team_id": "team-123",
+                "channel_id": "general-channel-123",
+                "channel_name": "General"
+            }),
+            "client-123",
+            &BTreeMap::from([
+                ("MS_GRAPH_REFRESH_TOKEN".into(), "refresh-123".into()),
+                ("MS_GRAPH_ACCESS_TOKEN".into(), "access-123".into()),
+                ("tenant_id".into(), "tenant-123".into()),
+                ("team_id".into(), "team-123".into()),
+                ("channel_id".into(), "general-channel-123".into()),
+                ("channel_name".into(), "General".into()),
+            ]),
+        )
+        .unwrap();
+
+        let answers = &request["answers"];
+        assert_eq!(answers["desired_channel_name"], json!("hr onboarding"));
+        assert_eq!(answers["refresh_token"], json!("refresh-123"));
+        assert_eq!(answers["access_token"], json!("access-123"));
+        assert_eq!(answers["MS_GRAPH_REFRESH_TOKEN"], json!("refresh-123"));
+        assert_eq!(answers["team_id"], json!("team-123"));
+        assert_eq!(answers["channel_name"], json!("General"));
     }
 
     #[test]
