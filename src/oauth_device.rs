@@ -516,8 +516,19 @@ pub fn execute_post_login_discovery(
         let url = resolve_discovery_url(step, &context)?;
         let mut response = ureq::get(&url)
             .header("Authorization", &format!("Bearer {access_token}"))
+            .config()
+            .http_status_as_error(false)
+            .build()
             .call()
             .with_context(|| format!("OAuth device-code discovery request failed: {}", step.id))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            bail!(
+                "{}",
+                discovery_http_error_message(step, &url, status, &body)
+            );
+        }
         let json = response
             .body_mut()
             .read_json::<Value>()
@@ -527,6 +538,34 @@ pub fn execute_post_login_discovery(
         responses.extend(saved);
     }
     Ok(responses)
+}
+
+fn discovery_http_error_message(
+    step: &DiscoveryStep,
+    url: &str,
+    status: u16,
+    body: &str,
+) -> String {
+    let mut message = format!(
+        "OAuth device-code discovery request failed: {} (HTTP {status} from {url})",
+        step.id
+    );
+    let body = compact_error_body(body);
+    if !body.is_empty() {
+        message.push_str(": ");
+        message.push_str(&body);
+    }
+    message
+}
+
+fn compact_error_body(body: &str) -> String {
+    const MAX_BODY_CHARS: usize = 2000;
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_BODY_CHARS {
+        return compact;
+    }
+    let truncated = compact.chars().take(MAX_BODY_CHARS).collect::<String>();
+    format!("{truncated}...")
 }
 
 pub fn execute_post_login_discovery_with_responses<F>(
@@ -1392,5 +1431,36 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("selected item missing value"));
+    }
+
+    #[test]
+    fn discovery_http_error_includes_step_status_url_and_body() {
+        let step = DiscoveryStep {
+            id: "joined_teams".into(),
+            method: "GET".into(),
+            url: Some("https://graph.example/me/joinedTeams".into()),
+            url_template: None,
+            requires: Vec::new(),
+            save: BTreeMap::new(),
+            select: None,
+        };
+
+        let message = discovery_http_error_message(
+            &step,
+            "https://graph.example/me/joinedTeams",
+            403,
+            r#"{
+                "error": {
+                    "code": "Authorization_RequestDenied",
+                    "message": "Insufficient privileges to complete the operation."
+                }
+            }"#,
+        );
+
+        assert!(message.contains("joined_teams"));
+        assert!(message.contains("HTTP 403"));
+        assert!(message.contains("https://graph.example/me/joinedTeams"));
+        assert!(message.contains("Authorization_RequestDenied"));
+        assert!(message.contains("Insufficient privileges"));
     }
 }
