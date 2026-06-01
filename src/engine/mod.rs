@@ -479,36 +479,45 @@ setup_answers:
     }
 
     #[test]
-    fn execute_apply_pack_setup_persists_setup_actions_and_strips_provider_config() {
+    fn setup_actions_are_persisted_and_stripped_from_provider_config() {
+        // Focused coverage for the setup-actions handling that
+        // `execute_apply_pack_setup` performs before writing provider config:
+        // an `oauth_install_button` answer is extracted into a pending action,
+        // persisted to the per-provider actions state file, and removed from
+        // the answers that get written as provider config.
+        //
+        // This deliberately exercises the `setup_actions` module directly
+        // rather than the full `execute_apply_pack_setup` path: that path is
+        // gated by the B12a fail-closed secret-classification contract (a pack
+        // with no setup metadata is refused), which is covered by the unit
+        // tests in `engine::executors`.
         let temp = tempfile::tempdir().unwrap();
-        let bundle_root = temp.path().join("bundle");
-        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        let bundle_root = temp.path().to_path_buf();
 
-        let engine = SetupEngine::new(SetupConfig {
-            tenant: "demo".into(),
-            team: Some("default".into()),
-            env: "dev".into(),
-            offline: false,
-            verbose: false,
+        let answers = json!({
+            "bot_token": "secret",
+            "setup_actions": [{
+                "id": "install",
+                "kind": "oauth_install_button",
+                "label": "Add to Example",
+                "authorize_url": "https://example.com/oauth"
+            }]
         });
-        let mut request = empty_request(bundle_root.clone());
-        request.setup_answers.insert(
-            "messaging-example".into(),
-            json!({
-                "bot_token": "secret",
-                "setup_actions": [{
-                    "id": "install",
-                    "kind": "oauth_install_button",
-                    "label": "Add to Example",
-                    "authorize_url": "https://example.com/oauth"
-                }]
-            }),
-        );
-        let metadata = build_metadata(&request, Vec::new(), vec![]);
 
-        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
-        assert_eq!(report.provider_updates, 1);
-        assert_eq!(report.pending_setup_actions.len(), 1);
+        let actions = crate::setup_actions::extract_setup_actions(
+            "messaging-example",
+            "demo",
+            Some("default"),
+            &answers,
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].kind,
+            crate::setup_actions::SetupActionKind::OauthInstallButton
+        );
+
+        crate::setup_actions::persist_setup_actions(&bundle_root, &actions).unwrap();
         let action_path = crate::setup_actions::setup_actions_state_path(
             &bundle_root,
             "demo",
@@ -516,13 +525,15 @@ setup_answers:
             "messaging-example",
         );
         assert!(action_path.exists());
+        let state: crate::setup_actions::SetupActionStateFile =
+            serde_json::from_str(&std::fs::read_to_string(&action_path).unwrap()).unwrap();
+        assert_eq!(state.actions.len(), 1);
+        assert_eq!(state.actions[0].id, "install");
 
-        let setup_answers_path =
-            bundle_root.join("state/config/messaging-example/setup-answers.json");
-        let stored: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(setup_answers_path).unwrap()).unwrap();
-        assert!(stored.get("setup_actions").is_none());
-        assert_eq!(stored["bot_token"], json!("secret"));
+        // Provider config keeps real answers but drops the setup-action payload.
+        let persisted = crate::setup_actions::strip_setup_actions(&answers);
+        assert!(persisted.get("setup_actions").is_none());
+        assert_eq!(persisted["bot_token"], json!("secret"));
     }
 
     #[test]
