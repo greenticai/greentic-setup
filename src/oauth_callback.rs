@@ -35,7 +35,8 @@ pub fn load_provider_oauth_metadata(
         .ok_or_else(|| anyhow::anyhow!("provider not found for OAuth callback: {provider_id}"))?;
     let raw = crate::discovery::read_pack_extension(&provider.pack_path, extension_key)?
         .ok_or_else(|| anyhow::anyhow!("provider missing OAuth metadata: {extension_key}"))?;
-    serde_json::from_value(raw).context("failed to parse provider OAuth metadata")
+    let metadata = raw.get("inline").cloned().unwrap_or(raw);
+    serde_json::from_value(metadata).context("failed to parse provider OAuth metadata")
 }
 
 pub async fn complete_oauth_callback_with_token_response(
@@ -421,6 +422,35 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(missing_extension.contains("missing OAuth metadata"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_provider_oauth_metadata_accepts_inline_extension_wrapper() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle = temp.path();
+        std::fs::create_dir_all(bundle.join("providers/messaging"))?;
+        write_provider_pack_with_manifest(
+            &bundle.join("providers/messaging/messaging-example.gtpack"),
+            json!({
+                "pack_id": "messaging-example",
+                "extensions": {
+                    "messaging.oauth.v1": {
+                        "kind": "messaging.oauth.v1",
+                        "inline": {
+                            "token_url": "https://example.com/token",
+                            "secret_keys": ["EXAMPLE_TOKEN"]
+                        }
+                    }
+                }
+            }),
+        )?;
+
+        let metadata =
+            load_provider_oauth_metadata(bundle, "messaging-example", "messaging.oauth.v1")?;
+
+        assert_eq!(metadata.token_url, "https://example.com/token");
+        assert_eq!(metadata.secret_keys, vec!["EXAMPLE_TOKEN"]);
         Ok(())
     }
 

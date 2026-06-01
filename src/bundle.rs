@@ -172,6 +172,31 @@ pub fn ensure_bundle_metadata(root: &Path, bundle_name: Option<&str>) -> anyhow:
     Ok(())
 }
 
+pub fn read_bundle_name(root: &Path) -> anyhow::Result<Option<String>> {
+    for path in [
+        root.join(BUNDLE_WORKSPACE_MARKER),
+        root.join(LEGACY_BUNDLE_MARKER),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: YamlValue =
+            serde_yaml_bw::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        let Some(map) = parsed.as_mapping() else {
+            continue;
+        };
+        if let Some(value) = yaml_get_string(map, "bundle_name") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(Some(value.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Register pack references in both `bundle.yaml` and `bundle.lock.json`.
 pub fn register_bundle_references(
     root: &Path,
@@ -802,6 +827,17 @@ mod tests {
 
         let p = gmap_path(Path::new("/b"), "demo", Some("ops"));
         assert_eq!(p, PathBuf::from("/b/tenants/demo/teams/ops/team.gmap"));
+    }
+
+    #[test]
+    fn read_bundle_name_reads_workspace_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        create_demo_bundle_structure(root.path(), Some("Provider Test")).unwrap();
+
+        assert_eq!(
+            read_bundle_name(root.path()).unwrap().as_deref(),
+            Some("Provider Test")
+        );
     }
 
     #[test]

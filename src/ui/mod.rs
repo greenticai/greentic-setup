@@ -9,7 +9,7 @@ mod assets;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -24,6 +24,9 @@ use crate::engine::{SetupConfig, SetupRequest};
 use crate::plan::TenantSelection;
 use crate::platform_setup::StaticRoutesPolicy;
 use crate::qa::wizard;
+use crate::setup_tunnel::{
+    SetupTunnel, inject_setup_public_base_url, should_start_setup_tunnel, start_setup_tunnel,
+};
 use crate::{SetupEngine, SetupMode, discovery, setup_to_formspec};
 
 use crate::qa::shared_questions::HIDDEN_FROM_PROMPTS;
@@ -40,15 +43,14 @@ struct UiState {
     locale: Option<String>,
     /// Pre-loaded answers from `--answers` file, keyed by provider_id.
     prefill_answers: Option<JsonMap<String, Value>>,
-    /// When true the tenant/env came from an answers file and should not be
-    /// overridden by bundle auto-detection.
-    scope_from_answers: bool,
     /// Where the on-disk artifact should be written back after a successful
     /// setup. `Some(Archive)` means re-pack the extracted bundle dir into
     /// a `.gtbundle`; `Some(Directory)` means copy the dir; `None` means
     /// the user passed a directory and the working dir IS the artifact, so
     /// no copy/repack is needed.
     output_target: Option<crate::cli_helpers::SetupOutputTarget>,
+    local_base_url: String,
+    setup_tunnel: Mutex<Option<SetupTunnel>>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -208,10 +210,14 @@ pub async fn launch(
     advanced: bool,
     locale: Option<&str>,
     prefill_answers: Option<JsonMap<String, Value>>,
-    scope_from_answers: bool,
+    _scope_from_answers: bool,
     output_target: Option<crate::cli_helpers::SetupOutputTarget>,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let url = format!("http://127.0.0.1:{port}");
 
     let state = std::sync::Arc::new(UiState {
         bundle_path: bundle_path.to_path_buf(),
@@ -221,17 +227,14 @@ pub async fn launch(
         advanced,
         locale: locale.map(String::from),
         prefill_answers,
-        scope_from_answers,
         output_target,
+        local_base_url: url.clone(),
+        setup_tunnel: Mutex::new(None),
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
 
     let router = build_router(state.clone());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let url = format!("http://127.0.0.1:{port}");
 
     eprintln!("Setup UI started at: {url}");
     let _ = open::that(&url);
@@ -257,6 +260,8 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/providers", get(get_providers))
         .route("/api/draft", post(post_draft))
         .route("/api/execute", post(post_execute))
+        .route("/api/oauth-device/start", post(post_oauth_device_start))
+        .route("/api/oauth-device/poll", post(post_oauth_device_poll))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
         .route("/oauth/callback/{provider}", get(get_oauth_callback))
@@ -344,20 +349,10 @@ async fn get_scope(State(state): State<std::sync::Arc<UiState>>) -> Json<ScopeRe
     // Detect tenant from the bundle's tenants/ directory for informational display.
     let detected_tenant = detect_tenant_from_bundle(bundle_path);
 
-    // When the scope was explicitly provided via --answers, use it as-is
-    // without overriding with bundle detection.
-    let effective_tenant = if state.scope_from_answers {
-        cli_tenant.clone()
-    } else if cli_tenant == "demo" {
-        // Apply same resolution logic as resolve_setup_scope_with_bundle:
-        // if CLI tenant is the default "demo" and we detect a tenant from
-        // the bundle, use it.
-        detected_tenant
-            .clone()
-            .unwrap_or_else(|| cli_tenant.clone())
-    } else {
-        cli_tenant.clone()
-    };
+    // The web UI should honor the requested CLI/answers scope. Detected bundle
+    // tenants are informational only; otherwise a scaffold containing both
+    // `demo` and `default` can silently shift setup into the wrong tenant.
+    let effective_tenant = cli_tenant.clone();
 
     let cloud_deploy = prefill_has_cloud_deployment_targets(state.prefill_answers.as_ref());
 
@@ -433,6 +428,10 @@ async fn get_existing_scopes(State(state): State<std::sync::Arc<UiState>>) -> Js
             t.push(state.tenant.clone());
         }
         t.sort();
+        if let Some(pos) = t.iter().position(|tenant| tenant == &state.tenant) {
+            let selected = t.remove(pos);
+            t.insert(0, selected);
+        }
         t
     };
 
@@ -797,7 +796,8 @@ async fn post_execute(
     let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
     let team = req.team.or_else(|| state.team.clone());
     let env = req.env.unwrap_or_else(|| state.env.clone());
-    let answers = req.answers;
+    let mut answers = req.answers;
+    let tunnel_mode = req.tunnel.as_deref().unwrap_or("off").to_string();
 
     // Persist tunnel config from the UI selection.
     if let Some(mode) = req.tunnel.as_deref() {
@@ -806,6 +806,26 @@ async fn post_execute(
         };
         let _ = crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel);
     }
+
+    let setup_public_base_url = if should_start_setup_tunnel(&tunnel_mode, &answers) {
+        match ensure_setup_tunnel(&state, &tunnel_mode).await {
+            Ok(url) => {
+                inject_setup_public_base_url(&mut answers, &url);
+                Some(url)
+            }
+            Err(err) => {
+                return Json(ExecutionResult {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: format!("Failed to start setup tunnel: {err}"),
+                    manual_steps: vec![],
+                    pending_setup_actions: vec![],
+                });
+            }
+        }
+    } else {
+        None
+    };
 
     let bundle_path_for_repack = bundle_path.clone();
     let mut result = tokio::task::spawn_blocking(move || {
@@ -819,6 +839,14 @@ async fn post_execute(
         manual_steps: vec![],
         pending_setup_actions: vec![],
     });
+    if let Some(public_base_url) = setup_public_base_url.as_deref()
+        && result.success
+    {
+        result.stdout = append_line(
+            &result.stdout,
+            &format!("Setup tunnel public_base_url: {public_base_url}"),
+        );
+    }
 
     // After a successful UI setup, re-pack the extracted bundle dir back
     // to its original `.gtbundle` archive (or copy it to a directory
@@ -1023,7 +1051,12 @@ async fn get_oauth_callback(
     if code.is_empty() || oauth_state.is_empty() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            "OAuth callback missing code or state".to_string(),
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            oauth_callback_page(
+                false,
+                "OAuth setup failed",
+                "OAuth callback missing code or state.",
+            ),
         );
     }
     match crate::oauth_callback::complete_oauth_callback(
@@ -1037,17 +1070,108 @@ async fn get_oauth_callback(
     )
     .await
     {
-        Ok(report) => (
-            axum::http::StatusCode::OK,
-            format!(
+        Ok(report) => {
+            let message = format!(
                 "OAuth setup complete for {} ({}/{})",
                 report.provider_id, report.tenant, report.team
-            ),
-        ),
+            );
+            (
+                axum::http::StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                oauth_callback_page(
+                    true,
+                    "OAuth setup complete",
+                    &format!("{message}. You can close this tab and return to setup."),
+                ),
+            )
+        }
         Err(err) => (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("OAuth setup failed: {err}"),
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            oauth_callback_page(false, "OAuth setup failed", &err.to_string()),
         ),
+    }
+}
+
+fn oauth_callback_page(success: bool, title: &str, message: &str) -> String {
+    let status_class = if success { "success" } else { "error" };
+    let close_script = if success {
+        r#"<script>
+setTimeout(function () {
+  window.close();
+}, 800);
+</script>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f8fb; color: #17202a; }}
+    main {{ width: min(520px, calc(100vw - 32px)); padding: 28px; border: 1px solid #d7dee8; border-radius: 8px; background: #fff; box-shadow: 0 16px 40px rgba(15, 23, 42, .08); }}
+    h1 {{ margin: 0 0 12px; font-size: 1.35rem; line-height: 1.25; }}
+    p {{ margin: 0; line-height: 1.55; color: #465466; }}
+    .success h1 {{ color: #087f5b; }}
+    .error h1 {{ color: #b42318; }}
+  </style>
+</head>
+<body>
+  <main class="{status_class}">
+    <h1>{title}</h1>
+    <p>{message}</p>
+  </main>
+  {close_script}
+</body>
+</html>"#,
+        title = html_escape(title),
+        message = html_escape(message),
+        status_class = status_class,
+        close_script = close_script
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn post_oauth_device_start(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<crate::oauth_device::OAuthDeviceStartInput>,
+) -> Json<Value> {
+    match crate::oauth_device::start_oauth_device_code(
+        &state.bundle_path,
+        &req,
+        crate::oauth_device::DEFAULT_EXTENSION_KEY,
+    ) {
+        Ok(report) => Json(serde_json::json!({ "ok": true, "report": report })),
+        Err(err) => Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
+    }
+}
+
+async fn post_oauth_device_poll(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<crate::oauth_device::OAuthDevicePollInput>,
+) -> Json<Value> {
+    match crate::oauth_device::poll_oauth_device_code(
+        &state.bundle_path,
+        &state.env,
+        &req,
+        crate::oauth_device::DEFAULT_EXTENSION_KEY,
+    )
+    .await
+    {
+        Ok(report) => Json(serde_json::json!({ "ok": true, "report": report })),
+        Err(err) => Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
     }
 }
 
@@ -1056,6 +1180,41 @@ async fn post_shutdown(State(state): State<std::sync::Arc<UiState>>) {
 }
 
 // ── Execution ──
+
+fn append_line(existing: &str, line: &str) -> String {
+    if existing.trim().is_empty() {
+        line.to_string()
+    } else {
+        format!("{existing}\n{line}")
+    }
+}
+
+async fn ensure_setup_tunnel(state: &std::sync::Arc<UiState>, mode: &str) -> Result<String> {
+    {
+        let guard = state
+            .setup_tunnel
+            .lock()
+            .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
+        if let Some(tunnel) = guard.as_ref()
+            && tunnel.mode == mode
+        {
+            return Ok(tunnel.public_base_url.clone());
+        }
+    }
+
+    let mode = mode.to_string();
+    let local_base_url = state.local_base_url.clone();
+    let tunnel = tokio::task::spawn_blocking(move || start_setup_tunnel(&mode, &local_base_url))
+        .await
+        .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
+    let public_base_url = tunnel.public_base_url.clone();
+    let mut guard = state
+        .setup_tunnel
+        .lock()
+        .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
+    *guard = Some(tunnel);
+    Ok(public_base_url)
+}
 
 fn execute_setup(
     bundle_path: &Path,
@@ -1096,6 +1255,7 @@ fn execute_setup(
 
     let request = SetupRequest {
         bundle: bundle_path.to_path_buf(),
+        bundle_name: crate::bundle::read_bundle_name(bundle_path).ok().flatten(),
         tenants: vec![TenantSelection {
             tenant: tenant.to_string(),
             team: team.map(String::from),
@@ -1362,6 +1522,18 @@ mod tests {
         zip.write_all(req_json.as_bytes())?;
         zip.finish()?;
         Ok(())
+    }
+
+    #[test]
+    fn oauth_callback_page_tells_user_to_close_success_tab() {
+        let page = super::oauth_callback_page(
+            true,
+            "OAuth setup complete",
+            "OAuth setup complete for messaging-slack. You can close this tab.",
+        );
+
+        assert!(page.contains("window.close()"));
+        assert!(page.contains("You can close this tab"));
     }
 
     #[tokio::test]

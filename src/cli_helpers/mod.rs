@@ -19,6 +19,7 @@ use crate::platform_setup::{
 };
 use crate::qa::wizard;
 use crate::setup_to_formspec;
+use crate::setup_tunnel::{SetupTunnel, inject_setup_public_base_url, should_start_setup_tunnel};
 
 // Re-export from submodules
 pub use bundle::{
@@ -30,6 +31,28 @@ pub use env_vars::{
     confirm_env_var_placeholders,
 };
 pub use prompts::{SetupParams, prompt_setup_params};
+
+/// Start a setup-time tunnel for non-UI setup and inject its public URL into
+/// provider answers that need `public_base_url`.
+pub fn maybe_start_cli_setup_tunnel(
+    loaded: &mut LoadedAnswers,
+    local_base_url: &str,
+) -> Result<Option<SetupTunnel>> {
+    let mode = loaded
+        .platform_setup
+        .tunnel
+        .as_ref()
+        .and_then(|tunnel| tunnel.mode.as_deref())
+        .unwrap_or("off")
+        .to_string();
+    if !should_start_setup_tunnel(&mode, &loaded.setup_answers) {
+        return Ok(None);
+    }
+
+    let tunnel = crate::setup_tunnel::start_setup_tunnel(&mode, local_base_url)?;
+    inject_setup_public_base_url(&mut loaded.setup_answers, &tunnel.public_base_url);
+    Ok(Some(tunnel))
+}
 
 /// Resolve tenant/team/env for setup.
 ///
@@ -320,6 +343,13 @@ pub fn complete_loaded_answers_with_prompts(
     // Build FormSpecs for ALL providers to identify shared questions
     let all_provider_form_specs: Vec<wizard::ProviderFormSpec> = setup_targets
         .iter()
+        .filter(|provider| {
+            loaded
+                .setup_answers
+                .get(&provider.provider_id)
+                .map(crate::provider_state::provider_enabled)
+                .unwrap_or(true)
+        })
         .filter_map(|provider| {
             setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id).map(
                 |form_spec| wizard::ProviderFormSpec {
@@ -381,6 +411,10 @@ pub fn complete_loaded_answers_with_prompts(
             .get(provider_id)
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !crate::provider_state::provider_enabled(&existing) {
+            loaded.setup_answers.insert(provider_id.clone(), existing);
+            continue;
+        }
 
         // In non-interactive mode, never prompt. Preserve whatever was loaded
         // from the answers file as-is; downstream validation fails fast on
@@ -466,6 +500,9 @@ pub fn ensure_required_setup_answers_present(
             .get(&provider.provider_id)
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
+        if !crate::provider_state::provider_enabled(&answers) {
+            continue;
+        }
         let answer_map = answers.as_object().ok_or_else(|| {
             anyhow::anyhow!("answers for {} must be an object", provider.provider_id)
         })?;

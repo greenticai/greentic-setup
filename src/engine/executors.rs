@@ -4,10 +4,12 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use anyhow::Context;
-use serde_json::Value;
+use anyhow::{Context, anyhow};
+use serde_json::{Map as JsonMap, Value};
 use sha2::{Digest, Sha256};
+use zip::{ZipArchive, result::ZipError};
 
 use crate::plan::{ResolvedPackInfo, SetupPlanMetadata};
 use crate::{bundle, bundle_source::BundleSource, discovery};
@@ -15,6 +17,7 @@ use crate::{bundle, bundle_source::BundleSource, discovery};
 use super::plan_builders::compute_simple_hash;
 use super::types::SetupConfig;
 
+#[derive(Debug)]
 pub struct ApplyPackSetupReport {
     pub provider_updates: usize,
     pub pending_setup_actions: Vec<crate::setup_actions::SetupAction>,
@@ -311,23 +314,98 @@ pub fn execute_apply_pack_setup(
         None
     };
 
+    let provider_ids = setup_provider_ids(metadata, discovered.as_ref());
+
     // Persist setup answers to local config files and dev secrets store
-    for (provider_id, answers) in &metadata.setup_answers {
+    for provider_id in provider_ids {
+        let empty_answers = Value::Object(serde_json::Map::new());
+        let answers = metadata
+            .setup_answers
+            .get(&provider_id)
+            .unwrap_or(&empty_answers);
+        let mut effective_answers = answers.clone();
+        let pack_path = discovered.as_ref().and_then(|d| {
+            d.find_setup_target(&provider_id)
+                .map(|p| p.pack_path.as_path())
+        });
+        if !crate::provider_state::provider_enabled(&effective_answers) {
+            let persisted_answers = crate::setup_actions::strip_setup_actions(&effective_answers);
+            let config_dir = bundle_path.join("state").join("config").join(&provider_id);
+            std::fs::create_dir_all(&config_dir)?;
+            let config_path = config_dir.join("setup-answers.json");
+            let content = serde_json::to_string_pretty(&persisted_answers)
+                .context("failed to serialize setup answers")?;
+            std::fs::write(&config_path, content).with_context(|| {
+                format!(
+                    "failed to write setup answers to: {}",
+                    config_path.display()
+                )
+            })?;
+            let env = crate::resolve_env(Some(&config.env));
+            let rt = tokio::runtime::Runtime::new()
+                .context("failed to create tokio runtime for secrets persistence")?;
+            rt.block_on(crate::qa::persist::persist_all_config_as_secrets(
+                bundle_path,
+                &env,
+                &config.tenant,
+                config.team.as_deref(),
+                &provider_id,
+                &persisted_answers,
+                pack_path,
+            ))?;
+            if let Some(pack_path) = pack_path {
+                crate::config_envelope::write_provider_config_envelope(
+                    &bundle_path.join(".providers"),
+                    &provider_id,
+                    "setup-input",
+                    &persisted_answers,
+                    pack_path,
+                    false,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to write provider config envelope for {} using {}",
+                        provider_id,
+                        pack_path.display()
+                    )
+                })?;
+            }
+            count += 1;
+            continue;
+        }
         let mut setup_actions = crate::setup_actions::extract_setup_actions(
-            provider_id,
+            &provider_id,
             &config.tenant,
             config.team.as_deref(),
             answers,
         )?;
+        setup_actions.extend(extract_pack_setup_actions(
+            discovered.as_ref(),
+            &provider_id,
+            &config.tenant,
+            config.team.as_deref(),
+        )?);
+        defer_registration_actions_missing_inputs(&mut setup_actions, &effective_answers);
+        run_setup_action_registrations(SetupActionRegistrationContext {
+            bundle_path,
+            discovered: discovered.as_ref(),
+            provider_id: &provider_id,
+            config,
+            bundle_name: metadata.bundle_name.as_deref(),
+            public_base_url: metadata.static_routes.public_base_url.as_deref(),
+            answers: &mut effective_answers,
+            actions: &mut setup_actions,
+        })?;
+        hydrate_oauth_install_actions(&mut setup_actions, &effective_answers);
         if !setup_actions.is_empty() {
             crate::setup_actions::sign_pending_oauth_actions(bundle_path, &mut setup_actions)?;
             crate::setup_actions::persist_setup_actions(bundle_path, &setup_actions)?;
             pending_setup_actions.extend(setup_actions.clone());
         }
-        let persisted_answers = crate::setup_actions::strip_setup_actions(answers);
+        let persisted_answers = crate::setup_actions::strip_setup_actions(&effective_answers);
 
         // Write answers to provider config directory
-        let config_dir = bundle_path.join("state").join("config").join(provider_id);
+        let config_dir = bundle_path.join("state").join("config").join(&provider_id);
         std::fs::create_dir_all(&config_dir)?;
 
         // Resolve the pack path early so we can both discover secret-marked
@@ -384,7 +462,7 @@ pub fn execute_apply_pack_setup(
                 &env,
                 &config.tenant,
                 config.team.as_deref(),
-                provider_id,
+                &provider_id,
                 "_example_key",
             );
             println!("  [secrets] URI pattern: {example_uri}");
@@ -400,7 +478,7 @@ pub fn execute_apply_pack_setup(
             &env,
             &config.tenant,
             config.team.as_deref(),
-            provider_id,
+            &provider_id,
             &persisted_answers,
             pack_path,
         ))?;
@@ -425,7 +503,7 @@ pub fn execute_apply_pack_setup(
         if let Some(pack_path) = pack_path {
             crate::config_envelope::write_provider_config_envelope(
                 &bundle_path.join(".providers"),
-                provider_id,
+                &provider_id,
                 "setup-input",
                 &envelope_answers,
                 pack_path,
@@ -448,7 +526,7 @@ pub fn execute_apply_pack_setup(
         match crate::tenant_config::sync_oauth_to_tenant_config(
             bundle_path,
             &config.tenant,
-            provider_id,
+            &provider_id,
             &persisted_answers,
         ) {
             Ok(true) => {
@@ -466,7 +544,7 @@ pub fn execute_apply_pack_setup(
         match crate::tenant_config::sync_skin_to_tenant_config(
             bundle_path,
             &config.tenant,
-            provider_id,
+            &provider_id,
             &persisted_answers,
         ) {
             Ok(true) => {
@@ -492,7 +570,7 @@ pub fn execute_apply_pack_setup(
         match crate::tenant_config::sync_nav_links_to_tenant_config(
             bundle_path,
             &config.tenant,
-            provider_id,
+            &provider_id,
             &persisted_answers,
         ) {
             Ok(true) => {
@@ -508,7 +586,7 @@ pub fn execute_apply_pack_setup(
 
         // Register webhooks if the provider needs one (e.g. Telegram, Slack, Webex)
         if let Some(result) = crate::webhook::register_webhook(
-            provider_id,
+            &provider_id,
             &persisted_answers,
             &config.tenant,
             config.team.as_deref(),
@@ -538,6 +616,7 @@ pub fn execute_apply_pack_setup(
     let provider_configs: Vec<(String, Value)> = metadata
         .setup_answers
         .iter()
+        .filter(|(_, val)| crate::provider_state::provider_enabled(val))
         .map(|(id, val)| (id.clone(), val.clone()))
         .collect();
     let team = config.team.as_deref().unwrap_or("default");
@@ -546,6 +625,736 @@ pub fn execute_apply_pack_setup(
     Ok(ApplyPackSetupReport {
         provider_updates: count,
         pending_setup_actions,
+    })
+}
+
+fn setup_provider_ids(
+    metadata: &SetupPlanMetadata,
+    discovered: Option<&crate::discovery::DiscoveryResult>,
+) -> BTreeSet<String> {
+    let mut provider_ids: BTreeSet<String> = metadata.setup_answers.keys().cloned().collect();
+    if let Some(discovered) = discovered {
+        for provider in discovered.setup_targets() {
+            if let Ok(Some(spec)) = crate::setup_input::load_setup_spec(&provider.pack_path)
+                && !spec.setup_actions.is_empty()
+            {
+                provider_ids.insert(provider.provider_id.clone());
+            }
+        }
+    }
+    provider_ids
+}
+
+fn extract_pack_setup_actions(
+    discovered: Option<&crate::discovery::DiscoveryResult>,
+    provider_id: &str,
+    tenant: &str,
+    team: Option<&str>,
+) -> anyhow::Result<Vec<crate::setup_actions::SetupAction>> {
+    let Some(provider) = discovered.and_then(|d| d.find_setup_target(provider_id)) else {
+        return Ok(Vec::new());
+    };
+    let Some(spec) = crate::setup_input::load_setup_spec(&provider.pack_path)? else {
+        return Ok(Vec::new());
+    };
+    if spec.setup_actions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let setup_actions = spec
+        .setup_actions
+        .into_iter()
+        .map(|mut action| {
+            if let Some(obj) = action.as_object_mut() {
+                obj.remove("provider_id");
+                obj.remove("tenant");
+                obj.remove("team");
+            }
+            action
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({ "setup_actions": setup_actions });
+    crate::setup_actions::extract_setup_actions(provider_id, tenant, team, &value)
+}
+
+fn defer_registration_actions_missing_inputs(
+    actions: &mut Vec<crate::setup_actions::SetupAction>,
+    answers: &Value,
+) {
+    actions.retain(|action| {
+        !(action.kind == crate::setup_actions::SetupActionKind::OauthInstallButton
+            && action.extra.get("registration").is_some()
+            && client_id_for_action(action, answers).is_none()
+            && !registration_has_any_declared_input(action.extra.get("registration"), answers))
+    });
+}
+
+fn registration_has_any_declared_input(registration: Option<&Value>, answers: &Value) -> bool {
+    let Some(registration_obj) = registration.and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(answers_obj) = answers.as_object() else {
+        return false;
+    };
+    registration_obj.iter().any(|(key, field_value)| {
+        key.ends_with("_field")
+            && field_value
+                .as_str()
+                .map(str::trim)
+                .filter(|field_name| !field_name.is_empty())
+                .and_then(|field_name| answers_obj.get(field_name))
+                .is_some_and(|value| !is_empty_value(value))
+    })
+}
+
+struct SetupActionRegistrationContext<'a> {
+    bundle_path: &'a Path,
+    discovered: Option<&'a crate::discovery::DiscoveryResult>,
+    provider_id: &'a str,
+    config: &'a SetupConfig,
+    bundle_name: Option<&'a str>,
+    public_base_url: Option<&'a str>,
+    answers: &'a mut Value,
+    actions: &'a mut [crate::setup_actions::SetupAction],
+}
+
+fn run_setup_action_registrations(ctx: SetupActionRegistrationContext<'_>) -> anyhow::Result<()> {
+    let SetupActionRegistrationContext {
+        bundle_path,
+        discovered,
+        provider_id,
+        config,
+        bundle_name,
+        public_base_url,
+        answers,
+        actions,
+    } = ctx;
+
+    let Some(provider) = discovered.and_then(|d| d.find_setup_target(provider_id)) else {
+        if actions
+            .iter()
+            .any(|action| needs_setup_action_registration(action, answers))
+        {
+            anyhow::bail!("provider pack not found for setup action registration: {provider_id}");
+        }
+        return Ok(());
+    };
+
+    for action in actions {
+        if !needs_setup_action_registration(action, answers) {
+            continue;
+        }
+        let registration = action
+            .extra
+            .get("registration")
+            .cloned()
+            .ok_or_else(|| anyhow!("setup action registration metadata missing"))?;
+        let request = build_registration_request(
+            provider_id,
+            config,
+            bundle_name,
+            public_base_url,
+            answers,
+            action,
+            &registration,
+        )?;
+        let output = invoke_registration_operation(
+            bundle_path,
+            &provider.pack_path,
+            &registration,
+            &request,
+            config,
+        )
+        .with_context(|| {
+            format!(
+                "failed to run setup action registration {} for {}",
+                action.id, provider_id
+            )
+        })?;
+        if let Some(error) = registration_error_message(&output) {
+            anyhow::bail!(
+                "setup action registration {} returned an error: {}",
+                action.id,
+                error
+            );
+        }
+        merge_registration_output(action, answers, &registration, &output)?;
+        if client_id_for_action(action, answers).is_none()
+            && !authorize_url_has_query_key(action.authorize_url.as_deref(), "client_id")
+        {
+            anyhow::bail!(
+                "setup action registration {} did not produce a client_id",
+                action.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn needs_setup_action_registration(
+    action: &crate::setup_actions::SetupAction,
+    answers: &Value,
+) -> bool {
+    action.kind == crate::setup_actions::SetupActionKind::OauthInstallButton
+        && action.extra.get("registration").is_some()
+        && client_id_for_action(action, answers).is_none()
+        && !authorize_url_has_query_key(action.authorize_url.as_deref(), "client_id")
+}
+
+fn authorize_url_has_query_key(url: Option<&str>, key: &str) -> bool {
+    url.and_then(|value| url::Url::parse(value).ok())
+        .is_some_and(|parsed| parsed.query_pairs().any(|(candidate, _)| candidate == key))
+}
+
+fn build_registration_request(
+    provider_id: &str,
+    config: &SetupConfig,
+    bundle_name: Option<&str>,
+    public_base_url: Option<&str>,
+    answers: &Value,
+    action: &crate::setup_actions::SetupAction,
+    registration: &Value,
+) -> anyhow::Result<Value> {
+    let registration_obj = registration
+        .as_object()
+        .ok_or_else(|| anyhow!("setup action registration must be an object"))?;
+    let answers_obj = answers
+        .as_object()
+        .ok_or_else(|| anyhow!("provider setup answers must be an object"))?;
+    let effective_public_base_url = public_base_url.or_else(|| {
+        answers_obj
+            .get("public_base_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    let effective_team = config.team.as_deref().unwrap_or("default");
+    let mut input = JsonMap::new();
+    input.insert("answers".into(), answers.clone());
+    input.insert("provider_id".into(), Value::String(provider_id.to_string()));
+    input.insert("tenant".into(), Value::String(config.tenant.clone()));
+    input.insert("team".into(), Value::String(effective_team.to_string()));
+    if let Some(public_base_url) = effective_public_base_url {
+        input.insert(
+            "public_base_url".into(),
+            Value::String(public_base_url.to_string()),
+        );
+    }
+    input.insert("action_id".into(), Value::String(action.id.clone()));
+
+    for (key, field_value) in registration_obj {
+        let Some(input_name) = key.strip_suffix("_field") else {
+            continue;
+        };
+        let Some(field_name) = field_value
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        if let Some(value) = answers_obj
+            .get(field_name)
+            .filter(|value| !is_empty_value(value))
+        {
+            input.insert(field_name.to_string(), value.clone());
+            input.insert(input_name.to_string(), value.clone());
+        }
+    }
+
+    if input.get("app_name").is_none()
+        && let Some(app_name) = registration_app_name(action, bundle_name)
+    {
+        input.insert("app_name".into(), Value::String(app_name.clone()));
+        if let Some(field_name) = registration_obj
+            .get("app_name_field")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            input.insert(field_name.to_string(), Value::String(app_name));
+        }
+    }
+
+    let mut context = JsonMap::new();
+    context.insert("provider_id".into(), Value::String(provider_id.to_string()));
+    context.insert("tenant".into(), Value::String(config.tenant.clone()));
+    context.insert("team".into(), Value::String(effective_team.to_string()));
+    if let Some(public_base_url) = effective_public_base_url {
+        context.insert(
+            "public_base_url".into(),
+            Value::String(public_base_url.to_string()),
+        );
+    }
+    if let Some(app_name) = input.get("app_name") {
+        context.insert("app_name".into(), app_name.clone());
+    }
+    input.insert("context".into(), Value::Object(context));
+    Ok(Value::Object(input))
+}
+
+fn registration_app_name(
+    action: &crate::setup_actions::SetupAction,
+    bundle_name: Option<&str>,
+) -> Option<String> {
+    let bundle_name = bundle_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Greentic");
+    if let Some(template) = action
+        .extra
+        .get("app_name_template")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let rendered = template
+            .replace("{{ bundle_name }}", bundle_name)
+            .replace("{{bundle_name}}", bundle_name)
+            .trim()
+            .to_string();
+        if !rendered.is_empty() {
+            return Some(rendered);
+        }
+    }
+    action
+        .extra
+        .get("default_app_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn invoke_registration_operation(
+    bundle_path: &Path,
+    pack_path: &Path,
+    registration: &Value,
+    request: &Value,
+    config: &SetupConfig,
+) -> anyhow::Result<Value> {
+    let registration_obj = registration
+        .as_object()
+        .ok_or_else(|| anyhow!("setup action registration must be an object"))?;
+    let component_ref = registration_obj
+        .get("component_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("setup action registration missing component_ref"))?;
+    let op = registration_obj
+        .get("op")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("setup action registration missing op"))?;
+
+    if let Some(result) = registration_obj
+        .get("result")
+        .or_else(|| registration_obj.get("mock_result"))
+        .or_else(|| registration_obj.get("outputs"))
+    {
+        return Ok(result.clone());
+    }
+
+    if let Ok(component) = read_registration_component(pack_path, component_ref)
+        && let Some(output) = invoke_json_registration_component(&component, op, request)
+    {
+        return Ok(output);
+    }
+
+    invoke_wasm_registration_component(bundle_path, pack_path, component_ref, op, request, config)
+}
+
+pub fn invoke_setup_component_operation(
+    bundle_path: &Path,
+    pack_path: &Path,
+    component_ref: &str,
+    op: &str,
+    request: &Value,
+    config: &SetupConfig,
+) -> anyhow::Result<Value> {
+    let registration = serde_json::json!({
+        "component_ref": component_ref,
+        "op": op,
+    });
+    invoke_registration_operation(bundle_path, pack_path, &registration, request, config)
+}
+
+#[derive(Debug, Default)]
+struct SetupRegistrationSecrets {
+    values: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl greentic_secrets_lib::SecretsManager for SetupRegistrationSecrets {
+    async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        let values = self.values.lock().map_err(|_| {
+            greentic_secrets_lib::SecretError::Backend(
+                "setup registration secrets lock poisoned".into(),
+            )
+        })?;
+        values
+            .get(path)
+            .cloned()
+            .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+    }
+
+    async fn write(&self, path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+        let mut values = self.values.lock().map_err(|_| {
+            greentic_secrets_lib::SecretError::Backend(
+                "setup registration secrets lock poisoned".into(),
+            )
+        })?;
+        values.insert(path.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn delete(&self, path: &str) -> greentic_secrets_lib::Result<()> {
+        let mut values = self.values.lock().map_err(|_| {
+            greentic_secrets_lib::SecretError::Backend(
+                "setup registration secrets lock poisoned".into(),
+            )
+        })?;
+        values.remove(path);
+        Ok(())
+    }
+}
+
+fn invoke_wasm_registration_component(
+    bundle_path: &Path,
+    pack_path: &Path,
+    component_ref: &str,
+    op: &str,
+    request: &Value,
+    config: &SetupConfig,
+) -> anyhow::Result<Value> {
+    use greentic_runner_host::component_api::node::{
+        ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx,
+    };
+    use greentic_runner_host::config::{OperatorPolicy, SecretsPolicy};
+    use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
+    use greentic_runner_host::provider::ProviderBinding;
+    use greentic_runner_host::storage::{new_session_store, new_state_store};
+    use greentic_runner_host::{HostConfig, RunnerWasiPolicy};
+    use std::sync::Arc;
+
+    let bindings_path = bundle_path
+        .join("state")
+        .join("config")
+        .join("setup-registration-bindings.yaml");
+    if let Some(parent) = bindings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &bindings_path,
+        format!(
+            r#"tenant: {}
+flow_type_bindings:
+  messaging:
+    adapter: setup-registration
+    config: {{}}
+    secrets: []
+rate_limits: {{}}
+retry: {{}}
+timers: []
+"#,
+            config.tenant
+        ),
+    )
+    .with_context(|| format!("write {}", bindings_path.display()))?;
+
+    let mut host_config = HostConfig::load_from_path(&bindings_path)
+        .with_context(|| format!("load {}", bindings_path.display()))?;
+    host_config.secrets_policy = SecretsPolicy::allow_all();
+    host_config.operator_policy = OperatorPolicy::allow_all();
+    let host_config = Arc::new(host_config);
+
+    let session_store = new_session_store();
+    let state_store = new_state_store();
+    let secrets: greentic_runner_host::secrets::DynSecretsManager =
+        Arc::new(SetupRegistrationSecrets::default());
+    let pack = greentic_runner_host::runtime::block_on(PackRuntime::load(
+        pack_path,
+        Arc::clone(&host_config),
+        None,
+        Some(pack_path),
+        Some(Arc::clone(&session_store)),
+        Some(Arc::clone(&state_store)),
+        Arc::new(RunnerWasiPolicy::default()),
+        secrets,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))
+    .with_context(|| format!("load registration pack {}", pack_path.display()))?;
+
+    let exec_ctx = ComponentExecCtx {
+        tenant: ComponentTenantCtx {
+            tenant: config.tenant.clone(),
+            team: config.team.clone(),
+            user: None,
+            trace_id: None,
+            i18n_id: None,
+            correlation_id: Some(format!("setup-action-registration:{component_ref}:{op}")),
+            deadline_unix_ms: None,
+            attempt: 1,
+            idempotency_key: Some(format!("setup-action-registration:{component_ref}:{op}")),
+        },
+        i18n_id: None,
+        flow_id: format!("setup-action-registration/{op}"),
+        node_id: Some(component_ref.to_string()),
+    };
+    let input_json = serde_json::to_vec(request)?;
+    let binding = ProviderBinding {
+        provider_id: Some(component_ref.to_string()),
+        provider_type: component_ref.to_string(),
+        component_ref: component_ref.to_string(),
+        export: "schema-core-api".to_string(),
+        world: "greentic:provider/schema-core@1.0.0".to_string(),
+        config_json: None,
+        pack_ref: None,
+    };
+    match greentic_runner_host::runtime::block_on(pack.invoke_provider(
+        &binding,
+        exec_ctx.clone(),
+        op,
+        input_json,
+    )) {
+        Ok(output) => Ok(output),
+        Err(provider_err) => {
+            let input_json = serde_json::to_string(request)?;
+            greentic_runner_host::runtime::block_on(pack.invoke_component(
+                component_ref,
+                exec_ctx,
+                op,
+                None,
+                input_json,
+            ))
+            .with_context(|| {
+                format!(
+                    "invoke registration component '{component_ref}' op '{op}' (provider path failed: {provider_err})"
+                )
+            })
+        }
+    }
+}
+
+fn read_registration_component(pack_path: &Path, component_ref: &str) -> anyhow::Result<Value> {
+    let file = File::open(pack_path).with_context(|| format!("open {}", pack_path.display()))?;
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(ZipError::InvalidArchive(_)) | Err(ZipError::UnsupportedArchive(_)) => {
+            anyhow::bail!("{} is not a zip pack", pack_path.display())
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let candidates = registration_component_candidates(component_ref);
+    for candidate in candidates {
+        match archive.by_name(&candidate) {
+            Ok(mut entry) => {
+                let mut raw = String::new();
+                entry
+                    .read_to_string(&mut raw)
+                    .with_context(|| format!("read registration component {candidate}"))?;
+                return serde_json::from_str(&raw)
+                    .or_else(|_| serde_yaml_bw::from_str(&raw))
+                    .with_context(|| format!("parse registration component {candidate}"));
+            }
+            Err(ZipError::FileNotFound) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    anyhow::bail!(
+        "registration component_ref '{}' not found in {}",
+        component_ref,
+        pack_path.display()
+    )
+}
+
+fn registration_component_candidates(component_ref: &str) -> Vec<String> {
+    let trimmed = component_ref.trim().trim_start_matches("./");
+    let mut candidates = vec![trimmed.to_string()];
+    if !trimmed.ends_with(".json") && !trimmed.ends_with(".yaml") && !trimmed.ends_with(".yml") {
+        candidates.push(format!("{trimmed}.json"));
+        candidates.push(format!("components/{trimmed}.json"));
+        candidates.push(format!("assets/{trimmed}.json"));
+        candidates.push(format!("assets/components/{trimmed}.json"));
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn invoke_json_registration_component(
+    component: &Value,
+    op: &str,
+    request: &Value,
+) -> Option<Value> {
+    let obj = component.as_object()?;
+    if let Some(operations) = obj.get("operations").and_then(Value::as_object)
+        && let Some(operation) = operations.get(op)
+    {
+        return operation_result(operation, request);
+    }
+    if let Some(ops) = obj.get("ops").and_then(Value::as_array) {
+        for operation in ops {
+            if operation.get("op").and_then(Value::as_str) == Some(op)
+                || operation.get("name").and_then(Value::as_str) == Some(op)
+                || operation.get("id").and_then(Value::as_str) == Some(op)
+            {
+                return operation_result(operation, request);
+            }
+        }
+    }
+    obj.get(op)
+        .and_then(|operation| operation_result(operation, request))
+}
+
+fn operation_result(operation: &Value, request: &Value) -> Option<Value> {
+    if let Some(result) = operation
+        .get("result")
+        .or_else(|| operation.get("output"))
+        .or_else(|| operation.get("outputs"))
+    {
+        return Some(result.clone());
+    }
+    if operation.get("echo_request").and_then(Value::as_bool) == Some(true) {
+        return Some(request.clone());
+    }
+    if operation.is_object() {
+        return Some(operation.clone());
+    }
+    None
+}
+
+fn merge_registration_output(
+    action: &mut crate::setup_actions::SetupAction,
+    answers: &mut Value,
+    registration: &Value,
+    output: &Value,
+) -> anyhow::Result<()> {
+    let registration_obj = registration
+        .as_object()
+        .ok_or_else(|| anyhow!("setup action registration must be an object"))?;
+    let output_obj = output
+        .as_object()
+        .ok_or_else(|| anyhow!("setup action registration output must be an object"))?;
+    let answers_obj = answers
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("provider setup answers must be an object"))?;
+
+    for (mapping_key, source_value) in registration_obj {
+        let Some(generic_key) = mapping_key.strip_suffix("_output") else {
+            continue;
+        };
+        let Some(source_key) = source_value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(value) = output_obj
+            .get(source_key)
+            .or_else(|| output_obj.get(generic_key))
+            .filter(|value| !is_empty_value(value))
+            .cloned()
+        else {
+            continue;
+        };
+        answers_obj.insert(source_key.to_string(), value.clone());
+        answers_obj.insert(generic_key.to_string(), value.clone());
+        if generic_key == "client_id" {
+            if let Some(client_id_field) =
+                action.extra.get("client_id_field").and_then(Value::as_str)
+            {
+                answers_obj.insert(client_id_field.to_string(), value.clone());
+            }
+            action.extra.insert("client_id".into(), value);
+        } else {
+            action.extra.insert(generic_key.to_string(), value);
+        }
+    }
+    Ok(())
+}
+
+fn registration_error_message(output: &Value) -> Option<String> {
+    if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        return output
+            .get("error")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| Some(output.to_string()));
+    }
+    None
+}
+
+fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => value.trim().is_empty(),
+        Value::Array(values) => values.is_empty(),
+        Value::Object(values) => values.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn hydrate_oauth_install_actions(
+    actions: &mut [crate::setup_actions::SetupAction],
+    answers: &Value,
+) {
+    for action in actions {
+        if action.kind != crate::setup_actions::SetupActionKind::OauthInstallButton {
+            continue;
+        }
+        let client_id = client_id_for_action(action, answers);
+        let Some(authorize_url) = action.authorize_url.as_mut() else {
+            continue;
+        };
+        let Ok(mut parsed) = url::Url::parse(authorize_url) else {
+            continue;
+        };
+        if !parsed.query_pairs().any(|(key, _)| key == "client_id")
+            && let Some(client_id) = client_id
+        {
+            parsed
+                .query_pairs_mut()
+                .append_pair("client_id", &client_id);
+        }
+        if !parsed.query_pairs().any(|(key, _)| key == "scope")
+            && let Some(scopes) = action.extra.get("scopes").and_then(Value::as_array)
+        {
+            let scope = scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !scope.is_empty() {
+                parsed.query_pairs_mut().append_pair("scope", &scope);
+            }
+        }
+        *authorize_url = parsed.to_string();
+    }
+}
+
+fn client_id_for_action(
+    action: &crate::setup_actions::SetupAction,
+    answers: &Value,
+) -> Option<String> {
+    let obj = answers.as_object()?;
+    let mut keys = Vec::new();
+    if let Some(field) = action.extra.get("client_id_field").and_then(Value::as_str) {
+        keys.push(field);
+    }
+    keys.extend(["client_id", "oauth_client_id"]);
+    keys.into_iter().find_map(|key| {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
     })
 }
 

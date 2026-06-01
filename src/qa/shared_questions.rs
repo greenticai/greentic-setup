@@ -22,11 +22,12 @@ pub const SHARED_QUESTION_IDS: &[&str] = &[
     // (e.g., slack.com, telegram.org, webexapis.com)
 ];
 
-/// Questions hidden from interactive prompts (both terminal and web UI) because
-/// they are auto-injected by the operator at runtime (e.g. tunnel URL
-/// auto-detection via ngrok/cloudflared). The questions are still accepted if
-/// supplied via `--answers` file or prefill.
-pub const HIDDEN_FROM_PROMPTS: &[&str] = &["public_base_url"];
+/// Questions hidden from interactive prompts (both terminal and web UI).
+///
+/// Values may still be supplied via `--answers` file or prefill. Keep this list
+/// empty by default: providers such as OAuth/webhook integrations often need a
+/// real HTTPS `public_base_url` during setup-time app registration.
+pub const HIDDEN_FROM_PROMPTS: &[&str] = &[];
 
 /// Information about a provider and its FormSpec for multi-provider setup.
 #[derive(Clone)]
