@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::platform_setup::types::{StaticRoutesPolicy, TunnelAnswers};
+use crate::platform_setup::types::{StaticRoutesPolicy, TelemetryAnswers, TunnelAnswers};
 
 /// Get the path to the static routes artifact file.
 pub fn static_routes_artifact_path(bundle_root: &Path) -> PathBuf {
@@ -124,6 +124,43 @@ pub fn persist_static_routes_artifact(
         std::fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(policy).context("serialize static routes policy")?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Get the path to the telemetry artifact file (sidecar to bundle.yaml).
+pub fn telemetry_artifact_path(bundle_root: &Path) -> PathBuf {
+    bundle_root
+        .join("state")
+        .join("config")
+        .join("platform")
+        .join("telemetry.json")
+}
+
+/// Load telemetry answers from the bundle artifact file.
+pub fn load_telemetry_artifact(bundle_root: &Path) -> Result<Option<TelemetryAnswers>> {
+    let path = telemetry_artifact_path(bundle_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let answers: TelemetryAnswers = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(answers))
+}
+
+/// Persist telemetry answers to the bundle artifact file.
+pub fn persist_telemetry_artifact(
+    bundle_root: &Path,
+    answers: &TelemetryAnswers,
+) -> Result<PathBuf> {
+    let path = telemetry_artifact_path(bundle_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string_pretty(answers).context("serialize telemetry answers")?;
     std::fs::write(&path, payload)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)

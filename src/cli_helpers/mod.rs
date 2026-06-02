@@ -185,6 +185,7 @@ pub fn run_interactive_wizard(
                 static_routes: Some(static_routes.to_answers()),
                 deployment_targets,
                 tunnel,
+                telemetry: None,
             },
             setup_answers: all_answers,
         });
@@ -263,6 +264,7 @@ pub fn run_interactive_wizard(
             static_routes: Some(static_routes.to_answers()),
             deployment_targets,
             tunnel,
+            telemetry: None,
         },
         setup_answers: all_answers,
     })

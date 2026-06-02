@@ -243,6 +243,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         .context(i18n.t("cli.error.failed_read_answers"))?,
         deployment_targets: loaded_answers.platform_setup.deployment_targets,
         tunnel: loaded_answers.platform_setup.tunnel,
+        telemetry: loaded_answers.platform_setup.telemetry,
         setup_answers: loaded_answers.setup_answers,
         ..Default::default()
     };
