@@ -11,6 +11,10 @@ readme = "README.md"
 keywords = ["greentic", "setup", "bundle", "qa", "secrets"]
 categories = ["command-line-utilities", "config"]
 
+[[bin]]
+name = "greentic-setup"
+path = "src/bin/greentic_setup.rs"
+
 [features]
 default = ["oci", "squashfs", "ui"]
 ui = ["axum", "open"]
@@ -21,41 +25,37 @@ squashfs = ["backhand"]
 aes-gcm-siv = "0.11"
 anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.8", optional = true }
 backhand = { version = "0.25", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+dialoguer = "0.12"
 greentic-distributor-client = { version = "0.5", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 greentic-i18n-lib = "0.5"
 greentic-runner-host = { version = "0.5", default-features = false }
 greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
 greentic-types = { version = "0.5", features = ["serde"] }
 hmac = "0.13"
+open = { version = "5", optional = true }
 qa-spec = "0.5"
-regex = "1"
-dialoguer = "0.12"
-rpassword = "7"
 rand = "0.10"
+regex = "1"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"
 serde_json = "1"
 serde_yaml_bw = { package = "serde_yaml_gtc", version = "2.5.2" }
 sha2 = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
-axum = { version = "0.8", optional = true }
-open = { version = "5", optional = true }
 tar = "0.4"
-ureq = { version = "3", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
 tracing = "0.1"
+ureq = { version = "3", features = ["json"] }
 url = "2"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
-[[bin]]
-name = "greentic-setup"
-path = "src/bin/greentic_setup.rs"
-
 [dev-dependencies]
-tempfile = "3"
 criterion = "0.8"
+tempfile = "3"
 
 [[bench]]
 name = "perf"
