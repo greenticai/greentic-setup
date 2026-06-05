@@ -618,6 +618,19 @@ setup_actions:
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        // A pack with classifiable setup metadata so B12a can resolve a form
+        // spec for `messaging-example`; the install action itself is
+        // answer-provided, which is the behavior under test.
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions:
+  - name: workspace_name
+    kind: string
+"#,
+            json!({"operations": {}}),
+        );
 
         let engine = SetupEngine::new(SetupConfig {
             tenant: "demo".into(),
@@ -664,7 +677,9 @@ setup_actions:
             &bundle_root,
             r#"
 title: Example
-questions: []
+questions:
+  - name: workspace_name
+    kind: string
 setup_actions:
   - id: install
     label: Add
@@ -711,21 +726,13 @@ setup_actions:
             .authorize_url
             .as_deref()
             .unwrap();
+        // The hydrated `client_id` proves the pack-declared registration ran
+        // and produced the OAuth client id BEFORE the install URL was built —
+        // the unique coverage of this test. Where those registration outputs
+        // land (setup-answers.json vs the dev secrets store) is the B12a
+        // redaction concern, covered by the `engine::executors` unit tests, so
+        // we don't re-assert it here.
         assert!(url.contains("client_id=client-from-registration"), "{url}");
-
-        let setup_answers_path =
-            bundle_root.join("state/config/messaging-example/setup-answers.json");
-        let stored: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(setup_answers_path).unwrap()).unwrap();
-        assert_eq!(stored["oauth_client_id"], json!("client-from-registration"));
-        assert_eq!(stored["client_id"], json!("client-from-registration"));
-        assert_eq!(
-            stored["registered_client_secret"],
-            json!("secret-from-registration")
-        );
-        assert_eq!(stored["client_secret"], json!("secret-from-registration"));
-        assert_eq!(stored["registered_app_id"], json!("app-from-registration"));
-        assert_eq!(stored["app_id"], json!("app-from-registration"));
     }
 
     #[test]
@@ -798,7 +805,9 @@ setup_actions:
             &bundle_root,
             r#"
 title: Example
-questions: []
+questions:
+  - name: workspace_name
+    kind: string
 setup_actions:
   - id: install
     label: Add
@@ -841,12 +850,32 @@ setup_actions:
 
         execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
 
-        let setup_answers_path =
-            bundle_root.join("state/config/messaging-example/setup-answers.json");
-        let stored: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(setup_answers_path).unwrap()).unwrap();
-        assert_eq!(stored["slack_app_name"], json!("Acme Support Slack"));
-        assert_eq!(stored["app_name"], json!("Acme Support Slack"));
+        // The registration echoes the templated app name into both
+        // `app_name` and `slack_app_name`. Post-B12a these registration
+        // outputs are persisted to the dev secrets store (every config value
+        // is readable via the secrets API), not written back into
+        // setup-answers.json, so assert against the store. `canonical_secret_uri`
+        // collapses the literal "default" team into the `_` wildcard segment.
+        use greentic_secrets_lib::SecretsStore as _;
+        let store = crate::secrets::open_dev_store(&bundle_root).expect("open dev store");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // setup uses the A4b `dev` -> `local` env alias for the secrets URI.
+        let env = crate::resolve_env(Some("dev"));
+        let read = |key: &str| -> String {
+            let uri = crate::canonical_secret_uri(
+                &env,
+                "demo",
+                Some("default"),
+                "messaging-example",
+                key,
+            );
+            let bytes = rt
+                .block_on(async { store.get(&uri).await })
+                .unwrap_or_else(|_| panic!("missing dev-store key: {key}"));
+            String::from_utf8(bytes).expect("utf8")
+        };
+        assert_eq!(read("slack_app_name"), "Acme Support Slack");
+        assert_eq!(read("app_name"), "Acme Support Slack");
     }
 
     #[test]
@@ -912,7 +941,9 @@ setup_actions:
             &bundle_root,
             r#"
 title: Example
-questions: []
+questions:
+  - name: workspace_name
+    kind: string
 setup_actions:
   - id: install
     label: Add

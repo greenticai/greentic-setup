@@ -2,7 +2,9 @@
 //!
 //! Each executor handles a specific `SetupStepKind`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -412,7 +414,7 @@ pub fn execute_apply_pack_setup(
         // keys (to redact plaintext from the on-disk artifacts — B12a) and
         // pass it to the envelope writer + secrets-persist path.
         let pack_path = discovered.as_ref().and_then(|d| {
-            d.find_setup_target(provider_id)
+            d.find_setup_target(&provider_id)
                 .map(|p| p.pack_path.as_path())
         });
         let env = crate::resolve_env(Some(&config.env));
@@ -430,8 +432,8 @@ pub fn execute_apply_pack_setup(
         //     fail closed rather than silently writing plaintext.
         // A missing pack path is the same "can't classify" situation.
         let resolved_secret_keys: Option<BTreeSet<String>> =
-            pack_path.and_then(|pp| resolve_secret_answer_keys(pp, provider_id));
-        let secret_keys = secret_keys_or_fail_closed(resolved_secret_keys, answers, provider_id)?;
+            pack_path.and_then(|pp| resolve_secret_answer_keys(pp, &provider_id));
+        let secret_keys = secret_keys_or_fail_closed(resolved_secret_keys, answers, &provider_id)?;
         let answers_for_disk = strip_secret_answer_keys(answers, &secret_keys);
         let envelope_answers = redact_secret_answer_values_to_uri_refs(
             answers,
@@ -439,7 +441,7 @@ pub fn execute_apply_pack_setup(
             &env,
             &config.tenant,
             config.team.as_deref(),
-            provider_id,
+            &provider_id,
         );
 
         let config_path = config_dir.join("setup-answers.json");
