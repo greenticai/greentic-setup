@@ -297,7 +297,11 @@ pub(crate) fn bootstrap_local_environment(i18n: &CliI18n) -> Result<()> {
     let root = LocalFsStore::default_root()
         .context("Cannot determine default environment store root (no home directory).")?;
     let store = LocalFsStore::new(root.clone());
-    let (_env, outcome) = ensure_local_environment(&store)
+    // greentic-setup never seeds a `public_base_url` at bootstrap time; the
+    // operator sets it later via `gtc op env init --public-url <URL>` or
+    // `gtc op env set-public-url`. Passing `None` preserves prior behavior on
+    // both first-run and idempotent re-runs.
+    let (_env, outcome) = ensure_local_environment(&store, None)
         .with_context(|| format!("Bootstrapping `local` environment at {}", root.display()))?;
     if outcome == LocalEnvOutcome::Created {
         println!(
