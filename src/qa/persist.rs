@@ -441,6 +441,11 @@ pub fn emit_pack_config_input(
         return Ok(None);
     }
 
+    // Apply the same visibility filter that `persist_qa_secrets` uses so
+    // that conditionally-invisible answers do not leak into the
+    // pack-config-input file (and from there into runtime config).
+    let visibility = resolve_visibility(form_spec, config, VisibilityMode::Visible);
+
     let secret_ids: std::collections::HashSet<&str> = form_spec
         .questions
         .iter()
@@ -448,9 +453,21 @@ pub fn emit_pack_config_input(
         .map(|q| q.id.as_str())
         .collect();
 
+    let visible_ids: std::collections::HashSet<&str> = form_spec
+        .questions
+        .iter()
+        .filter(|q| visibility.get(&q.id).copied().unwrap_or(true))
+        .map(|q| q.id.as_str())
+        .collect();
+
     let mut non_secret = BTreeMap::new();
     let mut secret_refs = BTreeMap::new();
     for (key, value) in config_map {
+        // Skip keys that are not visible according to the form spec's
+        // visibility rules (matches `persist_qa_secrets` behavior).
+        if !visible_ids.contains(key.as_str()) {
+            continue;
+        }
         let text = value_to_text(value);
         if text.is_empty() || text == "null" {
             continue;
@@ -507,6 +524,11 @@ fn validate_segment(label: &str, value: &str) -> Result<()> {
     if value.contains('/') {
         anyhow::bail!(
             "{label} `{value}` contains '/' which would corrupt the pack-config-input layout"
+        );
+    }
+    if value == "." || value == ".." {
+        anyhow::bail!(
+            "{label} `{value}` is a relative path component and would corrupt the pack-config-input layout"
         );
     }
     Ok(())
@@ -830,6 +852,52 @@ mod tests {
         assert!(
             emit_pack_config_input(root, "local", "b/c", "p", &cfg, &form).is_err(),
             "bundle_id with `/` rejected"
+        );
+        assert!(
+            emit_pack_config_input(root, "local", "b", "..", &cfg, &form).is_err(),
+            "pack_id `..` rejected"
+        );
+        assert!(
+            emit_pack_config_input(root, ".", "b", "p", &cfg, &form).is_err(),
+            "env_id `.` rejected"
+        );
+    }
+
+    /// Invisible questions (conditional `visible_if` that evaluates to false)
+    /// must not leak into the pack-config-input file.
+    #[test]
+    fn emit_pack_config_input_respects_visibility() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let form = make_form_spec(vec![question("mode", false), {
+            let mut q = question("advanced_url", false);
+            q.visible_if = Some(qa_spec::Expr::Eq {
+                left: Box::new(qa_spec::Expr::Answer {
+                    path: "mode".into(),
+                }),
+                right: Box::new(qa_spec::Expr::Literal {
+                    value: Value::String("advanced".into()),
+                }),
+            });
+            q
+        }]);
+        // mode=basic → advanced_url should be invisible
+        let config = json!({
+            "mode": "basic",
+            "advanced_url": "https://should-be-hidden.example.com",
+        });
+        let path = emit_pack_config_input(root, "local", "b", "p", &config, &form)
+            .expect("emit")
+            .expect("path");
+        let parsed: PackConfigInput =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            !parsed.non_secret.contains_key("advanced_url"),
+            "invisible question should not appear in non_secret: {parsed:?}"
+        );
+        assert_eq!(
+            parsed.non_secret.get("mode"),
+            Some(&Value::String("basic".into())),
         );
     }
 }

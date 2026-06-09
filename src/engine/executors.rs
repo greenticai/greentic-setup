@@ -548,6 +548,30 @@ pub fn execute_apply_pack_setup(
             );
         }
 
+        // C7: emit pack-config-input.v1 for the enabled-provider path as
+        // well. Same soft-fail posture as the disabled-provider branch above.
+        if let Some(pack_path) = pack_path
+            && let Some(form_spec) =
+                crate::setup_to_formspec::pack_to_form_spec(pack_path, &provider_id)
+        {
+            let bundle_id = crate::qa::persist::infer_bundle_id(bundle_path);
+            if let Err(err) = crate::qa::persist::emit_pack_config_input(
+                bundle_path,
+                &env,
+                &bundle_id,
+                &provider_id,
+                &persisted_answers,
+                &form_spec,
+            ) {
+                tracing::warn!(
+                    provider_id = %provider_id,
+                    env = %env,
+                    error = %err,
+                    "pack-config-input emission failed (apply-answers path); runtime falls back to DevStore via C4.2 compat shim",
+                );
+            }
+        }
+
         // Sync OAuth answers to tenant config JSON for webchat-gui providers
         match crate::tenant_config::sync_oauth_to_tenant_config(
             bundle_path,
