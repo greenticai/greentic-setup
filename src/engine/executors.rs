@@ -165,6 +165,39 @@ fn answers_have_content(answers: &Value) -> bool {
     })
 }
 
+/// C7: attempt to emit a `pack-config-input.v1` file for one provider.
+/// Soft-fails on error — the C4.2 compat shim still serves these keys from
+/// DevStore.
+fn try_emit_pack_config_input(
+    bundle_path: &Path,
+    pack_path: &Path,
+    env: &str,
+    provider_id: &str,
+    answers: &Value,
+    trace_context: &str,
+) {
+    let Some(form_spec) = crate::setup_to_formspec::pack_to_form_spec(pack_path, provider_id)
+    else {
+        return;
+    };
+    let bundle_id = crate::qa::persist::infer_bundle_id(bundle_path);
+    if let Err(err) = crate::qa::persist::emit_pack_config_input(
+        bundle_path,
+        env,
+        &bundle_id,
+        provider_id,
+        answers,
+        &form_spec,
+    ) {
+        tracing::warn!(
+            provider_id = %provider_id,
+            env = %env,
+            error = %err,
+            "pack-config-input emission failed ({trace_context}); runtime falls back to DevStore via C4.2 compat shim",
+        );
+    }
+}
+
 /// Execute the CreateBundle step.
 pub fn execute_create_bundle(
     bundle_path: &Path,
@@ -371,30 +404,14 @@ pub fn execute_apply_pack_setup(
                         pack_path.display()
                     )
                 })?;
-                // C7: also emit a pack-config-input.v1 file the deployer picks
-                // up at revision-create to populate the pack-config.v1.non_secret
-                // channel. Soft-fail because the C4.2 compat shim still serves
-                // these keys from DevStore (written just above).
-                if let Some(form_spec) =
-                    crate::setup_to_formspec::pack_to_form_spec(pack_path, &provider_id)
-                {
-                    let bundle_id = crate::qa::persist::infer_bundle_id(bundle_path);
-                    if let Err(err) = crate::qa::persist::emit_pack_config_input(
-                        bundle_path,
-                        &env,
-                        &bundle_id,
-                        &provider_id,
-                        &persisted_answers,
-                        &form_spec,
-                    ) {
-                        tracing::warn!(
-                            provider_id = %provider_id,
-                            env = %env,
-                            error = %err,
-                            "pack-config-input emission failed (setup-input path); runtime falls back to DevStore via C4.2 compat shim",
-                        );
-                    }
-                }
+                try_emit_pack_config_input(
+                    bundle_path,
+                    pack_path,
+                    &env,
+                    &provider_id,
+                    &persisted_answers,
+                    "setup-input path",
+                );
             }
             count += 1;
             continue;
@@ -550,26 +567,15 @@ pub fn execute_apply_pack_setup(
 
         // C7: emit pack-config-input.v1 for the enabled-provider path as
         // well. Same soft-fail posture as the disabled-provider branch above.
-        if let Some(pack_path) = pack_path
-            && let Some(form_spec) =
-                crate::setup_to_formspec::pack_to_form_spec(pack_path, &provider_id)
-        {
-            let bundle_id = crate::qa::persist::infer_bundle_id(bundle_path);
-            if let Err(err) = crate::qa::persist::emit_pack_config_input(
+        if let Some(pack_path) = pack_path {
+            try_emit_pack_config_input(
                 bundle_path,
+                pack_path,
                 &env,
-                &bundle_id,
                 &provider_id,
                 &persisted_answers,
-                &form_spec,
-            ) {
-                tracing::warn!(
-                    provider_id = %provider_id,
-                    env = %env,
-                    error = %err,
-                    "pack-config-input emission failed (apply-answers path); runtime falls back to DevStore via C4.2 compat shim",
-                );
-            }
+                "apply-answers path",
+            );
         }
 
         // Sync OAuth answers to tenant config JSON for webchat-gui providers

@@ -284,15 +284,10 @@ pub async fn persist_qa_results(
     Ok(keys)
 }
 
-/// Derive a stable `bundle_id` from the bundle root path. Mirrors
-/// `crate::bundle::infer_bundle_id` (which is private). Used by callers that
-/// don't have an explicit `bundle_id` field in their context.
+/// Re-export of [`crate::bundle::infer_bundle_id`] for callers that don't
+/// have an explicit `bundle_id` field in their context.
 pub(crate) fn infer_bundle_id(root: &Path) -> String {
-    root.file_name()
-        .and_then(|value| value.to_str())
-        .map(ToOwned::to_owned)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "bundle".to_string())
+    crate::bundle::infer_bundle_id(root)
 }
 
 /// OAuth authorization stub.
