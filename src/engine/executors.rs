@@ -371,6 +371,30 @@ pub fn execute_apply_pack_setup(
                         pack_path.display()
                     )
                 })?;
+                // C7: also emit a pack-config-input.v1 file the deployer picks
+                // up at revision-create to populate the pack-config.v1.non_secret
+                // channel. Soft-fail because the C4.2 compat shim still serves
+                // these keys from DevStore (written just above).
+                if let Some(form_spec) =
+                    crate::setup_to_formspec::pack_to_form_spec(pack_path, &provider_id)
+                {
+                    let bundle_id = crate::qa::persist::infer_bundle_id(bundle_path);
+                    if let Err(err) = crate::qa::persist::emit_pack_config_input(
+                        bundle_path,
+                        &env,
+                        &bundle_id,
+                        &provider_id,
+                        &persisted_answers,
+                        &form_spec,
+                    ) {
+                        tracing::warn!(
+                            provider_id = %provider_id,
+                            env = %env,
+                            error = %err,
+                            "pack-config-input emission failed (setup-input path); runtime falls back to DevStore via C4.2 compat shim",
+                        );
+                    }
+                }
             }
             count += 1;
             continue;
