@@ -18,6 +18,7 @@ pub mod deployment_targets;
 pub mod discovery;
 pub mod doctor;
 pub mod engine;
+pub mod env_mode;
 pub mod flow;
 pub mod gtbundle;
 pub mod no_ui_oauth;
