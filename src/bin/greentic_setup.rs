@@ -7,6 +7,7 @@
 //! greentic-setup --dry-run ./my-bundle                    # Preview wizard
 //! greentic-setup --dry-run --emit-answers a.json ./my-bundle  # Generate template
 //! greentic-setup --answers a.json ./my-bundle.gtbundle    # Apply answers
+//! greentic-setup --answers local.env.json                 # Apply an env manifest
 //! ```
 //!
 //! ## Advanced Usage (bundle subcommands)
@@ -21,7 +22,6 @@
 //! - `bundle status` - Show bundle status
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use std::fs;
 use std::io::{self, Write};
 use std::thread;
@@ -59,10 +59,61 @@ fn init_i18n(locale: Option<&str>) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse through ArgMatches (not `Cli::parse()`) so the env wizard can
+    // tell an explicit `--env <id>` from the clap default `local` — the
+    // wizard must only trigger on what the user actually said.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    let env_explicit = matches.value_source("env") == Some(clap::parser::ValueSource::CommandLine);
 
     init_i18n(cli.locale.as_deref());
     let i18n = get_i18n();
+
+    // A `greentic.env-manifest.v1` answers document routes to the
+    // deployer's env-apply engine — library call, no web UI, bundle
+    // onboarding untouched. The sniff is positive-identification only:
+    // unreadable or unrecognized answers fall through to the existing
+    // paths and their established errors.
+    if cli.command.is_none()
+        && let Some(answers_path) = &cli.answers
+        && let Some(manifest) = greentic_setup::env_mode::sniff_env_manifest(answers_path)
+    {
+        if cli.bundle.is_some() {
+            bail!(
+                "--answers {} is an environment manifest; it configures an environment, \
+                 not a bundle — drop the bundle path",
+                answers_path.display()
+            );
+        }
+        let env = greentic_setup::resolve_env(Some(&cli.env));
+        return greentic_setup::env_mode::run_env_apply(
+            answers_path,
+            &manifest,
+            &env,
+            cli.dry_run,
+            cli.non_interactive,
+        );
+    }
+
+    // Bare explicit `--env <id>` (no subcommand, no bundle, no --answers,
+    // no --emit-answers): the environment wizard — author or gap-fill
+    // `./<id>.env.json` interactively, then hand off to the env-apply
+    // engine. Never starts the web UI.
+    if cli.command.is_none()
+        && cli.bundle.is_none()
+        && cli.answers.is_none()
+        && cli.emit_answers.is_none()
+        && env_explicit
+    {
+        let env = greentic_setup::resolve_env(Some(&cli.env));
+        return greentic_setup::env_wizard::run_env_wizard(
+            &env,
+            cli.advanced,
+            cli.dry_run,
+            cli.non_interactive,
+        );
+    }
 
     // Launch web UI by default unless --no-ui is set.
     #[cfg(feature = "ui")]
@@ -124,6 +175,11 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             cli.advanced,
         )
     };
+
+    // A10 follow-up: canonicalize env through `resolve_env` so the A4b
+    // `dev` → `local` compat alias fires on the primary binary entry
+    // (the subcommand path was already fixed by greentic-setup#114).
+    env = greentic_setup::resolve_env(Some(&env));
 
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
 
@@ -631,7 +687,7 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         let loader_engine = SetupEngine::new(SetupConfig {
             tenant: cli.tenant.clone(),
             team: cli.team.clone(),
-            env: cli.env.clone(),
+            env: greentic_setup::resolve_env(Some(&cli.env)),
             offline: false,
             verbose: false,
         });
@@ -659,7 +715,9 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         answers_tenant.is_some() || answers_team.is_some() || answers_env.is_some();
     let tenant = answers_tenant.unwrap_or_else(|| cli.tenant.clone());
     let team = answers_team.or_else(|| cli.team.clone());
-    let env = answers_env.unwrap_or_else(|| cli.env.clone());
+    // A10 follow-up: canonicalize the resolved env (whether from answers
+    // metadata or CLI) so the A4b `dev` → `local` compat alias fires.
+    let env = greentic_setup::resolve_env(Some(&answers_env.unwrap_or_else(|| cli.env.clone())));
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(greentic_setup::ui::launch(

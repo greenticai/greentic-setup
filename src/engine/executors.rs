@@ -25,6 +25,179 @@ pub struct ApplyPackSetupReport {
     pub pending_setup_actions: Vec<crate::setup_actions::SetupAction>,
 }
 
+/// Resolve the canonical set of secret-marked answer keys for a pack (B12a).
+///
+/// The source of truth is `pack_to_form_spec()`, which unions:
+/// - `setup.yaml` / `qa/*.json` questions with `secret: true`, and
+/// - entries from `assets/secret-requirements.json` / CBOR manifest.
+///
+/// Each key is normalized via `canonical_secret_name` so the redaction
+/// match logic below can mirror `seed_secret_requirement_aliases`'s
+/// suffix-matching (so `bot_token` answers satisfy a `webex_bot_token`
+/// requirement).
+///
+/// Returns `None` when the pack carries no setup metadata at all — the
+/// caller should then refuse to write the transitional artifacts for
+/// non-empty answers (B12a fail-closed contract).
+fn resolve_secret_answer_keys(pack_path: &Path, provider_id: &str) -> Option<BTreeSet<String>> {
+    let form = crate::setup_to_formspec::pack_to_form_spec(pack_path, provider_id)?;
+    let secret_ids = form
+        .questions
+        .iter()
+        .filter(|q| q.secret)
+        .map(|q| crate::secret_name::canonical_secret_name(&q.id))
+        .collect::<BTreeSet<String>>();
+    Some(secret_ids)
+}
+
+/// Match an answer key (post-normalization) against the secret-marked set.
+///
+/// This MUST mirror `qa::persist::seed_secret_requirement_aliases` exactly
+/// (`canonical_req_key.ends_with(&norm_cfg)`), so that the set of answers
+/// redacted from disk is identical to the set persisted to the dev secrets
+/// store as secrets. If redaction were narrower than seeding, a key the
+/// persist path treats as a secret would stay as plaintext on disk — a leak.
+///
+/// Match when the answer key's canonical form equals a secret key, or a
+/// secret key ends with it (forward direction only — so requirement
+/// `webex_bot_token` is satisfied by answer `bot_token`). The earlier
+/// version ALSO matched the reverse direction (`norm.ends_with(secret)`),
+/// which the persist path does not do; that over-matched (answer `bot_token`
+/// wrongly redacted for an unrelated secret `token`) and is dropped here.
+fn is_secret_answer_key(answer_key: &str, secret_keys: &BTreeSet<String>) -> bool {
+    let norm = crate::secret_name::canonical_secret_name(answer_key);
+    secret_keys
+        .iter()
+        .any(|secret| secret == &norm || secret.ends_with(&norm))
+}
+
+/// Drop secret-marked answer values entirely (B12a). Used for the on-disk
+/// `setup-answers.json` — its downstream readers in `greentic-start`
+/// (`messaging_app::inject_pack_setup_answers`,
+/// `ingress_dispatch::build_injected_config`) already source secret values
+/// from `SecretsManager`, so the key has no value to contribute. Dropping
+/// the key avoids putting any reference (URI or otherwise) into a JSON
+/// value slot consumers may treat as the raw credential.
+fn strip_secret_answer_keys(answers: &Value, secret_keys: &BTreeSet<String>) -> Value {
+    let Some(map) = answers.as_object() else {
+        return answers.clone();
+    };
+    let mut filtered = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        if is_secret_answer_key(key, secret_keys) {
+            continue;
+        }
+        filtered.insert(key.clone(), value.clone());
+    }
+    Value::Object(filtered)
+}
+
+/// Replace secret-marked answer values with canonical `secrets://` URI
+/// references for the `config.envelope.cbor` artifact. Components that
+/// already consume the envelope's config via the URI-resolving pattern
+/// (e.g. greentic-start `notifier/config.rs` for state-redis) keep working
+/// unchanged; components that read the `<key>_b64` injection see the
+/// resolved plaintext from `SecretsManager` via `runner_host.get_secret`.
+fn redact_secret_answer_values_to_uri_refs(
+    answers: &Value,
+    secret_keys: &BTreeSet<String>,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+) -> Value {
+    let Some(map) = answers.as_object() else {
+        return answers.clone();
+    };
+    let mut filtered = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        if is_secret_answer_key(key, secret_keys) {
+            let uri = crate::canonical_secret_uri(env, tenant, team, provider_id, key);
+            filtered.insert(key.clone(), Value::String(uri));
+        } else {
+            filtered.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(filtered)
+}
+
+/// Decide the secret-key set for redaction, applying the B12a fail-closed
+/// contract.
+///
+/// `resolved` carries a load-bearing `Option`:
+///   - `Some(set)` — the pack HAS classifiable metadata. An empty set means
+///     the pack legitimately declares zero secrets; proceed (write every
+///     answer as non-secret). This is NOT a failure.
+///   - `None` — no pack / no classifiable metadata at all. With non-empty
+///     answers we cannot tell which are secret, so fail closed rather than
+///     risk writing plaintext. With empty answers there's nothing to leak,
+///     so proceed with an empty set.
+fn secret_keys_or_fail_closed(
+    resolved: Option<BTreeSet<String>>,
+    answers: &Value,
+    provider_id: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    match resolved {
+        Some(set) => Ok(set),
+        None if answers_have_content(answers) => anyhow::bail!(
+            "B12a: refusing to write setup-answers for `{provider_id}` — the pack ships no \
+             classifiable setup metadata (no setup.yaml / qa/*.json / secret-requirements), so \
+             we can't tell which answers are secrets and won't risk writing plaintext. \
+             Install/repair the pack with a setup.yaml (`secret: true` flags) or an \
+             `assets/secret-requirements.json`, or pass an explicit pack ref, then retry.",
+        ),
+        None => Ok(BTreeSet::new()),
+    }
+}
+
+/// Return true if `answers` is a JSON object with at least one non-null
+/// string-typed field — i.e. material that could plausibly be a secret.
+/// Used to decide whether the B12a fail-closed contract applies when the
+/// redaction metadata can't be resolved.
+fn answers_have_content(answers: &Value) -> bool {
+    let Some(map) = answers.as_object() else {
+        return false;
+    };
+    map.values().any(|v| match v {
+        Value::String(s) => !s.is_empty(),
+        Value::Null => false,
+        _ => true,
+    })
+}
+
+/// C7: attempt to emit a `pack-config-input.v1` file for one provider.
+/// Soft-fails on error — the C4.2 compat shim still serves these keys from
+/// DevStore.
+fn try_emit_pack_config_input(
+    bundle_path: &Path,
+    pack_path: &Path,
+    env: &str,
+    provider_id: &str,
+    answers: &Value,
+    trace_context: &str,
+) {
+    let Some(form_spec) = crate::setup_to_formspec::pack_to_form_spec(pack_path, provider_id)
+    else {
+        return;
+    };
+    let bundle_id = crate::qa::persist::infer_bundle_id(bundle_path);
+    if let Err(err) = crate::qa::persist::emit_pack_config_input(
+        bundle_path,
+        env,
+        &bundle_id,
+        provider_id,
+        answers,
+        &form_spec,
+    ) {
+        tracing::warn!(
+            provider_id = %provider_id,
+            env = %env,
+            error = %err,
+            "pack-config-input emission failed ({trace_context}); runtime falls back to DevStore via C4.2 compat shim",
+        );
+    }
+}
+
 /// Execute the CreateBundle step.
 pub fn execute_create_bundle(
     bundle_path: &Path,
@@ -231,6 +404,14 @@ pub fn execute_apply_pack_setup(
                         pack_path.display()
                     )
                 })?;
+                try_emit_pack_config_input(
+                    bundle_path,
+                    pack_path,
+                    &env,
+                    &provider_id,
+                    &persisted_answers,
+                    "setup-input path",
+                );
             }
             count += 1;
             continue;
@@ -270,8 +451,42 @@ pub fn execute_apply_pack_setup(
         let config_dir = bundle_path.join("state").join("config").join(&provider_id);
         std::fs::create_dir_all(&config_dir)?;
 
+        // Resolve the pack path early so we can both discover secret-marked
+        // keys (to redact plaintext from the on-disk artifacts — B12a) and
+        // pass it to the envelope writer + secrets-persist path.
+        let pack_path = discovered.as_ref().and_then(|d| {
+            d.find_setup_target(&provider_id)
+                .map(|p| p.pack_path.as_path())
+        });
+        let env = crate::resolve_env(Some(&config.env));
+
+        // B12a fail-closed contract: resolve the secret-marked answer key
+        // set from the pack's `pack_to_form_spec` (the union of setup.yaml /
+        // qa/*.json `secret: true` questions and `secret-requirements.json`
+        // entries). The `Option` is load-bearing:
+        //   - `Some(set)` — the pack HAS a form spec. An empty set means the
+        //     pack legitimately declares zero secrets (e.g. only model/url
+        //     config); we proceed and write every answer as non-secret.
+        //   - `None` — the pack ships NO classifiable metadata at all (no
+        //     setup.yaml, no qa/*.json, no secret-requirements). We cannot
+        //     tell which answers are secret, so with non-empty answers we
+        //     fail closed rather than silently writing plaintext.
+        // A missing pack path is the same "can't classify" situation.
+        let resolved_secret_keys: Option<BTreeSet<String>> =
+            pack_path.and_then(|pp| resolve_secret_answer_keys(pp, &provider_id));
+        let secret_keys = secret_keys_or_fail_closed(resolved_secret_keys, answers, &provider_id)?;
+        let answers_for_disk = strip_secret_answer_keys(answers, &secret_keys);
+        let envelope_answers = redact_secret_answer_values_to_uri_refs(
+            answers,
+            &secret_keys,
+            &env,
+            &config.tenant,
+            config.team.as_deref(),
+            &provider_id,
+        );
+
         let config_path = config_dir.join("setup-answers.json");
-        let content = serde_json::to_string_pretty(&persisted_answers)
+        let content = serde_json::to_string_pretty(&answers_for_disk)
             .context("failed to serialize setup answers")?;
         std::fs::write(&config_path, content).with_context(|| {
             format!(
@@ -280,9 +495,6 @@ pub fn execute_apply_pack_setup(
             )
         })?;
 
-        // Persist all answer values to the dev secrets store so that
-        // WASM components can read them via the secrets API at runtime.
-        let env = crate::resolve_env(Some(&config.env));
         if config.verbose {
             let team_display = config.team.as_deref().unwrap_or("(none)");
             println!(
@@ -328,13 +540,15 @@ pub fn execute_apply_pack_setup(
         }
 
         // Materialize a provider config envelope so runtime/provider ingest
-        // paths can read setup-applied config, not just raw setup answers.
+        // paths can read setup-applied config. After B12a the envelope carries
+        // `secrets://` URI references for secret-marked keys (matching the
+        // canonical URIs in the dev secrets store) instead of plaintext.
         if let Some(pack_path) = pack_path {
             crate::config_envelope::write_provider_config_envelope(
                 &bundle_path.join(".providers"),
                 &provider_id,
                 "setup-input",
-                &persisted_answers,
+                &envelope_answers,
                 pack_path,
                 false,
             )
@@ -348,6 +562,19 @@ pub fn execute_apply_pack_setup(
         } else if config.verbose {
             println!(
                 "  [config] WARNING: no resolved pack path for {provider_id}; skipped config envelope write"
+            );
+        }
+
+        // C7: emit pack-config-input.v1 for the enabled-provider path as
+        // well. Same soft-fail posture as the disabled-provider branch above.
+        if let Some(pack_path) = pack_path {
+            try_emit_pack_config_input(
+                bundle_path,
+                pack_path,
+                &env,
+                &provider_id,
+                &persisted_answers,
+                "apply-answers path",
             );
         }
 
@@ -1542,5 +1769,199 @@ mod tests {
             !canonical_pack.exists(),
             "must not auto-install canonical-named duplicate when pack_id already present"
         );
+    }
+
+    fn secret_keys_for(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter()
+            .map(|k| crate::secret_name::canonical_secret_name(k))
+            .collect()
+    }
+
+    #[test]
+    fn envelope_redaction_replaces_secret_values_with_canonical_uri_refs() {
+        let secret_keys = secret_keys_for(&["api_key", "oauth_client_secret"]);
+
+        let answers = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "api_key": "sk-PLAINTEXT-MUST-NOT-LEAK",
+            "oauth_client_secret": "PLAINTEXT-OAUTH-SECRET",
+            "non_secret_url": "https://api.openai.com/v1"
+        });
+
+        let redacted = redact_secret_answer_values_to_uri_refs(
+            &answers,
+            &secret_keys,
+            "dev",
+            "demo",
+            Some("default"),
+            "openai-llm",
+        );
+
+        let map = redacted.as_object().expect("object");
+        assert_eq!(map["model"].as_str(), Some("gpt-4o-mini"));
+        assert_eq!(
+            map["non_secret_url"].as_str(),
+            Some("https://api.openai.com/v1")
+        );
+        // `canonical_secret_uri` collapses the literal "default" team into
+        // the wildcard segment `_` (see `canonical_team` in lib.rs).
+        assert_eq!(
+            map["api_key"].as_str(),
+            Some("secrets://dev/demo/_/openai-llm/api_key"),
+            "secret value must be replaced with canonical secrets:// URI",
+        );
+        assert_eq!(
+            map["oauth_client_secret"].as_str(),
+            Some("secrets://dev/demo/_/openai-llm/oauth_client_secret"),
+        );
+
+        let json = serde_json::to_string(&redacted).expect("serialize");
+        assert!(
+            !json.contains("PLAINTEXT-MUST-NOT-LEAK"),
+            "api_key plaintext leaked into envelope JSON: {json}",
+        );
+        assert!(
+            !json.contains("PLAINTEXT-OAUTH-SECRET"),
+            "oauth_client_secret plaintext leaked into envelope JSON: {json}",
+        );
+    }
+
+    #[test]
+    fn setup_answers_redaction_drops_secret_keys_entirely() {
+        // setup-answers.json's downstream readers in greentic-start skip
+        // secret-marked keys (PR #179) and fetch from `SecretsManager`
+        // instead, so the producer drops them from this artifact — no
+        // value or URI ref appears in the JSON value slot.
+        let secret_keys = secret_keys_for(&["api_key"]);
+        let answers = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "api_key": "sk-PLAINTEXT-MUST-NOT-LEAK"
+        });
+
+        let stripped = strip_secret_answer_keys(&answers, &secret_keys);
+        let map = stripped.as_object().expect("object");
+        assert_eq!(map["model"].as_str(), Some("gpt-4o-mini"));
+        assert!(
+            !map.contains_key("api_key"),
+            "secret key must be removed entirely from setup-answers",
+        );
+        let json = serde_json::to_string(&stripped).expect("serialize");
+        assert!(
+            !json.contains("PLAINTEXT-MUST-NOT-LEAK"),
+            "plaintext leaked into setup-answers: {json}",
+        );
+        assert!(
+            !json.contains("secrets://"),
+            "setup-answers must not carry URI refs either — readers fetch via SecretsManager",
+        );
+    }
+
+    #[test]
+    fn is_secret_answer_key_matches_aliases_via_canonical_suffix() {
+        // Mirrors `qa::persist::seed_secret_requirement_aliases` (Codex
+        // F3): a `webex_bot_token` requirement is satisfied by an answer
+        // key `bot_token`, so redaction must match it too (forward direction:
+        // secret key ends with answer key).
+        let secret_keys = secret_keys_for(&["webex_bot_token"]);
+        assert!(is_secret_answer_key("bot_token", &secret_keys));
+        assert!(is_secret_answer_key("BOT_TOKEN", &secret_keys));
+        assert!(is_secret_answer_key("webex_bot_token", &secret_keys));
+        // Non-aliases must not match.
+        assert!(!is_secret_answer_key("model", &secret_keys));
+        assert!(!is_secret_answer_key("bot_url", &secret_keys));
+    }
+
+    #[test]
+    fn is_secret_answer_key_does_not_over_match_reverse_direction() {
+        // xhigh review C4: the previous symmetric `norm.ends_with(secret)`
+        // direction over-matched. A pack whose ONLY secret is the short key
+        // `token` must NOT cause an unrelated longer answer `bot_token` to be
+        // redacted — `seed_secret_requirement_aliases` would not seed it
+        // either (it matches `requirement.ends_with(answer)`, not the
+        // reverse), so redaction must stay consistent and leave it alone.
+        let secret_keys = secret_keys_for(&["token"]);
+        assert!(is_secret_answer_key("token", &secret_keys));
+        assert!(
+            !is_secret_answer_key("bot_token", &secret_keys),
+            "answer key longer than the secret key must not match (reverse direction removed)",
+        );
+        assert!(!is_secret_answer_key("refresh_token", &secret_keys));
+    }
+
+    #[test]
+    fn is_secret_answer_key_punctuation_only_key_does_not_match_unrelated_secret() {
+        // `canonical_secret_name` maps empty/punctuation-only keys to the
+        // sentinel "secret"; it must not collide with an unrelated secret
+        // key like `api_key`.
+        let secret_keys = secret_keys_for(&["api_key"]);
+        assert!(!is_secret_answer_key("", &secret_keys));
+        assert!(!is_secret_answer_key("---", &secret_keys));
+    }
+
+    #[test]
+    fn alias_answer_key_redacted_in_setup_answers_and_envelope() {
+        // End-to-end check for Codex F3: requirement `webex_bot_token`,
+        // operator-supplied key `bot_token`.
+        let secret_keys = secret_keys_for(&["webex_bot_token"]);
+        let answers = serde_json::json!({"bot_token": "T0K3N-MUST-NOT-LEAK"});
+
+        let stripped = strip_secret_answer_keys(&answers, &secret_keys);
+        assert!(
+            stripped.as_object().unwrap().is_empty(),
+            "alias-matched secret key must be dropped from setup-answers",
+        );
+
+        let envelope = redact_secret_answer_values_to_uri_refs(
+            &answers,
+            &secret_keys,
+            "dev",
+            "demo",
+            None,
+            "messaging-webex",
+        );
+        assert_eq!(
+            envelope["bot_token"].as_str(),
+            Some("secrets://dev/demo/_/messaging-webex/bot_token"),
+        );
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(!json.contains("T0K3N-MUST-NOT-LEAK"));
+    }
+
+    #[test]
+    fn secret_keys_fail_closed_distinguishes_none_from_empty_set() {
+        let content = serde_json::json!({"model": "gpt-4o"});
+        let empty = serde_json::json!({});
+
+        // xhigh review C3: a pack WITH a form spec that declares zero secrets
+        // resolves to Some(empty) and MUST proceed (write all answers as
+        // non-secret) — not bail.
+        let r = secret_keys_or_fail_closed(Some(BTreeSet::new()), &content, "p").unwrap();
+        assert!(r.is_empty(), "Some(empty) proceeds with no redaction");
+
+        // Some(nonempty) passes the set through.
+        let set = secret_keys_for(&["api_key"]);
+        let r = secret_keys_or_fail_closed(Some(set.clone()), &content, "p").unwrap();
+        assert_eq!(r, set);
+
+        // None + content => fail closed (can't classify, won't risk plaintext).
+        assert!(secret_keys_or_fail_closed(None, &content, "p").is_err());
+
+        // None + empty answers => nothing to leak, proceed.
+        assert!(
+            secret_keys_or_fail_closed(None, &empty, "p")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn answers_have_content_distinguishes_empty_from_meaningful() {
+        assert!(!answers_have_content(&serde_json::json!({})));
+        assert!(!answers_have_content(&serde_json::json!({"a": null})));
+        assert!(!answers_have_content(&serde_json::json!({"a": ""})));
+        assert!(answers_have_content(&serde_json::json!({"a": "value"})));
+        assert!(answers_have_content(&serde_json::json!({"a": 42})));
+        assert!(answers_have_content(&serde_json::json!({"a": true})));
+        assert!(answers_have_content(&serde_json::json!({"a": ["x"]})));
     }
 }

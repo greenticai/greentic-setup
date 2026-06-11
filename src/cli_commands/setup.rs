@@ -5,6 +5,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use greentic_deployer::cli::bootstrap::{LocalEnvOutcome, ensure_local_environment};
+use greentic_deployer::environment::LocalFsStore;
 
 use crate::cli_args::*;
 use crate::cli_helpers::{
@@ -16,7 +18,7 @@ use crate::cli_i18n::CliI18n;
 use crate::engine::{LoadedAnswers, SetupConfig, SetupRequest};
 use crate::plan::TenantSelection;
 use crate::platform_setup::StaticRoutesPolicy;
-use crate::{SetupEngine, SetupMode, bundle};
+use crate::{SetupEngine, SetupMode, bundle, resolve_env};
 
 /// Run the setup command.
 pub fn setup(args: BundleSetupArgs, i18n: &CliI18n) -> Result<()> {
@@ -50,7 +52,14 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         best_effort,
     } = args;
 
+    // A10: thread the env_id through the wizard surface as the canonical
+    // env id. resolve_env applies the A4b `dev` → `local` compat alias so
+    // a user passing `--env dev` doesn't slip past as a raw legacy string.
+    let cli_env = resolve_env(Some(&cli_env));
+
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
+
+    bootstrap_local_environment(i18n)?;
 
     let provider_display = provider_id.clone().unwrap_or_else(|| "all".to_string());
 
@@ -279,6 +288,34 @@ fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
     }
 }
 
+/// Idempotently auto-create the `local` Environment on first `gtc setup`.
+///
+/// Per A4 of `plans/next-gen-deployment.md`: every `gtc setup` (and update)
+/// invocation guarantees a `local` Environment exists with the five default
+/// capability-slot bindings (deployer/secrets/telemetry/sessions/state).
+/// Subsequent calls find the env on disk and stay silent.
+pub(crate) fn bootstrap_local_environment(i18n: &CliI18n) -> Result<()> {
+    let root = LocalFsStore::default_root()
+        .context("Cannot determine default environment store root (no home directory).")?;
+    let store = LocalFsStore::new(root.clone());
+    // greentic-setup never seeds a `public_base_url` at bootstrap time; the
+    // operator sets it later via `gtc op env init --public-url <URL>` or
+    // `gtc op env set-public-url`. Passing `None` preserves prior behavior on
+    // both first-run and idempotent re-runs.
+    let (_env, outcome) = ensure_local_environment(&store, None)
+        .with_context(|| format!("Bootstrapping `local` environment at {}", root.display()))?;
+    if outcome == LocalEnvOutcome::Created {
+        println!(
+            "{}",
+            i18n.tf(
+                "cli.bundle.setup.env_bootstrap_created",
+                &[&root.display().to_string()]
+            )
+        );
+    }
+    Ok(())
+}
+
 fn wait_for_pending_oauth_callbacks(
     server: Option<crate::no_ui_oauth::NoUiOAuthCallbackServer>,
     actions: &[crate::setup_actions::SetupAction],
@@ -368,4 +405,65 @@ fn execute_pending_oauth_device_actions(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `HOME` is process-global; serialize tests that mutate it.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_home<R>(tmp: &std::path::Path, body: impl FnOnce() -> R) -> R {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        // SAFETY: serialized by HOME_LOCK; tests are single-threaded inside the
+        // critical section. unsafe is required because set_var/remove_var are
+        // marked unsafe in Rust 2024 edition.
+        unsafe {
+            std::env::set_var("HOME", tmp);
+        }
+        let out = body();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bootstrap_creates_local_env_under_default_root() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let i18n = CliI18n::from_request(Some("en")).expect("i18n");
+        with_home(tmp.path(), || {
+            bootstrap_local_environment(&i18n).expect("first bootstrap");
+        });
+        let env_file = tmp
+            .path()
+            .join(".greentic")
+            .join("environments")
+            .join("local")
+            .join("environment.json");
+        assert!(env_file.exists(), "expected env file at {env_file:?}");
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent_across_calls() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let i18n = CliI18n::from_request(Some("en")).expect("i18n");
+        with_home(tmp.path(), || {
+            bootstrap_local_environment(&i18n).expect("first bootstrap");
+            bootstrap_local_environment(&i18n).expect("second bootstrap");
+        });
+        let env_file = tmp
+            .path()
+            .join(".greentic")
+            .join("environments")
+            .join("local")
+            .join("environment.json");
+        assert!(env_file.exists());
+    }
 }
