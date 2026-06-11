@@ -394,6 +394,7 @@ pub fn apply_remove(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             static_routes: request.static_routes.clone(),
             deployment_targets: request.deployment_targets.clone(),
             tunnel: request.tunnel.clone(),
+            telemetry: request.telemetry.clone(),
             setup_answers: request.setup_answers.clone(),
         },
     })
@@ -501,6 +502,7 @@ pub fn build_metadata(
         static_routes: request.static_routes.clone(),
         deployment_targets: request.deployment_targets.clone(),
         tunnel: request.tunnel.clone(),
+        telemetry: request.telemetry.clone(),
         setup_answers: request.setup_answers.clone(),
     }
 }

@@ -7,7 +7,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::deployment_targets::DeploymentTargetRecord;
-use crate::platform_setup::{StaticRoutesPolicy, TunnelAnswers};
+use crate::platform_setup::{StaticRoutesPolicy, TelemetryAnswers, TunnelAnswers};
 
 /// The operation mode for a setup plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,8 @@ pub struct SetupPlanMetadata {
     pub static_routes: StaticRoutesPolicy,
     pub deployment_targets: Vec<DeploymentTargetRecord>,
     pub tunnel: Option<TunnelAnswers>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryAnswers>,
     pub setup_answers: serde_json::Map<String, serde_json::Value>,
 }
 
