@@ -62,7 +62,8 @@ pub fn run_env_wizard(
     };
     let manifest = answers_to_manifest(&answer_set)?;
 
-    let mut rendered = serde_json::to_string_pretty(&manifest)?;
+    let doc = serde_json::to_value(&manifest)?;
+    let mut rendered = serde_json::to_string_pretty(&doc)?;
     rendered.push('\n');
     std::fs::write(&manifest_path, rendered)
         .with_context(|| format!("failed to write `{}`", manifest_path.display()))?;
@@ -71,7 +72,6 @@ pub fn run_env_wizard(
         manifest_path.display()
     );
 
-    let doc = serde_json::to_value(&manifest)?;
     env_mode::run_env_apply(&manifest_path, &doc, env, dry_run, false)
 }
 
