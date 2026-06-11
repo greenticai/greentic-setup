@@ -22,7 +22,6 @@
 //! - `bundle status` - Show bundle status
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use std::fs;
 use std::io::{self, Write};
 use std::thread;
@@ -60,7 +59,13 @@ fn init_i18n(locale: Option<&str>) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse through ArgMatches (not `Cli::parse()`) so the env wizard can
+    // tell an explicit `--env <id>` from the clap default `local` — the
+    // wizard must only trigger on what the user actually said.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    let env_explicit = matches.value_source("env") == Some(clap::parser::ValueSource::CommandLine);
 
     init_i18n(cli.locale.as_deref());
     let i18n = get_i18n();
@@ -86,6 +91,25 @@ fn main() -> Result<()> {
             answers_path,
             &manifest,
             &env,
+            cli.dry_run,
+            cli.non_interactive,
+        );
+    }
+
+    // Bare explicit `--env <id>` (no subcommand, no bundle, no --answers,
+    // no --emit-answers): the environment wizard — author or gap-fill
+    // `./<id>.env.json` interactively, then hand off to the env-apply
+    // engine. Never starts the web UI.
+    if cli.command.is_none()
+        && cli.bundle.is_none()
+        && cli.answers.is_none()
+        && cli.emit_answers.is_none()
+        && env_explicit
+    {
+        let env = greentic_setup::resolve_env(Some(&cli.env));
+        return greentic_setup::env_wizard::run_env_wizard(
+            &env,
+            cli.advanced,
             cli.dry_run,
             cli.non_interactive,
         );
