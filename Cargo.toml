@@ -24,7 +24,7 @@ async-trait = "0.1"
 backhand = { version = "0.25", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-greentic-deployer = { version = ">=1.1.0-dev.27092623472, <1.2.0-0", default-features = false }
+greentic-deployer = { version = ">=1.1.0-dev.27335176109, <1.2.0-0", default-features = false }
 greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 greentic-runner-host = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false }
 greentic-secrets-lib = { version = ">=1.1.0-dev, <1.2.0-0", features = ["providers-dev"] }

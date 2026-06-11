@@ -7,6 +7,7 @@
 //! greentic-setup --dry-run ./my-bundle                    # Preview wizard
 //! greentic-setup --dry-run --emit-answers a.json ./my-bundle  # Generate template
 //! greentic-setup --answers a.json ./my-bundle.gtbundle    # Apply answers
+//! greentic-setup --answers local.env.json                 # Apply an env manifest
 //! ```
 //!
 //! ## Advanced Usage (bundle subcommands)
@@ -63,6 +64,32 @@ fn main() -> Result<()> {
 
     init_i18n(cli.locale.as_deref());
     let i18n = get_i18n();
+
+    // A `greentic.env-manifest.v1` answers document routes to the
+    // deployer's env-apply engine — library call, no web UI, bundle
+    // onboarding untouched. The sniff is positive-identification only:
+    // unreadable or unrecognized answers fall through to the existing
+    // paths and their established errors.
+    if cli.command.is_none()
+        && let Some(answers_path) = &cli.answers
+        && let Some(manifest) = greentic_setup::env_mode::sniff_env_manifest(answers_path)
+    {
+        if cli.bundle.is_some() {
+            bail!(
+                "--answers {} is an environment manifest; it configures an environment, \
+                 not a bundle — drop the bundle path",
+                answers_path.display()
+            );
+        }
+        let env = greentic_setup::resolve_env(Some(&cli.env));
+        return greentic_setup::env_mode::run_env_apply(
+            answers_path,
+            &manifest,
+            &env,
+            cli.dry_run,
+            cli.non_interactive,
+        );
+    }
 
     // Launch web UI by default unless --no-ui is set.
     #[cfg(feature = "ui")]
