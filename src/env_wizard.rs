@@ -127,7 +127,11 @@ fn load_initial_answers(path: &Path, env: &str) -> Result<JsonMap<String, Value>
         path.display()
     );
     let answers = manifest_to_answers(&manifest)?;
-    Ok(answers.answers.as_object().cloned().unwrap_or_default())
+    Ok(answers
+        .answers
+        .as_object()
+        .cloned()
+        .expect("manifest_to_answers always produces an Object"))
 }
 
 /// Inverse of the deployer's `answers_to_manifest` — manifest → wizard
@@ -152,10 +156,10 @@ pub fn manifest_to_answers(manifest: &EnvManifest) -> Result<AnswerSet> {
     }
     map.insert(
         "trust_root_bootstrap".to_string(),
-        Value::Bool(matches!(
-            manifest.trust_root,
-            Some(TrustRootDirective::Bootstrap)
-        )),
+        Value::Bool(match manifest.trust_root {
+            Some(TrustRootDirective::Bootstrap) => true,
+            None => false,
+        }),
     );
     if !manifest.secrets.is_empty() {
         let rows = manifest
