@@ -164,11 +164,24 @@ fn bundle_tenant(bundle: &ManifestBundle) -> String {
 /// just `<KEY>` for the default tenant. A hint only — the operator types the
 /// actual variable name.
 fn default_env_var_name(tenant: &str, key: &str) -> String {
-    let key = key.to_ascii_uppercase();
+    /// Replace non-ASCII-alphanumeric chars with `_` and uppercase — produces
+    /// a POSIX-safe env-var name fragment from an arbitrary identifier.
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    let key = sanitize(key);
     if tenant.is_empty() || tenant.eq_ignore_ascii_case("default") {
         key
     } else {
-        format!("{}_{}", tenant.to_ascii_uppercase(), key)
+        format!("{}_{}", sanitize(tenant), key)
     }
 }
 
@@ -241,7 +254,10 @@ fn derive_required_secrets(
                 continue;
             };
             match by_path.get_mut(&path) {
-                Some(existing) => existing.bundle_ids.push(bundle.bundle_id.clone()),
+                Some(existing) => {
+                    existing.required |= requirement.required;
+                    existing.bundle_ids.push(bundle.bundle_id.clone());
+                }
                 None => {
                     order.push(path.clone());
                     by_path.insert(
@@ -343,7 +359,10 @@ fn prompt_env_var_name(default: &str) -> Result<String> {
         print!("  > env var name [{default}]: ");
         std::io::stdout().flush()?;
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
+        let n = std::io::stdin().read_line(&mut line)?;
+        if n == 0 {
+            bail!("unexpected end of input while prompting for env var name");
+        }
         let trimmed = line.trim();
         let value = if trimmed.is_empty() { default } else { trimmed };
         if value.is_empty() {
@@ -760,6 +779,12 @@ mod tests {
             "TELEGRAM_BOT_TOKEN"
         );
         assert_eq!(default_env_var_name("", "api_key"), "API_KEY");
+        // Special characters in tenant/key are sanitized to underscores so
+        // the suggested default is a valid POSIX env-var name.
+        assert_eq!(
+            default_env_var_name("my-tenant", "bot.token"),
+            "MY_TENANT_BOT_TOKEN"
+        );
     }
 
     fn bundle_from(value: Value) -> ManifestBundle {
