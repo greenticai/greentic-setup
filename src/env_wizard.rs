@@ -13,16 +13,28 @@
 //! pre-loads it via [`manifest_to_answers`]: satisfied questions are kept
 //! (gap-fill mode); for full edits, hand-edit the file and re-apply with
 //! `--answers <file>`.
+//!
+//! Secrets are the exception to the pure-form flow: this wizard drops the
+//! generic `secrets` table from the prompt loop and handles it *last* as a
+//! derived step. Once the bundles are known it reads each bundle's packs'
+//! `secret-requirements.json` (via the deployer's
+//! [`greentic_deployer::runtime_secrets::bundle_secret_requirements`],
+//! scoped to the bundle's route tenant) and asks only for the env-var NAME
+//! of each required secret — never the path (auto-derived), never the value
+//! (apply reads it from the env / dev-store). So the operator only enters
+//! the secrets the configured bundles actually need.
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use greentic_deployer::cli::env_manifest::{
-    ENV_MANIFEST_FORM_ID, ENV_MANIFEST_FORM_VERSION, EnvManifest, TrustRootDirective,
-    answers_to_manifest, manifest_form_spec,
+    ENV_MANIFEST_FORM_ID, ENV_MANIFEST_FORM_VERSION, EnvManifest, ManifestBundle,
+    TrustRootDirective, answers_to_manifest, manifest_form_spec,
 };
-use qa_spec::AnswerSet;
+use greentic_deployer::runtime_secrets::{bundle_secret_requirements, manifest_secret_path};
+use qa_spec::{AnswerSet, FormSpec};
 use serde_json::{Map as JsonMap, Value, json};
 
 use crate::env_mode;
@@ -47,20 +59,45 @@ pub fn run_env_wizard(
     let manifest_path = prompt_manifest_path(env)?;
     let initial = load_initial_answers(&manifest_path, env)?;
 
+    // Drive the shared form WITHOUT the secrets section: this terminal
+    // wizard owns secrets as a final, derived step — it asks only for the
+    // secrets the configured bundles actually declare, and only for the
+    // env-var NAME of each (never the path, never the value).
     let spec = manifest_form_spec();
-    let answers = prompt_form_spec_answers_with_existing(
-        &spec,
+    let form_spec = spec_without_question(&spec, "secrets");
+    let prompted = prompt_form_spec_answers_with_existing(
+        &form_spec,
         "environment",
         advanced,
         &Value::Object(initial),
     )?;
-    let answer_set = AnswerSet {
-        form_id: ENV_MANIFEST_FORM_ID.to_string(),
-        spec_version: ENV_MANIFEST_FORM_VERSION.to_string(),
-        answers,
-        meta: None,
-    };
-    let manifest = answers_to_manifest(&answer_set)?;
+    let mut answers = prompted.as_object().cloned().unwrap_or_default();
+
+    // Pre-loaded from_env values (editing an existing manifest) become the
+    // per-secret defaults so a re-run doesn't re-ask what hasn't changed.
+    let existing_from_env = existing_from_env_by_path(&answers);
+
+    // Relative bundle paths resolve against the manifest file's directory,
+    // exactly like the apply engine.
+    let manifest_dir = manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Derive + prompt secrets from the bundles just authored. A provisional
+    // manifest gives the typed bundle list; any pre-loaded secrets in it are
+    // ignored (recomputed below).
+    let provisional = answers_to_manifest(&answer_set(answers.clone()))?;
+    let secret_rows =
+        derive_and_prompt_secrets(&manifest_dir, env, &provisional.bundles, &existing_from_env)?;
+    if secret_rows.is_empty() {
+        answers.remove("secrets");
+    } else {
+        answers.insert("secrets".to_string(), Value::Array(secret_rows));
+    }
+
+    let manifest = answers_to_manifest(&answer_set(answers))?;
 
     let doc = serde_json::to_value(&manifest)?;
     let mut rendered = serde_json::to_string_pretty(&doc)?;
@@ -73,6 +110,267 @@ pub fn run_env_wizard(
     );
 
     env_mode::run_env_apply(&manifest_path, &doc, env, dry_run, false)
+}
+
+/// The env-manifest answer-set wrapper (form id + version) around a raw
+/// answers map.
+fn answer_set(answers: JsonMap<String, Value>) -> AnswerSet {
+    AnswerSet {
+        form_id: ENV_MANIFEST_FORM_ID.to_string(),
+        spec_version: ENV_MANIFEST_FORM_VERSION.to_string(),
+        answers: Value::Object(answers),
+        meta: None,
+    }
+}
+
+/// Clone of `spec` with the question whose id is `id` removed. The terminal
+/// wizard handles `secrets` itself (derived), so it is dropped from the
+/// prompt loop while remaining in the shared spec for other front-ends.
+fn spec_without_question(spec: &FormSpec, id: &str) -> FormSpec {
+    let mut reduced = spec.clone();
+    reduced.questions.retain(|question| question.id != id);
+    reduced
+}
+
+/// `path -> from_env` from a pre-loaded `secrets` answer array, used as
+/// per-secret defaults when editing an existing manifest.
+fn existing_from_env_by_path(answers: &JsonMap<String, Value>) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    if let Some(Value::Array(rows)) = answers.get("secrets") {
+        for row in rows {
+            if let (Some(path), Some(from_env)) = (
+                row.get("path").and_then(Value::as_str),
+                row.get("from_env").and_then(Value::as_str),
+            ) {
+                map.insert(path.to_string(), from_env.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Tenant a bundle's route binding selects (defaulting to `default`) — the
+/// scope the dev-store secret path is built under.
+fn bundle_tenant(bundle: &ManifestBundle) -> String {
+    bundle
+        .route_binding
+        .as_ref()
+        .and_then(|binding| binding.tenant_selector.as_ref())
+        .map(|selector| selector.tenant.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// Suggested env-var name for a derived secret: `<TENANT>_<KEY>` (upper), or
+/// just `<KEY>` for the default tenant. A hint only — the operator types the
+/// actual variable name.
+fn default_env_var_name(tenant: &str, key: &str) -> String {
+    /// Replace non-ASCII-alphanumeric chars with `_` and uppercase — produces
+    /// a POSIX-safe env-var name fragment from an arbitrary identifier.
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    let key = sanitize(key);
+    if tenant.is_empty() || tenant.eq_ignore_ascii_case("default") {
+        key
+    } else {
+        format!("{}_{}", sanitize(tenant), key)
+    }
+}
+
+/// One secret a configured bundle declares, with the context needed to
+/// prompt for its env-var name.
+struct DerivedSecret {
+    /// Manifest secret path `<tenant>/<team>/<pack>/<name>`.
+    path: String,
+    /// Pack/provider that declared it (for display).
+    provider_id: String,
+    /// Canonical secret key (drives the default env-var name).
+    key: String,
+    /// Tenant the path is scoped to.
+    tenant: String,
+    /// Whether the declaring pack marked it required.
+    required: bool,
+    /// Bundle ids that need this same secret (display only).
+    bundle_ids: Vec<String>,
+}
+
+/// Read each bundle's packs' `secret-requirements.json` (via the deployer's
+/// [`bundle_secret_requirements`]) and collect the unique secrets they
+/// declare, in first-seen order, deduplicated by manifest path. Bundles
+/// whose artifact (or built `packs/`) is missing are skipped with a note and
+/// reported via the returned `skipped` flag — the wizard never hard-fails
+/// just because a bundle has not been built yet.
+fn derive_required_secrets(
+    manifest_dir: &Path,
+    env: &str,
+    bundles: &[ManifestBundle],
+) -> (Vec<DerivedSecret>, bool) {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_path: BTreeMap<String, DerivedSecret> = BTreeMap::new();
+    let mut skipped = false;
+
+    for bundle in bundles {
+        let tenant = bundle_tenant(bundle);
+        let artifact = if bundle.bundle_path.is_absolute() {
+            bundle.bundle_path.clone()
+        } else {
+            manifest_dir.join(&bundle.bundle_path)
+        };
+        let Some(bundle_root) = artifact.parent() else {
+            skipped = true;
+            continue;
+        };
+        if !artifact.exists() {
+            eprintln!(
+                "  note: bundle `{}` artifact `{}` not found — build it before the \
+                 wizard to auto-detect its secrets (skipping)",
+                bundle.bundle_id,
+                artifact.display()
+            );
+            skipped = true;
+            continue;
+        }
+        let requirements = match bundle_secret_requirements(bundle_root, env, &tenant) {
+            Ok(requirements) => requirements,
+            Err(err) => {
+                eprintln!(
+                    "  note: could not read secrets for bundle `{}`: {err} (skipping)",
+                    bundle.bundle_id
+                );
+                skipped = true;
+                continue;
+            }
+        };
+        for requirement in requirements {
+            let Some(path) = manifest_secret_path(&requirement.uri, env) else {
+                continue;
+            };
+            match by_path.get_mut(&path) {
+                Some(existing) => {
+                    existing.required |= requirement.required;
+                    existing.bundle_ids.push(bundle.bundle_id.clone());
+                }
+                None => {
+                    order.push(path.clone());
+                    by_path.insert(
+                        path.clone(),
+                        DerivedSecret {
+                            path,
+                            provider_id: requirement.provider_id,
+                            key: requirement.key,
+                            tenant: tenant.clone(),
+                            required: requirement.required,
+                            bundle_ids: vec![bundle.bundle_id.clone()],
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let derived = order
+        .into_iter()
+        .map(|path| by_path.remove(&path).expect("path was just inserted"))
+        .collect();
+    (derived, skipped)
+}
+
+/// Derive the secrets the configured bundles need and prompt for the env-var
+/// NAME of each, returning `secrets[]` answer rows (`{path, from_env}`) to
+/// merge into the manifest answers.
+///
+/// When a bundle was skipped (unbuilt/unreadable) any pre-loaded secrets not
+/// re-derived are preserved as-is, so a partial edit never silently drops a
+/// secret the wizard couldn't recompute.
+fn derive_and_prompt_secrets(
+    manifest_dir: &Path,
+    env: &str,
+    bundles: &[ManifestBundle],
+    existing_from_env: &BTreeMap<String, String>,
+) -> Result<Vec<Value>> {
+    let (derived, skipped) = derive_required_secrets(manifest_dir, env, bundles);
+
+    // When a bundle was skipped, pre-loaded secrets we couldn't recompute are
+    // preserved rather than dropped (see the tail of this fn).
+    let preserving = skipped && !existing_from_env.is_empty();
+    if derived.is_empty() && !preserving {
+        println!("\nSecrets — the configured bundles declare no secrets; nothing to enter.");
+        return Ok(Vec::new());
+    }
+
+    if !derived.is_empty() {
+        println!(
+            "\nSecrets — the configured bundles need {} secret(s).",
+            derived.len()
+        );
+        println!("Enter the NAME of the environment variable that holds each value.");
+        println!("(The value itself is never written to the manifest; apply reads it");
+        println!(" from the environment / dev-store at apply time.)");
+    }
+
+    let mut rows = Vec::with_capacity(derived.len());
+    let mut taken = BTreeMap::new();
+    for secret in &derived {
+        let default = existing_from_env
+            .get(&secret.path)
+            .cloned()
+            .unwrap_or_else(|| default_env_var_name(&secret.tenant, &secret.key));
+        println!();
+        println!(
+            "  {} — {} (bundle: {}){}",
+            secret.key,
+            secret.provider_id,
+            secret.bundle_ids.join(", "),
+            if secret.required { "" } else { " [optional]" }
+        );
+        println!("  secret path: {}", secret.path);
+        let from_env = prompt_env_var_name(&default)?;
+        taken.insert(secret.path.clone(), ());
+        rows.push(json!({ "path": secret.path.clone(), "from_env": from_env }));
+    }
+
+    // Preserve pre-loaded secrets the wizard couldn't recompute (a bundle was
+    // skipped), so editing a manifest without rebuilt bundles is non-destructive.
+    if skipped {
+        for (path, from_env) in existing_from_env {
+            if taken.contains_key(path) {
+                continue;
+            }
+            eprintln!("  note: keeping existing secret `{path}` (bundle not rebuilt)");
+            rows.push(json!({ "path": path, "from_env": from_env }));
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Prompt for one env-var name, defaulting to `default` on empty input.
+/// Re-prompts only if both the input and the default are blank.
+fn prompt_env_var_name(default: &str) -> Result<String> {
+    loop {
+        print!("  > env var name [{default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        let n = std::io::stdin().read_line(&mut line)?;
+        if n == 0 {
+            bail!("unexpected end of input while prompting for env var name");
+        }
+        let trimmed = line.trim();
+        let value = if trimmed.is_empty() { default } else { trimmed };
+        if value.is_empty() {
+            println!("  An environment variable name is required.");
+            continue;
+        }
+        return Ok(value.to_string());
+    }
 }
 
 /// Ask where the manifest lives (and will be written). Empty input takes
@@ -430,5 +728,150 @@ mod tests {
             format!("{err:#}").contains("--answers"),
             "points at the headless alternative: {err:#}"
         );
+    }
+
+    #[test]
+    fn spec_without_question_drops_only_the_named_question() {
+        let spec = manifest_form_spec();
+        let reduced = spec_without_question(&spec, "secrets");
+        assert!(
+            spec.questions.iter().any(|q| q.id == "secrets"),
+            "fixture has the secrets question"
+        );
+        assert!(
+            reduced.questions.iter().all(|q| q.id != "secrets"),
+            "secrets question is dropped"
+        );
+        assert_eq!(
+            reduced.questions.len(),
+            spec.questions.len() - 1,
+            "exactly one question removed"
+        );
+    }
+
+    #[test]
+    fn existing_from_env_by_path_indexes_preloaded_secrets() {
+        let answers = json!({
+            "secrets": [
+                {"path": "legal/_/messaging-telegram/telegram_bot_token", "from_env": "LEGAL_TOK"},
+                {"path": "acct/_/messaging-telegram/telegram_bot_token", "from_env": "ACCT_TOK"}
+            ]
+        });
+        let map = existing_from_env_by_path(answers.as_object().unwrap());
+        assert_eq!(
+            map.get("legal/_/messaging-telegram/telegram_bot_token")
+                .map(String::as_str),
+            Some("LEGAL_TOK")
+        );
+        assert_eq!(map.len(), 2);
+        // No secrets key → empty map.
+        assert!(existing_from_env_by_path(&JsonMap::new()).is_empty());
+    }
+
+    #[test]
+    fn default_env_var_name_prefixes_non_default_tenant() {
+        assert_eq!(
+            default_env_var_name("legal", "telegram_bot_token"),
+            "LEGAL_TELEGRAM_BOT_TOKEN"
+        );
+        assert_eq!(
+            default_env_var_name("default", "telegram_bot_token"),
+            "TELEGRAM_BOT_TOKEN"
+        );
+        assert_eq!(default_env_var_name("", "api_key"), "API_KEY");
+        // Special characters in tenant/key are sanitized to underscores so
+        // the suggested default is a valid POSIX env-var name.
+        assert_eq!(
+            default_env_var_name("my-tenant", "bot.token"),
+            "MY_TENANT_BOT_TOKEN"
+        );
+    }
+
+    fn bundle_from(value: Value) -> ManifestBundle {
+        serde_json::from_value(value).expect("valid manifest bundle")
+    }
+
+    /// Lay down a built-bundle workspace next to a `.gtbundle` artifact with a
+    /// marked provider pack declaring one secret. Returns the manifest dir.
+    fn built_bundle_with_telegram_secret(root: &Path, workspace: &str) {
+        let pack_dir = root.join(workspace).join("packs/messaging-telegram");
+        std::fs::create_dir_all(pack_dir.join("assets")).unwrap();
+        std::fs::write(pack_dir.join("pack.yaml"), "id: messaging-telegram\n").unwrap();
+        std::fs::write(
+            pack_dir.join("assets/secret-requirements.json"),
+            r#"[{"key":"TELEGRAM_BOT_TOKEN","required":true}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(workspace).join("realbot.gtbundle"),
+            b"squashfs-placeholder",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn derive_required_secrets_reads_built_bundle_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        built_bundle_with_telegram_secret(dir.path(), "ws-legal");
+        let bundle = bundle_from(json!({
+            "bundle_id": "realbot-legal",
+            "bundle_path": "ws-legal/realbot.gtbundle",
+            "route_binding": {
+                "hosts": [],
+                "path_prefixes": ["/legal"],
+                "tenant_selector": {"tenant": "legal", "team": "default"}
+            }
+        }));
+
+        let (derived, skipped) =
+            derive_required_secrets(dir.path(), "local", std::slice::from_ref(&bundle));
+        assert!(!skipped);
+        assert_eq!(derived.len(), 1);
+        assert_eq!(
+            derived[0].path,
+            "legal/_/messaging-telegram/telegram_bot_token"
+        );
+        assert_eq!(derived[0].tenant, "legal");
+        assert_eq!(derived[0].bundle_ids, vec!["realbot-legal".to_string()]);
+    }
+
+    #[test]
+    fn derive_required_secrets_dedups_same_path_across_bundles() {
+        // Two bundles, same tenant + same provider pack → one secret path,
+        // both bundle ids recorded.
+        let dir = tempfile::tempdir().unwrap();
+        built_bundle_with_telegram_secret(dir.path(), "ws-a");
+        built_bundle_with_telegram_secret(dir.path(), "ws-b");
+        let bundles = [
+            bundle_from(json!({
+                "bundle_id": "a", "bundle_path": "ws-a/realbot.gtbundle",
+                "route_binding": {"hosts": [], "path_prefixes": ["/a"],
+                    "tenant_selector": {"tenant": "shared", "team": "default"}}
+            })),
+            bundle_from(json!({
+                "bundle_id": "b", "bundle_path": "ws-b/realbot.gtbundle",
+                "route_binding": {"hosts": [], "path_prefixes": ["/b"],
+                    "tenant_selector": {"tenant": "shared", "team": "default"}}
+            })),
+        ];
+        let (derived, _) = derive_required_secrets(dir.path(), "local", &bundles);
+        assert_eq!(derived.len(), 1, "deduped by path");
+        assert_eq!(
+            derived[0].bundle_ids,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn derive_required_secrets_skips_unbuilt_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = bundle_from(json!({
+            "bundle_id": "missing",
+            "bundle_path": "ws-missing/realbot.gtbundle"
+        }));
+        let (derived, skipped) =
+            derive_required_secrets(dir.path(), "local", std::slice::from_ref(&bundle));
+        assert!(derived.is_empty());
+        assert!(skipped, "missing artifact flags skipped");
     }
 }
