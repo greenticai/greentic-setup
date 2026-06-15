@@ -667,6 +667,12 @@ mod tests {
             environment: ManifestEnvironment {
                 id: "demo".to_string(),
                 public_base_url: Some("https://demo.example.com".to_string()),
+                // Form-less env fields: `answers_to_manifest` always produces
+                // None, so the round-trip only holds when these start None.
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
             },
             trust_root: Some(TrustRootDirective::Bootstrap),
             secrets: vec![ManifestSecret {
@@ -696,6 +702,9 @@ mod tests {
                     }),
                 }),
             }],
+            // No form questions for packs/extensions; default empty.
+            packs: Vec::new(),
+            extensions: Vec::new(),
             messaging_endpoints: vec![ManifestEndpoint {
                 name: "demo-telegram".to_string(),
                 provider_type: "messaging.telegram.bot".to_string(),
@@ -735,10 +744,16 @@ mod tests {
             environment: ManifestEnvironment {
                 id: "local".to_string(),
                 public_base_url: None,
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
             },
             trust_root: None,
             secrets: Vec::new(),
+            packs: Vec::new(),
             bundles: Vec::new(),
+            extensions: Vec::new(),
             messaging_endpoints: Vec::new(),
         };
         let back = round_trip(&original);
