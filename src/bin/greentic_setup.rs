@@ -93,6 +93,9 @@ fn main() -> Result<()> {
             &env,
             cli.dry_run,
             cli.non_interactive,
+            // The headless `--answers` path collects no pasted secrets; values
+            // resolve from `from_env` (or a prompt on a TTY) inside the engine.
+            Default::default(),
         );
     }
 

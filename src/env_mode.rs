@@ -10,6 +10,7 @@
 //! input, and the engine's missing-inputs contract + TTY fill-in own the
 //! gaps.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -17,6 +18,7 @@ use greentic_deployer::cli::env_apply::{self, ApplyMode, ApplyOptions};
 use greentic_deployer::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
 use greentic_deployer::cli::{OpFlags, OpOutcome, dispatch::print_outcome};
 use greentic_deployer::environment::LocalFsStore;
+use greentic_deployer::runtime_secrets::SecretValue;
 use serde_json::Value;
 
 /// Positive identification of an env-manifest answers document.
@@ -46,6 +48,7 @@ pub fn run_env_apply(
     resolved_env: &str,
     dry_run: bool,
     non_interactive: bool,
+    prefilled_secrets: BTreeMap<String, SecretValue>,
 ) -> Result<()> {
     let root = LocalFsStore::default_root()
         .context("cannot locate the environment store: HOME / USERPROFILE not set")?;
@@ -57,6 +60,7 @@ pub fn run_env_apply(
         resolved_env,
         dry_run,
         non_interactive,
+        prefilled_secrets,
     )?;
     print_outcome(&outcome)?;
     Ok(())
@@ -77,6 +81,7 @@ pub fn apply_manifest_with_store(
     resolved_env: &str,
     dry_run: bool,
     non_interactive: bool,
+    prefilled_secrets: BTreeMap<String, SecretValue>,
 ) -> Result<OpOutcome> {
     if let Some(manifest_env) = manifest.pointer("/environment/id").and_then(Value::as_str)
         && manifest_env != resolved_env
@@ -102,6 +107,7 @@ pub fn apply_manifest_with_store(
         updated_by: Some("greentic-setup".to_string()),
         yes: false,
         non_interactive,
+        prefilled_secrets,
     };
     env_apply::apply(store, &flags, opts)
         .with_context(|| format!("env-manifest apply failed for `{}`", answers_path.display()))
@@ -168,8 +174,16 @@ mod tests {
         let manifest = manifest_value("demo");
         let path = write(dir.path(), "demo.env.json", &manifest.to_string());
 
-        let err =
-            apply_manifest_with_store(&store, &path, &manifest, "local", false, true).unwrap_err();
+        let err = apply_manifest_with_store(
+            &store,
+            &path,
+            &manifest,
+            "local",
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("`demo`"), "names the manifest env: {msg}");
         assert!(msg.contains("`local`"), "names the --env value: {msg}");
@@ -186,8 +200,16 @@ mod tests {
         let manifest = manifest_value("local");
         let path = write(dir.path(), "local.env.json", &manifest.to_string());
 
-        let outcome = apply_manifest_with_store(&store, &path, &manifest, "local", true, true)
-            .expect("dry-run succeeds");
+        let outcome = apply_manifest_with_store(
+            &store,
+            &path,
+            &manifest,
+            "local",
+            true,
+            true,
+            Default::default(),
+        )
+        .expect("dry-run succeeds");
         assert_eq!(outcome.noun, "env");
         assert_eq!(outcome.op, "apply");
         assert_eq!(outcome.result["mode"], "dry-run", "{}", outcome.result);
@@ -210,8 +232,16 @@ mod tests {
         });
         let path = write(dir.path(), "local.env.json", &manifest.to_string());
 
-        let err =
-            apply_manifest_with_store(&store, &path, &manifest, "local", false, true).unwrap_err();
+        let err = apply_manifest_with_store(
+            &store,
+            &path,
+            &manifest,
+            "local",
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap_err();
         // The engine's missing-inputs report surfaces verbatim through the
         // anyhow chain: count, env-var name, and manifest secret path.
         let msg = format!("{err:#}");

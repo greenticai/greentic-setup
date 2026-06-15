@@ -19,10 +19,13 @@
 //! derived step. Once the bundles are known it reads each bundle's packs'
 //! `secret-requirements.json` (via the deployer's
 //! [`greentic_deployer::runtime_secrets::bundle_secret_requirements`],
-//! scoped to the bundle's route tenant) and asks only for the env-var NAME
-//! of each required secret — never the path (auto-derived), never the value
-//! (apply reads it from the env / dev-store). So the operator only enters
-//! the secrets the configured bundles actually need.
+//! scoped to the bundle's route tenant) and, for each required secret, asks
+//! whether the value comes from a named environment variable (the operator
+//! enters the NAME; apply reads it from the env / dev-store) or is pasted in
+//! now (collected with a masked prompt and handed to apply, which writes it
+//! to the env's secrets store). The path is always auto-derived, and the
+//! pasted value is never written to the manifest. So the operator only
+//! enters the secrets the configured bundles actually need.
 //!
 //! Basic vs advanced: by default the wizard asks only the everyday fields.
 //! The optional row columns an operator almost always leaves empty
@@ -41,8 +44,11 @@ use greentic_deployer::cli::env_manifest::{
     ENV_MANIFEST_FORM_ID, ENV_MANIFEST_FORM_VERSION, EnvManifest, ManifestBundle,
     TrustRootDirective, answers_to_manifest, manifest_form_spec,
 };
-use greentic_deployer::runtime_secrets::{bundle_secret_requirements, manifest_secret_path};
+use greentic_deployer::runtime_secrets::{
+    SecretValue, bundle_secret_requirements, manifest_secret_path,
+};
 use qa_spec::{AnswerSet, FormSpec};
+use rpassword::prompt_password;
 use serde_json::{Map as JsonMap, Value, json};
 
 use crate::env_mode;
@@ -93,6 +99,8 @@ pub fn run_env_wizard(
     // Pre-loaded from_env values (editing an existing manifest) become the
     // per-secret defaults so a re-run doesn't re-ask what hasn't changed.
     let existing_from_env = existing_from_env_by_path(&answers);
+    // Pre-loaded source choices default the env-vs-paste prompt on a re-edit.
+    let existing_source = existing_source_by_path(&answers);
 
     // Relative bundle paths resolve against the manifest file's directory,
     // exactly like the apply engine.
@@ -106,8 +114,13 @@ pub fn run_env_wizard(
     // manifest gives the typed bundle list; any pre-loaded secrets in it are
     // ignored (recomputed below).
     let provisional = answers_to_manifest(&answer_set(answers.clone()))?;
-    let secret_rows =
-        derive_and_prompt_secrets(&manifest_dir, env, &provisional.bundles, &existing_from_env)?;
+    let (secret_rows, prefilled_secrets) = derive_and_prompt_secrets(
+        &manifest_dir,
+        env,
+        &provisional.bundles,
+        &existing_from_env,
+        &existing_source,
+    )?;
     if secret_rows.is_empty() {
         answers.remove("secrets");
     } else {
@@ -126,7 +139,7 @@ pub fn run_env_wizard(
         manifest_path.display()
     );
 
-    env_mode::run_env_apply(&manifest_path, &doc, env, dry_run, false)
+    env_mode::run_env_apply(&manifest_path, &doc, env, dry_run, false, prefilled_secrets)
 }
 
 /// The env-manifest answer-set wrapper (form id + version) around a raw
@@ -208,6 +221,30 @@ fn existing_from_env_by_path(answers: &JsonMap<String, Value>) -> BTreeMap<Strin
             ) {
                 map.insert(path.to_string(), from_env.to_string());
             }
+        }
+    }
+    map
+}
+
+/// `path -> source` (`env` | `paste`) from a pre-loaded `secrets` answer
+/// array, used to default the env-vs-paste choice on a re-edit. A row with no
+/// explicit `source` is inferred from `from_env` presence (back-compat with
+/// manifests authored before the source discriminator existed).
+fn existing_source_by_path(answers: &JsonMap<String, Value>) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    if let Some(Value::Array(rows)) = answers.get("secrets") {
+        for row in rows {
+            let Some(path) = row.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let source = row.get("source").and_then(Value::as_str).unwrap_or(
+                if row.get("from_env").is_some() {
+                    "env"
+                } else {
+                    "paste"
+                },
+            );
+            map.insert(path.to_string(), source.to_string());
         }
     }
     map
@@ -361,9 +398,11 @@ fn derive_required_secrets(
     (derived, skipped)
 }
 
-/// Derive the secrets the configured bundles need and prompt for the env-var
-/// NAME of each, returning `secrets[]` answer rows (`{path, from_env}`) to
-/// merge into the manifest answers.
+/// Derive the secrets the configured bundles need and, for each, prompt for a
+/// source: an environment variable NAME or a pasted value. Returns the
+/// `secrets[]` answer rows (`{path, source, from_env?}`) to merge into the
+/// manifest answers, plus the pasted values keyed by path to hand to the apply
+/// engine (`ApplyOptions.prefilled_secrets`) so it does not re-prompt.
 ///
 /// When a bundle was skipped (unbuilt/unreadable) any pre-loaded secrets not
 /// re-derived are preserved as-is, so a partial edit never silently drops a
@@ -373,15 +412,16 @@ fn derive_and_prompt_secrets(
     env: &str,
     bundles: &[ManifestBundle],
     existing_from_env: &BTreeMap<String, String>,
-) -> Result<Vec<Value>> {
+    existing_source: &BTreeMap<String, String>,
+) -> Result<(Vec<Value>, BTreeMap<String, SecretValue>)> {
     let (derived, skipped) = derive_required_secrets(manifest_dir, env, bundles);
 
     // When a bundle was skipped, pre-loaded secrets we couldn't recompute are
     // preserved rather than dropped (see the tail of this fn).
-    let preserving = skipped && !existing_from_env.is_empty();
+    let preserving = skipped && !existing_source.is_empty();
     if derived.is_empty() && !preserving {
         println!("\nSecrets — the configured bundles declare no secrets; nothing to enter.");
-        return Ok(Vec::new());
+        return Ok((Vec::new(), BTreeMap::new()));
     }
 
     if !derived.is_empty() {
@@ -389,18 +429,15 @@ fn derive_and_prompt_secrets(
             "\nSecrets — the configured bundles need {} secret(s).",
             derived.len()
         );
-        println!("Enter the NAME of the environment variable that holds each value.");
-        println!("(The value itself is never written to the manifest; apply reads it");
-        println!(" from the environment / dev-store at apply time.)");
+        println!("For each, choose where the value comes from: a named environment");
+        println!("variable, or paste it in now. Pasted values are stored in the");
+        println!("environment's secrets store — never written to the manifest.");
     }
 
     let mut rows = Vec::with_capacity(derived.len());
+    let mut prefilled = BTreeMap::new();
     let mut taken = BTreeMap::new();
     for secret in &derived {
-        let default = existing_from_env
-            .get(&secret.path)
-            .cloned()
-            .unwrap_or_else(|| default_env_var_name(&secret.tenant, &secret.key));
         println!();
         println!(
             "  {} — {} (bundle: {}){}",
@@ -410,24 +447,115 @@ fn derive_and_prompt_secrets(
             if secret.required { "" } else { " [optional]" }
         );
         println!("  secret path: {}", secret.path);
-        let from_env = prompt_env_var_name(&default)?;
+
+        // Re-edit defaults to the previously-chosen source.
+        let was_paste = existing_source.get(&secret.path).map(String::as_str) == Some("paste");
+        match prompt_secret_source(was_paste)? {
+            SecretSource::Env => {
+                let default = existing_from_env
+                    .get(&secret.path)
+                    .cloned()
+                    .unwrap_or_else(|| default_env_var_name(&secret.tenant, &secret.key));
+                let from_env = prompt_env_var_name(&default)?;
+                rows.push(
+                    json!({ "path": secret.path.clone(), "source": "env", "from_env": from_env }),
+                );
+            }
+            SecretSource::Paste => {
+                // On a re-edit of an already-paste secret, the value is already
+                // in the store: empty input keeps it (apply no-ops). Otherwise a
+                // value is required now.
+                if let Some(value) = prompt_paste_value(was_paste)? {
+                    prefilled.insert(secret.path.clone(), SecretValue::from(value));
+                }
+                rows.push(json!({ "path": secret.path.clone(), "source": "paste" }));
+            }
+        }
         taken.insert(secret.path.clone(), ());
-        rows.push(json!({ "path": secret.path.clone(), "from_env": from_env }));
     }
 
     // Preserve pre-loaded secrets the wizard couldn't recompute (a bundle was
     // skipped), so editing a manifest without rebuilt bundles is non-destructive.
+    // Env secrets keep their `from_env`; paste secrets keep their store value
+    // (apply no-ops on the already-stored value).
     if skipped {
-        for (path, from_env) in existing_from_env {
+        for (path, source) in existing_source {
             if taken.contains_key(path) {
                 continue;
             }
-            eprintln!("  note: keeping existing secret `{path}` (bundle not rebuilt)");
-            rows.push(json!({ "path": path, "from_env": from_env }));
+            match source.as_str() {
+                "paste" => {
+                    eprintln!(
+                        "  note: keeping existing pasted secret `{path}` (bundle not rebuilt)"
+                    );
+                    rows.push(json!({ "path": path, "source": "paste" }));
+                }
+                _ => {
+                    let Some(from_env) = existing_from_env.get(path) else {
+                        continue;
+                    };
+                    eprintln!("  note: keeping existing secret `{path}` (bundle not rebuilt)");
+                    rows.push(json!({ "path": path, "source": "env", "from_env": from_env }));
+                }
+            }
         }
     }
 
-    Ok(rows)
+    Ok((rows, prefilled))
+}
+
+/// Where a secret's value comes from, as chosen in the wizard.
+enum SecretSource {
+    /// A named environment variable, read at apply time.
+    Env,
+    /// A value pasted in now and stored in the env's secrets store.
+    Paste,
+}
+
+/// Prompt whether a secret's value comes from an environment variable or is
+/// pasted in now. `default_paste` seeds the default (a re-edit keeps the
+/// previous choice).
+fn prompt_secret_source(default_paste: bool) -> Result<SecretSource> {
+    let default = if default_paste { "2" } else { "1" };
+    loop {
+        print!("  > value from [1] environment variable or [2] paste it now? [{default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        let n = std::io::stdin().read_line(&mut line)?;
+        if n == 0 {
+            bail!("unexpected end of input while choosing a secret source");
+        }
+        let trimmed = line.trim();
+        let choice = if trimmed.is_empty() { default } else { trimmed };
+        match choice.to_ascii_lowercase().as_str() {
+            "1" | "env" | "e" => return Ok(SecretSource::Env),
+            "2" | "paste" | "p" => return Ok(SecretSource::Paste),
+            _ => println!("  Enter 1 (environment variable) or 2 (paste)."),
+        }
+    }
+}
+
+/// Masked prompt for a pasted secret value. When `keep_stored` is true (a
+/// re-edit of an already-stored paste secret), empty input keeps the stored
+/// value (`Ok(None)` — apply leaves the store entry untouched). Otherwise a
+/// non-empty value is required.
+fn prompt_paste_value(keep_stored: bool) -> Result<Option<String>> {
+    loop {
+        let prompt = if keep_stored {
+            "  > paste value (hidden; empty keeps the stored value): "
+        } else {
+            "  > paste value (hidden): "
+        };
+        let value = prompt_password(prompt)?;
+        if value.is_empty() {
+            if keep_stored {
+                return Ok(None);
+            }
+            println!("  A value is required (or choose [1] environment variable instead).");
+            continue;
+        }
+        return Ok(Some(value));
+    }
 }
 
 /// Prompt for one env-var name, defaulting to `default` on empty input.
@@ -541,7 +669,10 @@ pub fn manifest_to_answers(manifest: &EnvManifest) -> Result<AnswerSet> {
         let rows = manifest
             .secrets
             .iter()
-            .map(|s| json!({"path": s.path, "from_env": s.from_env}))
+            .map(|s| match &s.from_env {
+                Some(from_env) => json!({"path": s.path, "source": "env", "from_env": from_env}),
+                None => json!({"path": s.path, "source": "paste"}),
+            })
             .collect();
         map.insert("secrets".to_string(), Value::Array(rows));
     }
@@ -677,7 +808,7 @@ mod tests {
             trust_root: Some(TrustRootDirective::Bootstrap),
             secrets: vec![ManifestSecret {
                 path: "default/_/messaging-telegram/telegram_bot_token".to_string(),
-                from_env: "DEMO_BOT_TOKEN".to_string(),
+                from_env: Some("DEMO_BOT_TOKEN".to_string()),
             }],
             bundles: vec![ManifestBundle {
                 bundle_id: "realbot".to_string(),
@@ -735,6 +866,54 @@ mod tests {
             serde_json::to_value(&original).unwrap(),
             serde_json::to_value(&back).unwrap(),
         );
+    }
+
+    #[test]
+    fn paste_and_env_secrets_round_trip_through_the_converter() {
+        // Mixed sources: an env-sourced secret keeps `from_env`; a
+        // paste-sourced one carries `source: paste` and no `from_env` (no
+        // value in the manifest). Both survive manifest → answers → manifest.
+        let mut manifest = full_manifest();
+        manifest.secrets = vec![
+            ManifestSecret {
+                path: "default/_/messaging-telegram/telegram_bot_token".to_string(),
+                from_env: Some("DEMO_BOT_TOKEN".to_string()),
+            },
+            ManifestSecret {
+                path: "default/_/messaging-slack/slack_bot_token".to_string(),
+                from_env: None,
+            },
+        ];
+        let back = round_trip(&manifest);
+        assert_eq!(back.secrets[0].from_env.as_deref(), Some("DEMO_BOT_TOKEN"));
+        assert_eq!(back.secrets[1].from_env, None);
+
+        // The wizard answers carry the source discriminator; the paste row
+        // never carries a value.
+        let answers = manifest_to_answers(&manifest).unwrap();
+        let rows = answers.answers["secrets"].as_array().unwrap();
+        assert_eq!(rows[0]["source"], "env");
+        assert_eq!(rows[0]["from_env"], "DEMO_BOT_TOKEN");
+        assert_eq!(rows[1]["source"], "paste");
+        assert!(rows[1].get("from_env").is_none());
+    }
+
+    #[test]
+    fn existing_source_by_path_reads_and_infers() {
+        let answers = json!({
+            "secrets": [
+                {"path": "a/_/p/tok", "source": "paste"},
+                {"path": "b/_/p/tok", "source": "env", "from_env": "B"},
+                // Legacy row (no `source`): inferred from `from_env` presence.
+                {"path": "c/_/p/tok", "from_env": "C"},
+                {"path": "d/_/p/tok"}
+            ]
+        });
+        let map = existing_source_by_path(answers.as_object().unwrap());
+        assert_eq!(map.get("a/_/p/tok").map(String::as_str), Some("paste"));
+        assert_eq!(map.get("b/_/p/tok").map(String::as_str), Some("env"));
+        assert_eq!(map.get("c/_/p/tok").map(String::as_str), Some("env"));
+        assert_eq!(map.get("d/_/p/tok").map(String::as_str), Some("paste"));
     }
 
     #[test]
