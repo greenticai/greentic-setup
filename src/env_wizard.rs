@@ -139,6 +139,20 @@ pub fn run_env_wizard(
         manifest_path.display()
     );
 
+    // A pasted value lives only in memory until a confirmed apply writes it to
+    // the store. A dry run previews without executing, so it would silently
+    // discard what was just entered — and, because a paste secret already in
+    // the store is treated as satisfied on a later apply, an existing stale
+    // value would then win. Warn rather than drop it silently.
+    if dry_run && !prefilled_secrets.is_empty() {
+        println!(
+            "\nNote: --dry-run previews only — the {} pasted secret value(s) you entered are \
+             NOT written to the store. Re-run without --dry-run and confirm the plan to persist \
+             them.",
+            prefilled_secrets.len()
+        );
+    }
+
     env_mode::run_env_apply(&manifest_path, &doc, env, dry_run, false, prefilled_secrets)
 }
 
@@ -539,12 +553,17 @@ fn prompt_secret_source(default_paste: bool) -> Result<SecretSource> {
 /// re-edit of an already-stored paste secret), empty input keeps the stored
 /// value (`Ok(None)` — apply leaves the store entry untouched). Otherwise a
 /// non-empty value is required.
+///
+/// Single-line only: `rpassword` reads to the first newline, so a multiline
+/// secret (a PEM key, certificate, multiline JSON) would be truncated to its
+/// first line. Such secrets should use the environment-variable source
+/// instead — the prompt says "single line" to steer the operator there.
 fn prompt_paste_value(keep_stored: bool) -> Result<Option<String>> {
     loop {
         let prompt = if keep_stored {
-            "  > paste value (hidden; empty keeps the stored value): "
+            "  > paste value (hidden, single line; empty keeps the stored value): "
         } else {
-            "  > paste value (hidden): "
+            "  > paste value (hidden, single line): "
         };
         let value = prompt_password(prompt)?;
         if value.is_empty() {
