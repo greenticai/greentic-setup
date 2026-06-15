@@ -257,7 +257,11 @@ pub fn persist(root: &Path, tenant: &str, discovery: &DiscoveryResult) -> anyhow
 impl DiscoveryResult {
     /// Return every discovered pack that can participate in setup.
     pub fn setup_targets(&self) -> Vec<&DetectedProvider> {
-        self.providers.iter().chain(self.app_packs.iter()).collect()
+        self.providers
+            .iter()
+            .chain(self.app_packs.iter())
+            .filter(|pack| pack.participates_in_setup())
+            .collect()
     }
 
     /// Find a discovered setup target by pack/provider ID.
@@ -265,7 +269,14 @@ impl DiscoveryResult {
         self.providers
             .iter()
             .chain(self.app_packs.iter())
-            .find(|pack| pack.provider_id == provider_id)
+            .find(|pack| pack.provider_id == provider_id && pack.participates_in_setup())
+    }
+}
+
+impl DetectedProvider {
+    fn participates_in_setup(&self) -> bool {
+        self.domain != "secrets"
+            && !crate::deployment_targets::is_deployer_pack_path(&self.pack_path)
     }
 }
 
@@ -770,6 +781,44 @@ mod tests {
         assert_eq!(discovered.app_packs[0].provider_id, "weather-app");
         assert_eq!(discovered.app_packs[0].domain, "app");
         assert_eq!(discovered.app_packs[0].kind, DetectedPackKind::App);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_targets_exclude_secrets_providers_and_deployer_packs() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("providers/messaging"))?;
+        std::fs::create_dir_all(root.join("providers/secrets"))?;
+        std::fs::create_dir_all(root.join("packs"))?;
+
+        write_test_pack(
+            &root
+                .join("providers")
+                .join("messaging")
+                .join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+            "Telegram",
+        )?;
+        write_test_pack(
+            &root
+                .join("providers")
+                .join("secrets")
+                .join("secrets-vault.gtpack"),
+            "secrets-vault",
+            "Vault",
+        )?;
+        write_test_pack(&root.join("packs").join("aws.gtpack"), "aws", "AWS")?;
+
+        let discovered = discover(root)?;
+        let setup_ids: Vec<_> = discovered
+            .setup_targets()
+            .into_iter()
+            .map(|provider| provider.provider_id.as_str())
+            .collect();
+        assert_eq!(setup_ids, vec!["messaging-telegram"]);
+        assert!(discovered.find_setup_target("secrets-vault").is_none());
+        assert!(discovered.find_setup_target("aws").is_none());
         Ok(())
     }
 

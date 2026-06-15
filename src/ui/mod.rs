@@ -1050,7 +1050,7 @@ fn find_setup_backend_contract(
     let Some(provider) = discovered.find_setup_target(provider_id) else {
         return Ok(None);
     };
-    Ok(load_setup_backend_contract_descriptor(&provider))
+    Ok(load_setup_backend_contract_descriptor(provider))
 }
 
 fn extension_inline(extension: &Value) -> Option<&Value> {
@@ -2865,7 +2865,7 @@ async fn setup_backend_binary_request(
         .with_context(|| format!("request failed: {url}"))?;
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
-    let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text));
+    let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
     Ok(serde_json::json!({
         "ok": status < 400,
         "status": status,
@@ -3118,7 +3118,7 @@ fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String
     .and_then(|policy| policy.public_base_url)
     .map(|value| value.trim().trim_end_matches('/').to_string())
     .filter(|value| !value.is_empty())
-    .or_else(|| configured_runtime_proxy_base_url())
+    .or_else(configured_runtime_proxy_base_url)
 }
 
 fn setup_backend_host_capability_url(
@@ -3679,9 +3679,9 @@ fn persist_provider_setup_event(state: &UiState, req: ProviderSetupEventRequest)
     });
     let path = provider_setup_event_log_path(
         state,
-        &env_segment,
-        &tenant_segment,
-        &team_segment,
+        env_segment,
+        tenant_segment,
+        team_segment,
         provider_id,
     );
     if let Some(parent) = path.parent() {
@@ -3712,9 +3712,9 @@ fn read_provider_setup_events(
     let env_segment = validate_log_path_segment(&env, "env")?;
     let path = provider_setup_event_log_path(
         state,
-        &env_segment,
-        &tenant_segment,
-        &team_segment,
+        env_segment,
+        tenant_segment,
+        team_segment,
         provider_id,
     );
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
