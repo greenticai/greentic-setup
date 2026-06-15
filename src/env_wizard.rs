@@ -283,10 +283,17 @@ fn derive_required_secrets(
 
     for bundle in bundles {
         let tenant = bundle_tenant(bundle);
-        let artifact = if bundle.bundle_path.is_absolute() {
-            bundle.bundle_path.clone()
+        // Revision-based bundles carry no `.gtbundle` path, so there is no
+        // artifact to scan for secret requirements — skip them quietly (the
+        // wizard authors path-based bundles; this only arises when pre-loading
+        // an existing manifest).
+        let Some(bundle_path) = bundle.bundle_path.as_ref() else {
+            continue;
+        };
+        let artifact = if bundle_path.is_absolute() {
+            bundle_path.clone()
         } else {
-            manifest_dir.join(&bundle.bundle_path)
+            manifest_dir.join(bundle_path)
         };
         let Some(bundle_root) = artifact.parent() else {
             skipped = true;
@@ -538,10 +545,17 @@ pub fn manifest_to_answers(manifest: &EnvManifest) -> Result<AnswerSet> {
             .map(|b| -> Result<Value> {
                 let mut row = JsonMap::new();
                 row.insert("bundle_id".to_string(), Value::String(b.bundle_id.clone()));
-                row.insert(
-                    "bundle_path".to_string(),
-                    Value::String(b.bundle_path.display().to_string()),
-                );
+                // Render the bundle path only when present. A path-less
+                // (revision-based) bundle has no `bundle_path` form field;
+                // `revisions`/`revenue_share`/`status` have no form questions
+                // either, so the path-based wizard simply round-trips them as
+                // their `answers_to_manifest` defaults (None).
+                if let Some(path) = &b.bundle_path {
+                    row.insert(
+                        "bundle_path".to_string(),
+                        Value::String(path.display().to_string()),
+                    );
+                }
                 if let Some(customer) = &b.customer_id {
                     row.insert("customer_id".to_string(), Value::String(customer.clone()));
                 }
@@ -643,6 +657,12 @@ mod tests {
             environment: ManifestEnvironment {
                 id: "demo".to_string(),
                 public_base_url: Some("https://demo.example.com".to_string()),
+                // Form-less env fields: `answers_to_manifest` always produces
+                // None, so the round-trip only holds when these start None.
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
             },
             trust_root: Some(TrustRootDirective::Bootstrap),
             secrets: vec![ManifestSecret {
@@ -651,7 +671,12 @@ mod tests {
             }],
             bundles: vec![ManifestBundle {
                 bundle_id: "realbot".to_string(),
-                bundle_path: PathBuf::from("./bundles/realbot.gtbundle"),
+                bundle_path: Some(PathBuf::from("./bundles/realbot.gtbundle")),
+                // Revision/billing/status fields have no form questions;
+                // `answers_to_manifest` defaults them to None.
+                revisions: None,
+                revenue_share: None,
+                status: None,
                 customer_id: Some("acme".to_string()),
                 config_overrides: Some(BTreeMap::from([(
                     "pack-a".to_string(),
@@ -669,6 +694,9 @@ mod tests {
                     }),
                 }),
             }],
+            // No form questions for packs/extensions; default empty.
+            packs: Vec::new(),
+            extensions: Vec::new(),
             messaging_endpoints: vec![ManifestEndpoint {
                 name: "demo-telegram".to_string(),
                 provider_type: "messaging.telegram.bot".to_string(),
@@ -708,10 +736,16 @@ mod tests {
             environment: ManifestEnvironment {
                 id: "local".to_string(),
                 public_base_url: None,
+                name: None,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
             },
             trust_root: None,
             secrets: Vec::new(),
+            packs: Vec::new(),
             bundles: Vec::new(),
+            extensions: Vec::new(),
             messaging_endpoints: Vec::new(),
         };
         let back = round_trip(&original);
