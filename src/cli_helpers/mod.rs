@@ -161,7 +161,7 @@ pub fn run_interactive_wizard(
     let deployer_candidates =
         crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
     let deployment_targets =
-        crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
+        crate::deployment_targets::reconcile_deployment_targets(bundle_path, &[])?;
 
     // Prompt for tunnel mode when no deployer packs are present (local dev).
     let tunnel = if has_cloud_deployment_target(&deployment_targets) {
@@ -305,10 +305,11 @@ pub fn complete_loaded_answers_with_prompts(
     }
     let deployer_candidates =
         crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
-    if loaded.platform_setup.deployment_targets.is_empty() && !non_interactive {
-        loaded.platform_setup.deployment_targets =
-            crate::deployment_targets::prompt_deployment_targets(&deployer_candidates)?;
-    }
+    loaded.platform_setup.deployment_targets =
+        crate::deployment_targets::reconcile_deployment_targets(
+            bundle_path,
+            &loaded.platform_setup.deployment_targets,
+        )?;
     if has_cloud_deployment_target(&loaded.platform_setup.deployment_targets) {
         loaded.platform_setup.tunnel = Some(default_no_tunnel_answers());
     } else if deployer_candidates.is_empty()
@@ -461,21 +462,11 @@ pub fn complete_loaded_answers_with_prompts(
 
 /// Ensure deployment targets are present if bundle has deployer packs.
 pub fn ensure_deployment_targets_present(bundle_path: &Path, loaded: &LoadedAnswers) -> Result<()> {
-    if !loaded.platform_setup.deployment_targets.is_empty() {
-        return Ok(());
-    }
-    let candidates = crate::deployment_targets::discover_deployer_pack_candidates(bundle_path)?;
-    if candidates.is_empty() {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "bundle contains deployer packs ({}) but answers did not define platform_setup.deployment_targets",
-        candidates
-            .iter()
-            .map(|value| value.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    let _ = crate::deployment_targets::reconcile_deployment_targets(
+        bundle_path,
+        &loaded.platform_setup.deployment_targets,
+    )?;
+    Ok(())
 }
 
 /// Ensure loaded answers satisfy all visible required setup questions.
