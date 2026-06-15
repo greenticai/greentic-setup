@@ -3118,11 +3118,9 @@ fn setup_backend_host_default_overrides_empty(key: &str) -> bool {
 }
 
 fn default_setup_backend_config(state: &UiState, tenant: &str) -> JsonMap<String, Value> {
-    default_setup_backend_config_with_runtime_base(
-        state,
-        tenant,
-        configured_runtime_proxy_base_url().as_deref(),
-    )
+    let runtime_base = configured_runtime_proxy_base_url()
+        .or_else(|| setup_backend_runtime_local_base_url(state, tenant));
+    default_setup_backend_config_with_runtime_base(state, tenant, runtime_base.as_deref())
 }
 
 fn default_setup_backend_config_with_runtime_base(
@@ -3160,6 +3158,9 @@ fn setup_backend_apply_host_defaults_with_runtime_base(
     runtime_base: Option<&str>,
     config: &mut JsonMap<String, Value>,
 ) {
+    let runtime_base = runtime_base
+        .map(ToString::to_string)
+        .or_else(|| setup_backend_runtime_local_base_url(state, tenant));
     if setup_backend_config_str(config, "public_base_url").is_empty()
         && let Some(public_base_url) = setup_backend_public_base_url(state, tenant)
     {
@@ -3170,6 +3171,7 @@ fn setup_backend_apply_host_defaults_with_runtime_base(
     }
     if setup_backend_config_str(config, "provider_setup_base_url").is_empty()
         && let Some(url) = runtime_base
+            .as_deref()
             .map(|base| base.trim_end_matches('/').to_string())
             .filter(|base| !base.is_empty())
     {
@@ -3202,6 +3204,18 @@ fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String
     .map(|value| value.trim().trim_end_matches('/').to_string())
     .filter(|value| !value.is_empty())
     .or_else(configured_runtime_proxy_base_url)
+}
+
+fn setup_backend_runtime_local_base_url(state: &UiState, tenant: &str) -> Option<String> {
+    crate::platform_setup::load_runtime_local_base_url(
+        &state.bundle_path,
+        tenant,
+        state.team.as_deref(),
+    )
+    .ok()
+    .flatten()
+    .map(|value| value.trim().trim_end_matches('/').to_string())
+    .filter(|value| !value.is_empty())
 }
 
 fn setup_backend_template_unresolved(value: &str) -> bool {
@@ -5044,6 +5058,33 @@ mod tests {
         );
 
         assert_eq!(config["provider_setup_base_url"], "http://127.0.0.1:9101");
+    }
+
+    #[test]
+    fn setup_backend_defaults_include_provider_setup_base_from_runtime_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_dir = temp
+            .path()
+            .join("state")
+            .join("runtime")
+            .join("demo.support");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "gateway_listen_addr": "127.0.0.1",
+                "gateway_port": 8081
+            })
+            .to_string(),
+        )
+        .expect("runtime endpoints");
+        let state = test_ui_state(temp.path());
+
+        let config = super::default_setup_backend_config(&state, "demo");
+
+        assert_eq!(config["provider_setup_base_url"], "http://127.0.0.1:8081");
     }
 
     #[tokio::test]

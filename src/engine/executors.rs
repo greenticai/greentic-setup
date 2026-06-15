@@ -96,7 +96,9 @@ pub fn execute_add_packs_to_bundle(
         std::fs::create_dir_all(&target_dir)?;
 
         let target_path = target_dir.join(format!("{}.gtpack", pack.pack_id));
-        if pack.cached_path.exists() && !target_path.exists() {
+        let source_path = pack.cached_path.canonicalize().ok();
+        let existing_target_path = target_path.canonicalize().ok();
+        if pack.cached_path.exists() && source_path != existing_target_path {
             std::fs::copy(&pack.cached_path, &target_path).with_context(|| {
                 format!(
                     "failed to copy pack {} to {}",
