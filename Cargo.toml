@@ -27,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 greentic-deployer = { version = ">=1.1.0-dev.27535364044, <1.2.0-0", default-features = false }
 greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 greentic-runner-host = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false }
-greentic-secrets-lib = { version = ">=1.1.0-dev, <1.2.0-0", features = ["providers-dev"] }
+greentic-secrets-lib = { version = ">=1.1.0-dev.27563392344, <1.2.0-0", features = ["providers-dev"] }
 greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }
 hmac = "0.13"
 qa-spec = ">=1.1.0-dev, <1.2.0-0"
