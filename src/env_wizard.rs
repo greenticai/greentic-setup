@@ -23,6 +23,14 @@
 //! of each required secret — never the path (auto-derived), never the value
 //! (apply reads it from the env / dev-store). So the operator only enters
 //! the secrets the configured bundles actually need.
+//!
+//! Basic vs advanced: by default the wizard asks only the everyday fields.
+//! The optional row columns an operator almost always leaves empty
+//! (`customer_id`, `config_overrides`, `route_hosts` on bundles; the
+//! `welcome_*` trio and `secret_refs` on endpoints) are hidden until
+//! `--advanced` is passed — the same flag that already reveals the optional
+//! top-level questions. The route path/tenant/team and endpoint links stay
+//! in the basic flow; the common multi-bundle setup needs them.
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -64,7 +72,16 @@ pub fn run_env_wizard(
     // secrets the configured bundles actually declare, and only for the
     // env-var NAME of each (never the path, never the value).
     let spec = manifest_form_spec();
+    // Basic flow hides the advanced-only row columns; `--advanced` reveals
+    // them (mirrors the existing top-level optional-question gating).
+    let spec = spec_for_mode(&spec, advanced);
     let form_spec = spec_without_question(&spec, "secrets");
+    if !advanced {
+        println!(
+            "\nBasic mode — pass --advanced to also set customer id, config \
+             overrides, route hosts, welcome flow, and endpoint secret refs."
+        );
+    }
     let prompted = prompt_form_spec_answers_with_existing(
         &form_spec,
         "environment",
@@ -129,6 +146,53 @@ fn answer_set(answers: JsonMap<String, Value>) -> AnswerSet {
 fn spec_without_question(spec: &FormSpec, id: &str) -> FormSpec {
     let mut reduced = spec.clone();
     reduced.questions.retain(|question| question.id != id);
+    reduced
+}
+
+/// Optional `List` row columns hidden from the basic (non-`--advanced`)
+/// flow, keyed by the owning list question id. They map to manifest fields
+/// an operator almost always leaves empty. Everything not listed here — and
+/// every required column — stays in the basic flow, notably the route
+/// path/tenant/team and endpoint links the common multi-bundle setup needs.
+const ADVANCED_LIST_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "bundles",
+        &["customer_id", "config_overrides", "route_hosts"],
+    ),
+    (
+        "messaging_endpoints",
+        &[
+            "welcome_bundle_id",
+            "welcome_pack_id",
+            "welcome_flow_id",
+            "secret_refs",
+        ],
+    ),
+];
+
+/// Clone of `spec` with the advanced-only row columns
+/// ([`ADVANCED_LIST_COLUMNS`]) removed from each `List` question, so the
+/// basic flow asks only the everyday fields. A no-op when `advanced` is
+/// true. Hiding at the spec level (like [`spec_without_question`]) keeps the
+/// shared prompt loop generic — it never learns which columns are advanced.
+fn spec_for_mode(spec: &FormSpec, advanced: bool) -> FormSpec {
+    if advanced {
+        return spec.clone();
+    }
+    let mut reduced = spec.clone();
+    for question in &mut reduced.questions {
+        let Some(hidden) = ADVANCED_LIST_COLUMNS
+            .iter()
+            .find(|(id, _)| *id == question.id)
+            .map(|(_, columns)| *columns)
+        else {
+            continue;
+        };
+        if let Some(list) = question.list.as_mut() {
+            list.fields
+                .retain(|field| !hidden.contains(&field.id.as_str()));
+        }
+    }
     reduced
 }
 
@@ -873,5 +937,114 @@ mod tests {
             derive_required_secrets(dir.path(), "local", std::slice::from_ref(&bundle));
         assert!(derived.is_empty());
         assert!(skipped, "missing artifact flags skipped");
+    }
+
+    /// Sorted row-field ids of the `List` question `id` in `spec`.
+    fn list_field_ids(spec: &FormSpec, id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = spec
+            .questions
+            .iter()
+            .find(|q| q.id == id)
+            .and_then(|q| q.list.as_ref())
+            .map(|list| list.fields.iter().map(|f| f.id.clone()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn spec_for_mode_basic_hides_only_the_curated_columns() {
+        let basic = spec_for_mode(&manifest_form_spec(), false);
+        assert_eq!(
+            list_field_ids(&basic, "bundles"),
+            [
+                "bundle_id",
+                "bundle_path",
+                "route_path_prefixes",
+                "route_team",
+                "route_tenant",
+            ],
+            "basic bundles keep id/path + route path/tenant/team only"
+        );
+        assert_eq!(
+            list_field_ids(&basic, "messaging_endpoints"),
+            ["links", "name", "provider_type"],
+            "basic endpoints keep name/provider_type/links only"
+        );
+    }
+
+    #[test]
+    fn spec_for_mode_advanced_is_a_noop() {
+        let spec = manifest_form_spec();
+        let advanced = spec_for_mode(&spec, true);
+        // Every curated column survives, and the column sets are identical to
+        // the source spec's.
+        assert_eq!(
+            list_field_ids(&advanced, "bundles"),
+            list_field_ids(&spec, "bundles"),
+        );
+        assert_eq!(
+            list_field_ids(&advanced, "messaging_endpoints"),
+            list_field_ids(&spec, "messaging_endpoints"),
+        );
+        for col in ["customer_id", "config_overrides", "route_hosts"] {
+            assert!(
+                list_field_ids(&advanced, "bundles").contains(&col.to_string()),
+                "advanced keeps bundles.{col}"
+            );
+        }
+        for col in [
+            "welcome_bundle_id",
+            "welcome_pack_id",
+            "welcome_flow_id",
+            "secret_refs",
+        ] {
+            assert!(
+                list_field_ids(&advanced, "messaging_endpoints").contains(&col.to_string()),
+                "advanced keeps messaging_endpoints.{col}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_spec_answers_convert_to_a_valid_manifest() {
+        // A two-dept-style answer set using only basic-flow columns passes the
+        // basic form spec and converts + shape-validates through the deployer —
+        // proving the hidden columns are never required.
+        let basic = spec_for_mode(&manifest_form_spec(), false);
+        let raw = json!({
+            "environment_id": "local",
+            "trust_root_bootstrap": true,
+            "bundles": [{
+                "bundle_id": "legal",
+                "bundle_path": "ws-legal/realbot.gtbundle",
+                "route_path_prefixes": "/legal",
+                "route_tenant": "legal",
+                "route_team": "default"
+            }],
+            "messaging_endpoints": [{
+                "name": "legal",
+                "provider_type": "messaging.telegram.bot",
+                "links": "legal"
+            }]
+        });
+        let set = answer_set(raw.as_object().unwrap().clone());
+
+        let report = qa_spec::validate(&basic, &set.answers);
+        assert!(
+            report.valid,
+            "basic answers must pass the basic spec: {report:?}"
+        );
+
+        let manifest = answers_to_manifest(&set).expect("converts");
+        manifest.validate_shape().expect("valid shape");
+        let bundle = &manifest.bundles[0];
+        assert!(bundle.customer_id.is_none());
+        assert!(bundle.config_overrides.is_none());
+        let rb = bundle.route_binding.as_ref().expect("route binding built");
+        assert_eq!(rb.path_prefixes, ["/legal"]);
+        assert!(rb.hosts.is_empty(), "route_hosts stays empty in basic mode");
+        assert!(manifest.messaging_endpoints[0].welcome_flow.is_none());
+        assert!(manifest.messaging_endpoints[0].secret_refs.is_empty());
     }
 }
