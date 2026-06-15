@@ -1804,7 +1804,7 @@ mod tests {
             Some("https://api.openai.com/v1")
         );
         // `canonical_secret_uri` collapses the literal "default" team into
-        // the wildcard segment `_` (see `canonical_team` in lib.rs).
+        // the wildcard segment `_` (via `greentic_secrets_lib::normalize_team`).
         assert_eq!(
             map["api_key"].as_str(),
             Some("secrets://dev/demo/_/openai-llm/api_key"),
