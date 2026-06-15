@@ -551,7 +551,7 @@ fn prompt_paste_value(keep_stored: bool) -> Result<Option<String>> {
             if keep_stored {
                 return Ok(None);
             }
-            println!("  A value is required (or choose [1] environment variable instead).");
+            println!("  A value is required.");
             continue;
         }
         return Ok(Some(value));
