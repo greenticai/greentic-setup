@@ -69,7 +69,7 @@ The generic executor kinds currently handled by `greentic-setup` are:
 
 - `oauth_device_code`
 - `microsoft_graph_application`
-- `bot_framework_registration`
+- `provider_http`
 - `microsoft_graph_teams_app_catalog_publish`
 - `microsoft_graph_teams_app_user_install`
 - `runtime_observation`
@@ -82,15 +82,37 @@ Before executing actions, `greentic-setup` injects generic host-derived defaults
 into setup backend config. This includes `public_base_url` from setup/public
 environment variables, an active setup tunnel, persisted static-routes/runtime
 endpoint artifacts, or the local runtime proxy in development. It also includes
-known host capability URLs such as `bot_framework_registration_url` when a
-compatible runtime is available through `GREENTIC_SETUP_RUNTIME_URL`.
+`provider_setup_base_url` when a provider setup runtime is available through
+`GREENTIC_SETUP_RUNTIME_URL`.
 
 Contracts should reference host-provided values through generic placeholders
-such as `{public_base_url}` and `{bot_framework_registration_url}`, or through
-future explicit metadata such as `host_capability:
-"bot_framework_registration"`. If the setup host cannot provide a required
-capability, the action returns a blocked result naming the missing capability
-instead of asking the user for internal URLs.
+such as `{public_base_url}` and `{provider_setup_base_url}`. Provider-owned
+setup work should use the generic `provider_http` executor, with either an
+absolute `url_template` or a relative `path_template` that is resolved against
+`provider_setup_base_url`.
+
+Example:
+
+```json
+{
+  "id": "register_provider_endpoint",
+  "executor": {
+    "kind": "provider_http",
+    "path_template": "/v1/setup/provider-endpoint",
+    "body": {
+      "provider_id": "messaging-example",
+      "tenant": "{tenant}",
+      "team": "{team}",
+      "endpoint": "{public_base_url}/v1/messaging/ingress/messaging-example/{tenant}/{team}"
+    },
+    "state_store_key": "last_reconcile"
+  },
+  "completion": {
+    "state_path": "last_reconcile.ok",
+    "equals": true
+  }
+}
+```
 
 The route response shape remains generic and component-friendly:
 

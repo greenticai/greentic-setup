@@ -1725,11 +1725,8 @@ async fn setup_backend_execute_action(
         "microsoft_graph_application" => {
             setup_backend_execute_graph_application(contract, tenant, stored, action).await
         }
-        "bot_framework_registration" => {
-            setup_backend_execute_bot_framework_registration(
-                state, contract, tenant, stored, action,
-            )
-            .await
+        "provider_http" => {
+            setup_backend_execute_provider_http(state, contract, tenant, stored, action).await
         }
         "microsoft_graph_teams_app_catalog_publish" => {
             setup_backend_execute_teams_app_publish(state, contract, tenant, stored, action).await
@@ -2177,7 +2174,7 @@ async fn setup_backend_execute_graph_application(
     ))
 }
 
-async fn setup_backend_execute_bot_framework_registration(
+async fn setup_backend_execute_provider_http(
     state: &UiState,
     contract: &ProviderBackendContract,
     tenant: &str,
@@ -2187,98 +2184,79 @@ async fn setup_backend_execute_bot_framework_registration(
     let executor = setup_backend_executor(action)?;
     let config = setup_backend_config_mut(stored)?;
     setup_backend_apply_host_defaults(state, tenant, config);
-    let app_id_key = required_executor_str(executor, "bot_app_id_config_key")?;
-    let password_key = required_executor_str(executor, "bot_app_password_config_key")?;
-    let app_id = setup_backend_config_str(config, app_id_key);
-    let password = setup_backend_config_str(config, password_key);
-    if app_id.is_empty() || password.is_empty() {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            &format!("{app_id_key} and {password_key} are required"),
-            serde_json::json!({ "ok": false, "missing_config_keys": [app_id_key, password_key] }),
-        ));
-    }
-    let endpoint_template = required_executor_str(executor, "messaging_endpoint_template")?;
-    let target = setup_backend_expand_template(state, tenant, config, endpoint_template);
-    if setup_backend_template_unresolved(&target) {
-        return Ok(setup_backend_missing_host_capability_result(
-            action,
-            "public_base_url",
-            "public_base_url",
-        ));
-    }
-    let Some(registration_url_template) = executor
-        .get("registration_url_template")
-        .or_else(|| executor.get("url_template"))
-        .and_then(Value::as_str)
-    else {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            "bot_framework_registration executor requires registration_url_template or url_template",
-            serde_json::json!({
-                "ok": false,
-                "missing_executor_field": "registration_url_template",
-                "target_messaging_endpoint": target,
-            }),
-        ));
-    };
-    let registration_url =
-        setup_backend_expand_template(state, tenant, config, registration_url_template);
-    if setup_backend_template_unresolved(&registration_url) || registration_url.trim().is_empty() {
-        let capability = setup_backend_executor_host_capability(executor)
-            .unwrap_or("bot_framework_registration");
-        return Ok(setup_backend_missing_host_capability_result(
-            action,
-            capability,
-            "bot_framework_registration_url",
-        ));
-    }
-    let client = reqwest::Client::new();
-    let response = match setup_backend_json_request(
-        &client,
-        reqwest::Method::POST,
-        &registration_url,
-        None,
-        Some(serde_json::json!({
-            "bot_app_id": app_id,
-            "bot_app_password": password,
-            "messaging_endpoint": target,
-            "channel": executor.get("channel").cloned().unwrap_or(Value::Null),
-            "provider_id": contract.provider_id,
-            "tenant": tenant,
-            "team": state.team.clone().unwrap_or_else(|| "default".to_string()),
-        })),
-    )
-    .await
-    {
-        Ok(response) => response,
+
+    let target = match setup_backend_provider_http_url(state, tenant, config, executor) {
+        Ok(url) => url,
         Err(err) => {
             return Ok(setup_backend_step_result(
                 action,
                 false,
-                "Provider setup service is not running",
+                &err.to_string(),
                 serde_json::json!({
                     "ok": false,
                     "blocked": true,
-                    "error": "Provider setup service is not running",
-                    "target": registration_url,
-                    "detail": err.to_string(),
+                    "error": err.to_string(),
                 }),
             ));
         }
     };
-    let ok = response.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if setup_backend_template_unresolved(&target) || target.trim().is_empty() {
+        return Ok(setup_backend_step_result(
+            action,
+            false,
+            "provider_http executor target could not be resolved",
+            serde_json::json!({
+                "ok": false,
+                "blocked": true,
+                "error": "provider_http executor target could not be resolved",
+                "target": target,
+            }),
+        ));
+    }
+
+    let method = executor
+        .get("method")
+        .and_then(Value::as_str)
+        .and_then(|method| reqwest::Method::from_bytes(method.as_bytes()).ok())
+        .unwrap_or(reqwest::Method::POST);
+    let payload = setup_backend_provider_http_payload(state, contract, tenant, config, action);
+    let client = reqwest::Client::new();
+    let response =
+        match setup_backend_json_request(&client, method, &target, None, Some(payload)).await {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(setup_backend_step_result(
+                    action,
+                    false,
+                    "Provider setup service is not running",
+                    serde_json::json!({
+                        "ok": false,
+                        "blocked": true,
+                        "error": "Provider setup service is not running",
+                        "target": target,
+                        "detail": err.to_string(),
+                    }),
+                ));
+            }
+        };
+    let ok = response
+        .get("body")
+        .and_then(|body| body.get("ok"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| response.get("ok").and_then(Value::as_bool).unwrap_or(false));
     let state_key = executor
         .get("state_store_key")
         .and_then(Value::as_str)
-        .unwrap_or("last_reconcile");
+        .unwrap_or_else(|| {
+            action
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("last_provider_http")
+        });
     let result = serde_json::json!({
         "ok": ok,
-        "target_messaging_endpoint": target,
-        "registration_url": registration_url,
-        "registration": response,
+        "target": target,
+        "response": response,
     });
     stored.insert(state_key.to_string(), result.clone());
     Ok(setup_backend_step_result(
@@ -2287,7 +2265,7 @@ async fn setup_backend_execute_bot_framework_registration(
         if ok {
             "click again to continue setup"
         } else {
-            "fix Bot Framework registration endpoint and retry"
+            "fix provider setup endpoint and retry"
         },
         result,
     ))
@@ -2821,6 +2799,113 @@ fn setup_backend_expand_executor_links(
     Value::Object(links)
 }
 
+fn setup_backend_provider_http_url(
+    state: &UiState,
+    tenant: &str,
+    config: &JsonMap<String, Value>,
+    executor: &Value,
+) -> Result<String> {
+    if let Some(template) = executor
+        .get("url_template")
+        .or_else(|| executor.get("target_url_template"))
+        .and_then(Value::as_str)
+    {
+        let url = setup_backend_expand_template(state, tenant, config, template);
+        validate_setup_backend_provider_http_url(&url)?;
+        return Ok(url);
+    }
+
+    let path_template = executor
+        .get("path_template")
+        .or_else(|| executor.get("target_path_template"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("provider_http executor requires url_template or path_template"))?;
+    let path = setup_backend_expand_template(state, tenant, config, path_template);
+    if !is_safe_same_origin_path(&path) {
+        anyhow::bail!("provider_http executor path_template must resolve to a safe absolute path");
+    }
+    let base = setup_backend_provider_http_base_url(config)
+        .ok_or_else(|| anyhow!("provider_http executor path_template requires GREENTIC_SETUP_RUNTIME_URL or provider_setup_base_url"))?;
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    validate_setup_backend_provider_http_url(&url)?;
+    Ok(url)
+}
+
+fn setup_backend_provider_http_base_url(config: &JsonMap<String, Value>) -> Option<String> {
+    let configured = setup_backend_config_str(config, "provider_setup_base_url")
+        .trim_end_matches('/')
+        .to_string();
+    if configured.is_empty() {
+        configured_runtime_proxy_base_url()
+    } else {
+        Some(configured)
+    }
+}
+
+fn validate_setup_backend_provider_http_url(url: &str) -> Result<()> {
+    let parsed =
+        Url::parse(url).with_context(|| format!("provider_http target is not a URL: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!("provider_http target must be an http(s) URL");
+    }
+    Ok(())
+}
+
+fn setup_backend_provider_http_payload(
+    state: &UiState,
+    contract: &ProviderBackendContract,
+    tenant: &str,
+    config: &JsonMap<String, Value>,
+    action: &Value,
+) -> Value {
+    let executor = action.get("executor").unwrap_or(&Value::Null);
+    if let Some(template) = executor
+        .get("body")
+        .or_else(|| executor.get("body_template"))
+        .or_else(|| executor.get("request_body"))
+    {
+        return setup_backend_expand_json_template(state, tenant, config, template);
+    }
+    serde_json::json!({
+        "provider_id": contract.provider_id,
+        "tenant": tenant,
+        "team": state.team.clone().unwrap_or_else(|| "default".to_string()),
+        "env": state.env,
+        "step": action.get("id").cloned().unwrap_or(Value::Null),
+        "config": config,
+    })
+}
+
+fn setup_backend_expand_json_template(
+    state: &UiState,
+    tenant: &str,
+    config: &JsonMap<String, Value>,
+    value: &Value,
+) -> Value {
+    match value {
+        Value::String(template) => Value::String(setup_backend_expand_template(
+            state, tenant, config, template,
+        )),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| setup_backend_expand_json_template(state, tenant, config, item))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        setup_backend_expand_json_template(state, tenant, config, value),
+                    )
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 async fn setup_backend_json_request(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -3029,7 +3114,7 @@ fn ensure_setup_backend_config_defaults(
 }
 
 fn setup_backend_host_default_overrides_empty(key: &str) -> bool {
-    matches!(key, "public_base_url" | "bot_framework_registration_url")
+    matches!(key, "public_base_url" | "provider_setup_base_url")
 }
 
 fn default_setup_backend_config(state: &UiState, tenant: &str) -> JsonMap<String, Value> {
@@ -3083,14 +3168,12 @@ fn setup_backend_apply_host_defaults_with_runtime_base(
             Value::String(public_base_url),
         );
     }
-    if setup_backend_config_str(config, "bot_framework_registration_url").is_empty()
-        && let Some(url) =
-            setup_backend_host_capability_url("bot_framework_registration", runtime_base)
+    if setup_backend_config_str(config, "provider_setup_base_url").is_empty()
+        && let Some(url) = runtime_base
+            .map(|base| base.trim_end_matches('/').to_string())
+            .filter(|base| !base.is_empty())
     {
-        config.insert(
-            "bot_framework_registration_url".to_string(),
-            Value::String(url),
-        );
+        config.insert("provider_setup_base_url".to_string(), Value::String(url));
     }
 }
 
@@ -3121,74 +3204,8 @@ fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String
     .or_else(configured_runtime_proxy_base_url)
 }
 
-fn setup_backend_host_capability_url(
-    capability: &str,
-    runtime_base: Option<&str>,
-) -> Option<String> {
-    let env_key = format!(
-        "GREENTIC_SETUP_{}_URL",
-        capability.to_ascii_uppercase().replace('-', "_")
-    );
-    if let Some(value) = std::env::var(env_key)
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Some(value);
-    }
-    match capability {
-        "bot_framework_registration" => runtime_base.map(|base| {
-            format!(
-                "{}/v1/setup/bot-framework/registration",
-                base.trim_end_matches('/')
-            )
-        }),
-        _ => None,
-    }
-}
-
-fn setup_backend_executor_host_capability(executor: &Value) -> Option<&str> {
-    executor
-        .get("host_capability")
-        .or_else(|| executor.get("capability"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            if executor
-                .get("registration_url_source")
-                .and_then(Value::as_str)
-                == Some("host_runtime")
-            {
-                Some("bot_framework_registration")
-            } else {
-                None
-            }
-        })
-}
-
 fn setup_backend_template_unresolved(value: &str) -> bool {
     value.contains('{') && value.contains('}')
-}
-
-fn setup_backend_missing_host_capability_result(
-    action: &Value,
-    capability: &str,
-    config_key: &str,
-) -> Value {
-    let message = format!(
-        "Setup host does not provide capability `{capability}`. Start a compatible greentic-start runtime or configure GREENTIC_SETUP_RUNTIME_URL."
-    );
-    setup_backend_step_result(
-        action,
-        false,
-        &message,
-        serde_json::json!({
-            "ok": false,
-            "blocked": true,
-            "missing_host_capability": capability,
-            "missing_config_key": config_key,
-            "error": message,
-        }),
-    )
 }
 
 fn setup_backend_server_owned_keys(
@@ -5016,7 +5033,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_backend_defaults_include_bot_framework_registration_runtime_capability_url() {
+    fn setup_backend_defaults_include_provider_setup_runtime_base_url() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
 
@@ -5026,14 +5043,30 @@ mod tests {
             Some("http://127.0.0.1:9101/"),
         );
 
-        assert_eq!(
-            config["bot_framework_registration_url"],
-            "http://127.0.0.1:9101/v1/setup/bot-framework/registration"
-        );
+        assert_eq!(config["provider_setup_base_url"], "http://127.0.0.1:9101");
     }
 
     #[tokio::test]
-    async fn bot_framework_registration_missing_host_capability_is_blocked() {
+    async fn provider_http_executor_calls_declared_provider_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let app = axum::Router::new().route(
+            "/v1/setup/register",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                axum::Json(json!({
+                    "ok": true,
+                    "received": body,
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider server");
+        });
+
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
         let contract = super::ProviderBackendContract {
@@ -5059,22 +5092,28 @@ mod tests {
                 "team": "support",
                 "bot_app_id": "app-id",
                 "bot_app_password": "app-password",
-                "public_base_url": "https://runtime.example.com"
+                "public_base_url": "https://runtime.example.com",
+                "provider_setup_base_url": base_url
             }),
         );
         let action = json!({
             "id": "register_endpoint",
             "executor": {
-                "kind": "bot_framework_registration",
-                "bot_app_id_config_key": "bot_app_id",
-                "bot_app_password_config_key": "bot_app_password",
-                "registration_url_template": "{bot_framework_registration_url}",
-                "messaging_endpoint_template": "{public_base_url}/v1/messaging/ingress/{tenant}/{team}",
+                "kind": "provider_http",
+                "path_template": "/v1/setup/register",
+                "body": {
+                    "provider_id": "messaging-example",
+                    "bot_app_id": "{bot_app_id}",
+                    "bot_app_password": "{bot_app_password}",
+                    "messaging_endpoint": "{public_base_url}/v1/messaging/ingress/{tenant}/{team}",
+                    "tenant": "{tenant}",
+                    "team": "{team}"
+                },
                 "state_store_key": "last_reconcile"
             }
         });
 
-        let result = super::setup_backend_execute_bot_framework_registration(
+        let result = super::setup_backend_execute_provider_http(
             &state,
             &contract,
             "demo",
@@ -5084,31 +5123,22 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result["ok"], false);
+        assert_eq!(result["ok"], true);
+        assert_eq!(stored["last_reconcile"]["ok"], true);
         assert_eq!(
-            result["result"]["missing_host_capability"],
-            "bot_framework_registration"
+            stored["last_reconcile"]["response"]["body"]["received"]["messaging_endpoint"],
+            "https://runtime.example.com/v1/messaging/ingress/demo/support"
         );
-        assert!(
-            result["next"]
-                .as_str()
-                .unwrap()
-                .contains("GREENTIC_SETUP_RUNTIME_URL")
+        assert_eq!(
+            stored["last_reconcile"]["response"]["body"]["received"]["bot_app_id"],
+            "app-id"
         );
 
         stored.insert("last_setup_result".to_string(), result);
         let rendered =
             super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
-        assert_eq!(
-            rendered["setup_status"]["blocked"]["missing_host_capability"],
-            "bot_framework_registration"
-        );
-        assert!(
-            rendered["setup_status"]["blocked"]["summary"]
-                .as_str()
-                .unwrap()
-                .contains("GREENTIC_SETUP_RUNTIME_URL")
-        );
+        assert_eq!(rendered["setup_status"]["ok"], true);
+        server.abort();
     }
 
     #[test]
