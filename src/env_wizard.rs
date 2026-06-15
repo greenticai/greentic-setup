@@ -283,17 +283,24 @@ fn derive_required_secrets(
 
     for bundle in bundles {
         let tenant = bundle_tenant(bundle);
-        // Revision-based bundles carry no `.gtbundle` path, so there is no
-        // artifact to scan for secret requirements — skip them quietly (the
-        // wizard authors path-based bundles; this only arises when pre-loading
-        // an existing manifest).
-        let Some(bundle_path) = bundle.bundle_path.as_ref() else {
+        // A bundle declares either a single `bundle_path` or a multi-revision
+        // `revisions[]` list (mutually exclusive). For secret auto-detection,
+        // resolve the single artifact, or the first revision as a representative
+        // (revisions of one deployment share the same tenant/secrets).
+        let Some(raw) = bundle.bundle_path.as_ref().or_else(|| {
+            bundle
+                .revisions
+                .as_ref()
+                .and_then(|revs| revs.first())
+                .map(|rev| &rev.bundle_path)
+        }) else {
+            skipped = true;
             continue;
         };
-        let artifact = if bundle_path.is_absolute() {
-            bundle_path.clone()
+        let artifact = if raw.is_absolute() {
+            raw.clone()
         } else {
-            manifest_dir.join(bundle_path)
+            manifest_dir.join(raw)
         };
         let Some(bundle_root) = artifact.parent() else {
             skipped = true;
@@ -545,15 +552,18 @@ pub fn manifest_to_answers(manifest: &EnvManifest) -> Result<AnswerSet> {
             .map(|b| -> Result<Value> {
                 let mut row = JsonMap::new();
                 row.insert("bundle_id".to_string(), Value::String(b.bundle_id.clone()));
-                // Render the bundle path only when present. A path-less
-                // (revision-based) bundle has no `bundle_path` form field;
-                // `revisions`/`revenue_share`/`status` have no form questions
-                // either, so the path-based wizard simply round-trips them as
-                // their `answers_to_manifest` defaults (None).
-                if let Some(path) = &b.bundle_path {
+                // Single-revision bundles carry `bundle_path`; multi-revision
+                // (JSON-first) bundles use the first revision's artifact as a
+                // representative for the wizard answer-set (which models one path).
+                if let Some(bp) = b.bundle_path.as_ref().or_else(|| {
+                    b.revisions
+                        .as_ref()
+                        .and_then(|revs| revs.first())
+                        .map(|rev| &rev.bundle_path)
+                }) {
                     row.insert(
                         "bundle_path".to_string(),
-                        Value::String(path.display().to_string()),
+                        Value::String(bp.display().to_string()),
                     );
                 }
                 if let Some(customer) = &b.customer_id {
@@ -672,8 +682,6 @@ mod tests {
             bundles: vec![ManifestBundle {
                 bundle_id: "realbot".to_string(),
                 bundle_path: Some(PathBuf::from("./bundles/realbot.gtbundle")),
-                // Revision/billing/status fields have no form questions;
-                // `answers_to_manifest` defaults them to None.
                 revisions: None,
                 revenue_share: None,
                 status: None,
