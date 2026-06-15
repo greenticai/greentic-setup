@@ -35,7 +35,7 @@
 //! top-level questions. The route path/tenant/team and endpoint links stay
 //! in the basic flow; the common multi-bundle setup needs them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -436,7 +436,7 @@ fn derive_and_prompt_secrets(
 
     let mut rows = Vec::with_capacity(derived.len());
     let mut prefilled = BTreeMap::new();
-    let mut taken = BTreeMap::new();
+    let mut taken = BTreeSet::new();
     for secret in &derived {
         println!();
         println!(
@@ -471,7 +471,7 @@ fn derive_and_prompt_secrets(
                 rows.push(json!({ "path": secret.path.clone(), "source": "paste" }));
             }
         }
-        taken.insert(secret.path.clone(), ());
+        taken.insert(secret.path.clone());
     }
 
     // Preserve pre-loaded secrets the wizard couldn't recompute (a bundle was
@@ -480,7 +480,7 @@ fn derive_and_prompt_secrets(
     // (apply no-ops on the already-stored value).
     if skipped {
         for (path, source) in existing_source {
-            if taken.contains_key(path) {
+            if taken.contains(path.as_str()) {
                 continue;
             }
             match source.as_str() {
