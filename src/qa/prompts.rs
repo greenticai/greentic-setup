@@ -2,6 +2,7 @@
 //!
 //! Handles user input collection, validation, and formatting for FormSpec questions.
 
+use std::borrow::Cow;
 use std::io::{self, Write as _};
 
 use anyhow::{Result, anyhow};
@@ -205,6 +206,37 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
     }
 }
 
+/// Resolve a row column's effective question for prompting.
+///
+/// When a column carries a `computed` expression *and* is
+/// `computed_overridable`, evaluate the expression against the row collected
+/// so far and surface the result as the column's `default_value` — so the
+/// operator sees a derived suggestion (e.g. route tenant defaulting to the
+/// bundle id) and accepts it with Enter or types their own. Columns without
+/// an overridable computed expression, and columns whose expression yields
+/// nothing for the current row, are returned untouched so their own
+/// `default_value` (if any) still applies.
+fn resolve_row_column_default<'a>(
+    column: &'a QuestionSpec,
+    row_so_far: &JsonMap<String, Value>,
+) -> Cow<'a, QuestionSpec> {
+    if !column.computed_overridable {
+        return Cow::Borrowed(column);
+    }
+    let Some(expr) = column.computed.as_ref() else {
+        return Cow::Borrowed(column);
+    };
+    let ctx = qa_spec::build_expression_context(&Value::Object(row_so_far.clone()));
+    let derived = match expr.evaluate_value(&ctx) {
+        Some(Value::String(text)) if !text.trim().is_empty() => text,
+        Some(Value::String(_)) | None => return Cow::Borrowed(column),
+        Some(other) => other.to_string(),
+    };
+    let mut resolved = column.clone();
+    resolved.default_value = Some(derived);
+    Cow::Owned(resolved)
+}
+
 /// Prompt for a `QuestionType::List` (repeating-row) question. Loops
 /// "Add another?" / row-by-row prompts and returns a `Value::Array` of
 /// per-row JSON objects whose keys match the column field IDs.
@@ -241,13 +273,15 @@ fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<
             break;
         }
 
-        // Ask whether to add another row.
+        // Ask whether to add another row. `item_label` lets the spec name
+        // the row noun (e.g. "bundle" ⇒ "Add bundle?"); falls back to "row".
+        let label = list.item_label.as_deref().unwrap_or("row");
         let prompt = if rows.is_empty() {
-            "  > Add a row? [y/N] "
+            format!("  > Add {label}? [y/N] ")
         } else {
-            "  > Add another row? [y/N] "
+            format!("  > Add another {label}? [y/N] ")
         };
-        let input = read_input(prompt, false)?;
+        let input = read_input(&prompt, false)?;
         let trimmed = input.trim().to_ascii_lowercase();
         let yes = matches!(trimmed.as_str(), "y" | "yes" | "1" | "true");
         if !yes {
@@ -265,7 +299,11 @@ fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<
         println!("  Row #{}:", rows.len() + 1);
         let mut row_obj = JsonMap::new();
         for column in &list.fields {
-            if let Some(value) = ask_form_spec_question(column)? {
+            // A column may derive its default from earlier columns in the
+            // same row (e.g. route_tenant ⇐ bundle_id). Resolve it against
+            // the row collected so far before prompting.
+            let column = resolve_row_column_default(column, &row_obj);
+            if let Some(value) = ask_form_spec_question(&column)? {
                 row_obj.insert(column.id.clone(), value);
             }
         }
@@ -411,5 +449,89 @@ mod tests {
         assert!(matches_pattern("http://localhost:8080", r"^https?://\S+"));
         assert!(!matches_pattern("not-a-url", r"^https?://\S+"));
         assert!(!matches_pattern("https://", r"^https?://\S+")); // too short
+    }
+
+    fn column(value: Value) -> QuestionSpec {
+        serde_json::from_value(value).expect("question spec")
+    }
+
+    fn row(pairs: &[(&str, &str)]) -> JsonMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect()
+    }
+
+    #[test]
+    fn row_column_default_derives_overridable_computed_from_siblings() {
+        let legal = row(&[("bundle_id", "legal")]);
+
+        // Copy of a sibling answer (route_tenant ⇐ bundle_id).
+        let tenant = column(json!({
+            "id": "route_tenant", "type": "string", "title": "Route tenant",
+            "computed": {"op": "var", "path": "bundle_id"},
+            "computed_overridable": true,
+        }));
+        assert_eq!(
+            resolve_row_column_default(&tenant, &legal)
+                .default_value
+                .as_deref(),
+            Some("legal")
+        );
+
+        // String concat (route_path_prefixes ⇐ "/" + bundle_id).
+        let prefixes = column(json!({
+            "id": "route_path_prefixes", "type": "string", "title": "Route path prefixes",
+            "computed": {"op": "concat", "parts": [
+                {"op": "literal", "value": "/"},
+                {"op": "var", "path": "bundle_id"}
+            ]},
+            "computed_overridable": true,
+        }));
+        assert_eq!(
+            resolve_row_column_default(&prefixes, &legal)
+                .default_value
+                .as_deref(),
+            Some("/legal")
+        );
+    }
+
+    #[test]
+    fn row_column_default_left_untouched_when_inapplicable() {
+        let legal = row(&[("bundle_id", "legal")]);
+
+        // Non-overridable computed → wizard does not surface a default.
+        let forced = column(json!({
+            "id": "x", "type": "string", "title": "X",
+            "computed": {"op": "var", "path": "bundle_id"},
+            "computed_overridable": false,
+        }));
+        assert!(matches!(
+            resolve_row_column_default(&forced, &legal),
+            Cow::Borrowed(_)
+        ));
+
+        // Overridable computed but the source is absent → no default.
+        let tenant = column(json!({
+            "id": "route_tenant", "type": "string", "title": "Route tenant",
+            "computed": {"op": "var", "path": "bundle_id"},
+            "computed_overridable": true,
+        }));
+        assert_eq!(
+            resolve_row_column_default(&tenant, &JsonMap::new()).default_value,
+            None
+        );
+
+        // No computed expression → the column's own static default survives.
+        let team = column(json!({
+            "id": "route_team", "type": "string", "title": "Route team",
+            "default_value": "default",
+        }));
+        assert_eq!(
+            resolve_row_column_default(&team, &legal)
+                .default_value
+                .as_deref(),
+            Some("default")
+        );
     }
 }

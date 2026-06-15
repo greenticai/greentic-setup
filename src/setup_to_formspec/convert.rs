@@ -205,6 +205,7 @@ fn convert_table_question(q: &SetupQuestion, _provider_id: &str) -> QuestionSpec
             min_items: q.min_rows.map(usize::from),
             max_items: q.max_rows.map(usize::from),
             fields,
+            item_label: None,
         }),
         computed: None,
         policy: Default::default(),
