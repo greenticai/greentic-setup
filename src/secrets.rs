@@ -211,8 +211,7 @@ impl SecretsSetup {
     ) -> Result<()> {
         for req in generated {
             let team = generated_secrets::scope_team(&req.spec, self.team.as_deref());
-            let uri =
-                canonical_secret_uri(&self.env, &self.tenant, team, provider_id, &req.key);
+            let uri = canonical_secret_uri(&self.env, &self.tenant, team, provider_id, &req.key);
             if !req.spec.regenerate_if_present
                 && self.generated_present(provider_id, team, req).await?
             {
@@ -246,9 +245,7 @@ impl SecretsSetup {
         team: Option<&str>,
         req: &GeneratedRequirement,
     ) -> Result<bool> {
-        for key in std::iter::once(req.key.as_str())
-            .chain(req.aliases.iter().map(String::as_str))
-        {
+        for key in std::iter::once(req.key.as_str()).chain(req.aliases.iter().map(String::as_str)) {
             let uri = canonical_secret_uri(&self.env, &self.tenant, team, provider_id, key);
             match self.store.get(&uri).await {
                 Ok(_) => return Ok(true),
@@ -665,7 +662,13 @@ mod tests {
             .expect("ensure secrets");
 
         // Tenant-scoped secret collapses the team segment to `_`.
-        let uri = canonical_secret_uri("dev", "demo", None, "messaging-webchat-gui", "jwt_signing_key");
+        let uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
         let value = setup.store().get(&uri).await.expect("generated value");
         let value = String::from_utf8(value).expect("utf8");
         assert_eq!(value.len(), 20);
@@ -681,7 +684,13 @@ mod tests {
         write_pack_with_manifest(&pack, &generated_manifest(true));
 
         let setup = SecretsSetup::new(&bundle, "dev", "demo", Some("default")).expect("setup");
-        let uri = canonical_secret_uri("dev", "demo", None, "messaging-webchat-gui", "jwt_signing_key");
+        let uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
         setup
             .store()
             .put(&uri, SecretFormat::Text, b"already-set")
@@ -715,7 +724,13 @@ mod tests {
             .await
             .expect("ensure secrets");
 
-        let uri = canonical_secret_uri("dev", "demo", Some("default"), "messaging-slack", "RUNTIME_OAUTH_TOKEN");
+        let uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "RUNTIME_OAUTH_TOKEN",
+        );
         // Optional secret must be left unset (warn + slide), not placeholdered.
         assert!(matches!(
             setup.store().get(&uri).await,

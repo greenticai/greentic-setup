@@ -53,7 +53,9 @@ pub struct GeneratedSecretSpec {
 ///
 /// Returns an empty vector when the pack declares none (or is not a readable
 /// zip archive); discovery failures elsewhere must not block setup.
-pub fn load_generated_requirements_from_pack(pack_path: &Path) -> Result<Vec<GeneratedRequirement>> {
+pub fn load_generated_requirements_from_pack(
+    pack_path: &Path,
+) -> Result<Vec<GeneratedRequirement>> {
     let file = match File::open(pack_path) {
         Ok(file) => file,
         Err(_) => return Ok(Vec::new()),
@@ -94,7 +96,12 @@ fn load_from_json_manifest(
 
 fn load_from_cbor_manifest(archive: &mut ZipArchive<File>) -> Result<Vec<GeneratedRequirement>> {
     let manifest_names: Vec<String> = (0..archive.len())
-        .filter_map(|index| archive.by_index(index).ok().map(|entry| entry.name().to_string()))
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|entry| entry.name().to_string())
+        })
         .filter(|name| name == "manifest.cbor" || name.ends_with(".manifest.cbor"))
         .collect();
 
@@ -176,7 +183,10 @@ fn random_ascii(length: usize) -> String {
 /// Tenant-scoped secrets (or those that pin `team: "_"`) collapse to the
 /// tenant-wide `_` placeholder; otherwise the declared team wins, falling back
 /// to the active setup team.
-pub fn scope_team<'a>(spec: &'a GeneratedSecretSpec, default_team: Option<&'a str>) -> Option<&'a str> {
+pub fn scope_team<'a>(
+    spec: &'a GeneratedSecretSpec,
+    default_team: Option<&'a str>,
+) -> Option<&'a str> {
     if spec.scope_level.eq_ignore_ascii_case("tenant") || spec.scope_team.as_deref() == Some("_") {
         return None;
     }
@@ -342,7 +352,10 @@ mod tests {
             regenerate_if_present: false,
         })
         .unwrap_err();
-        assert!(err.to_string().contains("unsupported generated secret policy"));
+        assert!(
+            err.to_string()
+                .contains("unsupported generated secret policy")
+        );
     }
 
     #[test]
