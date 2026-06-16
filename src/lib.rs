@@ -75,6 +75,13 @@ pub fn resolve_env(override_env: Option<&str>) -> String {
 }
 
 /// Build a canonical secret URI: `secrets://{env}/{tenant}/{team}/{provider}/{key}`.
+///
+/// The team segment is normalized via `greentic-secrets`
+/// ([`greentic_secrets_lib::normalize_team`]) — the single source of truth for
+/// the "`_` everywhere" rule (empty / `"default"` / `None` → `_`) — and the key
+/// via the shared [`secret_name::canonical_secret_name`]. The empty-provider →
+/// `messaging` default and the infallible `String` shape are setup-local
+/// conveniences kept on top of the shared primitives.
 pub fn canonical_secret_uri(
     env: &str,
     tenant: &str,
@@ -82,7 +89,8 @@ pub fn canonical_secret_uri(
     provider: &str,
     key: &str,
 ) -> String {
-    let team_segment = canonical_team(team);
+    let team_segment = greentic_secrets_lib::normalize_team(team)
+        .unwrap_or_else(|| greentic_secrets_lib::TEAM_PLACEHOLDER.to_string());
     let provider_segment = if provider.is_empty() {
         "messaging".to_string()
     } else {
@@ -90,19 +98,6 @@ pub fn canonical_secret_uri(
     };
     let normalized_key = secret_name::canonical_secret_name(key);
     format!("secrets://{env}/{tenant}/{team_segment}/{provider_segment}/{normalized_key}")
-}
-
-/// Normalize the team segment for secret URIs.
-///
-/// Empty, `"default"`, or `None` → `"_"` (wildcard).
-fn canonical_team(team: Option<&str>) -> &str {
-    match team
-        .map(|v| v.trim())
-        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("default"))
-    {
-        Some(v) => v,
-        None => "_",
-    }
 }
 
 #[cfg(test)]
