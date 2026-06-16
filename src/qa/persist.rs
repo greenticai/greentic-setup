@@ -183,7 +183,9 @@ pub async fn persist_all_config_as_secrets(
     }
 
     if entries.is_empty() {
-        return Ok(vec![]);
+        // No answer/alias entries, but generated secrets may already have been
+        // introduced above — report those rather than dropping them.
+        return Ok(saved_keys);
     }
 
     tracing::info!(
