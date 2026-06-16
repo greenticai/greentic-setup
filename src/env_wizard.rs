@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use greentic_deployer::cli::env_manifest::{
     ENV_MANIFEST_FORM_ID, ENV_MANIFEST_FORM_VERSION, EnvManifest, ManifestBundle,
-    TrustRootDirective, answers_to_manifest, manifest_form_spec,
+    TrustRootDirective, answers_to_manifest, manifest_form_spec_for_env,
 };
 use greentic_deployer::runtime_secrets::{
     SecretValue, bundle_secret_requirements, manifest_secret_path,
@@ -77,7 +77,11 @@ pub fn run_env_wizard(
     // wizard owns secrets as a final, derived step — it asks only for the
     // secrets the configured bundles actually declare, and only for the
     // env-var NAME of each (never the path, never the value).
-    let spec = manifest_form_spec();
+    //
+    // Pass the target env so the `webchat_gui` question defaults match the
+    // runtime resolver (`resolved_gui_enabled()`): on for the `local` env id,
+    // off elsewhere. An explicit answer in a pre-loaded manifest still wins.
+    let spec = manifest_form_spec_for_env(env);
     // Basic flow hides the advanced-only row columns; `--advanced` reveals
     // them (mirrors the existing top-level optional-question gating).
     let spec = spec_for_mode(&spec, advanced);
@@ -814,7 +818,7 @@ mod tests {
     use greentic_deployer::cli::bundles::{RouteBindingPayload, TenantSelectorPayload};
     use greentic_deployer::cli::env_manifest::{
         ENV_MANIFEST_SCHEMA_V1, ManifestBundle, ManifestEndpoint, ManifestEnvironment,
-        ManifestSecret, ManifestWelcomeFlow,
+        ManifestSecret, ManifestWelcomeFlow, manifest_form_spec,
     };
     use std::collections::BTreeMap;
 
