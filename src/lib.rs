@@ -25,6 +25,7 @@ pub mod oauth_callback;
 pub mod oauth_device;
 pub mod plan;
 pub mod platform_setup;
+pub mod generated_secrets;
 pub mod provider_state;
 pub mod reload;
 pub mod secret_name;
