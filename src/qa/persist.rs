@@ -115,18 +115,42 @@ pub async fn persist_all_config_as_secrets(
     config: &Value,
     pack_path: Option<&Path>,
 ) -> Result<Vec<String>> {
-    let Some(config_map) = config.as_object() else {
-        return Ok(vec![]);
-    };
-    if config_map.is_empty() {
-        return Ok(vec![]);
-    }
-
     let store_path = crate::secrets::ensure_path(bundle_root)?;
     let store = crate::secrets::open_dev_store(bundle_root)?;
+    let mut saved_keys = Vec::new();
+
+    // Introduce pack-declared generated secrets (e.g. messaging-webchat-gui's
+    // jwt_signing_key) into the local store regardless of answer values, so
+    // `gtc start` can move the already-resolved value into the deployment
+    // target's secrets manager rather than regenerating a divergent one.
+    if let Some(pp) = pack_path {
+        let generated = crate::generated_secrets::introduce_into_store(
+            &store,
+            env,
+            tenant,
+            team,
+            provider_id,
+            pp,
+        )
+        .await?;
+        if !generated.is_empty() {
+            tracing::info!(
+                provider_id,
+                introduced = ?generated,
+                "setup secrets: introduced generated secrets"
+            );
+        }
+        saved_keys.extend(generated);
+    }
+
+    let Some(config_map) = config.as_object() else {
+        return Ok(saved_keys);
+    };
+    if config_map.is_empty() {
+        return Ok(saved_keys);
+    }
 
     let mut entries = Vec::new();
-    let mut saved_keys = Vec::new();
 
     for (key, value) in config_map {
         let text = value_to_text(value);

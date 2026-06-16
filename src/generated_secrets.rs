@@ -19,9 +19,11 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use greentic_secrets_lib::core::Error as SecretError;
+use greentic_secrets_lib::{SecretFormat, SecretsStore};
+use greentic_types::{ExtensionInline, decode_pack_manifest};
 use rand::RngExt as _;
 use serde::Deserialize;
-use serde_cbor::Value as CborValue;
 use zip::{ZipArchive, result::ZipError};
 
 const EXT_GENERATED_SECRETS_V1: &str = "greentic.generated-secrets.v1";
@@ -95,48 +97,32 @@ fn load_from_json_manifest(
 }
 
 fn load_from_cbor_manifest(archive: &mut ZipArchive<File>) -> Result<Vec<GeneratedRequirement>> {
-    let manifest_names: Vec<String> = (0..archive.len())
-        .filter_map(|index| {
-            archive
-                .by_index(index)
-                .ok()
-                .map(|entry| entry.name().to_string())
-        })
-        .filter(|name| name == "manifest.cbor" || name.ends_with(".manifest.cbor"))
-        .collect();
-
-    for name in manifest_names {
-        let mut bytes = Vec::new();
-        archive.by_name(&name)?.read_to_end(&mut bytes)?;
-        let Ok(value) = serde_cbor::from_slice::<CborValue>(&bytes) else {
-            continue;
-        };
-        let Some(inline) = cbor_get(&value, "extensions")
-            .and_then(|extensions| cbor_get(extensions, EXT_GENERATED_SECRETS_V1))
-            .and_then(|extension| cbor_get(extension, "inline"))
-        else {
-            continue;
-        };
-        // Re-encode the inline subtree and decode it through the typed shape so
-        // we reuse the same defaults as the JSON path.
-        let Ok(buf) = serde_cbor::to_vec(inline) else {
-            continue;
-        };
-        if let Ok(ext) = serde_cbor::from_slice::<GeneratedSecretsExtension>(&buf) {
-            let reqs = ext.into_requirements();
-            if !reqs.is_empty() {
-                return Ok(reqs);
-            }
+    let mut bytes = Vec::new();
+    match archive.by_name("manifest.cbor") {
+        Ok(mut entry) => {
+            entry.read_to_end(&mut bytes)?;
         }
+        Err(ZipError::FileNotFound) => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
     }
-    Ok(Vec::new())
-}
-
-fn cbor_get<'a>(value: &'a CborValue, key: &str) -> Option<&'a CborValue> {
-    match value {
-        CborValue::Map(map) => map.get(&CborValue::Text(key.to_string())),
-        _ => None,
-    }
+    // The pack manifest CBOR uses a symbol table to intern keys, so it must be
+    // decoded through `decode_pack_manifest` rather than navigated as raw CBOR.
+    let manifest = match decode_pack_manifest(&bytes) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let Some(extension) = manifest
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(EXT_GENERATED_SECRETS_V1))
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(ExtensionInline::Other(value)) = extension.inline.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let ext: GeneratedSecretsExtension = serde_json::from_value(value.clone())?;
+    Ok(ext.into_requirements())
 }
 
 /// Generate the value for a declared secret according to its policy.
@@ -191,6 +177,82 @@ pub fn scope_team<'a>(
         return None;
     }
     spec.scope_team.as_deref().or(default_team)
+}
+
+/// Generate and introduce a pack's declared generated secrets into `store`.
+///
+/// This is the single place that materialises generated secrets at setup time
+/// so `gtc start` can move the already-resolved value into the deployment
+/// target's secrets manager rather than regenerating a divergent one.
+///
+/// - Existing values are preserved unless the pack opts into
+///   `regenerate_if_present`.
+/// - Optional secrets that are absent are warned about and left for runtime
+///   resolution (mirroring runtime-acquired secrets such as OAuth tokens).
+///
+/// Returns the keys actually introduced (for logging).
+pub async fn introduce_into_store<S: SecretsStore + ?Sized>(
+    store: &S,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+    pack_path: &Path,
+) -> Result<Vec<String>> {
+    let mut introduced = Vec::new();
+    for req in load_generated_requirements_from_pack(pack_path)? {
+        let team = scope_team(&req.spec, team);
+        let uri = crate::canonical_secret_uri(env, tenant, team, provider_id, &req.key);
+
+        if !req.spec.regenerate_if_present
+            && generated_present(store, env, tenant, team, provider_id, &req).await?
+        {
+            continue;
+        }
+        if !req.required {
+            tracing::warn!(
+                uri = %uri,
+                provider = %provider_id,
+                key = %req.key,
+                "optional generated secret not introduced at setup; leaving for runtime resolution"
+            );
+            continue;
+        }
+        let value = generate_secret_value(&req.spec)?;
+        store
+            .put(&uri, SecretFormat::Text, value.as_bytes())
+            .await
+            .map_err(|err| anyhow!("failed to store generated secret {uri}: {err}"))?;
+        tracing::info!(
+            uri = %uri,
+            provider = %provider_id,
+            key = %req.key,
+            "setup: generated and introduced secret into the local store"
+        );
+        introduced.push(req.key.clone());
+    }
+    Ok(introduced)
+}
+
+/// Whether a generated secret already exists under its canonical key or any
+/// declared alias.
+async fn generated_present<S: SecretsStore + ?Sized>(
+    store: &S,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+    req: &GeneratedRequirement,
+) -> Result<bool> {
+    for key in std::iter::once(req.key.as_str()).chain(req.aliases.iter().map(String::as_str)) {
+        let uri = crate::canonical_secret_uri(env, tenant, team, provider_id, key);
+        match store.get(&uri).await {
+            Ok(_) => return Ok(true),
+            Err(SecretError::NotFound { .. }) => continue,
+            Err(err) => return Err(anyhow!("failed to read secret {uri}: {err}")),
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Deserialize)]
@@ -260,6 +322,76 @@ mod tests {
             zip.write_all(bytes).expect("write file");
         }
         zip.finish().expect("finish pack");
+    }
+
+    fn jwt_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "extensions": {
+                "greentic.generated-secrets.v1": {
+                    "inline": { "secrets": [{
+                        "key": "jwt_signing_key",
+                        "required": true,
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {"level": "tenant", "team": "_"},
+                        "regenerate_if_present": false
+                    }] }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn introduce_into_store_generates_persists_and_is_idempotent() {
+        use greentic_secrets_lib::DevStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("messaging-webchat-gui.gtpack");
+        write_pack(
+            &pack,
+            &[(
+                "pack.manifest.json",
+                serde_json::to_vec(&jwt_manifest()).unwrap(),
+            )],
+        );
+        let store = DevStore::with_path(dir.path().join(".dev.secrets.env")).expect("store");
+
+        let introduced = introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+        )
+        .await
+        .expect("introduce");
+        assert_eq!(introduced, vec!["jwt_signing_key".to_string()]);
+
+        // Tenant-scoped secret collapses the team segment to `_`.
+        let uri = crate::canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let value = store.get(&uri).await.expect("stored");
+        assert_eq!(value.len(), 20);
+
+        // regenerate_if_present=false -> a second pass preserves the value.
+        let again = introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+        )
+        .await
+        .expect("introduce again");
+        assert!(again.is_empty());
+        assert_eq!(store.get(&uri).await.expect("still"), value);
     }
 
     #[test]
