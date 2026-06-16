@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod engine;
 pub mod flow;
+pub mod generated_secrets;
 pub mod gtbundle;
 pub mod no_ui_oauth;
 pub mod oauth_callback;
