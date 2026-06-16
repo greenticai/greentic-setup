@@ -684,6 +684,13 @@ pub fn manifest_to_answers(manifest: &EnvManifest) -> Result<AnswerSet> {
             None => false,
         }),
     );
+    // Emit `webchat_gui` only when the manifest carries an explicit choice —
+    // an unset (`None`) value is left absent so it round-trips back to `None`
+    // (the env-id default resolves at runtime) and the wizard re-asks the
+    // question with its default-true. Mirrors `public_base_url` above.
+    if let Some(gui_enabled) = manifest.environment.gui_enabled {
+        map.insert("webchat_gui".to_string(), Value::Bool(gui_enabled));
+    }
     if !manifest.secrets.is_empty() {
         let rows = manifest
             .secrets
@@ -817,6 +824,9 @@ mod tests {
             environment: ManifestEnvironment {
                 id: "demo".to_string(),
                 public_base_url: Some("https://demo.example.com".to_string()),
+                // Form-backed (the `webchat_gui` question), so an explicit value
+                // survives the round-trip — unlike the form-less fields below.
+                gui_enabled: Some(true),
                 // Form-less env fields: `answers_to_manifest` always produces
                 // None, so the round-trip only holds when these start None.
                 name: None,
@@ -888,6 +898,31 @@ mod tests {
     }
 
     #[test]
+    fn gui_enabled_maps_to_webchat_gui_answer() {
+        // An explicit value surfaces as the boolean answer, so edit mode
+        // pre-fills the question instead of re-asking it.
+        let answers = manifest_to_answers(&full_manifest()).unwrap();
+        assert_eq!(answers.answers["webchat_gui"], json!(true));
+
+        // An explicit `false` opt-out is preserved as the boolean answer and
+        // survives the round-trip — it is never silently dropped or flipped.
+        let mut manifest = full_manifest();
+        manifest.environment.gui_enabled = Some(false);
+        let answers = manifest_to_answers(&manifest).unwrap();
+        assert_eq!(answers.answers["webchat_gui"], json!(false));
+        assert_eq!(round_trip(&manifest).environment.gui_enabled, Some(false));
+
+        // An unset value omits the answer entirely: the round-trip preserves
+        // `None` (env-id default resolves at runtime) and the wizard re-asks
+        // with its default-true.
+        let mut manifest = full_manifest();
+        manifest.environment.gui_enabled = None;
+        let answers = manifest_to_answers(&manifest).unwrap();
+        assert!(answers.answers.get("webchat_gui").is_none());
+        assert_eq!(round_trip(&manifest).environment.gui_enabled, None);
+    }
+
+    #[test]
     fn paste_and_env_secrets_round_trip_through_the_converter() {
         // Mixed sources: an env-sourced secret keeps `from_env`; a
         // paste-sourced one carries `source: paste` and no `from_env` (no
@@ -942,6 +977,7 @@ mod tests {
             environment: ManifestEnvironment {
                 id: "local".to_string(),
                 public_base_url: None,
+                gui_enabled: None,
                 name: None,
                 region: None,
                 tenant_org_id: None,
@@ -1255,6 +1291,7 @@ mod tests {
         let raw = json!({
             "environment_id": "local",
             "trust_root_bootstrap": true,
+            "webchat_gui": true,
             "bundles": [{
                 "bundle_id": "legal",
                 "bundle_path": "ws-legal/realbot.gtbundle",
