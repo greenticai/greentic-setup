@@ -904,6 +904,14 @@ mod tests {
         let answers = manifest_to_answers(&full_manifest()).unwrap();
         assert_eq!(answers.answers["webchat_gui"], json!(true));
 
+        // An explicit `false` opt-out is preserved as the boolean answer and
+        // survives the round-trip — it is never silently dropped or flipped.
+        let mut manifest = full_manifest();
+        manifest.environment.gui_enabled = Some(false);
+        let answers = manifest_to_answers(&manifest).unwrap();
+        assert_eq!(answers.answers["webchat_gui"], json!(false));
+        assert_eq!(round_trip(&manifest).environment.gui_enabled, Some(false));
+
         // An unset value omits the answer entirely: the round-trip preserves
         // `None` (env-id default resolves at runtime) and the wizard re-asks
         // with its default-true.
