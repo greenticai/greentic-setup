@@ -18,7 +18,8 @@ impl CliI18n {
     pub fn from_request(requested: Option<&str>) -> Result<Self, String> {
         let resolved = resolve_locale(requested);
         let fallback = load_catalog("en")?;
-        let catalog = load_catalog(&resolved).unwrap_or_else(|_| fallback.clone());
+        let catalog =
+            load_catalog_with_base_fallback(&resolved).unwrap_or_else(|_| fallback.clone());
         Ok(Self { catalog, fallback })
     }
 
@@ -194,6 +195,22 @@ fn load_catalog(locale: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(map)
 }
 
+/// Load `locale`'s catalog, retrying with its base language subtag before
+/// giving up. System locales (`LANG`/`LC_ALL`) and explicit `--locale` values
+/// like `nl_NL.UTF-8` normalize to a region tag (`nl-NL`) that has no exact
+/// catalog; the shipped catalogs are mostly base-language files (`nl.json`,
+/// `de.json`, …), so fall back to the lowercased base subtag (`nl-NL` -> `nl`)
+/// instead of dropping straight to English.
+fn load_catalog_with_base_fallback(locale: &str) -> Result<BTreeMap<String, String>, String> {
+    if let Ok(catalog) = load_catalog(locale) {
+        return Ok(catalog);
+    }
+    if let Some((base, _region)) = locale.split_once('-') {
+        return load_catalog(&base.to_ascii_lowercase());
+    }
+    Err(format!("unsupported locale `{locale}`"))
+}
+
 pub(crate) fn format_template(template: &str, args: &[&str]) -> String {
     let mut out = String::new();
     let mut idx = 0usize;
@@ -271,5 +288,24 @@ mod tests {
             i18n.t_or("env_wizard.q.bundles.title", "Bundles"),
             "Bundels"
         );
+    }
+
+    #[test]
+    fn regional_system_locale_falls_back_to_base_language_catalog() {
+        let key = "env_wizard.q.bundles.title";
+        // `nl_NL.UTF-8` normalizes to `nl-NL` (no exact catalog) -> base `nl`.
+        let nl = CliI18n::from_request(Some("nl_NL.UTF-8")).expect("should create i18n");
+        assert_eq!(nl.t(key), "Bundels");
+        // Other region tags resolve to their base-language catalog, not English.
+        for regional in ["de_DE.UTF-8", "pt_BR.UTF-8", "fr-FR"] {
+            let base = regional.split(['_', '-']).next().unwrap();
+            let from_regional = CliI18n::from_request(Some(regional)).expect("should create i18n");
+            let from_base = CliI18n::from_request(Some(base)).expect("should create i18n");
+            assert_eq!(
+                from_regional.t(key),
+                from_base.t(key),
+                "{regional} should resolve to the `{base}` catalog"
+            );
+        }
     }
 }
