@@ -115,6 +115,7 @@ fn main() -> Result<()> {
             cli.advanced,
             cli.dry_run,
             cli.non_interactive,
+            i18n,
         );
     }
 

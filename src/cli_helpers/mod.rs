@@ -240,12 +240,14 @@ pub fn run_interactive_wizard(
                 continue;
             }
 
-            // Use shared answers as initial values - already-answered questions will be skipped
+            // Use shared answers as initial values - already-answered questions will be skipped.
+            // None: provider-setup flow keeps English prompt chrome.
             let answers = wizard::prompt_form_spec_answers_with_existing(
                 &spec,
                 provider_id,
                 advanced,
                 &shared_answers,
+                None,
             )?;
             all_answers.insert(provider_id.clone(), answers);
         } else {
@@ -451,6 +453,7 @@ pub fn complete_loaded_answers_with_prompts(
                     provider_id,
                     advanced,
                     &merged_value,
+                    None,
                 )?
             }
         } else {

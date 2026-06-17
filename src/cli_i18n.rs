@@ -40,6 +40,25 @@ impl CliI18n {
         format_template(&self.t(key), args)
     }
 
+    /// Translate `key`, falling back to `default` when the key is absent from
+    /// both the active-locale catalog and the English fallback (i.e. when
+    /// [`Self::t`] would echo the key back). Lets a caller keep an inline
+    /// English literal as the canonical source string while still picking up a
+    /// localized override when the catalog carries one.
+    pub fn t_or(&self, key: &str, default: &str) -> String {
+        let value = self.t(key);
+        if value == key {
+            default.to_string()
+        } else {
+            value
+        }
+    }
+
+    /// [`Self::t_or`] with `{}` placeholders substituted from `args`.
+    pub fn tf_or(&self, key: &str, default: &str, args: &[&str]) -> String {
+        format_template(&self.t_or(key, default), args)
+    }
+
     /// Export all keys matching a prefix as a flat map.
     ///
     /// Used by the web UI to send translated strings to the frontend.
@@ -175,7 +194,7 @@ fn load_catalog(locale: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(map)
 }
 
-fn format_template(template: &str, args: &[&str]) -> String {
+pub(crate) fn format_template(template: &str, args: &[&str]) -> String {
     let mut out = String::new();
     let mut idx = 0usize;
     let mut i = 0usize;
@@ -219,5 +238,38 @@ mod tests {
         let i18n = CliI18n::from_request(Some("en")).expect("should create i18n");
         let msg = i18n.tf("cli.bundle.init.creating", &["/path/to/bundle"]);
         assert!(msg.contains("/path/to/bundle"));
+    }
+
+    #[test]
+    fn t_or_uses_catalog_then_falls_back_to_default() {
+        let i18n = CliI18n::from_request(Some("en")).expect("should create i18n");
+        // Present in en.json → catalog value wins over the inline default.
+        assert_eq!(
+            i18n.t_or("env_wizard.q.bundles.title", "IGNORED DEFAULT"),
+            "Bundles"
+        );
+        // Absent from every catalog → the inline default is returned verbatim.
+        assert_eq!(
+            i18n.t_or("env_wizard.q.__nope__.title", "Fallback title"),
+            "Fallback title"
+        );
+    }
+
+    #[test]
+    fn tf_or_substitutes_into_default_when_key_missing() {
+        let i18n = CliI18n::from_request(Some("en")).expect("should create i18n");
+        assert_eq!(
+            i18n.tf_or("env_wizard.__nope__", "Need {} secret(s).", &["3"]),
+            "Need 3 secret(s)."
+        );
+    }
+
+    #[test]
+    fn t_or_returns_localized_value_for_dutch() {
+        let i18n = CliI18n::from_request(Some("nl")).expect("should create i18n");
+        assert_eq!(
+            i18n.t_or("env_wizard.q.bundles.title", "Bundles"),
+            "Bundels"
+        );
     }
 }

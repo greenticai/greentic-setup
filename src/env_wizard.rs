@@ -47,10 +47,11 @@ use greentic_deployer::cli::env_manifest::{
 use greentic_deployer::runtime_secrets::{
     SecretValue, bundle_secret_requirements, manifest_secret_path,
 };
-use qa_spec::{AnswerSet, FormSpec};
+use qa_spec::{AnswerSet, FormSpec, QuestionSpec};
 use rpassword::prompt_password;
 use serde_json::{Map as JsonMap, Value, json};
 
+use crate::cli_i18n::CliI18n;
 use crate::env_mode;
 use crate::qa::prompts::prompt_form_spec_answers_with_existing;
 
@@ -63,6 +64,7 @@ pub fn run_env_wizard(
     advanced: bool,
     dry_run: bool,
     non_interactive: bool,
+    i18n: &CliI18n,
 ) -> Result<()> {
     if non_interactive || !std::io::stdin().is_terminal() {
         bail!(
@@ -70,7 +72,7 @@ pub fn run_env_wizard(
              --answers <file> (generate a skeleton with `gtc op env apply --emit-answers-template`)"
         );
     }
-    let manifest_path = prompt_manifest_path(env)?;
+    let manifest_path = prompt_manifest_path(env, i18n)?;
     let initial = load_initial_answers(&manifest_path, env)?;
 
     // Drive the shared form WITHOUT the secrets section: this terminal
@@ -86,10 +88,19 @@ pub fn run_env_wizard(
     // them (mirrors the existing top-level optional-question gating).
     let spec = spec_for_mode(&spec, advanced);
     let form_spec = spec_without_question(&spec, "secrets");
+    // Localize the question prompts (titles/descriptions/list nouns) for the
+    // requested locale before handing them to the prompt loop; choice VALUES
+    // stay canonical (see `localize_spec`). The deployer's English literals are
+    // the fallback, so an untranslated locale still renders.
+    let form_spec = localize_spec(&form_spec, i18n);
     if !advanced {
         println!(
-            "\nBasic mode — pass --advanced to also set customer id, config \
-             overrides, route hosts, welcome flow, and endpoint secret refs."
+            "\n{}",
+            i18n.t_or(
+                "env_wizard.basic_mode",
+                "Basic mode — pass --advanced to also set customer id, config \
+                 overrides, route hosts, welcome flow, and endpoint secret refs.",
+            )
         );
     }
     let prompted = prompt_form_spec_answers_with_existing(
@@ -97,6 +108,7 @@ pub fn run_env_wizard(
         "environment",
         advanced,
         &Value::Object(initial),
+        Some(i18n),
     )?;
     let mut answers = prompted.as_object().cloned().unwrap_or_default();
 
@@ -124,6 +136,7 @@ pub fn run_env_wizard(
         &provisional.bundles,
         &existing_from_env,
         &existing_source,
+        i18n,
     )?;
     if secret_rows.is_empty() {
         answers.remove("secrets");
@@ -139,8 +152,12 @@ pub fn run_env_wizard(
     std::fs::write(&manifest_path, rendered)
         .with_context(|| format!("failed to write `{}`", manifest_path.display()))?;
     println!(
-        "\nWrote `{}` — the manifest is the durable artifact; keep it in version control.",
-        manifest_path.display()
+        "\n{}",
+        i18n.tf_or(
+            "env_wizard.wrote_manifest",
+            "Wrote `{}` — the manifest is the durable artifact; keep it in version control.",
+            &[&manifest_path.display().to_string()],
+        )
     );
 
     // A pasted value lives only in memory until a confirmed apply writes it to
@@ -150,10 +167,14 @@ pub fn run_env_wizard(
     // value would then win. Warn rather than drop it silently.
     if dry_run && !prefilled_secrets.is_empty() {
         println!(
-            "\nNote: --dry-run previews only — the {} pasted secret value(s) you entered are \
-             NOT written to the store. Re-run without --dry-run and confirm the plan to persist \
-             them.",
-            prefilled_secrets.len()
+            "\n{}",
+            i18n.tf_or(
+                "env_wizard.dry_run_secrets_note",
+                "Note: --dry-run previews only — the {} pasted secret value(s) you entered are \
+                 NOT written to the store. Re-run without --dry-run and confirm the plan to \
+                 persist them.",
+                &[&prefilled_secrets.len().to_string()],
+            )
         );
     }
 
@@ -178,6 +199,53 @@ fn spec_without_question(spec: &FormSpec, id: &str) -> FormSpec {
     let mut reduced = spec.clone();
     reduced.questions.retain(|question| question.id != id);
     reduced
+}
+
+/// Return a clone of `spec` with the user-facing prompt text localized for
+/// `i18n`'s locale: the form title/description, every question's
+/// title/description (recursing into `List` row columns), and each `List`
+/// item label. Keys are derived from the stable question ids
+/// (`env_wizard.q.<id>.title`, `.desc`, `env_wizard.list.<id>.item_label`,
+/// `env_wizard.form.title`/`.desc`). A missing catalog key falls back to the
+/// English literal already on the spec — the deployer is the canonical English
+/// source, so an untranslated locale still renders.
+///
+/// Choice VALUES (`enum` options) are deliberately left untouched: they are
+/// canonical answer tokens written into the manifest, not display text.
+fn localize_spec(spec: &FormSpec, i18n: &CliI18n) -> FormSpec {
+    let mut spec = spec.clone();
+    spec.title = i18n.t_or("env_wizard.form.title", &spec.title);
+    if let Some(desc) = spec.description.take() {
+        spec.description = Some(i18n.t_or("env_wizard.form.desc", &desc));
+    }
+    for question in &mut spec.questions {
+        localize_question(question, i18n);
+    }
+    spec
+}
+
+/// Localize a single question in place (see [`localize_spec`]); recurses into
+/// `List` row columns.
+fn localize_question(question: &mut QuestionSpec, i18n: &CliI18n) {
+    question.title = i18n.t_or(
+        &format!("env_wizard.q.{}.title", question.id),
+        &question.title,
+    );
+    if let Some(desc) = question.description.take() {
+        question.description =
+            Some(i18n.t_or(&format!("env_wizard.q.{}.desc", question.id), &desc));
+    }
+    if let Some(list) = question.list.as_mut() {
+        if let Some(label) = list.item_label.take() {
+            list.item_label = Some(i18n.t_or(
+                &format!("env_wizard.list.{}.item_label", question.id),
+                &label,
+            ));
+        }
+        for field in &mut list.fields {
+            localize_question(field, i18n);
+        }
+    }
 }
 
 /// Optional `List` row columns hidden from the basic (non-`--advanced`)
@@ -431,6 +499,7 @@ fn derive_and_prompt_secrets(
     bundles: &[ManifestBundle],
     existing_from_env: &BTreeMap<String, String>,
     existing_source: &BTreeMap<String, String>,
+    i18n: &CliI18n,
 ) -> Result<(Vec<Value>, BTreeMap<String, SecretValue>)> {
     let (derived, skipped) = derive_required_secrets(manifest_dir, env, bundles);
 
@@ -438,18 +507,34 @@ fn derive_and_prompt_secrets(
     // preserved rather than dropped (see the tail of this fn).
     let preserving = skipped && !existing_source.is_empty();
     if derived.is_empty() && !preserving {
-        println!("\nSecrets — the configured bundles declare no secrets; nothing to enter.");
+        println!(
+            "\n{}",
+            i18n.t_or(
+                "env_wizard.secrets.none",
+                "Secrets — the configured bundles declare no secrets; nothing to enter.",
+            )
+        );
         return Ok((Vec::new(), BTreeMap::new()));
     }
 
     if !derived.is_empty() {
         println!(
-            "\nSecrets — the configured bundles need {} secret(s).",
-            derived.len()
+            "\n{}",
+            i18n.tf_or(
+                "env_wizard.secrets.need",
+                "Secrets — the configured bundles need {} secret(s).",
+                &[&derived.len().to_string()],
+            )
         );
-        println!("For each, choose where the value comes from: a named environment");
-        println!("variable, or paste it in now. Pasted values are stored in the");
-        println!("environment's secrets store — never written to the manifest.");
+        println!(
+            "{}",
+            i18n.t_or(
+                "env_wizard.secrets.choose",
+                "For each, choose where the value comes from: a named environment\n\
+                 variable, or paste it in now. Pasted values are stored in the\n\
+                 environment's secrets store — never written to the manifest.",
+            )
+        );
     }
 
     let mut rows = Vec::with_capacity(derived.len());
@@ -457,24 +542,42 @@ fn derive_and_prompt_secrets(
     let mut taken = BTreeSet::new();
     for secret in &derived {
         println!();
+        let optional_suffix = if secret.required {
+            String::new()
+        } else {
+            i18n.t_or("env_wizard.secrets.optional_suffix", " [optional]")
+        };
         println!(
-            "  {} — {} (bundle: {}){}",
-            secret.key,
-            secret.provider_id,
-            secret.bundle_ids.join(", "),
-            if secret.required { "" } else { " [optional]" }
+            "  {}",
+            i18n.tf_or(
+                "env_wizard.secrets.entry",
+                "{} — {} (bundle: {}){}",
+                &[
+                    &secret.key,
+                    &secret.provider_id,
+                    &secret.bundle_ids.join(", "),
+                    &optional_suffix,
+                ],
+            )
         );
-        println!("  secret path: {}", secret.path);
+        println!(
+            "  {}",
+            i18n.tf_or(
+                "env_wizard.secrets.path",
+                "secret path: {}",
+                &[&secret.path]
+            )
+        );
 
         // Re-edit defaults to the previously-chosen source.
         let was_paste = existing_source.get(&secret.path).map(String::as_str) == Some("paste");
-        match prompt_secret_source(was_paste)? {
+        match prompt_secret_source(was_paste, i18n)? {
             SecretSource::Env => {
                 let default = existing_from_env
                     .get(&secret.path)
                     .cloned()
                     .unwrap_or_else(|| default_env_var_name(&secret.tenant, &secret.key));
-                let from_env = prompt_env_var_name(&default)?;
+                let from_env = prompt_env_var_name(&default, i18n)?;
                 rows.push(
                     json!({ "path": secret.path.clone(), "source": "env", "from_env": from_env }),
                 );
@@ -483,7 +586,7 @@ fn derive_and_prompt_secrets(
                 // On a re-edit of an already-paste secret, the value is already
                 // in the store: empty input keeps it (apply no-ops). Otherwise a
                 // value is required now.
-                if let Some(value) = prompt_paste_value(was_paste)? {
+                if let Some(value) = prompt_paste_value(was_paste, i18n)? {
                     prefilled.insert(secret.path.clone(), SecretValue::from(value));
                 }
                 rows.push(json!({ "path": secret.path.clone(), "source": "paste" }));
@@ -504,7 +607,12 @@ fn derive_and_prompt_secrets(
             match source.as_str() {
                 "paste" => {
                     eprintln!(
-                        "  note: keeping existing pasted secret `{path}` (bundle not rebuilt)"
+                        "  {}",
+                        i18n.tf_or(
+                            "env_wizard.secrets.keep_paste_note",
+                            "note: keeping existing pasted secret `{}` (bundle not rebuilt)",
+                            &[path],
+                        )
                     );
                     rows.push(json!({ "path": path, "source": "paste" }));
                 }
@@ -512,7 +620,14 @@ fn derive_and_prompt_secrets(
                     let Some(from_env) = existing_from_env.get(path) else {
                         continue;
                     };
-                    eprintln!("  note: keeping existing secret `{path}` (bundle not rebuilt)");
+                    eprintln!(
+                        "  {}",
+                        i18n.tf_or(
+                            "env_wizard.secrets.keep_env_note",
+                            "note: keeping existing secret `{}` (bundle not rebuilt)",
+                            &[path],
+                        )
+                    );
                     rows.push(json!({ "path": path, "source": "env", "from_env": from_env }));
                 }
             }
@@ -533,10 +648,19 @@ enum SecretSource {
 /// Prompt whether a secret's value comes from an environment variable or is
 /// pasted in now. `default_paste` seeds the default (a re-edit keeps the
 /// previous choice).
-fn prompt_secret_source(default_paste: bool) -> Result<SecretSource> {
+fn prompt_secret_source(default_paste: bool, i18n: &CliI18n) -> Result<SecretSource> {
     let default = if default_paste { "2" } else { "1" };
     loop {
-        print!("  > value from [1] environment variable or [2] paste it now? [{default}]: ");
+        // The `[1]`/`[2]` reply tokens stay canonical — only the prose around
+        // them is localized.
+        print!(
+            "  > {}",
+            i18n.tf_or(
+                "env_wizard.secrets.source_prompt",
+                "value from [1] environment variable or [2] paste it now? [{}]: ",
+                &[default],
+            )
+        );
         std::io::stdout().flush()?;
         let mut line = String::new();
         let n = std::io::stdin().read_line(&mut line)?;
@@ -548,7 +672,13 @@ fn prompt_secret_source(default_paste: bool) -> Result<SecretSource> {
         match choice.to_ascii_lowercase().as_str() {
             "1" | "env" | "e" => return Ok(SecretSource::Env),
             "2" | "paste" | "p" => return Ok(SecretSource::Paste),
-            _ => println!("  Enter 1 (environment variable) or 2 (paste)."),
+            _ => println!(
+                "  {}",
+                i18n.t_or(
+                    "env_wizard.secrets.source_invalid",
+                    "Enter 1 (environment variable) or 2 (paste).",
+                )
+            ),
         }
     }
 }
@@ -562,19 +692,34 @@ fn prompt_secret_source(default_paste: bool) -> Result<SecretSource> {
 /// secret (a PEM key, certificate, multiline JSON) would be truncated to its
 /// first line. Such secrets should use the environment-variable source
 /// instead — the prompt says "single line" to steer the operator there.
-fn prompt_paste_value(keep_stored: bool) -> Result<Option<String>> {
+fn prompt_paste_value(keep_stored: bool, i18n: &CliI18n) -> Result<Option<String>> {
     loop {
         let prompt = if keep_stored {
-            "  > paste value (hidden, single line; empty keeps the stored value): "
+            format!(
+                "  > {}",
+                i18n.t_or(
+                    "env_wizard.secrets.paste_prompt_keep",
+                    "paste value (hidden, single line; empty keeps the stored value): ",
+                )
+            )
         } else {
-            "  > paste value (hidden, single line): "
+            format!(
+                "  > {}",
+                i18n.t_or(
+                    "env_wizard.secrets.paste_prompt",
+                    "paste value (hidden, single line): ",
+                )
+            )
         };
-        let value = prompt_password(prompt)?;
+        let value = prompt_password(&prompt)?;
         if value.is_empty() {
             if keep_stored {
                 return Ok(None);
             }
-            println!("  A value is required.");
+            println!(
+                "  {}",
+                i18n.t_or("env_wizard.secrets.paste_required", "A value is required.")
+            );
             continue;
         }
         return Ok(Some(value));
@@ -583,9 +728,16 @@ fn prompt_paste_value(keep_stored: bool) -> Result<Option<String>> {
 
 /// Prompt for one env-var name, defaulting to `default` on empty input.
 /// Re-prompts only if both the input and the default are blank.
-fn prompt_env_var_name(default: &str) -> Result<String> {
+fn prompt_env_var_name(default: &str, i18n: &CliI18n) -> Result<String> {
     loop {
-        print!("  > env var name [{default}]: ");
+        print!(
+            "  > {}",
+            i18n.tf_or(
+                "env_wizard.secrets.envvar_prompt",
+                "env var name [{}]: ",
+                &[default]
+            )
+        );
         std::io::stdout().flush()?;
         let mut line = String::new();
         let n = std::io::stdin().read_line(&mut line)?;
@@ -595,7 +747,13 @@ fn prompt_env_var_name(default: &str) -> Result<String> {
         let trimmed = line.trim();
         let value = if trimmed.is_empty() { default } else { trimmed };
         if value.is_empty() {
-            println!("  An environment variable name is required.");
+            println!(
+                "  {}",
+                i18n.t_or(
+                    "env_wizard.secrets.envvar_required",
+                    "An environment variable name is required.",
+                )
+            );
             continue;
         }
         return Ok(value.to_string());
@@ -604,9 +762,16 @@ fn prompt_env_var_name(default: &str) -> Result<String> {
 
 /// Ask where the manifest lives (and will be written). Empty input takes
 /// the conventional default `./<env>.env.json`.
-fn prompt_manifest_path(env: &str) -> Result<PathBuf> {
+fn prompt_manifest_path(env: &str, i18n: &CliI18n) -> Result<PathBuf> {
     let default = format!("./{env}.env.json");
-    print!("Manifest file [{default}]: ");
+    print!(
+        "{}",
+        i18n.tf_or(
+            "env_wizard.manifest_prompt",
+            "Manifest file [{}]: ",
+            &[&default]
+        )
+    );
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
@@ -1067,11 +1232,57 @@ mod tests {
 
     #[test]
     fn wizard_is_interactive_only() {
-        let err = run_env_wizard("demo", false, false, true).unwrap_err();
+        let i18n = CliI18n::from_request(None).unwrap();
+        let err = run_env_wizard("demo", false, false, true, &i18n).unwrap_err();
         assert!(
             format!("{err:#}").contains("--answers"),
             "points at the headless alternative: {err:#}"
         );
+    }
+
+    #[test]
+    fn localize_spec_translates_questions_and_list_labels_to_dutch() {
+        let i18n = CliI18n::from_request(Some("nl")).unwrap();
+        let spec = localize_spec(&manifest_form_spec_for_env("local"), &i18n);
+
+        // Form title + top-level question title are Dutch.
+        assert_eq!(spec.title, "Omgeving instellen");
+        let bundles = spec.questions.iter().find(|q| q.id == "bundles").unwrap();
+        assert_eq!(bundles.title, "Bundels");
+
+        let list = bundles.list.as_ref().unwrap();
+        // The list "Add <noun>?" label is localized…
+        assert_eq!(list.item_label.as_deref(), Some("bundel"));
+        // …and nested row-column titles recurse.
+        let bundle_id = list.fields.iter().find(|c| c.id == "bundle_id").unwrap();
+        assert_eq!(bundle_id.title, "Bundel-id");
+
+        // Enum choice VALUES stay canonical (answer tokens, not display text).
+        let secrets = spec.questions.iter().find(|q| q.id == "secrets").unwrap();
+        let source = secrets
+            .list
+            .as_ref()
+            .unwrap()
+            .fields
+            .iter()
+            .find(|c| c.id == "source")
+            .unwrap();
+        assert_eq!(
+            source.choices.as_deref(),
+            Some(["env".to_string(), "paste".to_string()].as_slice()),
+            "choice values must not be translated"
+        );
+    }
+
+    #[test]
+    fn localize_spec_falls_back_to_english_for_unknown_locale() {
+        // A locale with no catalog resolves to the English fallback, i.e. the
+        // deployer's canonical literals — the wizard still renders.
+        let i18n = CliI18n::from_request(Some("zz")).unwrap();
+        let spec = localize_spec(&manifest_form_spec_for_env("local"), &i18n);
+        assert_eq!(spec.title, "Environment setup");
+        let bundles = spec.questions.iter().find(|q| q.id == "bundles").unwrap();
+        assert_eq!(bundles.title, "Bundles");
     }
 
     #[test]
