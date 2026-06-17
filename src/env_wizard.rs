@@ -92,7 +92,7 @@ pub fn run_env_wizard(
     // requested locale before handing them to the prompt loop; choice VALUES
     // stay canonical (see `localize_spec`). The deployer's English literals are
     // the fallback, so an untranslated locale still renders.
-    let form_spec = localize_spec(&form_spec, i18n);
+    let form_spec = localize_spec(form_spec, i18n);
     if !advanced {
         println!(
             "\n{}",
@@ -201,7 +201,7 @@ fn spec_without_question(spec: &FormSpec, id: &str) -> FormSpec {
     reduced
 }
 
-/// Return a clone of `spec` with the user-facing prompt text localized for
+/// Return `spec` with the user-facing prompt text localized for
 /// `i18n`'s locale: the form title/description, every question's
 /// title/description (recursing into `List` row columns), and each `List`
 /// item label. Keys are derived from the stable question ids
@@ -212,8 +212,7 @@ fn spec_without_question(spec: &FormSpec, id: &str) -> FormSpec {
 ///
 /// Choice VALUES (`enum` options) are deliberately left untouched: they are
 /// canonical answer tokens written into the manifest, not display text.
-fn localize_spec(spec: &FormSpec, i18n: &CliI18n) -> FormSpec {
-    let mut spec = spec.clone();
+fn localize_spec(mut spec: FormSpec, i18n: &CliI18n) -> FormSpec {
     spec.title = i18n.t_or("env_wizard.form.title", &spec.title);
     if let Some(desc) = spec.description.take() {
         spec.description = Some(i18n.t_or("env_wizard.form.desc", &desc));
@@ -1243,7 +1242,7 @@ mod tests {
     #[test]
     fn localize_spec_translates_questions_and_list_labels_to_dutch() {
         let i18n = CliI18n::from_request(Some("nl")).unwrap();
-        let spec = localize_spec(&manifest_form_spec_for_env("local"), &i18n);
+        let spec = localize_spec(manifest_form_spec_for_env("local"), &i18n);
 
         // Form title + top-level question title are Dutch.
         assert_eq!(spec.title, "Omgeving instellen");
@@ -1279,7 +1278,7 @@ mod tests {
         // A locale with no catalog resolves to the English fallback, i.e. the
         // deployer's canonical literals — the wizard still renders.
         let i18n = CliI18n::from_request(Some("zz")).unwrap();
-        let spec = localize_spec(&manifest_form_spec_for_env("local"), &i18n);
+        let spec = localize_spec(manifest_form_spec_for_env("local"), &i18n);
         assert_eq!(spec.title, "Environment setup");
         let bundles = spec.questions.iter().find(|q| q.id == "bundles").unwrap();
         assert_eq!(bundles.title, "Bundles");

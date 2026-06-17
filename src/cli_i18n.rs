@@ -42,17 +42,15 @@ impl CliI18n {
     }
 
     /// Translate `key`, falling back to `default` when the key is absent from
-    /// both the active-locale catalog and the English fallback (i.e. when
-    /// [`Self::t`] would echo the key back). Lets a caller keep an inline
-    /// English literal as the canonical source string while still picking up a
-    /// localized override when the catalog carries one.
+    /// both the active-locale catalog and the English fallback. Lets a caller
+    /// keep an inline English literal as the canonical source string while
+    /// still picking up a localized override when the catalog carries one.
     pub fn t_or(&self, key: &str, default: &str) -> String {
-        let value = self.t(key);
-        if value == key {
-            default.to_string()
-        } else {
-            value
-        }
+        self.catalog
+            .get(key)
+            .or_else(|| self.fallback.get(key))
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// [`Self::t_or`] with `{}` placeholders substituted from `args`.

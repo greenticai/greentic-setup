@@ -36,6 +36,16 @@ fn ctf(i18n: Option<&CliI18n>, key: &str, default: &str, args: &[&str]) -> Strin
     }
 }
 
+/// The localized ` (required)` / ` (optional)` suffix appended to a question
+/// title in the prompt header.
+fn required_marker(question: &QuestionSpec, i18n: Option<&CliI18n>) -> String {
+    if question.required {
+        ct(i18n, "setup.qa.prompt.required_marker", " (required)")
+    } else {
+        ct(i18n, "setup.qa.prompt.optional_marker", " (optional)")
+    }
+}
+
 /// Interactively prompt the user using FormSpec questions.
 ///
 /// Evaluates `visible_if` expressions after each answer so that conditional
@@ -178,11 +188,7 @@ pub fn ask_form_spec_question(
     }
 
     // Print question header
-    let marker = if question.required {
-        ct(i18n, "setup.qa.prompt.required_marker", " (required)")
-    } else {
-        ct(i18n, "setup.qa.prompt.optional_marker", " (optional)")
-    };
+    let marker = required_marker(question, i18n);
     println!();
     println!("  {}{marker}", question.title);
 
@@ -313,11 +319,7 @@ fn ask_list_question(
     list: &ListSpec,
     i18n: Option<&CliI18n>,
 ) -> Result<Option<Value>> {
-    let marker = if question.required {
-        ct(i18n, "setup.qa.prompt.required_marker", " (required)")
-    } else {
-        ct(i18n, "setup.qa.prompt.optional_marker", " (optional)")
-    };
+    let marker = required_marker(question, i18n);
     println!();
     println!("  {}{marker}", question.title);
     if let Some(ref desc) = question.description
