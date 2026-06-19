@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "0.5.23"
+version = "0.5.24"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -41,7 +41,7 @@ open = { version = "5", optional = true }
 qa-spec = "0.5"
 rand = "0.10"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"

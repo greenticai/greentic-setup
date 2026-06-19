@@ -31,6 +31,7 @@ pub mod secret_name;
 pub mod secrets;
 pub mod setup_actions;
 pub mod setup_backend_contract;
+pub mod setup_final_actions;
 pub mod setup_input;
 pub mod setup_machine;
 pub mod setup_to_formspec;
