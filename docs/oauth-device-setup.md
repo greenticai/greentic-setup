@@ -1,31 +1,66 @@
 # OAuth Device-Code Setup Metadata
 
-Providers can use `messaging.oauth_device_code.v1` metadata to complete setup after a device-code login. The setup runner maps token response fields through `secrets_out` and `config_out`, then writes secret outputs to the dev secrets store and non-secret config outputs to `state/config/<provider>/setup-answers.json`.
+Providers should model OAuth device-code setup through the generic setup
+contracts, not through legacy pending setup actions.
+
+For new provider setup machines, declare an `oauth_device_code` step in
+`greentic.setup.machine.v1`. The runner stores transient device-code session
+state under the provider's scoped setup state directory, redacts public output,
+polls on resume/retry, and persists access or refresh tokens only through the
+server-side secrets path.
+
+For providers still migrating through `greentic.setup.backend-contract.v1`,
+declare an action whose `executor.kind` is `oauth_device_code`. The backend
+contract runner uses the same generic setup state layout:
+
+```text
+state/setup/{tenant}/{team}/{provider}/backend-contract.json
+```
+
+Legacy `setup_actions` and `pending_setup_actions` are no longer executed by
+bundle setup. Existing legacy state should be archived with
+`greentic-setup bundle setup-migrate <provider-id>` and the provider should
+move setup behavior into a setup machine or backend contract.
 
 ## Finalization Provisioning
 
-OAuth device-code setup can run a provider finalization operation before marking the setup action complete. Declare it under a setup mode as provisioning metadata:
+OAuth device-code setup can run provider finalization after login by following
+the OAuth step with a generic `provider_component_call`, `provider_http`, or
+provider-specific backend-contract action. In a setup machine this looks like:
 
 ```json
 {
-  "setup_modes": {
-    "channel": {
-      "provisioning": {
-        "resource": {
-          "component_ref": "messaging-provider-example",
-          "op": "apply-answers",
-          "output_keys": {
-            "resource_id": "resource_id",
-            "resource_name": "resource_name"
-          }
-        }
+  "version": 1,
+  "id": "example-setup",
+  "entry_step": "login",
+  "steps": [
+    {
+      "id": "login",
+      "kind": "oauth_device_code",
+      "authority_url_template": "https://login.example.com/{tenant}",
+      "client_id": "example-client-id",
+      "scopes": ["example.read"]
+    },
+    {
+      "id": "finalize",
+      "kind": "provider_component_call",
+      "component_ref": "messaging-provider-example",
+      "op": "apply-answers",
+      "idempotency_key": "finalize:{tenant}",
+      "request": {
+        "tenant": "{tenant}",
+        "team": "{team}",
+        "login": "{oauth_device_login}"
       }
     }
-  }
+  ]
 }
 ```
 
-When `op` is `apply-answers`, the setup runner merges existing setup answers, mapped token outputs, discovery outputs, and raw token fields into the provider request. The provider result must not return `ok:false`; otherwise the setup action remains pending. Returned `config` values are persisted, with secret token fields kept out of `setup-answers.json`.
+The provider result must not return `ok:false`; otherwise the setup step is
+blocked and retryable. Returned config should be persisted through explicit
+`persist_runtime_config` mappings or backend-contract state updates, with token
+fields kept out of `setup-answers.json`.
 
 ## Discovery Selection
 
@@ -56,13 +91,20 @@ Selection fields:
 - `default_label`: optional exact label to prefer.
 - `default_filter`: optional label substring to prefer. `{{ bundle_name }}` is replaced with the bundle display name.
 
-Persist both the ID and label when runtime behavior depends on a selected resource. IDs are for API calls; labels are for readable setup state, diagnostics, and later UX.
+Persist both the ID and label when runtime behavior depends on a selected
+resource. IDs are for API calls; labels are for readable setup state,
+diagnostics, and later UX. In setup machines, use `select_from_json` followed by
+`persist_runtime_config`; in backend contracts, store the selected values in the
+generic setup state and map only non-server-owned fields into runtime config.
 
 ## Interaction Modes
 
 Keep instructions aligned with the actual provider mode.
 
-- App or bot modes should provide explicit setup action instructions for installing, opening, or searching for the app/bot.
+- App or bot modes should provide explicit setup-step instructions for installing, opening, or searching for the app/bot.
 - Channel or subscription modes should describe resource selection and subscription setup. Do not describe a channel/subscription integration as a searchable bot unless the provider also exposes a real bot/app interaction path.
 
-Mode-specific instructions belong in setup action metadata such as `instructions`, `success_message`, and provider-specific labels. Discovery metadata should stay focused on selecting and persisting resources.
+Mode-specific instructions belong in setup machine/backend-contract metadata
+such as step labels, `instructions`, `message_key`, `success_message`, and
+provider-specific labels. Discovery metadata should stay focused on selecting
+and persisting resources.

@@ -257,7 +257,11 @@ pub fn persist(root: &Path, tenant: &str, discovery: &DiscoveryResult) -> anyhow
 impl DiscoveryResult {
     /// Return every discovered pack that can participate in setup.
     pub fn setup_targets(&self) -> Vec<&DetectedProvider> {
-        self.providers.iter().chain(self.app_packs.iter()).collect()
+        self.providers
+            .iter()
+            .chain(self.app_packs.iter())
+            .filter(|pack| pack.participates_in_setup())
+            .collect()
     }
 
     /// Find a discovered setup target by pack/provider ID.
@@ -265,7 +269,14 @@ impl DiscoveryResult {
         self.providers
             .iter()
             .chain(self.app_packs.iter())
-            .find(|pack| pack.provider_id == provider_id)
+            .find(|pack| pack.provider_id == provider_id && pack.participates_in_setup())
+    }
+}
+
+impl DetectedProvider {
+    fn participates_in_setup(&self) -> bool {
+        self.domain != "secrets"
+            && !crate::deployment_targets::is_deployer_pack_path(&self.pack_path)
     }
 }
 
@@ -330,6 +341,79 @@ pub fn read_pack_extension(
         }
     }
     Ok(None)
+}
+
+/// Read a JSON asset from a `.gtpack` by pack-relative path.
+pub fn read_pack_json_asset(path: &Path, asset_path: &str) -> anyhow::Result<serde_json::Value> {
+    if !is_safe_pack_relative_path(asset_path) {
+        anyhow::bail!("unsafe pack asset path: {asset_path}");
+    }
+
+    let file = std::fs::File::open(path)?;
+    match zip::ZipArchive::new(file) {
+        Ok(mut archive) => {
+            let mut asset = archive.by_name(asset_path)?;
+            let mut contents = String::new();
+            std::io::Read::read_to_string(&mut asset, &mut contents)?;
+            Ok(serde_json::from_str(&contents)?)
+        }
+        Err(_) => read_pack_json_asset_from_tar(path, asset_path),
+    }
+}
+
+fn read_pack_json_asset_from_tar(
+    path: &Path,
+    asset_path: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_ref() != Path::new(asset_path) {
+            continue;
+        }
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut contents)?;
+        return Ok(serde_json::from_str(&contents)?);
+    }
+    anyhow::bail!("pack asset not found: {asset_path}")
+}
+
+/// Return whether a pack-relative asset exists in a `.gtpack`.
+pub fn pack_asset_exists(path: &Path, asset_path: &str) -> anyhow::Result<bool> {
+    if !is_safe_pack_relative_path(asset_path) {
+        anyhow::bail!("unsafe pack asset path: {asset_path}");
+    }
+
+    let file = std::fs::File::open(path)?;
+    match zip::ZipArchive::new(file) {
+        Ok(mut archive) => match archive.by_name(asset_path) {
+            Ok(_) => Ok(true),
+            Err(ZipError::FileNotFound) => Ok(false),
+            Err(err) => Err(err.into()),
+        },
+        Err(_) => pack_asset_exists_in_tar(path, asset_path),
+    }
+}
+
+fn pack_asset_exists_in_tar(path: &Path, asset_path: &str) -> anyhow::Result<bool> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if entry.path()?.as_ref() == Path::new(asset_path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_safe_pack_relative_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
@@ -503,7 +587,13 @@ fn read_manifest_extension_cbor_from_tar(
         let CborValue::Map(map) = &value else {
             return Ok(None);
         };
-        return Ok(map_get(map, extension_key).map(cbor_to_json));
+        if let Some(value) = map_get(map, extension_key) {
+            return Ok(Some(cbor_to_json(value)));
+        }
+        let Some(CborValue::Map(extensions)) = map_get(map, "extensions") else {
+            return Ok(None);
+        };
+        return Ok(map_get(extensions, extension_key).map(cbor_to_json));
     }
     Ok(None)
 }
@@ -770,6 +860,44 @@ mod tests {
         assert_eq!(discovered.app_packs[0].provider_id, "weather-app");
         assert_eq!(discovered.app_packs[0].domain, "app");
         assert_eq!(discovered.app_packs[0].kind, DetectedPackKind::App);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_targets_exclude_secrets_providers_and_deployer_packs() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("providers/messaging"))?;
+        std::fs::create_dir_all(root.join("providers/secrets"))?;
+        std::fs::create_dir_all(root.join("packs"))?;
+
+        write_test_pack(
+            &root
+                .join("providers")
+                .join("messaging")
+                .join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+            "Telegram",
+        )?;
+        write_test_pack(
+            &root
+                .join("providers")
+                .join("secrets")
+                .join("secrets-vault.gtpack"),
+            "secrets-vault",
+            "Vault",
+        )?;
+        write_test_pack(&root.join("packs").join("aws.gtpack"), "aws", "AWS")?;
+
+        let discovered = discover(root)?;
+        let setup_ids: Vec<_> = discovered
+            .setup_targets()
+            .into_iter()
+            .map(|provider| provider.provider_id.as_str())
+            .collect();
+        assert_eq!(setup_ids, vec!["messaging-telegram"]);
+        assert!(discovered.find_setup_target("secrets-vault").is_none());
+        assert!(discovered.find_setup_target("aws").is_none());
         Ok(())
     }
 

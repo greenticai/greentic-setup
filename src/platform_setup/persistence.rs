@@ -37,14 +37,15 @@ struct RuntimeEndpoints {
     #[allow(dead_code)]
     team: Option<String>,
     public_base_url: Option<String>,
+    gateway_listen_addr: Option<String>,
+    gateway_port: Option<u16>,
 }
 
-/// Load public base URL from runtime endpoints file.
-pub fn load_runtime_public_base_url(
+fn load_runtime_endpoints(
     bundle_root: &Path,
     tenant: &str,
     team: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<Option<RuntimeEndpoints>> {
     let team = team.unwrap_or("default");
     let path = bundle_root
         .join("state")
@@ -58,12 +59,45 @@ pub fn load_runtime_public_base_url(
         .with_context(|| format!("failed to read {}", path.display()))?;
     let endpoints: RuntimeEndpoints = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(endpoints))
+}
+
+/// Load public base URL from runtime endpoints file.
+pub fn load_runtime_public_base_url(
+    bundle_root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(endpoints) = load_runtime_endpoints(bundle_root, tenant, team)? else {
+        return Ok(None);
+    };
     Ok(endpoints
         .public_base_url
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string))
+}
+
+/// Load local runtime base URL from runtime endpoints file.
+pub fn load_runtime_local_base_url(
+    bundle_root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(endpoints) = load_runtime_endpoints(bundle_root, tenant, team)? else {
+        return Ok(None);
+    };
+    let host = endpoints
+        .gateway_listen_addr
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1");
+    let Some(port) = endpoints.gateway_port else {
+        return Ok(None);
+    };
+    Ok(Some(format!("http://{host}:{port}")))
 }
 
 /// Load effective static routes defaults, merging artifact and runtime data.

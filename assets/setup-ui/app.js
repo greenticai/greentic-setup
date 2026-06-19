@@ -6,6 +6,22 @@
   var currentLocale = "en";
   var localeOptions = [];
   var draftSaveTimer = null;
+  var setupSessionId = "setup-ui-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  var providerSetupLogListeners = {};
+  var providerSetupDiagnostics = {};
+  var PROVIDER_SETUP_EVENT_NAMES = [
+    "greentic-provider-setup-state",
+    "greentic-provider-setup-request-start",
+    "greentic-provider-setup-request-success",
+    "greentic-provider-setup-request-error",
+    "greentic-provider-setup-action-start",
+    "greentic-provider-setup-action-complete",
+    "greentic-provider-setup-action-timeout",
+    "greentic-provider-setup-result",
+    "greentic-provider-setup-error",
+    "greentic-provider-setup-device-login",
+    "greentic-provider-setup-complete"
+  ];
 
   function t(key, args) {
     var text = i18n[key] || key.replace(/^ui\./, "");
@@ -91,6 +107,7 @@
       answers: answers,
       sharedAnswers: {},
       providersDone: {},
+      providerSetupStatus: {},
       sharedAnswersDone: false,
       executed: false,
     };
@@ -268,6 +285,9 @@
             }
             if (es.providers_done) {
               es.providers_done.forEach(function (pid) { s.providersDone[pid] = true; });
+            }
+            if (es.provider_setup_status && typeof es.provider_setup_status === "object") {
+              s.providerSetupStatus = es.provider_setup_status;
             }
             return s;
           });
@@ -689,13 +709,14 @@
       var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
+      var setupKind = p.setup_web_component ? "web setup" : qCount + ' ' + esc(t("ui.questions"));
       var displayName = formatProviderName(p);
       html +=
         '<div class="provider-card clickable' + (!enabled ? ' disabled' : '') + '" data-prov-idx="' + idx + '">' +
           '<div class="prov-icon">' + esc(displayName.charAt(0)) + '</div>' +
           '<div>' +
             '<div class="prov-name">' + esc(displayName) + '</div>' +
-            '<div class="prov-domain">' + esc(p.domain) + ' &middot; ' + (enabled ? qCount + ' ' + esc(t("ui.questions")) : 'disabled') + '</div>' +
+            '<div class="prov-domain">' + esc(p.domain) + ' &middot; ' + (enabled ? setupKind : 'disabled') + '</div>' +
           '</div>' +
           '<label class="provider-enable" data-provider-enable-wrap title="Enable provider">' +
             '<input type="checkbox" data-provider-enable="' + esc(p.provider_id) + '"' + (enabled ? ' checked' : '') + ' />' +
@@ -1391,6 +1412,10 @@
       renderDisabledProvider(p);
       return;
     }
+    if (p.setup_web_component) {
+      renderProviderWebComponent(p);
+      return;
+    }
     if (!form || form.questions.length === 0) {
       scope.providersDone[p.provider_id] = true;
       advanceProvider();
@@ -1406,6 +1431,423 @@
       scope.providersDone[p.provider_id] = true;
       advanceProvider();
     }, backFn);
+  }
+
+  function renderProviderWebComponent(p) {
+    var scope = cs();
+    var descriptor = p.setup_web_component || {};
+    var name = formatProviderName(p);
+    var html =
+      '<div class="fade-in">' +
+        '<div class="step-header">' +
+          '<button class="btn btn-ghost btn-sm btn-back" id="btn-back">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+            ' ' + esc(t("ui.back")) +
+          '</button>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="card-header">' +
+            '<h2 class="card-title">' + esc(name) + '</h2>' +
+            '<p class="card-desc" id="setup-component-status">Loading provider setup...</p>' +
+          '</div>' +
+          '<div class="card-content">' +
+            '<div id="setup-component-blocked" class="setup-component-blocked" hidden></div>' +
+            '<div id="setup-component-host" class="setup-component-host"></div>' +
+            '<details class="setup-diagnostics" id="setup-diagnostics">' +
+              '<summary>Advanced diagnostics</summary>' +
+              '<div class="setup-diagnostics-list" id="setup-diagnostics-list">No diagnostics yet.</div>' +
+            '</details>' +
+          '</div>' +
+          '<div class="card-footer card-footer-split">' +
+            '<button class="btn-secondary" id="btn-prev">' + esc(t("ui.back")) + '</button>' +
+            '<button class="btn btn-primary" id="btn-submit" disabled>' + esc(t("ui.continue")) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    app.innerHTML = html;
+
+    var backFn = function () {
+      if (state.currentProvider > 0) { state.currentProvider--; state.phase = "provider-form"; }
+      else if (state.sharedQuestions.length > 0) { state.phase = "shared"; }
+      else { state.phase = "providers"; }
+      render();
+    };
+    document.getElementById("btn-back").addEventListener("click", backFn);
+    document.getElementById("btn-prev").addEventListener("click", backFn);
+    document.getElementById("btn-submit").addEventListener("click", function () {
+      scope.providersDone[p.provider_id] = true;
+      scope.providerSetupStatus[p.provider_id] = { mode: "web_component", complete: true };
+      persistDraftNow().finally(advanceProvider);
+    });
+
+    mountProviderWebComponent(p, descriptor, scope);
+  }
+
+  function mountProviderWebComponent(p, descriptor, scope) {
+    var status = document.getElementById("setup-component-status");
+    var blocked = document.getElementById("setup-component-blocked");
+    var host = document.getElementById("setup-component-host");
+    var submit = document.getElementById("btn-submit");
+    var diagnosticsList = document.getElementById("setup-diagnostics-list");
+    var providerId = p.provider_id;
+    var context = {
+      tenant: scope.tenant || "demo",
+      locale: currentLocale || "en"
+    };
+    var moduleUrl = replaceKnownPlaceholders(String(descriptor.module_url || ""), context);
+    var tagName = String(descriptor.tag_name || "");
+    if (!isSafeSameOriginModuleUrl(moduleUrl) || !tagName) {
+      setComponentBlocked(blocked, status, "Provider setup component is not trusted", moduleUrl);
+      return;
+    }
+
+    import(moduleUrl)
+      .then(function () {
+        var element = document.createElement(tagName);
+        var attributes = descriptor.attributes || {};
+        var resolvedAttributes = {};
+        Object.keys(attributes).forEach(function (name) {
+          resolvedAttributes[name] = replaceKnownPlaceholders(String(attributes[name]), context);
+          element.setAttribute(name, resolvedAttributes[name]);
+        });
+
+        var completion = descriptor.completion || {};
+        var completionEvent = completion.event || (descriptor.events && descriptor.events.complete) || "greentic-provider-setup-complete";
+        var stateEvent = completion.state_event || (descriptor.events && descriptor.events.state) || "greentic-provider-setup-state";
+        var errorEvent = descriptor.events && descriptor.events.error;
+        var statePath = completion.state_path || "setup_status.ok";
+        var expected = completion.equals === undefined ? true : completion.equals;
+        installProviderSetupEventLogging(providerId, scope, descriptor, diagnosticsList, blocked, status, resolvedAttributes["state-path"] || moduleUrl);
+        loadProviderSetupDiagnostics(providerId, scope, diagnosticsList);
+
+        function markComplete(detail) {
+          if (!detailMatchesProvider(detail, providerId)) return;
+          scope.providersDone[providerId] = true;
+          scope.providerSetupStatus[providerId] = { mode: "web_component", complete: true };
+          status.textContent = "Provider setup complete.";
+          submit.disabled = false;
+          scheduleDraftSave();
+        }
+
+        function handleState(event) {
+          var detail = event.detail || {};
+          if (!detailMatchesProvider(detail, providerId)) return;
+          status.textContent = "Provider setup service connected.";
+          var state = detail.state || detail;
+          if (deepValue(state, statePath) === expected) {
+            markComplete(detail);
+          }
+        }
+
+        function handleComplete(event) {
+          markComplete(event.detail || {});
+        }
+
+        document.addEventListener(stateEvent, handleState);
+        document.addEventListener(completionEvent, handleComplete);
+        if (errorEvent) {
+          document.addEventListener(errorEvent, function (event) {
+            var detail = event.detail || {};
+            if (!detailMatchesProvider(detail, providerId)) return;
+            setComponentBlocked(blocked, status, detail.error || "Provider setup service error", resolvedAttributes["state-path"] || moduleUrl, latestProviderSetupDiagnosticText(providerId, detail));
+          });
+        }
+        host.innerHTML = "";
+        host.appendChild(element);
+        status.textContent = "Provider setup component loaded.";
+        return preflightProviderSetupService(resolvedAttributes).then(function () {
+          status.textContent = "Provider setup service connected.";
+        });
+      })
+      .catch(function (err) {
+        setComponentBlocked(blocked, status, "Provider setup service is not running", err.expected || moduleUrl, err.configure || err.detail || err.message);
+      });
+  }
+
+  function preflightProviderSetupService(attributes) {
+    var statePath = attributes["state-path"];
+    if (!statePath || !isSafeSameOriginModuleUrl(statePath)) return Promise.resolve();
+    return fetch(statePath, { headers: { "Accept": "application/json" } })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          var parsed = null;
+          try { parsed = text ? JSON.parse(text) : null; } catch (e) { /* non-json is fine */ }
+          var blocked = parsed && (parsed.blocked || (parsed.setup_status && parsed.setup_status.blocked));
+          var retryableSetupBlock = blocked && (
+            blocked.retryable === true ||
+            (blocked.detail && blocked.detail.retryable === true) ||
+            (blocked.detail && blocked.detail.waiting === true)
+          );
+          if (!res.ok || (blocked && !retryableSetupBlock)) {
+            var err = new Error((blocked && (blocked.summary || blocked.error || blocked.detail)) || (parsed && (parsed.error || parsed.detail)) || ("HTTP " + res.status));
+            err.expected = (blocked && (blocked.expected || blocked.target)) || (parsed && (parsed.expected || parsed.target)) || statePath;
+            err.configure = (blocked && blocked.configure) || (parsed && parsed.configure);
+            err.detail = (blocked && (blocked.next || blocked.detail || blocked.summary)) || (parsed && parsed.detail);
+            throw err;
+          }
+        });
+      });
+  }
+
+  function replaceKnownPlaceholders(value, context) {
+    return value
+      .replace(/\{tenant\}/g, context.tenant)
+      .replace(/\{locale\}/g, context.locale);
+  }
+
+  function isSafeSameOriginModuleUrl(url) {
+    return typeof url === "string" && url.charAt(0) === "/" && url.slice(0, 2) !== "//" && url.indexOf("\\") === -1;
+  }
+
+  function detailMatchesProvider(detail, providerId) {
+    return detail && (detail.providerId === providerId || detail.provider_id === providerId);
+  }
+
+  function deepValue(value, path) {
+    if (!path) return value;
+    return path.split(".").reduce(function (current, segment) {
+      return current && typeof current === "object" ? current[segment] : undefined;
+    }, value);
+  }
+
+  function setComponentBlocked(blocked, status, message, moduleUrl, detail) {
+    status.textContent = message;
+    blocked.hidden = false;
+    blocked.innerHTML =
+      '<div class="blocked-title">' + esc(message) + '</div>' +
+      '<div class="blocked-detail">Expected route/module: <code>' + esc(moduleUrl || "") + '</code></div>' +
+      (detail ? '<div class="blocked-detail">' + esc(detail) + '</div>' : '');
+  }
+
+  function installProviderSetupEventLogging(providerId, scope, descriptor, diagnosticsList, blocked, status, expectedPath) {
+    if (providerSetupLogListeners[providerId]) {
+      providerSetupLogListeners[providerId].forEach(function (entry) {
+        document.removeEventListener(entry.name, entry.handler);
+      });
+    }
+    var names = providerSetupGenericEventNames(descriptor);
+    providerSetupLogListeners[providerId] = names.map(function (name) {
+      var handler = function (event) {
+        var detail = event.detail || {};
+        if (!detailMatchesProvider(detail, providerId)) return;
+        rememberProviderSetupDiagnostic(providerId, name, detail, diagnosticsList);
+        postProviderSetupEvent(providerId, name, detail, scope);
+        if (name === "greentic-provider-setup-request-error" || name === "greentic-provider-setup-action-timeout" || name === "greentic-provider-setup-error") {
+          setComponentBlocked(
+            blocked,
+            status,
+            detail.error || detail.message || (name === "greentic-provider-setup-action-timeout" ? "Provider setup action timed out" : "Provider setup request failed"),
+            expectedPath,
+            latestProviderSetupDiagnosticText(providerId, detail)
+          );
+        }
+      };
+      document.addEventListener(name, handler);
+      return { name: name, handler: handler };
+    });
+  }
+
+  function providerSetupGenericEventNames(descriptor) {
+    var seen = {};
+    var names = PROVIDER_SETUP_EVENT_NAMES.slice();
+    var events = descriptor && descriptor.events || {};
+    Object.keys(events).forEach(function (key) {
+      if (typeof events[key] === "string" && events[key].indexOf("greentic-provider-setup-") === 0) {
+        names.push(events[key]);
+      }
+    });
+    var completion = descriptor && descriptor.completion || {};
+    ["event", "state_event"].forEach(function (key) {
+      if (typeof completion[key] === "string" && completion[key].indexOf("greentic-provider-setup-") === 0) {
+        names.push(completion[key]);
+      }
+    });
+    return names.filter(function (name) {
+      if (seen[name]) return false;
+      seen[name] = true;
+      return true;
+    });
+  }
+
+  function postProviderSetupEvent(providerId, eventName, detail, scope) {
+    var sanitized = sanitizeProviderSetupEventDetail(detail);
+    var payload = {
+      provider_id: providerId,
+      event_name: eventName,
+      event_detail: sanitized,
+      current_step_id: setupEventField(sanitized, ["currentStepId", "current_step_id", "stepId", "step_id", "step"]),
+      current_progress: setupEventField(sanitized, ["currentProgress", "current_progress", "progress"]),
+      action_name: setupEventField(sanitized, ["actionName", "action_name", "action", "name"]),
+      request_method: setupEventField(sanitized, ["method", "requestMethod", "request_method"]),
+      request_path: setupEventField(sanitized, ["path", "requestPath", "request_path", "url"]),
+      http_status: setupEventField(sanitized, ["status", "httpStatus", "http_status"]),
+      response_body: setupEventField(sanitized, ["responseBody", "response_body", "body", "response"]),
+      error: setupEventField(sanitized, ["error", "message", "detail"]),
+      correlation_id: setupEventField(sanitized, ["correlationId", "correlation_id", "trace_id", "traceId", "request-id", "client-request-id"]),
+      tenant: scope.tenant || "demo",
+      team: scope.team || null,
+      env: scope.env || "dev",
+      setup_session_id: setupSessionId,
+      setup_ui_url: window.location.origin
+    };
+    try {
+      fetch("/api/provider-setup-events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        keepalive: true
+      }).catch(function () { /* best-effort diagnostics only */ });
+    } catch (e) {
+      /* best-effort diagnostics only */
+    }
+  }
+
+  function sanitizeProviderSetupEventDetail(value) {
+    if (Array.isArray(value)) {
+      return value.map(sanitizeProviderSetupEventDetail);
+    }
+    if (value && typeof value === "object") {
+      var output = {};
+      Object.keys(value).forEach(function (key) {
+        var normalized = key.toLowerCase().replace(/[_-]/g, "");
+        if (isSecretProviderSetupEventKey(normalized)) {
+          output[key] = "[redacted]";
+        } else if (normalized === "usercode") {
+          output[key] = shortHashMarker(String(value[key] || ""));
+        } else {
+          output[key] = sanitizeProviderSetupEventDetail(value[key]);
+        }
+      });
+      return output;
+    }
+    return value;
+  }
+
+  function setupEventField(detail, names) {
+    for (var i = 0; i < names.length; i++) {
+      var value = deepFindField(detail, names[i]);
+      if (value !== undefined && value !== null && value !== "") return value;
+    }
+    return undefined;
+  }
+
+  function deepFindField(value, fieldName) {
+    if (!value || typeof value !== "object") return undefined;
+    if (Object.prototype.hasOwnProperty.call(value, fieldName)) return value[fieldName];
+    var normalized = String(fieldName).toLowerCase().replace(/[_-]/g, "");
+    var keys = Object.keys(value);
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].toLowerCase().replace(/[_-]/g, "") === normalized) return value[keys[i]];
+    }
+    for (var j = 0; j < keys.length; j++) {
+      var child = value[keys[j]];
+      if (child && typeof child === "object") {
+        var found = deepFindField(child, fieldName);
+        if (found !== undefined) return found;
+      }
+    }
+    return undefined;
+  }
+
+  function rememberProviderSetupDiagnostic(providerId, eventName, detail, container) {
+    var sanitized = sanitizeProviderSetupEventDetail(detail || {});
+    var entry = {
+      timestamp: new Date().toISOString(),
+      event_name: eventName,
+      event_detail: sanitized,
+      current_step_id: setupEventField(sanitized, ["currentStepId", "current_step_id", "stepId", "step_id", "step"]),
+      current_progress: setupEventField(sanitized, ["currentProgress", "current_progress", "progress"]),
+      action_name: setupEventField(sanitized, ["actionName", "action_name", "action", "name"]),
+      request_method: setupEventField(sanitized, ["method", "requestMethod", "request_method"]),
+      request_path: setupEventField(sanitized, ["path", "requestPath", "request_path", "url"]),
+      http_status: setupEventField(sanitized, ["status", "httpStatus", "http_status"]),
+      error: setupEventField(sanitized, ["error", "message", "detail"]),
+      correlation_id: setupEventField(sanitized, ["correlationId", "correlation_id", "trace_id", "traceId", "request-id", "client-request-id"])
+    };
+    var list = providerSetupDiagnostics[providerId] || [];
+    list.push(entry);
+    if (list.length > 10) list = list.slice(list.length - 10);
+    providerSetupDiagnostics[providerId] = list;
+    renderProviderSetupDiagnostics(providerId, container);
+  }
+
+  function loadProviderSetupDiagnostics(providerId, scope, container) {
+    if (!container) return;
+    var url = "/api/provider-setup-events?provider_id=" + encodeURIComponent(providerId) +
+      "&tenant=" + encodeURIComponent(scope.tenant || "demo") +
+      "&team=" + encodeURIComponent(scope.team || "default") +
+      "&env=" + encodeURIComponent(scope.env || "dev") +
+      "&limit=10";
+    fetch(url, { headers: { "Accept": "application/json" } })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (data) {
+        if (!data || !Array.isArray(data.events)) return;
+        providerSetupDiagnostics[providerId] = data.events.slice(-10);
+        renderProviderSetupDiagnostics(providerId, container);
+      })
+      .catch(function () { /* diagnostics are best-effort */ });
+  }
+
+  function renderProviderSetupDiagnostics(providerId, container) {
+    if (!container) return;
+    var list = providerSetupDiagnostics[providerId] || [];
+    if (!list.length) {
+      container.textContent = "No diagnostics yet.";
+      return;
+    }
+    container.innerHTML = list.slice(-10).reverse().map(function (entry) {
+      var detail = entry.event_detail || {};
+      var title = entry.event_name || "provider setup event";
+      var meta = [
+        entry.current_step_id || detail.step || detail.stepId,
+        entry.current_progress || detail.progress,
+        entry.action_name || detail.action || detail.actionName,
+        ((entry.request_method || detail.method || "") + " " + (entry.request_path || detail.path || detail.url || "")).trim(),
+        entry.http_status || detail.status || detail.httpStatus,
+        entry.correlation_id || detail.correlationId || detail.trace_id
+      ].filter(function (part) { return part !== undefined && part !== null && String(part).trim() !== ""; }).join(" | ");
+      var error = entry.error || detail.error || detail.message || "";
+      return '<div class="setup-diagnostic-entry">' +
+        '<div class="setup-diagnostic-title">' + esc(title) + '</div>' +
+        '<div class="setup-diagnostic-meta">' + esc(meta || entry.timestamp || "") + '</div>' +
+        (error ? '<div class="setup-diagnostic-error">' + esc(String(error)) + '</div>' : '') +
+      '</div>';
+    }).join("");
+  }
+
+  function latestProviderSetupDiagnosticText(providerId, fallbackDetail) {
+    var list = providerSetupDiagnostics[providerId] || [];
+    var entry = list.length ? list[list.length - 1] : { event_detail: fallbackDetail || {} };
+    var detail = entry.event_detail || {};
+    return [
+      entry.event_name,
+      entry.current_step_id || detail.step || detail.stepId,
+      ((entry.request_method || detail.method || "") + " " + (entry.request_path || detail.path || detail.url || "")).trim(),
+      entry.http_status || detail.status || detail.httpStatus,
+      entry.error || detail.error || detail.message || detail.detail
+    ].filter(function (part) { return part !== undefined && part !== null && String(part).trim() !== ""; }).join(" | ");
+  }
+
+  function isSecretProviderSetupEventKey(normalizedKey) {
+    return [
+      "accesstoken",
+      "refreshtoken",
+      "idtoken",
+      "clientsecret",
+      "botapppassword",
+      "devicecode",
+      "oauthdevicecode"
+    ].indexOf(normalizedKey) !== -1;
+  }
+
+  function shortHashMarker(value) {
+    if (!value) return "[redacted]";
+    var hash = 2166136261;
+    for (var i = 0; i < value.length; i++) {
+      hash ^= value.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return "[hash:" + (hash >>> 0).toString(16).padStart(8, "0") + "]";
   }
 
   function renderDisabledProvider(p) {
@@ -1497,6 +1939,13 @@
       '</div>';
 
     state.providers.forEach(function (p) {
+      var setupStatus = scope.providerSetupStatus && scope.providerSetupStatus[p.provider_id];
+      if (setupStatus && setupStatus.mode === "web_component" && setupStatus.complete) {
+        html += '<div class="review-group"><h4 class="review-group-title">' + esc(formatProviderName(p)) + '</h4>';
+        html += '<div class="review-item"><span class="review-key">setup</span><span class="review-val">web component complete</span></div>';
+        html += '</div>';
+        return;
+      }
       var answers = scope.answers[p.provider_id] || {};
       var form = state.providerForms[p.provider_id];
       var keys = Object.keys(answers);
@@ -1536,6 +1985,7 @@
     render();
     var payload = {
       answers: scope.answers,
+      provider_setup_status: scope.providerSetupStatus || {},
       tenant: scope.tenant,
       env: scope.env,
       tunnel: scope.tunnel || null,
@@ -1976,6 +2426,13 @@
   function formatProviderName(provider) {
     if (typeof provider === "object" && provider.display_name) return provider.display_name;
     return typeof provider === "object" ? provider.provider_id : provider;
+  }
+
+  if (typeof window !== "undefined") {
+    window.__greenticSetupTestHooks = {
+      providerSetupGenericEventNames: providerSetupGenericEventNames,
+      sanitizeProviderSetupEventDetail: sanitizeProviderSetupEventDetail
+    };
   }
 
   render();

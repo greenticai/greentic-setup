@@ -7,10 +7,11 @@ mod url;
 
 // Re-export public types
 pub use persistence::{
-    load_effective_static_routes_defaults, load_runtime_public_base_url,
-    load_static_routes_artifact, load_telemetry_artifact, load_tunnel_artifact,
-    persist_static_routes_artifact, persist_telemetry_artifact, persist_tunnel_artifact,
-    static_routes_artifact_path, telemetry_artifact_path, tunnel_artifact_path,
+    load_effective_static_routes_defaults, load_runtime_local_base_url,
+    load_runtime_public_base_url, load_static_routes_artifact, load_telemetry_artifact,
+    load_tunnel_artifact, persist_static_routes_artifact, persist_telemetry_artifact,
+    persist_tunnel_artifact, static_routes_artifact_path, telemetry_artifact_path,
+    tunnel_artifact_path,
 };
 pub use prompts::{
     prompt_static_routes_policy, prompt_static_routes_policy_with_answers, prompt_tunnel_mode,
@@ -26,7 +27,10 @@ mod tests {
         PACK_DECLARED_POLICY, STATIC_ROUTES_VERSION, SURFACE_DISABLED, SURFACE_ENABLED,
         StaticRoutesAnswers, StaticRoutesPolicy,
     };
-    use super::{load_effective_static_routes_defaults, persist_static_routes_artifact};
+    use super::{
+        load_effective_static_routes_defaults, load_runtime_local_base_url,
+        persist_static_routes_artifact,
+    };
 
     #[test]
     fn disabled_is_default() {
@@ -175,6 +179,27 @@ mod tests {
         assert_eq!(
             loaded.and_then(|policy| policy.public_base_url),
             Some("https://runtime.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_local_base_url_uses_gateway_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp
+            .path()
+            .join("state")
+            .join("runtime")
+            .join("demo.default");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            r#"{"tenant":"demo","team":"default","gateway_listen_addr":"127.0.0.1","gateway_port":8081}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_runtime_local_base_url(temp.path(), "demo", Some("default")).unwrap(),
+            Some("http://127.0.0.1:8081".to_string())
         );
     }
 
