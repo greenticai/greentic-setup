@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod engine;
 pub mod flow;
+pub mod generated_secrets;
 pub mod gtbundle;
 pub mod no_ui_oauth;
 pub mod oauth_callback;
@@ -75,6 +76,13 @@ pub fn resolve_env(override_env: Option<&str>) -> String {
 }
 
 /// Build a canonical secret URI: `secrets://{env}/{tenant}/{team}/{provider}/{key}`.
+///
+/// The team segment is normalized via `greentic-secrets`
+/// ([`greentic_secrets_lib::normalize_team`]) — the single source of truth for
+/// the "`_` everywhere" rule (empty / `"default"` / `None` → `_`) — and the key
+/// via the shared [`secret_name::canonical_secret_name`]. The empty-provider →
+/// `messaging` default and the infallible `String` shape are setup-local
+/// conveniences kept on top of the shared primitives.
 pub fn canonical_secret_uri(
     env: &str,
     tenant: &str,
@@ -82,27 +90,19 @@ pub fn canonical_secret_uri(
     provider: &str,
     key: &str,
 ) -> String {
-    let team_segment = canonical_team(team);
+    let team_segment = greentic_secrets_lib::normalize_team(team)
+        .unwrap_or_else(|| greentic_secrets_lib::TEAM_PLACEHOLDER.to_string());
+    // Normalize the provider segment the same way as the key (and as the cloud
+    // secret name / env-bridge key already do), so a value written under a
+    // provider id like `messaging-webchat-gui` resolves when a component fetches
+    // it under `messaging.webchat-gui` — both collapse to `messaging_webchat_gui`.
     let provider_segment = if provider.is_empty() {
         "messaging".to_string()
     } else {
-        provider.to_string()
+        secret_name::canonical_secret_name(provider)
     };
     let normalized_key = secret_name::canonical_secret_name(key);
     format!("secrets://{env}/{tenant}/{team_segment}/{provider_segment}/{normalized_key}")
-}
-
-/// Normalize the team segment for secret URIs.
-///
-/// Empty, `"default"`, or `None` → `"_"` (wildcard).
-fn canonical_team(team: Option<&str>) -> &str {
-    match team
-        .map(|v| v.trim())
-        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("default"))
-    {
-        Some(v) => v,
-        None => "_",
-    }
 }
 
 #[cfg(test)]
@@ -117,13 +117,13 @@ mod tests {
     #[test]
     fn secret_uri_basic() {
         let uri = canonical_secret_uri("dev", "demo", None, "messaging-telegram", "bot_token");
-        assert_eq!(uri, "secrets://dev/demo/_/messaging-telegram/bot_token");
+        assert_eq!(uri, "secrets://dev/demo/_/messaging_telegram/bot_token");
     }
 
     #[test]
     fn secret_uri_with_team() {
         let uri = canonical_secret_uri("dev", "acme", Some("ops"), "state-redis", "redis_url");
-        assert_eq!(uri, "secrets://dev/acme/ops/state-redis/redis_url");
+        assert_eq!(uri, "secrets://dev/acme/ops/state_redis/redis_url");
     }
 
     #[test]
@@ -135,6 +135,32 @@ mod tests {
             "messaging-slack",
             "bot_token",
         );
-        assert_eq!(uri, "secrets://dev/demo/_/messaging-slack/bot_token");
+        assert_eq!(uri, "secrets://dev/demo/_/messaging_slack/bot_token");
+    }
+
+    #[test]
+    fn secret_uri_normalizes_provider_segment() {
+        // The provider segment is normalized like the key, so a secret written
+        // under the pack id `messaging-webchat-gui` resolves when fetched under
+        // the component's dotted id `messaging.webchat-gui`.
+        let stored = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let fetched = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging.webchat-gui",
+            "jwt_signing_key",
+        );
+        assert_eq!(stored, fetched);
+        assert_eq!(
+            stored,
+            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+        );
     }
 }

@@ -8,30 +8,13 @@
 
 /// Convert a raw secret name (e.g. `TELEGRAM_BOT_TOKEN`) into canonical form
 /// (`telegram_bot_token`).
+///
+/// The normalization itself lives in `greentic-secrets`
+/// ([`greentic_secrets_lib::canonical_secret_name`]) — the single
+/// ecosystem-wide definition shared by start/setup/deployer, so a producer and
+/// a reader can never derive a name differently.
 pub fn canonical_secret_name(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut prev_underscore = false;
-
-    for ch in raw.chars() {
-        if let Some(normalized) = normalize_char(ch) {
-            if normalized == '_' {
-                if prev_underscore {
-                    continue;
-                }
-                prev_underscore = true;
-            } else {
-                prev_underscore = false;
-            }
-            result.push(normalized);
-        }
-    }
-
-    let trimmed = result.trim_matches('_').to_string();
-    if trimmed.is_empty() {
-        "secret".to_string()
-    } else {
-        trimmed
-    }
+    greentic_secrets_lib::canonical_secret_name(raw)
 }
 
 /// Apply [`canonical_secret_name`] to each segment of a slash-delimited key path.
@@ -41,15 +24,6 @@ pub fn canonical_secret_key_path(raw: &str) -> String {
         .map(canonical_secret_name)
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn normalize_char(ch: char) -> Option<char> {
-    match ch {
-        'A'..='Z' => Some(ch.to_ascii_lowercase()),
-        'a'..='z' | '0'..='9' | '_' => Some(ch),
-        '-' | '.' | ' ' | '/' => Some('_'),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
