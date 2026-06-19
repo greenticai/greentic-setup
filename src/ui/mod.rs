@@ -7857,6 +7857,13 @@ mod tests {
     async fn runtime_observation_blocks_stale_ephemeral_tunnel_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
+        crate::platform_setup::persist_tunnel_artifact(
+            temp.path(),
+            &crate::platform_setup::TunnelAnswers {
+                mode: Some("off".to_string()),
+            },
+        )
+        .expect("persist tunnel off");
         let contract = super::ProviderBackendContract {
             provider_id: "messaging-example".to_string(),
             inline: json!({
