@@ -1573,7 +1573,12 @@
           var parsed = null;
           try { parsed = text ? JSON.parse(text) : null; } catch (e) { /* non-json is fine */ }
           var blocked = parsed && (parsed.blocked || (parsed.setup_status && parsed.setup_status.blocked));
-          if (!res.ok || blocked) {
+          var retryableSetupBlock = blocked && (
+            blocked.retryable === true ||
+            (blocked.detail && blocked.detail.retryable === true) ||
+            (blocked.detail && blocked.detail.waiting === true)
+          );
+          if (!res.ok || (blocked && !retryableSetupBlock)) {
             var err = new Error((blocked && (blocked.summary || blocked.error || blocked.detail)) || (parsed && (parsed.error || parsed.detail)) || ("HTTP " + res.status));
             err.expected = (blocked && (blocked.expected || blocked.target)) || (parsed && (parsed.expected || parsed.target)) || statePath;
             err.configure = (blocked && blocked.configure) || (parsed && parsed.configure);

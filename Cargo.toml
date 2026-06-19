@@ -35,6 +35,7 @@ greentic-i18n-lib = "0.5"
 greentic-runner-host = { version = "0.5", default-features = false }
 greentic-secrets-lib = { version = ">=0.5.2, <0.6.0", features = ["providers-dev"] }
 greentic-types = { version = "0.5", features = ["serde"] }
+flate2 = "1"
 hmac = "0.13"
 open = { version = "5", optional = true }
 qa-spec = "0.5"

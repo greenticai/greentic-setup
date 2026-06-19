@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.greentic.ai/setup-machine/v1",
+  "title": "Greentic Provider Setup Machine v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["version", "id", "entry_step", "steps"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "entry_step": {
+      "type": "string",
+      "minLength": 1
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true
+          }
+        ]
+      },
+      "default": []
+    },
+    "fixture_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    }
+  },
+  "$defs": {
+    "step": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "qa_form",
+            "platform_public_url",
+            "cloudflare_tunnel",
+            "oauth_device_code",
+            "oauth_authorization_code",
+            "http_probe",
+            "http_json",
+            "select_from_json",
+            "generate_file",
+            "download_file",
+            "manual_action",
+            "provider_component_call",
+            "persist_runtime_config"
+          ]
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object"
+              }
+            ]
+          },
+          "default": []
+        },
+        "on_success": {
+          "type": "string",
+          "minLength": 1
+        },
+        "on_failure": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rule"
+          },
+          "default": []
+        },
+        "recover": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rule"
+          },
+          "default": []
+        },
+        "retry": {
+          "type": "object"
+        },
+        "timeout": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ]
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["when", "action"],
+      "properties": {
+        "when": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "step": {
+          "type": "string"
+        },
+        "next": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "message_key": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

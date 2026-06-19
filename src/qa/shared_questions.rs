@@ -7,7 +7,7 @@
 use anyhow::Result;
 use qa_spec::{FormSpec, QuestionSpec};
 use serde_json::{Map as JsonMap, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::qa::prompts::ask_form_spec_question;
 use crate::setup_to_formspec;
@@ -61,23 +61,22 @@ pub fn collect_shared_questions(providers: &[ProviderFormSpec]) -> SharedQuestio
         return SharedQuestionsResult::default();
     }
 
-    // Count occurrences of each question ID across providers.
-    // Store counts only (not provider IDs) to avoid excessive cloning/allocation
-    // for questions that are not ultimately shared.
-    let mut question_count: HashMap<String, usize> = HashMap::new();
-    let mut first_question: HashMap<String, QuestionSpec> = HashMap::new();
+    // Count occurrences by borrowed question ID and retain borrowed provider
+    // IDs in the same pass. Only allocate owned strings for final shared rows.
+    let mut questions: HashMap<&str, (usize, &QuestionSpec, Vec<&str>)> = HashMap::new();
 
     for provider in providers {
         for question in &provider.form_spec.questions {
             if question.id.is_empty() {
                 continue;
             }
-            *question_count.entry(question.id.clone()).or_insert(0) += 1;
-
-            // Keep the first occurrence of each question
-            first_question
-                .entry(question.id.clone())
-                .or_insert_with(|| question.clone());
+            questions
+                .entry(question.id.as_str())
+                .and_modify(|(count, _, provider_ids)| {
+                    *count += 1;
+                    provider_ids.push(provider.provider_id.as_str());
+                })
+                .or_insert_with(|| (1, question, vec![provider.provider_id.as_str()]));
         }
     }
 
@@ -106,12 +105,9 @@ pub fn collect_shared_questions(providers: &[ProviderFormSpec]) -> SharedQuestio
         )
     }
 
-    let mut shared_ids = HashSet::new();
-    for (question_id, count) in &question_count {
+    for (question_id, (count, question, provider_ids)) in questions {
         // Only share questions that actually appear in 2+ providers
-        if *count >= 2
-            && let Some(question) = first_question.get(question_id)
-        {
+        if count >= 2 {
             // Skip secrets - they should never be shared across providers
             if question.secret {
                 continue;
@@ -123,20 +119,10 @@ pub fn collect_shared_questions(providers: &[ProviderFormSpec]) -> SharedQuestio
             }
 
             shared_questions.push(question.clone());
-            question_providers.insert(question_id.clone(), Vec::new());
-            shared_ids.insert(question_id.clone());
-        }
-    }
-
-    if !shared_ids.is_empty() {
-        for provider in providers {
-            for question in &provider.form_spec.questions {
-                if shared_ids.contains(&question.id)
-                    && let Some(provider_ids) = question_providers.get_mut(&question.id)
-                {
-                    provider_ids.push(provider.provider_id.clone());
-                }
-            }
+            question_providers.insert(
+                question_id.to_string(),
+                provider_ids.into_iter().map(str::to_string).collect(),
+            );
         }
     }
 

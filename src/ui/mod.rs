@@ -9,8 +9,9 @@ mod assets;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::{Body, Bytes, to_bytes};
@@ -30,7 +31,8 @@ use crate::plan::TenantSelection;
 use crate::platform_setup::StaticRoutesPolicy;
 use crate::qa::wizard;
 use crate::setup_tunnel::{
-    SetupTunnel, inject_setup_public_base_url, should_start_setup_tunnel, start_setup_tunnel,
+    SetupTunnel, inject_setup_public_base_url, is_ephemeral_tunnel_url, should_start_setup_tunnel,
+    start_setup_tunnel,
 };
 use crate::{SetupEngine, SetupMode, discovery, setup_to_formspec};
 
@@ -57,9 +59,30 @@ struct UiState {
     local_base_url: String,
     setup_session_id: String,
     setup_tunnel: Mutex<Option<SetupTunnel>>,
+    setup_runtime: Mutex<Option<SetupRuntime>>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
+}
+
+struct SetupRuntime {
+    child: Child,
+    info: Arc<Mutex<SetupRuntimeInfo>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SetupRuntimeInfo {
+    local_base_url: Option<String>,
+    public_base_url: Option<String>,
+    system_log_line_floor: Option<usize>,
+    ready: bool,
+}
+
+impl Drop for SetupRuntime {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[derive(Serialize)]
@@ -82,6 +105,8 @@ struct ProviderInfo {
     setup_web_component: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     setup_backend_contract: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_machine: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -251,8 +276,6 @@ struct ExecutionResult {
     stdout: String,
     stderr: String,
     manual_steps: Vec<crate::webhook::ProviderInstruction>,
-    #[serde(default)]
-    pending_setup_actions: Vec<crate::setup_actions::SetupAction>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     provider_setup_status: JsonMap<String, Value>,
 }
@@ -270,6 +293,47 @@ struct ProviderBackendContract {
     provider_id: String,
     inline: Value,
     load_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DeclaredProviderHttpRoute {
+    provider_id: String,
+    pack_path: PathBuf,
+    methods: Vec<String>,
+    target: ProviderHttpRouteTarget,
+    segments: Vec<ProviderHttpRouteSegment>,
+}
+
+#[derive(Clone, Debug)]
+enum ProviderHttpRouteTarget {
+    SetupComponent { component_ref: String, op: String },
+    ProviderIngress { component_ref: String, op: String },
+}
+
+#[derive(Clone, Debug)]
+enum ProviderHttpRouteSegment {
+    Literal(String),
+    Tenant,
+    Team,
+    Wildcard,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderHttpRouteMatch {
+    route: DeclaredProviderHttpRoute,
+    tenant: String,
+    team: String,
+}
+
+struct ProviderHttpLocalExecution<'a> {
+    contract: &'a ProviderBackendContract,
+    provider_id: &'a str,
+    tenant: &'a str,
+    action: &'a Value,
+    target: &'a str,
+    method: &'a str,
+    payload: Value,
+    runtime_context: Value,
 }
 
 // ── Public API ──
@@ -310,6 +374,7 @@ pub async fn launch(
         local_base_url: url.clone(),
         setup_session_id,
         setup_tunnel: Mutex::new(None),
+        setup_runtime: Mutex::new(None),
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -347,12 +412,14 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         )
         .route("/api/draft", post(post_draft))
         .route("/api/execute", post(post_execute))
-        .route("/api/oauth-device/start", post(post_oauth_device_start))
-        .route("/api/oauth-device/poll", post(post_oauth_device_poll))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
         .route("/oauth/callback/{provider}", get(get_oauth_callback))
         .route("/v1/web/{*asset_path}", get(get_declared_static_asset))
+        .route(
+            "/v1/setup/{*proxy_path}",
+            any(proxy_declared_provider_http_route),
+        )
         .route(
             "/v1/messaging/setup/{*proxy_path}",
             any(proxy_provider_setup_api),
@@ -688,6 +755,7 @@ async fn get_providers(
             );
             let setup_backend_contract =
                 load_setup_backend_contract_descriptor(p).map(|contract| contract.inline);
+            let setup_machine = load_setup_machine_descriptor(p);
             ProviderInfo {
                 provider_id: p.provider_id.clone(),
                 display_name: p.display_name.clone(),
@@ -695,6 +763,7 @@ async fn get_providers(
                 question_count: form.as_ref().map(|f| f.questions.len()).unwrap_or(0),
                 setup_web_component,
                 setup_backend_contract,
+                setup_machine,
             }
         })
         .collect();
@@ -993,6 +1062,27 @@ fn load_setup_backend_contract_descriptor(
     })
 }
 
+fn load_setup_machine_descriptor(provider: &discovery::DetectedProvider) -> Option<Value> {
+    let machine = crate::setup_machine::load_setup_machine_from_pack(&provider.pack_path)
+        .ok()
+        .flatten()?;
+    Some(serde_json::json!({
+        "schema_id": crate::setup_machine::SETUP_MACHINE_EXTENSION,
+        "provider_id": provider.provider_id,
+        "id": machine.id,
+        "version": machine.version,
+        "display_name": machine.display_name,
+        "entry_step": machine.entry_step,
+        "steps": machine.steps.iter().map(|step| {
+            serde_json::json!({
+                "id": step.id,
+                "kind": step.kind,
+                "title": step.title,
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
 fn load_setup_backend_contract_asset(
     provider: &discovery::DetectedProvider,
     asset: &str,
@@ -1164,6 +1254,7 @@ fn serve_pack_asset(route: &DeclaredStaticRoute, relative_asset: &str) -> Respon
     if let Err(err) = std::io::Read::read_to_end(&mut entry, &mut bytes) {
         return status_text(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
     }
+    let bytes = maybe_patch_setup_web_component_asset(&entry_name, bytes);
     let mut response = Body::from(bytes).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -1175,6 +1266,258 @@ fn serve_pack_asset(route: &DeclaredStaticRoute, relative_asset: &str) -> Respon
             .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
     );
     response
+}
+
+fn maybe_patch_setup_web_component_asset(entry_name: &str, bytes: Vec<u8>) -> Vec<u8> {
+    if !entry_name.ends_with(".js") || !entry_name.contains("/setup/") {
+        return bytes;
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => return err.into_bytes(),
+    };
+    let patched = patch_setup_web_component_reset_guard(text);
+    patched.into_bytes()
+}
+
+fn patch_setup_web_component_reset_guard(text: String) -> String {
+    let mut text = text;
+    let marker = "if (!result || typeof result !== \"object\") return \"\";";
+    if !text.contains("pending_device_login") && text.contains(marker) {
+        text = text.replacen(
+            marker,
+            "if (!result || typeof result !== \"object\") return \"\";\n    if ((result.result && result.result.pending_device_login) || result.pending_device_login) return \"\";",
+            1,
+        );
+    }
+    let marker = "if (status.blocked) {\n      return {\n        kind: \"blocked-refresh\",\n        label: this._t(\"refreshAfterManualAction\")\n      };\n    }";
+    if !text.contains("status.blocked.retryable") && text.contains(marker) {
+        text = text.replacen(
+            marker,
+            "if (status.blocked && !status.blocked.retryable) {\n      return {\n        kind: \"blocked-refresh\",\n        label: this._t(\"refreshAfterManualAction\")\n      };\n    }",
+            1,
+        );
+    }
+    let marker = r#"if (publish.ok && !install.ok && addToTeamsUrl) {
+      if (this._manualActions.addToTeamsOpened) {
+        return {
+          kind: "continue",
+          label: this._t("verifyTeamsInstall")
+        };
+      }
+      return {
+        kind: "add-to-teams",
+        label: this._t("addToTeams"),
+        url: addToTeamsUrl
+      };
+    }"#;
+    if !text.contains("greentic-setup always verifies Teams install after publish")
+        && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"if (publish.ok && !install.ok && addToTeamsUrl) {
+      // greentic-setup always offers install verification after publish; relying
+      // on sessionStorage to switch from Add to Teams can loop after browser remounts.
+      return {
+        kind: "continue",
+        label: this._t("verifyTeamsInstall"),
+        stepId: "teams_app_user_install",
+        addToTeamsUrl
+      };
+    }"#,
+            1,
+        );
+    }
+    let marker = r#"const result = await this._request("POST", this._endpoint("next"), this._collectConfig());"#;
+    if !text.contains("greentic-setup can run a targeted setup action") && text.contains(marker) {
+        text = text.replacen(
+            marker,
+            r#"// greentic-setup can run a targeted setup action for manual verification
+        // buttons, instead of republishing whatever the scheduler considers next.
+        const path = waitAction.stepId
+          ? this._endpoint("next").replace(/\/next$/, `/action/${encodeURIComponent(waitAction.stepId)}`)
+          : this._endpoint("next");
+        const result = await this._request("POST", path, this._collectConfig());"#,
+            1,
+        );
+    }
+    let marker = r#"  _actionHtml(action) {
+    return `<button type="button" class="primary" data-action="run-current">${this._escape(action.label || this._t("continue"))}</button>`;
+  }"#;
+    if !text.contains("greentic-setup exposes Add to Teams next to Verify") && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"  _actionHtml(action) {
+    const primary = `<button type="button" class="primary" data-action="run-current">${this._escape(action.label || this._t("continue"))}</button>`;
+    if (action && action.addToTeamsUrl) {
+      // greentic-setup exposes Add to Teams next to Verify without making
+      // verification depend on sessionStorage surviving the Teams deep link.
+      return `${primary}<a class="button" target="_blank" rel="noopener noreferrer" href="${this._escape(action.addToTeamsUrl)}">${this._escape(this._t("addToTeams"))}</a>`;
+    }
+    return primary;
+  }"#,
+            1,
+        );
+    }
+    let marker = r#"  _oauthComplete(kind) {
+    const values = this._state && this._state.values || {};
+    const oauth = values.oauth || {};
+    return Boolean(oauth[kind || "default"] && oauth[kind || "default"].ok);
+  }"#;
+    if !text.contains("greentic-setup oauth_resume keeps refreshed OAuth incomplete")
+        && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"  _oauthComplete(kind) {
+    const values = this._state && this._state.values || {};
+    const resume = values.oauth_resume || {};
+    const normalized = kind || "default";
+    const tokenKey = resume.token_store_key || "";
+    if (
+      // greentic-setup oauth_resume keeps refreshed OAuth incomplete until the
+      // new device-code token exchange succeeds.
+      (normalized === "management" && tokenKey === "azure_management_access_token") ||
+      (normalized === "graph" && tokenKey === "graph_access_token")
+    ) {
+      return false;
+    }
+    const oauth = values.oauth || {};
+    return Boolean(oauth[normalized] && oauth[normalized].ok);
+  }"#,
+            1,
+        );
+    }
+    let marker = r#"    const response = values.last_oauth && values.last_oauth.response || {};
+    const oauthKind = this._oauthKind();
+    const codeKey = oauthKind === "management" ? "azure_management_user_code" : "oauth_user_code";
+    const userCode = cfg[codeKey] || response.user_code || response.userCode;"#;
+    if !text.contains("greentic-setup prefers newest OAuth response code") && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"    const response = values.last_oauth && values.last_oauth.response || {};
+    const oauthKind = this._oauthKind();
+    const codeKey = oauthKind === "management" ? "azure_management_user_code" : "oauth_user_code";
+    // greentic-setup prefers newest OAuth response code over stale persisted config.
+    const userCode = response.user_code || response.userCode || cfg[codeKey];"#,
+            1,
+        );
+    }
+    let marker =
+        r#"const firstMessage = values.last_activity || values.last_webchat_conversation;"#;
+    if !text.contains("greentic-setup ignores stale runtime observations") && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"// greentic-setup ignores stale runtime observations when deciding
+    // whether the first Teams message has arrived for the current tunnel.
+    const firstMessage = [values.last_activity, values.last_webchat_conversation].find((value) => value && !value.stale);"#,
+            1,
+        );
+    }
+    let marker = r#"if (install.ok && !firstMessage && openBotChatUrl) {"#;
+    if !text.contains("greentic-setup waits for endpoint registration before bot chat")
+        && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"const pendingStep = this._currentPendingStepId && this._currentPendingStepId();
+    if (install.ok && openBotChatUrl && pendingStep && pendingStep !== "first_bot_framework_post") {
+      // greentic-setup waits for the Bot Framework endpoint registration to be
+      // current before asking Teams to send the first message.
+      return {
+        kind: "continue",
+        label: this._t("continue") || "Continue setup"
+      };
+    }
+
+    if (install.ok && !firstMessage && openBotChatUrl) {"#,
+            1,
+        );
+    }
+    let marker = r#"        kind: "open-chat","#;
+    if !text.contains("greentic-setup waits for endpoint registration before bot chat")
+        && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"        ...(() => {
+          const pendingStep = this._currentPendingStepId && this._currentPendingStepId();
+          if (pendingStep && pendingStep !== "first_bot_framework_post") {
+            // greentic-setup waits for the Bot Framework endpoint registration to be
+            // current before asking Teams to send the first message.
+            return {
+              kind: "continue",
+              label: this._t("continue") || "Continue setup"
+            };
+          }
+          return { kind: "open-chat" };
+        })(),"#,
+            1,
+        );
+    }
+    let marker = r#"&& !(values.last_activity || values.last_webchat_conversation)"#;
+    if text.contains("greentic-setup ignores stale runtime observations") && text.contains(marker) {
+        text = text.replacen(
+            marker,
+            r#"&& ![values.last_activity, values.last_webchat_conversation].some((value) => value && !value.stale)"#,
+            1,
+        );
+    }
+    let marker =
+        r#"firstMessage: Boolean(values.last_activity || values.last_webchat_conversation)"#;
+    if text.contains("greentic-setup ignores stale runtime observations") && text.contains(marker) {
+        text = text.replacen(
+            marker,
+            r#"firstMessage: [values.last_activity, values.last_webchat_conversation].some((value) => value && !value.stale)"#,
+            1,
+        );
+    }
+    let marker = r#"    if (!complete) {
+      return {
+        kind: "continue",
+        label: this._t("continue") || "Continue setup"
+      };
+    }"#;
+    if !text.contains("greentic-setup has no next action after observed completion")
+        && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"    if (complete && firstMessage) {
+      // greentic-setup has no next action after observed completion.
+      return null;
+    }
+
+    if (!complete) {
+      return {
+        kind: "continue",
+        label: this._t("continue") || "Continue setup"
+      };
+    }"#,
+            1,
+        );
+    }
+    let marker = r#"    if (pending === "first_bot_framework_post") {
+      return await this._runtimeIngressPreflight();
+    }"#;
+    if !text.contains("greentic-setup lets backend verify runtime observation")
+        && text.contains(marker)
+    {
+        text = text.replacen(
+            marker,
+            r#"    if (pending === "first_bot_framework_post") {
+      // greentic-setup lets the backend/runtime observation path verify Teams
+      // activity; browser GET probes against Bot Framework ingress can fail.
+      return "";
+    }"#,
+            1,
+        );
+    }
+    text
 }
 
 async fn proxy_provider_setup_api(
@@ -1217,15 +1560,41 @@ async fn proxy_provider_setup_api(
         }
     }
 
+    let declared_path = format!("/v1/messaging/setup/{}", proxy_path.trim_start_matches('/'));
+    match dispatch_declared_provider_http_route(
+        &state,
+        method.as_str(),
+        &declared_path,
+        &query,
+        &headers,
+        body.clone(),
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "blocked": true,
+                    "error": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let Some(runtime_base) = configured_runtime_proxy_base_url() else {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({
             "ok": false,
             "blocked": true,
-            "error": "Provider setup service is not running",
+            "error": "provider setup route is not declared by pack",
             "expected": format!("/v1/messaging/setup/{proxy_path}"),
-            "configure": "Set GREENTIC_SETUP_RUNTIME_URL to the active local runtime base URL."
+            "configure": "Declare the route in greentic.http-routes.v1 or use a backend-contract route."
             })),
         )
             .into_response();
@@ -1269,6 +1638,47 @@ async fn proxy_provider_setup_api(
                 "target": target,
                 "detail": err.to_string(),
                 "configure": "Start the provider setup runtime, then set GREENTIC_SETUP_RUNTIME_URL to its local base URL."
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn proxy_declared_provider_http_route(
+    State(state): State<std::sync::Arc<UiState>>,
+    AxumPath(proxy_path): AxumPath<String>,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    let method = request.method().clone();
+    let query = request
+        .uri()
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let path = format!("/v1/setup/{}", proxy_path.trim_start_matches('/'));
+    let body = match to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(err) => return status_text(StatusCode::BAD_REQUEST, &err.to_string()),
+    };
+    match dispatch_declared_provider_http_route(
+        &state,
+        method.as_str(),
+        &path,
+        &query,
+        &headers,
+        body,
+    )
+    .await
+    {
+        Ok(Some(response)) => response,
+        Ok(None) => status_text(StatusCode::NOT_FOUND, "provider route not declared by pack"),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "blocked": true,
+                "error": err.to_string(),
             })),
         )
             .into_response(),
@@ -1328,6 +1738,16 @@ async fn handle_provider_setup_backend_contract(
     let provider_id = segments[0];
     let tenant = segments[1];
     let suffix = &segments[2..];
+    if let Some(response) = handle_provider_setup_machine(
+        state,
+        method.as_str(),
+        provider_id,
+        tenant,
+        suffix,
+        body.clone(),
+    )? {
+        return Ok(Some(response));
+    }
     let Some(contract) = find_setup_backend_contract(&state.bundle_path, provider_id)? else {
         return Ok(None);
     };
@@ -1351,6 +1771,21 @@ async fn handle_provider_setup_backend_contract(
                     &contract,
                     tenant,
                     &format!("/v1/messaging/setup/{provider_id}/{tenant}/next"),
+                    &body,
+                )
+                .await?,
+            )
+            .into_response()
+        }
+        ("POST", ["action", step]) if is_safe_runtime_path_segment(step) => {
+            let body = parse_json_body(body)?;
+            Json(
+                setup_backend_contract_action(
+                    state,
+                    &contract,
+                    tenant,
+                    step,
+                    &format!("/v1/messaging/setup/{provider_id}/{tenant}/action/{step}"),
                     &body,
                 )
                 .await?,
@@ -1385,6 +1820,112 @@ fn parse_json_body(body: Bytes) -> Result<Value> {
     serde_json::from_slice(&body).context("invalid JSON request body")
 }
 
+fn handle_provider_setup_machine(
+    state: &UiState,
+    method: &str,
+    provider_id: &str,
+    tenant: &str,
+    suffix: &[&str],
+    body: Bytes,
+) -> Result<Option<Response>> {
+    let discovered = discovery::discover(&state.bundle_path)?;
+    let Some(provider) = discovered.find_setup_target(provider_id) else {
+        return Ok(None);
+    };
+    let Some(machine) = crate::setup_machine::load_setup_machine_from_pack(&provider.pack_path)?
+    else {
+        return Ok(None);
+    };
+    let team = state.team.as_deref().unwrap_or("default");
+    let response = match (method, suffix) {
+        ("GET", []) => Json(setup_machine_ui_state(
+            state,
+            &provider.provider_id,
+            tenant,
+            team,
+            &machine,
+        )?)
+        .into_response(),
+        ("POST", ["next"]) => {
+            let _ = parse_json_body(body)?;
+            let output = crate::setup_machine::advance_setup_machine_with_pack(
+                &state.bundle_path,
+                Some(&provider.pack_path),
+                &provider.provider_id,
+                tenant,
+                team,
+                &machine,
+                false,
+            )?;
+            Json(setup_machine_ui_report(
+                state,
+                &provider.provider_id,
+                tenant,
+                team,
+                &machine,
+                Some(output),
+            )?)
+            .into_response()
+        }
+        ("POST", ["retry"]) => {
+            let body = parse_json_body(body)?;
+            let step = body
+                .get("step")
+                .or_else(|| body.get("step_id"))
+                .and_then(Value::as_str);
+            let output = crate::setup_machine::retry_setup_machine_step(
+                &state.bundle_path,
+                &provider.provider_id,
+                tenant,
+                team,
+                &machine,
+                step,
+            )?;
+            Json(setup_machine_ui_report(
+                state,
+                &provider.provider_id,
+                tenant,
+                team,
+                &machine,
+                Some(output),
+            )?)
+            .into_response()
+        }
+        ("POST", ["reset"]) => {
+            let _ = parse_json_body(body)?;
+            let archive_path = crate::setup_machine::reset_setup_machine_state(
+                &state.bundle_path,
+                tenant,
+                team,
+                &provider.provider_id,
+                "ui reset",
+            )?;
+            let mut report =
+                setup_machine_ui_state(state, &provider.provider_id, tenant, team, &machine)?;
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert(
+                    "reset".to_string(),
+                    serde_json::json!({
+                        "archive_path": archive_path.map(|path| path.display().to_string()),
+                    }),
+                );
+            }
+            Json(report).into_response()
+        }
+        ("POST", ["config"]) => Json(setup_machine_ui_state(
+            state,
+            &provider.provider_id,
+            tenant,
+            team,
+            &machine,
+        )?)
+        .into_response(),
+        ("GET", _) => status_text(StatusCode::NOT_FOUND, "setup-machine route not declared"),
+        _ => status_text(StatusCode::NOT_FOUND, "setup-machine route not declared"),
+    };
+    Ok(Some(response))
+}
+
 fn contract_unsupported_response(provider_id: &str, message: &str) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -1400,15 +1941,518 @@ fn contract_unsupported_response(provider_id: &str, message: &str) -> Response {
         .into_response()
 }
 
+async fn dispatch_declared_provider_http_route(
+    state: &UiState,
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Option<Response>> {
+    let Some(route_match) = find_declared_provider_http_route(
+        &state.bundle_path,
+        method,
+        path,
+        state.tenant.as_str(),
+        state.team.as_deref().unwrap_or("default"),
+    )?
+    else {
+        return Ok(None);
+    };
+    let output = invoke_declared_provider_http_route(
+        state,
+        &route_match,
+        method,
+        path,
+        query,
+        headers,
+        body,
+    )
+    .await?;
+    Ok(Some(provider_http_output_to_response(output)))
+}
+
+fn provider_http_output_to_response(output: Value) -> Response {
+    let status = output
+        .get("response")
+        .and_then(|response| response.get("status"))
+        .or_else(|| output.get("status"))
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(StatusCode::OK);
+    let body = output
+        .get("response")
+        .and_then(|response| response.get("body_json"))
+        .or_else(|| output.get("body_json"))
+        .or_else(|| output.get("body"))
+        .cloned()
+        .unwrap_or(output);
+    (status, Json(body)).into_response()
+}
+
+async fn invoke_declared_provider_http_route(
+    state: &UiState,
+    route_match: &ProviderHttpRouteMatch,
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Value> {
+    let headers_json = provider_ingress_headers_json(method, path, query, headers)?;
+    let body_json = if body.is_empty() {
+        "{}".to_string()
+    } else {
+        String::from_utf8(body.to_vec()).context("provider route request body is not utf-8")?
+    };
+    let request = serde_json::json!({
+        "v": 1,
+        "domain": "messaging",
+        "provider": route_match.route.provider_id,
+        "tenant": route_match.tenant,
+        "team": route_match.team,
+        "method": method,
+        "path": path,
+        "query": parse_query_pairs(query),
+        "headers": headers_json,
+        "body_json": body_json,
+    });
+    let setup_config = SetupConfig {
+        tenant: route_match.tenant.clone(),
+        team: Some(route_match.team.clone()),
+        env: state.env.clone(),
+        offline: false,
+        verbose: state.advanced,
+    };
+    let output = match &route_match.route.target {
+        ProviderHttpRouteTarget::SetupComponent { component_ref, op } => {
+            invoke_setup_component_operation_blocking(
+                state.bundle_path.clone(),
+                route_match.route.pack_path.clone(),
+                component_ref.clone(),
+                op.clone(),
+                request,
+                setup_config,
+            )
+            .await?
+        }
+        ProviderHttpRouteTarget::ProviderIngress { component_ref, op } => {
+            anyhow::bail!(
+                "provider route '{}' for {} declares provider ingress component '{}' op '{}', but greentic-setup requires setup_component_ref/setup_op for setup-time pack routes",
+                path,
+                route_match.route.provider_id,
+                component_ref,
+                op
+            );
+        }
+    };
+    Ok(output)
+}
+
+async fn invoke_setup_component_operation_blocking(
+    bundle_path: PathBuf,
+    pack_path: PathBuf,
+    component_ref: String,
+    op: String,
+    request: Value,
+    setup_config: SetupConfig,
+) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        crate::engine::invoke_setup_component_operation(
+            &bundle_path,
+            &pack_path,
+            &component_ref,
+            &op,
+            &request,
+            &setup_config,
+        )
+    })
+    .await
+    .context("provider setup route task panicked")?
+}
+
+fn provider_ingress_headers_json(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+) -> Result<String> {
+    let mut object = JsonMap::new();
+    for (name, value) in headers {
+        if let Ok(value) = value.to_str() {
+            object.insert(name.as_str().to_string(), Value::String(value.to_string()));
+        }
+    }
+    object.insert("method".to_string(), Value::String(method.to_string()));
+    object.insert("path".to_string(), Value::String(path.to_string()));
+    object.insert(
+        "query".to_string(),
+        Value::String(query.trim_start_matches('?').to_string()),
+    );
+    Ok(serde_json::to_string(&Value::Object(object))?)
+}
+
+fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (key.to_string(), value.to_string())
+        })
+        .collect()
+}
+
+fn find_declared_provider_http_route(
+    bundle_path: &Path,
+    method: &str,
+    path: &str,
+    default_tenant: &str,
+    default_team: &str,
+) -> Result<Option<ProviderHttpRouteMatch>> {
+    let mut routes = load_declared_provider_http_routes(bundle_path)?;
+    routes.sort_by(|a, b| {
+        let a_wild = a
+            .segments
+            .iter()
+            .any(|segment| matches!(segment, ProviderHttpRouteSegment::Wildcard));
+        let b_wild = b
+            .segments
+            .iter()
+            .any(|segment| matches!(segment, ProviderHttpRouteSegment::Wildcard));
+        b.segments
+            .len()
+            .cmp(&a.segments.len())
+            .then(a_wild.cmp(&b_wild))
+    });
+    let request_segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    for route in routes {
+        if !route.methods.is_empty()
+            && !route
+                .methods
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(method))
+        {
+            continue;
+        }
+        if let Some((tenant, team)) =
+            match_provider_http_route(&route, &request_segments, default_tenant, default_team)
+        {
+            return Ok(Some(ProviderHttpRouteMatch {
+                route,
+                tenant,
+                team,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn load_declared_provider_http_routes(
+    bundle_path: &Path,
+) -> Result<Vec<DeclaredProviderHttpRoute>> {
+    let discovered = discovery::discover(bundle_path)?;
+    let mut routes = Vec::new();
+    for provider in discovered.providers {
+        let Some(http_routes_extension) =
+            discovery::read_pack_extension(&provider.pack_path, "greentic.http-routes.v1")?
+        else {
+            continue;
+        };
+        let http_routes =
+            extension_inline(&http_routes_extension).unwrap_or(&http_routes_extension);
+        let ingress_extension =
+            discovery::read_pack_extension(&provider.pack_path, "messaging.provider_ingress.v1")?;
+        let ingress = ingress_extension
+            .as_ref()
+            .and_then(|extension| extension_inline(extension).or(Some(extension)));
+        let Some(records) = http_routes.get("routes").and_then(Value::as_array) else {
+            continue;
+        };
+        for record in records {
+            let Some(pattern) = record
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let methods = record
+                .get("methods")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            let target = match declared_provider_http_route_target(record, ingress) {
+                Some(target) => target,
+                None => continue,
+            };
+            routes.push(DeclaredProviderHttpRoute {
+                provider_id: provider.provider_id.clone(),
+                pack_path: provider.pack_path.clone(),
+                methods,
+                target,
+                segments: parse_provider_http_route_pattern(pattern),
+            });
+        }
+    }
+    Ok(routes)
+}
+
+fn declared_provider_http_route_target(
+    record: &Value,
+    ingress: Option<&Value>,
+) -> Option<ProviderHttpRouteTarget> {
+    let setup_component_ref = record
+        .get("setup_component_ref")
+        .or_else(|| record.get("component_ref"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(component_ref) = setup_component_ref {
+        let op = record
+            .get("setup_op")
+            .or_else(|| record.get("op"))
+            .or_else(|| record.get("provider_op"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("handle_http")
+            .to_string();
+        return Some(ProviderHttpRouteTarget::SetupComponent {
+            component_ref: component_ref.to_string(),
+            op,
+        });
+    }
+
+    let ingress = ingress?;
+    let component_ref = ingress
+        .get("component_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let op = record
+        .get("provider_op")
+        .or_else(|| record.get("op"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("ingest_http")
+        .to_string();
+    Some(ProviderHttpRouteTarget::ProviderIngress {
+        component_ref: component_ref.to_string(),
+        op,
+    })
+}
+
+fn parse_provider_http_route_pattern(pattern: &str) -> Vec<ProviderHttpRouteSegment> {
+    pattern
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if segment == "{tenant}" {
+                ProviderHttpRouteSegment::Tenant
+            } else if segment == "{team}" {
+                ProviderHttpRouteSegment::Team
+            } else if segment.ends_with("*}") || segment == "*" {
+                ProviderHttpRouteSegment::Wildcard
+            } else {
+                ProviderHttpRouteSegment::Literal(segment.to_string())
+            }
+        })
+        .collect()
+}
+
+fn match_provider_http_route(
+    route: &DeclaredProviderHttpRoute,
+    request_segments: &[&str],
+    default_tenant: &str,
+    default_team: &str,
+) -> Option<(String, String)> {
+    let mut tenant = default_tenant.to_string();
+    let mut team = default_team.to_string();
+    let mut request_index = 0;
+    for segment in &route.segments {
+        match segment {
+            ProviderHttpRouteSegment::Literal(expected) => {
+                if request_segments.get(request_index)? != expected {
+                    return None;
+                }
+                request_index += 1;
+            }
+            ProviderHttpRouteSegment::Tenant => {
+                tenant = request_segments.get(request_index)?.to_string();
+                if tenant.is_empty() {
+                    return None;
+                }
+                request_index += 1;
+            }
+            ProviderHttpRouteSegment::Team => {
+                team = request_segments.get(request_index)?.to_string();
+                if team.is_empty() {
+                    return None;
+                }
+                request_index += 1;
+            }
+            ProviderHttpRouteSegment::Wildcard => {
+                return Some((tenant, team));
+            }
+        }
+    }
+    if request_index == request_segments.len() {
+        Some((tenant, team))
+    } else {
+        None
+    }
+}
+
 fn setup_backend_contract_state(
     state: &UiState,
     contract: &ProviderBackendContract,
     tenant: &str,
 ) -> Result<Value> {
-    let stored = load_setup_backend_contract_state(state, &contract.provider_id, tenant)?;
+    let mut stored = load_setup_backend_contract_state(state, &contract.provider_id, tenant)?;
+    setup_backend_refresh_renderable_runtime_observation(state, contract, tenant, &mut stored)?;
+    save_setup_backend_contract_state(state, &contract.provider_id, tenant, &stored)?;
     Ok(render_setup_backend_contract_state(
         state, contract, tenant, stored,
     ))
+}
+
+fn setup_backend_refresh_renderable_runtime_observation(
+    state: &UiState,
+    contract: &ProviderBackendContract,
+    tenant: &str,
+    stored: &mut JsonMap<String, Value>,
+) -> Result<()> {
+    let Some(action) = setup_backend_action_by_id(contract, "first_bot_framework_post") else {
+        return Ok(());
+    };
+    let Some(executor) = action.get("executor") else {
+        return Ok(());
+    };
+    if executor.get("kind").and_then(Value::as_str) != Some("runtime_observation") {
+        return Ok(());
+    }
+    let config = stored
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| default_setup_backend_config(state, tenant));
+    let runtime_context = setup_backend_runtime_context(state, tenant, &config);
+    let state_key = executor
+        .get("state_store_key")
+        .and_then(Value::as_str)
+        .unwrap_or("last_activity");
+    setup_backend_refresh_runtime_observation_from_runtime_logs(
+        state,
+        tenant,
+        executor,
+        stored,
+        state_key,
+        &runtime_context,
+    )
+}
+
+fn setup_machine_ui_state(
+    state: &UiState,
+    provider_id: &str,
+    tenant: &str,
+    team: &str,
+    machine: &crate::setup_machine::SetupMachine,
+) -> Result<Value> {
+    setup_machine_ui_report(state, provider_id, tenant, team, machine, None)
+}
+
+fn setup_machine_ui_report(
+    state: &UiState,
+    provider_id: &str,
+    tenant: &str,
+    team: &str,
+    machine: &crate::setup_machine::SetupMachine,
+    result: Option<Value>,
+) -> Result<Value> {
+    let machine_state = crate::setup_machine::load_or_init_setup_machine_state(
+        &state.bundle_path,
+        provider_id,
+        tenant,
+        team,
+        machine,
+    )?;
+    let status = crate::setup_machine::render_setup_machine_status(machine, &machine_state);
+    let items = status
+        .get("steps")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ok = machine_state.status == crate::setup_machine::SetupMachineStatus::Complete;
+    let blocked = setup_machine_blocked(&machine_state.last_error);
+    let next = if ok {
+        "Setup complete.".to_string()
+    } else if let Some(blocked) = blocked.as_ref() {
+        blocked
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("Setup requires attention.")
+            .to_string()
+    } else if let Some(result_next) = result
+        .as_ref()
+        .and_then(|result| result.get("result"))
+        .and_then(|result| result.get("next"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        result_next.to_string()
+    } else {
+        "Run the next setup step.".to_string()
+    };
+    Ok(serde_json::json!({
+        "ok": true,
+        "values": status.get("outputs").cloned().unwrap_or_else(|| machine_state.outputs.clone()),
+        "setup_status": {
+            "ok": ok,
+            "items": items,
+            "selected": {
+                "provider_id": provider_id,
+                "tenant": tenant,
+                "team": team,
+                "env": state.env,
+            },
+            "blocked": blocked,
+            "last_step": machine_state.current_step.clone().unwrap_or_else(|| "complete".to_string()),
+            "next": next,
+            "reset": false,
+            "machine": status,
+            "last_result": result,
+        },
+    }))
+}
+
+fn setup_machine_blocked(last_error: &Option<Value>) -> Option<Value> {
+    let error = last_error.as_ref()?;
+    Some(serde_json::json!({
+        "title": "Setup step blocked",
+        "summary": error
+            .get("detail")
+            .and_then(Value::as_str)
+            .or_else(|| error.get("error").and_then(Value::as_str))
+            .unwrap_or("Setup requires attention before it can continue."),
+        "retryable": error
+            .get("recoverable")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        "detail": error,
+    }))
 }
 
 fn setup_backend_contract_save_config(
@@ -1422,20 +2466,12 @@ fn setup_backend_contract_save_config(
         .get("config")
         .or_else(|| body.get("values").and_then(|values| values.get("config")))
         .unwrap_or(body);
-    if let Some(incoming) = incoming.as_object() {
-        let server_owned = setup_backend_server_owned_keys(contract);
-        let config = stored
-            .entry("config".to_string())
-            .or_insert_with(|| Value::Object(default_setup_backend_config(state, tenant)))
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("stored config is not an object"))?;
-        for (key, value) in incoming {
-            if server_owned.contains(key.as_str()) {
-                continue;
-            }
-            config.insert(key.clone(), value.clone());
-        }
-    }
+    crate::setup_backend_contract::merge_browser_config_update(
+        &mut stored,
+        incoming,
+        &contract.inline,
+        default_setup_backend_config(state, tenant),
+    )?;
     save_setup_backend_contract_state(state, &contract.provider_id, tenant, &stored)?;
     Ok(render_setup_backend_contract_state(
         state, contract, tenant, stored,
@@ -1456,7 +2492,7 @@ async fn setup_backend_contract_next(
     let mut stored = load_setup_backend_contract_state(state, &contract.provider_id, tenant)?;
     ensure_setup_backend_config_defaults(state, tenant, &mut stored)?;
     let state_before = render_setup_backend_contract_state(state, contract, tenant, stored.clone());
-    let next_step = setup_backend_first_pending_step(contract, &stored);
+    let next_step = setup_backend_first_pending_step(state, contract, tenant, &stored);
     let action = setup_backend_action_by_id(contract, &next_step).cloned();
     let executor = action
         .as_ref()
@@ -1473,9 +2509,15 @@ async fn setup_backend_contract_next(
     } else {
         setup_backend_execute_action(state, contract, tenant, &mut stored, &next_step).await?
     };
-    stored.insert("last_setup_result".to_string(), result.clone());
+    crate::setup_backend_contract::record_action_result(
+        &state.bundle_path,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+        &contract.provider_id,
+        &mut stored,
+        result.clone(),
+    )?;
     let state_after = render_setup_backend_contract_state(state, contract, tenant, stored.clone());
-    save_setup_backend_contract_state(state, &contract.provider_id, tenant, &stored)?;
     let _ = persist_setup_backend_next_diagnostic(
         state,
         contract,
@@ -1483,6 +2525,62 @@ async fn setup_backend_contract_next(
         request_path,
         body,
         &next_step,
+        action.as_ref(),
+        &executor,
+        &state_before,
+        &state_after,
+        &result,
+    );
+    Ok(render_setup_backend_contract_state(
+        state, contract, tenant, stored,
+    ))
+}
+
+async fn setup_backend_contract_action(
+    state: &UiState,
+    contract: &ProviderBackendContract,
+    tenant: &str,
+    step: &str,
+    request_path: &str,
+    body: &Value,
+) -> Result<Value> {
+    if contract.load_error.is_some() || setup_backend_required_steps(contract).is_empty() {
+        return setup_backend_contract_state(state, contract, tenant);
+    }
+    let _ = setup_backend_contract_save_config(state, contract, tenant, body)?;
+    let mut stored = load_setup_backend_contract_state(state, &contract.provider_id, tenant)?;
+    ensure_setup_backend_config_defaults(state, tenant, &mut stored)?;
+    let state_before = render_setup_backend_contract_state(state, contract, tenant, stored.clone());
+    let action = setup_backend_action_by_id(contract, step).cloned();
+    let executor = action
+        .as_ref()
+        .and_then(|action| action.get("executor"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let result = if action.is_some() {
+        setup_backend_execute_action(state, contract, tenant, &mut stored, step).await?
+    } else {
+        setup_backend_action_error(
+            "missing_action",
+            &format!("backend contract has no action for requested step {step}"),
+        )
+    };
+    crate::setup_backend_contract::record_action_result(
+        &state.bundle_path,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+        &contract.provider_id,
+        &mut stored,
+        result.clone(),
+    )?;
+    let state_after = render_setup_backend_contract_state(state, contract, tenant, stored.clone());
+    let _ = persist_setup_backend_next_diagnostic(
+        state,
+        contract,
+        tenant,
+        request_path,
+        body,
+        step,
         action.as_ref(),
         &executor,
         &state_before,
@@ -1667,8 +2765,14 @@ async fn setup_backend_contract_oauth_start(
     let result =
         setup_backend_execute_oauth_device_code_start(state, contract, tenant, &mut stored, action)
             .await?;
-    stored.insert("last_setup_result".to_string(), result.clone());
-    save_setup_backend_contract_state(state, &contract.provider_id, tenant, &stored)?;
+    crate::setup_backend_contract::record_action_result(
+        &state.bundle_path,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+        &contract.provider_id,
+        &mut stored,
+        result.clone(),
+    )?;
     Ok(result)
 }
 
@@ -1694,8 +2798,14 @@ async fn setup_backend_contract_oauth_complete(
         action,
     )
     .await?;
-    stored.insert("last_setup_result".to_string(), result.clone());
-    save_setup_backend_contract_state(state, &contract.provider_id, tenant, &stored)?;
+    crate::setup_backend_contract::record_action_result(
+        &state.bundle_path,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+        &contract.provider_id,
+        &mut stored,
+        result.clone(),
+    )?;
     Ok(result)
 }
 
@@ -1736,7 +2846,7 @@ async fn setup_backend_execute_action(
                 .await
         }
         "runtime_observation" => {
-            setup_backend_execute_runtime_observation(contract, tenant, stored, action)
+            setup_backend_execute_runtime_observation(state, contract, tenant, stored, action).await
         }
         "" => Ok(setup_backend_action_error(
             "missing_executor_kind",
@@ -1875,7 +2985,7 @@ async fn setup_backend_execute_oauth_device_code_start(
     }
     config.insert("oauth_token_url".to_string(), Value::String(token_url));
     config.insert("oauth_client_id".to_string(), Value::String(client_id));
-    let login = setup_backend_device_login_payload(config);
+    let login = setup_backend_device_login_payload(config, user_code_key, &body);
     stored.insert(
         "last_oauth".to_string(),
         serde_json::json!({
@@ -1886,7 +2996,7 @@ async fn setup_backend_execute_oauth_device_code_start(
     Ok(setup_backend_step_result(
         action,
         false,
-        "authorize in the opened browser, then wait for setup to continue",
+        setup_backend_device_login_next_message(),
         serde_json::json!({
             "ok": false,
             "pending_device_login": true,
@@ -1966,9 +3076,15 @@ async fn setup_backend_execute_oauth_device_code_complete(
         );
     }
     config.remove(device_code_key);
+    let user_code_key = executor
+        .get("user_code_store_key")
+        .and_then(Value::as_str)
+        .unwrap_or("oauth_user_code");
+    config.remove(user_code_key);
     config.remove("oauth_kind");
     config.remove("oauth_client_id");
     config.remove("oauth_token_url");
+    setup_backend_clear_oauth_resume_for_token(stored, token_store_key);
     let oauth = stored
         .entry("oauth".to_string())
         .or_insert_with(|| Value::Object(JsonMap::new()))
@@ -1999,179 +3115,11 @@ async fn setup_backend_execute_graph_application(
     stored: &mut JsonMap<String, Value>,
     action: &Value,
 ) -> Result<Value> {
-    let executor = setup_backend_executor(action)?;
-    let config = setup_backend_config_mut(stored)?;
-    let token_key = required_executor_str(executor, "graph_token_store_key")?;
-    let token = setup_backend_config_str(config, token_key);
-    if token.is_empty() {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            &format!("complete OAuth for {token_key}, then retry"),
-            serde_json::json!({ "ok": false, "missing_token_store_key": token_key }),
-        ));
-    }
-    let app_id_key = required_executor_str(executor, "app_id_config_key")?;
-    let secret_key = required_executor_str(executor, "client_secret_config_key")?;
-    let display_name_key = required_executor_str(executor, "display_name_config_key")?;
-    let configured_app_id = setup_backend_config_str(config, app_id_key);
-    let mut display_name = setup_backend_config_str(config, display_name_key);
-    if display_name.is_empty() {
-        display_name = "Greentic Bot".to_string();
-    }
-    let client = reqwest::Client::new();
-    let select = "id,appId,displayName,signInAudience";
-    let filter = if configured_app_id.is_empty() {
-        format!(
-            "displayName eq '{}'",
-            setup_backend_odata_string(&display_name)
-        )
-    } else {
-        format!(
-            "appId eq '{}'",
-            setup_backend_odata_string(&configured_app_id)
-        )
-    };
-    let lookup_url = format!(
-        "https://graph.microsoft.com/v1.0/applications?$filter={}&$select={}",
-        setup_backend_url_encode(&filter),
-        setup_backend_url_encode(select)
-    );
-    let lookup = setup_backend_json_request(
-        &client,
-        reqwest::Method::GET,
-        &lookup_url,
-        Some(&token),
-        None,
-    )
-    .await?;
-    if !lookup.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            "Microsoft Graph application lookup failed.",
-            lookup,
-        ));
-    }
-    let items = lookup
-        .get("body")
-        .and_then(|body| body.get("value"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let (app, action_name) = if let Some(app) = items.first() {
-        (
-            app.clone(),
-            if configured_app_id.is_empty() {
-                "reuse"
-            } else {
-                "reuse_by_app_id"
-            },
-        )
-    } else {
-        if !configured_app_id.is_empty() {
-            return Ok(setup_backend_step_result(
-                action,
-                false,
-                "configured app id was not found in Microsoft Graph applications",
-                serde_json::json!({ "ok": false, "configured_app_id": configured_app_id }),
-            ));
-        }
-        let create = setup_backend_json_request(
-            &client,
-            reqwest::Method::POST,
-            "https://graph.microsoft.com/v1.0/applications",
-            Some(&token),
-            Some(serde_json::json!({
-                "displayName": display_name,
-                "signInAudience": executor
-                    .get("sign_in_audience")
-                    .and_then(Value::as_str)
-                    .unwrap_or("AzureADMultipleOrgs"),
-            })),
-        )
-        .await?;
-        if !create.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(setup_backend_step_result(
-                action,
-                false,
-                "Microsoft Graph application create failed.",
-                create,
-            ));
-        }
-        (create.get("body").cloned().unwrap_or(Value::Null), "create")
-    };
-    let object_id = app.get("id").and_then(Value::as_str).unwrap_or_default();
-    let app_id = app.get("appId").and_then(Value::as_str).unwrap_or_default();
-    if !app_id.is_empty() {
-        config.insert(app_id_key.to_string(), Value::String(app_id.to_string()));
-    }
-    config.insert(
-        display_name_key.to_string(),
-        Value::String(display_name.clone()),
-    );
-    let mut secret_action = "keep_existing_secret";
-    if setup_backend_config_str(config, secret_key).is_empty() {
-        if object_id.is_empty() {
-            return Ok(setup_backend_step_result(
-                action,
-                false,
-                "app object id missing; cannot add password",
-                serde_json::json!({ "ok": false, "app": app }),
-            ));
-        }
-        let password_display_name = executor
-            .get("password_display_name")
-            .and_then(Value::as_str)
-            .unwrap_or("setup secret");
-        let url = format!("https://graph.microsoft.com/v1.0/applications/{object_id}/addPassword");
-        let secret = setup_backend_json_request(
-            &client,
-            reqwest::Method::POST,
-            &url,
-            Some(&token),
-            Some(serde_json::json!({
-                "passwordCredential": { "displayName": password_display_name }
-            })),
-        )
-        .await?;
-        if !secret.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(setup_backend_step_result(
-                action,
-                false,
-                "Microsoft Graph addPassword failed.",
-                secret,
-            ));
-        }
-        if let Some(secret_text) = secret
-            .get("body")
-            .and_then(|body| body.get("secretText"))
-            .and_then(Value::as_str)
-        {
-            config.insert(
-                secret_key.to_string(),
-                Value::String(secret_text.to_string()),
-            );
-            secret_action = "generated_secret";
-        }
-    }
-    let result = serde_json::json!({
-        "ok": true,
-        "action": action_name,
-        "secret_action": secret_action,
-        "app_id": app_id,
-        "bot_app_id": app_id,
-        "app_object_id": object_id,
-        "display_name": display_name,
-        "provider_id": contract.provider_id,
-    });
-    stored.insert("last_app_registration".to_string(), result.clone());
-    Ok(setup_backend_step_result(
+    crate::setup_backend_contract::execute_microsoft_graph_application(
+        stored,
+        &contract.provider_id,
         action,
-        true,
-        "click again to continue setup",
-        result,
-    ))
+    )
 }
 
 async fn setup_backend_execute_provider_http(
@@ -2184,6 +3132,37 @@ async fn setup_backend_execute_provider_http(
     let executor = setup_backend_executor(action)?;
     let config = setup_backend_config_mut(stored)?;
     setup_backend_apply_host_defaults(state, tenant, config);
+    setup_backend_adopt_runtime_public_base_url(state, tenant, config)?;
+    if setup_backend_public_base_url_needs_runtime(state, tenant, config)
+        && let Err(err) = ensure_setup_runtime(state, tenant).await
+    {
+        let detail = setup_backend_error_chain(&err);
+        return Ok(setup_backend_step_result(
+            action,
+            false,
+            "runtime/tunnel not running",
+            serde_json::json!({
+                "ok": false,
+                "blocked": true,
+                "error": "runtime/tunnel not running",
+                "detail": detail,
+            }),
+        ));
+    }
+    if let Err(err) = setup_backend_refresh_public_tunnel_if_needed(state, tenant, config).await {
+        let detail = setup_backend_error_chain(&err);
+        return Ok(setup_backend_step_result(
+            action,
+            false,
+            "runtime/tunnel not running",
+            serde_json::json!({
+                "ok": false,
+                "blocked": true,
+                "error": "runtime/tunnel not running",
+                "detail": detail,
+            }),
+        ));
+    }
 
     let target = match setup_backend_provider_http_url(state, tenant, config, executor) {
         Ok(url) => url,
@@ -2219,7 +3198,25 @@ async fn setup_backend_execute_provider_http(
         .and_then(Value::as_str)
         .and_then(|method| reqwest::Method::from_bytes(method.as_bytes()).ok())
         .unwrap_or(reqwest::Method::POST);
+    let runtime_context = setup_backend_runtime_context(state, tenant, config);
     let payload = setup_backend_provider_http_payload(state, contract, tenant, config, action);
+    if is_safe_same_origin_path(&target) {
+        return setup_backend_execute_provider_http_local(
+            state,
+            stored,
+            ProviderHttpLocalExecution {
+                contract,
+                provider_id: &contract.provider_id,
+                tenant,
+                action,
+                target: &target,
+                method: method.as_str(),
+                payload,
+                runtime_context,
+            },
+        )
+        .await;
+    }
     let client = reqwest::Client::new();
     let response =
         match setup_backend_json_request(&client, method, &target, None, Some(payload)).await {
@@ -2257,7 +3254,14 @@ async fn setup_backend_execute_provider_http(
         "ok": ok,
         "target": target,
         "response": response,
+        "runtime_context": runtime_context,
     });
+    if !ok
+        && let Some(oauth_result) =
+            setup_backend_provider_http_oauth_required_result(contract, action, &result)
+    {
+        return Ok(oauth_result);
+    }
     stored.insert(state_key.to_string(), result.clone());
     Ok(setup_backend_step_result(
         action,
@@ -2271,6 +3275,116 @@ async fn setup_backend_execute_provider_http(
     ))
 }
 
+async fn setup_backend_execute_provider_http_local(
+    state: &UiState,
+    stored: &mut JsonMap<String, Value>,
+    execution: ProviderHttpLocalExecution<'_>,
+) -> Result<Value> {
+    let Some(route_match) = find_declared_provider_http_route(
+        &state.bundle_path,
+        execution.method,
+        execution.target,
+        execution.tenant,
+        state.team.as_deref().unwrap_or("default"),
+    )?
+    else {
+        let message = format!(
+            "provider_http target {} is not declared by pack greentic.http-routes.v1",
+            execution.target
+        );
+        return Ok(setup_backend_step_result(
+            execution.action,
+            false,
+            &message,
+            serde_json::json!({
+                "ok": false,
+                "blocked": true,
+                "error": message,
+                "target": execution.target,
+                "provider_id": execution.provider_id,
+            }),
+        ));
+    };
+    let body = Bytes::from(serde_json::to_vec(&execution.payload)?);
+    let headers = HeaderMap::new();
+    let response = invoke_declared_provider_http_route(
+        state,
+        &route_match,
+        execution.method,
+        execution.target,
+        "",
+        &headers,
+        body,
+    )
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            return Ok(setup_backend_step_result(
+                execution.action,
+                false,
+                "Provider pack route failed",
+                serde_json::json!({
+                    "ok": false,
+                    "blocked": true,
+                    "error": err.to_string(),
+                    "target": execution.target,
+                    "provider_id": execution.provider_id,
+                }),
+            ));
+        }
+    };
+    let ok = response
+        .get("ok")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            response
+                .get("response")
+                .and_then(|response| response.get("body_json"))
+                .and_then(|body| body.get("ok"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true);
+    let state_key = execution
+        .action
+        .get("executor")
+        .and_then(|executor| executor.get("state_store_key"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            execution
+                .action
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("last_provider_http")
+        });
+    let result = serde_json::json!({
+        "ok": ok,
+        "target": execution.target,
+        "response": response,
+        "runtime_context": execution.runtime_context,
+    });
+    if !ok
+        && let Some(oauth_result) = setup_backend_provider_http_oauth_required_result(
+            execution.contract,
+            execution.action,
+            &result,
+        )
+    {
+        return Ok(oauth_result);
+    }
+    stored.insert(state_key.to_string(), result.clone());
+    Ok(setup_backend_step_result(
+        execution.action,
+        ok,
+        if ok {
+            "click again to continue setup"
+        } else {
+            "fix provider setup route and retry"
+        },
+        result,
+    ))
+}
+
 async fn setup_backend_execute_teams_app_publish(
     state: &UiState,
     contract: &ProviderBackendContract,
@@ -2278,141 +3392,20 @@ async fn setup_backend_execute_teams_app_publish(
     stored: &mut JsonMap<String, Value>,
     action: &Value,
 ) -> Result<Value> {
-    let executor = setup_backend_executor(action)?;
-    let config = setup_backend_config_mut(stored)?;
-    let token_key = required_executor_str(executor, "graph_token_store_key")?;
-    let token = setup_backend_config_str(config, token_key);
-    if token.is_empty() {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            &format!("complete OAuth for {token_key}, then retry"),
-            serde_json::json!({ "ok": false, "missing_token_store_key": token_key }),
-        ));
-    }
-    let app_id_key = required_executor_str(executor, "teams_app_id_config_key")?;
-    let version_key = required_executor_str(executor, "teams_app_version_config_key")?;
-    let bot_app_id_key = required_executor_str(executor, "bot_app_id_config_key")?;
-    if setup_backend_config_str(config, app_id_key).is_empty() {
-        let fallback = setup_backend_config_str(config, bot_app_id_key);
-        if fallback.is_empty() {
-            return Ok(setup_backend_step_result(
-                action,
-                false,
-                &format!("{app_id_key} or {bot_app_id_key} is required"),
-                serde_json::json!({ "ok": false, "missing_config_keys": [app_id_key, bot_app_id_key] }),
-            ));
-        }
-        config.insert(app_id_key.to_string(), Value::String(fallback));
-    }
-    if setup_backend_config_str(config, version_key).is_empty() {
-        config.insert(version_key.to_string(), Value::String("1.0.0".to_string()));
-    }
-    let package = setup_backend_build_teams_app_package(state, contract, tenant, config, executor)?;
-    let client = reqwest::Client::new();
-    let app_id = setup_backend_config_str(config, app_id_key);
-    let filter = format!("externalId eq '{}'", setup_backend_odata_string(&app_id));
-    let lookup_url = format!(
-        "https://graph.microsoft.com/v1.0/appCatalogs/teamsApps?$filter={}&$select={}",
-        setup_backend_url_encode(&filter),
-        setup_backend_url_encode("id,externalId,displayName,distributionMethod")
-    );
-    let lookup = setup_backend_json_request(
-        &client,
-        reqwest::Method::GET,
-        &lookup_url,
-        Some(&token),
-        None,
-    )
-    .await?;
-    if !lookup.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            "Teams app catalog lookup failed.",
-            lookup,
-        ));
-    }
-    let items = lookup
-        .get("body")
-        .and_then(|body| body.get("value"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let (url, action_name, catalog_app_id) = if let Some(item) = items.first() {
-        let catalog_app_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-        (
-            format!(
-                "https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/{}/appDefinitions",
-                setup_backend_url_encode(catalog_app_id)
-            ),
-            "update",
-            catalog_app_id.to_string(),
-        )
-    } else {
-        (
-            "https://graph.microsoft.com/v1.0/appCatalogs/teamsApps".to_string(),
-            "publish",
-            String::new(),
-        )
-    };
-    let published =
-        setup_backend_binary_request(&client, reqwest::Method::POST, &url, &token, package).await?;
-    if !published
-        .get("ok")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
     {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            "Teams app catalog publish failed.",
-            published,
-        ));
+        let config = setup_backend_config_mut(stored)?;
+        setup_backend_apply_host_defaults(state, tenant, config);
+        setup_backend_adopt_runtime_public_base_url(state, tenant, config)?;
     }
-    let body_catalog_id = published
-        .get("body")
-        .and_then(|body| body.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let catalog_app_id = if catalog_app_id.is_empty() {
-        body_catalog_id.to_string()
-    } else {
-        catalog_app_id
-    };
-    let add_to_teams_url = setup_backend_expand_executor_links(state, tenant, config, executor)
-        .get("add_to_teams_url")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if catalog_app_id.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "https://teams.microsoft.com/l/app/{}?source=app-details-dialog",
-                    setup_backend_url_encode(&catalog_app_id)
-                )
-            }
-        });
-    let result = serde_json::json!({
-        "ok": true,
-        "action": action_name,
-        "teams_app_id": app_id,
-        "catalog_app_id": catalog_app_id,
-        "manifest_version": setup_backend_config_str(config, version_key),
-        "add_to_teams_url": add_to_teams_url,
-    });
-    let state_key = executor
-        .get("state_store_key")
-        .and_then(Value::as_str)
-        .unwrap_or("last_teams_app_publish");
-    stored.insert(state_key.to_string(), result.clone());
-    Ok(setup_backend_step_result(
+    let provider_pack = setup_backend_provider_pack_path(state, &contract.provider_id)?;
+    crate::setup_backend_contract::execute_microsoft_graph_teams_app_catalog_publish(
+        &provider_pack,
+        stored,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+        &state.env,
         action,
-        true,
-        "open the Add to Teams link, install the app, then continue",
-        result,
-    ))
+    )
 }
 
 async fn setup_backend_execute_teams_app_user_install(
@@ -2422,183 +3415,107 @@ async fn setup_backend_execute_teams_app_user_install(
     stored: &mut JsonMap<String, Value>,
     action: &Value,
 ) -> Result<Value> {
-    let executor = setup_backend_executor(action)?;
-    let config = setup_backend_config_mut(stored)?;
-    let token_key = required_executor_str(executor, "graph_token_store_key")?;
-    let token = setup_backend_config_str(config, token_key);
-    let state_key = executor
-        .get("state_store_key")
-        .and_then(Value::as_str)
-        .unwrap_or("last_teams_app_install");
-    let links = setup_backend_expand_executor_links(state, tenant, config, executor);
-    let publish = stored
-        .get("last_teams_app_publish")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let catalog_app_id = publish
-        .get("catalog_app_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if catalog_app_id.is_empty() {
-        return Ok(setup_backend_step_result(
-            action,
-            false,
-            "publish the Teams app before installing it for the signed-in user",
-            serde_json::json!({ "ok": false, "error": "missing_catalog_app_id", "links": links }),
-        ));
-    }
-    if token.is_empty() {
-        let result = serde_json::json!({
-            "ok": true,
-            "action": "manual_unverified",
-            "catalog_app_id": catalog_app_id,
-            "warning": format!("{} is unavailable; continuing with manual install links", token_key),
-            "add_to_teams_url": links.get("add_to_teams_url").cloned().unwrap_or(Value::Null),
-            "open_bot_chat_url": links.get("open_bot_chat_url").cloned().unwrap_or(Value::Null),
-        });
-        stored.insert(state_key.to_string(), result.clone());
-        return Ok(setup_backend_step_result(
-            action,
-            true,
-            "open the bot chat link and send a message",
-            result,
-        ));
-    }
-    let client = reqwest::Client::new();
-    let installed = setup_backend_json_request(
-        &client,
-        reqwest::Method::GET,
-        "https://graph.microsoft.com/v1.0/me/teamwork/installedApps?$expand=teamsApp",
-        Some(&token),
-        None,
-    )
-    .await?;
-    if !installed
-        .get("ok")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
     {
-        let result = serde_json::json!({
-            "ok": true,
-            "action": "manual_unverified",
-            "catalog_app_id": catalog_app_id,
-            "warning": "Graph could not verify installed apps; continuing with manual install links",
-            "previous": installed,
-            "add_to_teams_url": links.get("add_to_teams_url").cloned().unwrap_or(Value::Null),
-            "open_bot_chat_url": links.get("open_bot_chat_url").cloned().unwrap_or(Value::Null),
-        });
-        stored.insert(state_key.to_string(), result.clone());
-        return Ok(setup_backend_step_result(
-            action,
-            true,
-            "open the bot chat link and send a message",
-            result,
-        ));
+        let config = setup_backend_config_mut(stored)?;
+        setup_backend_apply_host_defaults(state, tenant, config);
+        setup_backend_adopt_runtime_public_base_url(state, tenant, config)?;
     }
-    let items = installed
-        .get("body")
-        .and_then(|body| body.get("value"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let existing = items.iter().find(|item| {
-        item.get("teamsApp")
-            .and_then(|teams_app| teams_app.get("id"))
-            .and_then(Value::as_str)
-            == Some(catalog_app_id.as_str())
-    });
-    let (action_name, installed_app_id) = if let Some(item) = existing {
-        (
-            "keep",
-            item.get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        )
-    } else {
-        let created = setup_backend_json_request(
-            &client,
-            reqwest::Method::POST,
-            "https://graph.microsoft.com/v1.0/me/teamwork/installedApps",
-            Some(&token),
-            Some(serde_json::json!({
-                "teamsApp@odata.bind": format!("https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/{catalog_app_id}")
-            })),
-        )
-        .await?;
-        if !created.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            let result = serde_json::json!({
-                "ok": true,
-                "action": "manual_unverified",
-                "catalog_app_id": catalog_app_id,
-                "warning": "Graph could not install the app; continuing with manual install links",
-                "previous": created,
-                "add_to_teams_url": links.get("add_to_teams_url").cloned().unwrap_or(Value::Null),
-                "open_bot_chat_url": links.get("open_bot_chat_url").cloned().unwrap_or(Value::Null),
-            });
-            stored.insert(state_key.to_string(), result.clone());
-            return Ok(setup_backend_step_result(
-                action,
-                true,
-                "open the bot chat link and send a message",
-                result,
-            ));
-        }
-        (
-            "install",
-            created
-                .get("body")
-                .and_then(|body| body.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        )
-    };
-    let result = serde_json::json!({
-        "ok": true,
-        "action": action_name,
-        "catalog_app_id": catalog_app_id,
-        "installed_app_id": installed_app_id,
-        "add_to_teams_url": links.get("add_to_teams_url").cloned().unwrap_or(Value::Null),
-        "open_bot_chat_url": links.get("open_bot_chat_url").cloned().unwrap_or(Value::Null),
-    });
-    stored.insert(state_key.to_string(), result.clone());
-    Ok(setup_backend_step_result(
+    crate::setup_backend_contract::execute_microsoft_graph_teams_app_user_install(
+        stored,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+        &state.env,
         action,
-        true,
-        "open the bot chat link and send a message",
-        result,
-    ))
+    )
 }
 
-fn setup_backend_execute_runtime_observation(
+async fn setup_backend_execute_runtime_observation(
+    state: &UiState,
     contract: &ProviderBackendContract,
-    _tenant: &str,
+    tenant: &str,
     stored: &mut JsonMap<String, Value>,
     action: &Value,
 ) -> Result<Value> {
     let executor = setup_backend_executor(action)?;
+    let config = setup_backend_config_mut(stored)?;
+    if let Err(err) =
+        setup_backend_prepare_runtime_public_base_for_observation(state, tenant, config).await
+    {
+        return Ok(setup_backend_runtime_blocked_result(
+            action,
+            setup_backend_error_chain(&err),
+        ));
+    }
+    if let Err(err) = setup_backend_refresh_public_tunnel_if_needed(state, tenant, config).await {
+        let detail = setup_backend_error_chain(&err);
+        return Ok(setup_backend_step_result(
+            action,
+            false,
+            "runtime/tunnel not running",
+            serde_json::json!({
+                "ok": false,
+                "blocked": true,
+                "error": "runtime/tunnel not running",
+                "detail": detail,
+            }),
+        ));
+    }
+    let runtime_context = setup_backend_runtime_context(state, tenant, config);
     let state_key = executor
         .get("state_store_key")
         .and_then(Value::as_str)
         .unwrap_or("last_activity");
-    if stored.get(state_key).is_some_and(|value| !value.is_null()) {
+    if let Some(blocked) = setup_backend_runtime_context_blocked(state, &runtime_context).await {
+        return Ok(setup_backend_step_result(
+            action,
+            false,
+            "runtime/tunnel not running",
+            blocked,
+        ));
+    }
+    setup_backend_refresh_runtime_observation_from_runtime_logs(
+        state,
+        tenant,
+        executor,
+        stored,
+        state_key,
+        &runtime_context,
+    )?;
+    setup_backend_refresh_runtime_observation_from_provider_state(
+        state,
+        contract,
+        tenant,
+        stored,
+        state_key,
+        &runtime_context,
+    )
+    .await?;
+    if stored
+        .get(state_key)
+        .is_some_and(|value| setup_backend_runtime_context_current(value, &runtime_context))
+    {
         return Ok(setup_backend_step_result(
             action,
             true,
             "runtime observation is present",
-            serde_json::json!({ "ok": true, "state_store_key": state_key }),
+            serde_json::json!({
+                "ok": true,
+                "state_store_key": state_key,
+                "runtime_context": runtime_context,
+            }),
         ));
     }
     Ok(setup_backend_step_result(
         action,
         false,
-        "wait for the runtime observation, then refresh",
+        "waiting for runtime observation",
         serde_json::json!({
             "ok": false,
             "waiting": true,
+            "blocked": true,
+            "retryable": true,
+            "error": "runtime observation not present yet",
+            "detail": "runtime and tunnel are running, but no current observation has been recorded yet",
             "provider_id": executor
                 .get("provider_id")
                 .and_then(Value::as_str)
@@ -2606,8 +3523,186 @@ fn setup_backend_execute_runtime_observation(
             "source": executor.get("source").cloned().unwrap_or(Value::Null),
             "event": executor.get("event").cloned().unwrap_or(Value::Null),
             "state_store_key": state_key,
+            "runtime_context": runtime_context,
         }),
     ))
+}
+
+fn setup_backend_refresh_runtime_observation_from_runtime_logs(
+    state: &UiState,
+    tenant: &str,
+    executor: &Value,
+    stored: &mut JsonMap<String, Value>,
+    state_key: &str,
+    runtime_context: &Value,
+) -> Result<()> {
+    if executor.get("source").and_then(Value::as_str) != Some("greentic-start")
+        || executor.get("event").and_then(Value::as_str) != Some("bot_framework_activity_received")
+    {
+        return Ok(());
+    }
+    let Some(observed) = setup_backend_latest_runtime_activity_from_logs(
+        state,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+    )?
+    else {
+        return Ok(());
+    };
+    let observed = setup_backend_observation_with_runtime_context(observed, runtime_context);
+    setup_backend_store_runtime_observation(stored, state_key, observed);
+    Ok(())
+}
+
+fn setup_backend_latest_runtime_activity_from_logs(
+    state: &UiState,
+    tenant: &str,
+    team: &str,
+) -> Result<Option<Value>> {
+    let log_path = state.bundle_path.join("logs").join("system.log");
+    let file = match std::fs::File::open(&log_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", log_path.display())),
+    };
+    let line_floor = setup_backend_setup_runtime_info(state)
+        .and_then(|info| info.system_log_line_floor)
+        .unwrap_or(0);
+    let team_some = format!("team=Some(\"{team}\")");
+    let team_plain = format!("team={team}");
+    let tenant_match = format!("tenant={tenant}");
+    let mut observed = None;
+    for (index, line) in std::io::BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+        .enumerate()
+    {
+        if index < line_floor {
+            continue;
+        }
+        if line.contains("[fast2flow:gate] enter")
+            && line.contains(&tenant_match)
+            && (line.contains(&team_some) || line.contains(&team_plain))
+        {
+            observed = Some(serde_json::json!({
+                "source": "greentic-start",
+                "event": "bot_framework_activity_received",
+                "tenant": tenant,
+                "team": team,
+                "log_path": log_path,
+                "log_line": index + 1,
+            }));
+        }
+    }
+    Ok(observed)
+}
+
+async fn setup_backend_refresh_runtime_observation_from_provider_state(
+    state: &UiState,
+    contract: &ProviderBackendContract,
+    tenant: &str,
+    stored: &mut JsonMap<String, Value>,
+    state_key: &str,
+    runtime_context: &Value,
+) -> Result<()> {
+    let Some((method, path)) =
+        setup_backend_contract_state_route(contract, tenant, state.team.as_deref())
+    else {
+        return Ok(());
+    };
+    let Some(route_match) = find_declared_provider_http_route(
+        &state.bundle_path,
+        &method,
+        &path,
+        tenant,
+        state.team.as_deref().unwrap_or("default"),
+    )?
+    else {
+        return Ok(());
+    };
+    if !matches!(
+        route_match.route.target,
+        ProviderHttpRouteTarget::SetupComponent { .. }
+    ) {
+        return Ok(());
+    }
+    let response = invoke_declared_provider_http_route(
+        state,
+        &route_match,
+        &method,
+        &path,
+        "",
+        &HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await?;
+    let Some(observed) = response
+        .get("values")
+        .and_then(|values| values.get(state_key))
+        .filter(|value| !value.is_null())
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let observed = setup_backend_observation_with_runtime_context(observed, runtime_context);
+    setup_backend_store_runtime_observation(stored, state_key, observed);
+    Ok(())
+}
+
+fn setup_backend_contract_state_route(
+    contract: &ProviderBackendContract,
+    tenant: &str,
+    team: Option<&str>,
+) -> Option<(String, String)> {
+    let route = contract
+        .inline
+        .get("routes")
+        .and_then(|routes| routes.get("state"))
+        .and_then(Value::as_str)
+        .or_else(|| contract.inline.get("base_path").and_then(Value::as_str))?;
+    let (method, path) = match route.split_once(' ') {
+        Some((method, path)) => (method.trim(), path.trim()),
+        None => ("GET", route.trim()),
+    };
+    let team = team.unwrap_or("default");
+    Some((
+        method.to_string(),
+        path.replace("{tenant}", tenant).replace("{team}", team),
+    ))
+}
+
+fn setup_backend_observation_with_runtime_context(
+    observed: Value,
+    runtime_context: &Value,
+) -> Value {
+    let observed_at = Value::Number(serde_json::Number::from(setup_backend_timestamp_ms() as u64));
+    match observed {
+        Value::Object(mut object) => {
+            object.insert("runtime_context".to_string(), runtime_context.clone());
+            object
+                .entry("last_activity_received_at".to_string())
+                .or_insert_with(|| observed_at.clone());
+            Value::Object(object)
+        }
+        value => serde_json::json!({
+            "value": value,
+            "runtime_context": runtime_context,
+            "last_activity_received_at": observed_at,
+        }),
+    }
+}
+
+fn setup_backend_store_runtime_observation(
+    stored: &mut JsonMap<String, Value>,
+    state_key: &str,
+    observed: Value,
+) {
+    if state_key == "last_activity"
+        && let Some(received_at) = observed.get("last_activity_received_at").cloned()
+    {
+        stored.insert("last_activity_received_at".to_string(), received_at);
+    }
+    stored.insert(state_key.to_string(), observed);
 }
 
 fn setup_backend_action_by_id<'a>(
@@ -2693,12 +3788,21 @@ fn setup_backend_oauth_client_id(
 }
 
 fn setup_backend_step_result(action: &Value, ok: bool, next: &str, result: Value) -> Value {
-    serde_json::json!({
-        "ok": ok,
-        "step": action.get("id").and_then(Value::as_str).unwrap_or_default(),
-        "next": next,
-        "result": result,
-    })
+    crate::setup_backend_contract::step_result(action, ok, next, result)
+}
+
+fn setup_backend_runtime_blocked_result(action: &Value, detail: String) -> Value {
+    setup_backend_step_result(
+        action,
+        false,
+        "runtime/tunnel not running",
+        serde_json::json!({
+            "ok": false,
+            "blocked": true,
+            "error": "runtime/tunnel not running",
+            "detail": detail,
+        }),
+    )
 }
 
 fn setup_backend_action_error(kind: &str, message: &str) -> Value {
@@ -2716,6 +3820,13 @@ fn setup_backend_action_error(kind: &str, message: &str) -> Value {
     })
 }
 
+fn setup_backend_error_chain(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 fn setup_backend_public_oauth_response(body: &Value) -> Value {
     let mut public = body.clone();
     if let Some(obj) = public.as_object_mut() {
@@ -2727,13 +3838,22 @@ fn setup_backend_public_oauth_response(body: &Value) -> Value {
     public
 }
 
-fn setup_backend_device_login_payload(config: &JsonMap<String, Value>) -> Value {
+fn setup_backend_device_login_payload(
+    config: &JsonMap<String, Value>,
+    user_code_key: &str,
+    body: &Value,
+) -> Value {
+    let interval = body.get("interval").and_then(Value::as_u64).unwrap_or(5);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(900);
     serde_json::json!({
         "url": setup_backend_config_str(config, "oauth_verification_uri"),
-        "userCode": setup_backend_config_str(config, "oauth_user_code"),
-        "user_code": setup_backend_config_str(config, "oauth_user_code"),
-        "interval": 5,
-        "expiresIn": 900,
+        "userCode": setup_backend_config_str(config, user_code_key),
+        "user_code": setup_backend_config_str(config, user_code_key),
+        "interval": interval,
+        "expiresIn": expires_in,
     })
 }
 
@@ -2742,14 +3862,6 @@ fn setup_backend_timestamp_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
-}
-
-fn setup_backend_odata_string(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-fn setup_backend_url_encode(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 fn setup_backend_expand_template(
@@ -2774,29 +3886,6 @@ fn setup_backend_expand_template(
         }
     }
     expanded
-}
-
-fn setup_backend_expand_executor_links(
-    state: &UiState,
-    tenant: &str,
-    config: &JsonMap<String, Value>,
-    executor: &Value,
-) -> Value {
-    let mut links = JsonMap::new();
-    if let Some(raw_links) = executor.get("links").and_then(Value::as_object) {
-        for (key, value) in raw_links {
-            if let Some(template) = value.as_str() {
-                let output_key = key.strip_suffix("_template").unwrap_or(key).to_string();
-                links.insert(
-                    output_key,
-                    Value::String(setup_backend_expand_template(
-                        state, tenant, config, template,
-                    )),
-                );
-            }
-        }
-    }
-    Value::Object(links)
 }
 
 fn setup_backend_provider_http_url(
@@ -2824,22 +3913,7 @@ fn setup_backend_provider_http_url(
     if !is_safe_same_origin_path(&path) {
         anyhow::bail!("provider_http executor path_template must resolve to a safe absolute path");
     }
-    let base = setup_backend_provider_http_base_url(config)
-        .ok_or_else(|| anyhow!("provider_http executor path_template requires GREENTIC_SETUP_RUNTIME_URL or provider_setup_base_url"))?;
-    let url = format!("{}{}", base.trim_end_matches('/'), path);
-    validate_setup_backend_provider_http_url(&url)?;
-    Ok(url)
-}
-
-fn setup_backend_provider_http_base_url(config: &JsonMap<String, Value>) -> Option<String> {
-    let configured = setup_backend_config_str(config, "provider_setup_base_url")
-        .trim_end_matches('/')
-        .to_string();
-    if configured.is_empty() {
-        configured_runtime_proxy_base_url()
-    } else {
-        Some(configured)
-    }
+    Ok(path)
 }
 
 fn validate_setup_backend_provider_http_url(url: &str) -> Result<()> {
@@ -2933,68 +4007,146 @@ async fn setup_backend_json_request(
     }))
 }
 
-async fn setup_backend_binary_request(
-    client: &reqwest::Client,
-    method: reqwest::Method,
-    url: &str,
-    bearer: &str,
-    payload: Vec<u8>,
-) -> Result<Value> {
-    let response = client
-        .request(method, url)
-        .bearer_auth(bearer)
-        .header("Content-Type", "application/zip")
-        .body(payload)
-        .send()
-        .await
-        .with_context(|| format!("request failed: {url}"))?;
-    let status = response.status().as_u16();
-    let text = response.text().await.unwrap_or_default();
-    let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
-    Ok(serde_json::json!({
-        "ok": status < 400,
-        "status": status,
-        "body": body,
-    }))
+fn setup_backend_oauth_required_result(
+    action: &Value,
+    token_key: &str,
+    reason: &str,
+    response: &Value,
+) -> Option<Value> {
+    if !setup_backend_response_needs_oauth(response) {
+        return None;
+    }
+    Some(setup_backend_step_result(
+        action,
+        false,
+        &format!("complete OAuth for {token_key}, then retry"),
+        serde_json::json!({
+            "ok": false,
+            "blocked": true,
+            "error": "oauth_required",
+            "reason": reason,
+            "token_store_key": token_key,
+            "resume_step": action.get("id").and_then(Value::as_str).unwrap_or_default(),
+            "previous": response,
+        }),
+    ))
 }
 
-fn setup_backend_build_teams_app_package(
-    state: &UiState,
+fn setup_backend_provider_http_oauth_required_result(
     contract: &ProviderBackendContract,
-    tenant: &str,
-    config: &JsonMap<String, Value>,
-    executor: &Value,
-) -> Result<Vec<u8>> {
-    let manifest_asset = required_executor_str(executor, "manifest_template_asset")?;
-    let base = executor
-        .get("package_assets_base")
-        .and_then(Value::as_str)
-        .unwrap_or("assets/teams-app");
-    if !is_safe_pack_relative_path(manifest_asset) || !is_safe_pack_relative_path(base) {
-        anyhow::bail!("teams app package asset path is not safe");
+    action: &Value,
+    response: &Value,
+) -> Option<Value> {
+    if !setup_backend_response_needs_oauth(response) {
+        return None;
     }
-    let provider_pack = setup_backend_provider_pack_path(state, &contract.provider_id)?;
-    let mut manifest = read_pack_json_asset(&provider_pack, manifest_asset)?;
-    setup_backend_replace_json_templates(state, tenant, config, &mut manifest);
+    let token_key = setup_backend_oauth_token_key_for_action(contract, action, response)?;
+    setup_backend_oauth_required_result(action, &token_key, "provider setup auth failed", response)
+}
 
-    let mut out = std::io::Cursor::new(Vec::new());
+fn setup_backend_response_needs_oauth(response: &Value) -> bool {
+    let status = response.get("status").and_then(Value::as_u64).unwrap_or(0);
+    let body = response.get("body").unwrap_or(response);
+    let text = body.to_string().to_ascii_lowercase();
+    let says_unauthorized = status == 401
+        || text.contains("http 401")
+        || text.contains("status 401")
+        || text.contains("unauthorized")
+        || text.contains("invalid token");
+    let says_expired = text.contains("expired")
+        || text.contains("expiry")
+        || text.contains("token exp")
+        || text.contains("lifetime validation failed")
+        || text.contains("token is expired");
+    says_unauthorized && says_expired
+}
+
+fn setup_backend_oauth_token_key_for_action(
+    contract: &ProviderBackendContract,
+    action: &Value,
+    response: &Value,
+) -> Option<String> {
+    if let Some(token_key) = action
+        .get("executor")
+        .and_then(|executor| {
+            executor
+                .get("token_store_key")
+                .or_else(|| executor.get("auth_token_store_key"))
+                .or_else(|| executor.get("oauth_token_store_key"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     {
-        let mut writer = zip::ZipWriter::new(&mut out);
-        let options: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        writer.start_file("manifest.json", options)?;
-        let manifest_text = serde_json::to_vec_pretty(&manifest)?;
-        std::io::Write::write_all(&mut writer, &manifest_text)?;
-        for name in ["color.png", "outline.png"] {
-            let asset = format!("{}/{}", base.trim_end_matches('/'), name);
-            if let Ok(bytes) = read_pack_binary_asset(&provider_pack, &asset) {
-                writer.start_file(name, options)?;
-                std::io::Write::write_all(&mut writer, &bytes)?;
-            }
-        }
-        writer.finish()?;
+        return Some(token_key.to_string());
     }
-    Ok(out.into_inner())
+    if let Some(token_key) = response
+        .get("token_store_key")
+        .or_else(|| response.get("missing_token_store_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(token_key.to_string());
+    }
+    let oauth_token_keys = setup_backend_oauth_token_store_keys(contract);
+    let mut action_matches = oauth_token_keys
+        .iter()
+        .filter(|token_key| setup_backend_value_mentions_token_key(action, token_key))
+        .cloned()
+        .collect::<Vec<_>>();
+    action_matches.sort();
+    action_matches.dedup();
+    if action_matches.len() == 1 {
+        return action_matches.into_iter().next();
+    }
+    if oauth_token_keys.len() == 1 {
+        return oauth_token_keys.into_iter().next();
+    }
+    None
+}
+
+fn setup_backend_oauth_token_store_keys(contract: &ProviderBackendContract) -> Vec<String> {
+    let mut keys = contract
+        .inline
+        .get("actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| action.get("executor"))
+        .filter(|executor| {
+            executor.get("kind").and_then(Value::as_str) == Some("oauth_device_code")
+        })
+        .filter_map(|executor| executor.get("token_store_key").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn setup_backend_value_mentions_token_key(value: &Value, token_key: &str) -> bool {
+    match value {
+        Value::String(text) => text == token_key || text.contains(&format!("{{{token_key}}}")),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| setup_backend_value_mentions_token_key(item, token_key)),
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            key == token_key
+                || key.contains(token_key)
+                || setup_backend_value_mentions_token_key(value, token_key)
+        }),
+        _ => false,
+    }
+}
+
+fn setup_backend_clear_oauth_resume_for_token(
+    stored: &mut JsonMap<String, Value>,
+    token_store_key: &str,
+) {
+    crate::setup_backend_contract::clear_oauth_resume_for_token(stored, token_store_key);
 }
 
 fn setup_backend_provider_pack_path(state: &UiState, provider_id: &str) -> Result<PathBuf> {
@@ -3005,54 +4157,19 @@ fn setup_backend_provider_pack_path(state: &UiState, provider_id: &str) -> Resul
     Ok(provider.pack_path.clone())
 }
 
-fn read_pack_binary_asset(pack_path: &Path, entry_name: &str) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(pack_path)
-        .with_context(|| format!("open provider pack {}", pack_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("provider pack is not a zip archive")?;
-    let mut entry = archive
-        .by_name(entry_name)
-        .with_context(|| format!("provider pack missing {entry_name}"))?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut entry, &mut bytes)?;
-    Ok(bytes)
-}
-
-fn setup_backend_replace_json_templates(
-    state: &UiState,
-    tenant: &str,
-    config: &JsonMap<String, Value>,
-    value: &mut Value,
-) {
-    match value {
-        Value::String(text) => {
-            *text = setup_backend_expand_template(state, tenant, config, text);
-        }
-        Value::Array(items) => {
-            for item in items {
-                setup_backend_replace_json_templates(state, tenant, config, item);
-            }
-        }
-        Value::Object(map) => {
-            for value in map.values_mut() {
-                setup_backend_replace_json_templates(state, tenant, config, value);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn load_setup_backend_contract_state(
     state: &UiState,
     provider_id: &str,
     tenant: &str,
 ) -> Result<JsonMap<String, Value>> {
-    let path = setup_backend_state_path(state, provider_id, tenant)?;
-    let mut stored = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<JsonMap<String, Value>>(&text)
-            .with_context(|| format!("parse setup backend state {}", path.display()))?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => JsonMap::new(),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
+    let team = state.team.as_deref().unwrap_or("default");
+    let mut stored = crate::setup_backend_contract::load_backend_state(
+        &state.bundle_path,
+        &state.env,
+        tenant,
+        team,
+        provider_id,
+    )?;
     ensure_setup_backend_config_defaults(state, tenant, &mut stored)?;
     Ok(stored)
 }
@@ -3063,28 +4180,15 @@ fn save_setup_backend_contract_state(
     tenant: &str,
     stored: &JsonMap<String, Value>,
 ) -> Result<()> {
-    let path = setup_backend_state_path(state, provider_id, tenant)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create setup backend state dir {}", parent.display()))?;
-    }
-    std::fs::write(&path, serde_json::to_vec_pretty(stored)?)
-        .with_context(|| format!("write setup backend state {}", path.display()))
-}
-
-fn setup_backend_state_path(state: &UiState, provider_id: &str, tenant: &str) -> Result<PathBuf> {
-    let env = validate_log_path_segment(&state.env, "env")?;
-    let tenant = validate_log_path_segment(tenant, "tenant")?;
-    let team = validate_log_path_segment(state.team.as_deref().unwrap_or("default"), "team")?;
-    let provider_id = validate_log_path_segment(provider_id, "provider_id")?;
-    Ok(state
-        .bundle_path
-        .join("state")
-        .join("setup-backends")
-        .join(env)
-        .join(tenant)
-        .join(team)
-        .join(format!("{provider_id}.json")))
+    let team = state.team.as_deref().unwrap_or("default");
+    crate::setup_backend_contract::save_backend_state(
+        &state.bundle_path,
+        tenant,
+        team,
+        provider_id,
+        stored,
+    )?;
+    Ok(())
 }
 
 fn ensure_setup_backend_config_defaults(
@@ -3114,7 +4218,7 @@ fn ensure_setup_backend_config_defaults(
 }
 
 fn setup_backend_host_default_overrides_empty(key: &str) -> bool {
-    matches!(key, "public_base_url" | "provider_setup_base_url")
+    matches!(key, "public_base_url")
 }
 
 fn default_setup_backend_config(state: &UiState, tenant: &str) -> JsonMap<String, Value> {
@@ -3155,12 +4259,10 @@ fn setup_backend_apply_host_defaults(
 fn setup_backend_apply_host_defaults_with_runtime_base(
     state: &UiState,
     tenant: &str,
-    runtime_base: Option<&str>,
+    _runtime_base: Option<&str>,
     config: &mut JsonMap<String, Value>,
 ) {
-    let runtime_base = runtime_base
-        .map(ToString::to_string)
-        .or_else(|| setup_backend_runtime_local_base_url(state, tenant));
+    setup_backend_refresh_ephemeral_public_base_url(state, tenant, config);
     if setup_backend_config_str(config, "public_base_url").is_empty()
         && let Some(public_base_url) = setup_backend_public_base_url(state, tenant)
     {
@@ -3169,14 +4271,216 @@ fn setup_backend_apply_host_defaults_with_runtime_base(
             Value::String(public_base_url),
         );
     }
-    if setup_backend_config_str(config, "provider_setup_base_url").is_empty()
-        && let Some(url) = runtime_base
-            .as_deref()
-            .map(|base| base.trim_end_matches('/').to_string())
-            .filter(|base| !base.is_empty())
-    {
-        config.insert("provider_setup_base_url".to_string(), Value::String(url));
+}
+
+async fn setup_backend_prepare_runtime_public_base_for_observation(
+    state: &UiState,
+    tenant: &str,
+    config: &mut JsonMap<String, Value>,
+) -> Result<Option<String>> {
+    if setup_backend_bundle_runtime_startable(state) {
+        ensure_setup_runtime(state, tenant).await?;
     }
+    setup_backend_adopt_runtime_public_base_url(state, tenant, config)
+}
+
+fn setup_backend_bundle_runtime_startable(state: &UiState) -> bool {
+    state.bundle_path.is_dir()
+        && (state.bundle_path.join("bundle.yaml").is_file()
+            || state.bundle_path.join("greentic.yaml").is_file()
+            || state.bundle_path.join("bundle.json").is_file())
+}
+
+fn setup_backend_adopt_runtime_public_base_url(
+    state: &UiState,
+    tenant: &str,
+    config: &mut JsonMap<String, Value>,
+) -> Result<Option<String>> {
+    let Some(runtime_public_base_url) = setup_backend_runtime_public_base_url(state, tenant) else {
+        return Ok(None);
+    };
+    if !setup_backend_public_base_url_is_external_https(&runtime_public_base_url)
+        && !is_ephemeral_tunnel_public_base_url(&runtime_public_base_url)
+    {
+        return Ok(None);
+    }
+    let current = setup_backend_config_str(config, "public_base_url");
+    if current.trim_end_matches('/') == runtime_public_base_url {
+        return Ok(None);
+    }
+    if current.is_empty() || is_ephemeral_tunnel_public_base_url(&current) {
+        config.insert(
+            "public_base_url".to_string(),
+            Value::String(runtime_public_base_url.clone()),
+        );
+        return Ok(Some(runtime_public_base_url));
+    }
+    Ok(None)
+}
+
+fn setup_backend_public_base_url_needs_runtime(
+    state: &UiState,
+    _tenant: &str,
+    config: &JsonMap<String, Value>,
+) -> bool {
+    if !setup_backend_bundle_runtime_startable(state) {
+        return false;
+    }
+    let current = setup_backend_config_str(config, "public_base_url");
+    current.is_empty()
+        || is_ephemeral_tunnel_public_base_url(&current)
+        || !setup_backend_public_base_url_is_external_https(&current)
+}
+
+fn setup_backend_refresh_ephemeral_public_base_url(
+    state: &UiState,
+    tenant: &str,
+    config: &mut JsonMap<String, Value>,
+) {
+    let current = setup_backend_config_str(config, "public_base_url");
+    if current.is_empty() || !is_ephemeral_tunnel_public_base_url(&current) {
+        return;
+    }
+    let Some(active) = setup_backend_runtime_public_base_url(state, tenant)
+        .or_else(|| setup_backend_active_tunnel_public_base_url(state))
+    else {
+        return;
+    };
+    if active != current.trim_end_matches('/') {
+        config.insert("public_base_url".to_string(), Value::String(active));
+    }
+}
+
+async fn setup_backend_refresh_public_tunnel_if_needed(
+    state: &UiState,
+    tenant: &str,
+    config: &mut JsonMap<String, Value>,
+) -> Result<Option<String>> {
+    let current = setup_backend_config_str(config, "public_base_url");
+    let Some(mode) = setup_backend_tunnel_mode(state)?
+        .or_else(|| setup_backend_infer_tunnel_mode_from_public_base_url(&current))
+    else {
+        return Ok(None);
+    };
+    if !matches!(mode.as_str(), "cloudflared" | "ngrok") {
+        return Ok(None);
+    }
+    if !current.is_empty()
+        && !is_ephemeral_tunnel_public_base_url(&current)
+        && setup_backend_public_base_url_is_external_https(&current)
+    {
+        return Ok(None);
+    }
+    if let Some(runtime_public_base_url) = setup_backend_runtime_public_base_url(state, tenant) {
+        if !setup_backend_public_base_url_is_external_https(&runtime_public_base_url)
+            && !is_ephemeral_tunnel_public_base_url(&runtime_public_base_url)
+        {
+            // A setup-started runtime may persist its local HTTP base as the runtime
+            // "public" URL when its own tunnel is disabled. Provider webhooks still
+            // need a setup-owned public tunnel to that runtime.
+        } else if is_ephemeral_tunnel_public_base_url(&runtime_public_base_url)
+            && !setup_backend_public_tunnel_responds(&runtime_public_base_url).await
+        {
+            setup_backend_clear_setup_tunnel(state);
+        } else {
+            if current.trim_end_matches('/') == runtime_public_base_url {
+                return Ok(None);
+            }
+            config.insert(
+                "public_base_url".to_string(),
+                Value::String(runtime_public_base_url.clone()),
+            );
+            return Ok(Some(runtime_public_base_url));
+        }
+    }
+    let local_base_url = setup_backend_tunnel_local_base_url(state, tenant)?;
+    let public_base_url = ensure_setup_tunnel(state, &mode, &local_base_url).await?;
+    config.insert(
+        "public_base_url".to_string(),
+        Value::String(public_base_url.clone()),
+    );
+    Ok(Some(public_base_url))
+}
+
+fn setup_backend_public_base_url_is_external_https(public_base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(public_base_url.trim()) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    !matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+fn setup_backend_infer_tunnel_mode_from_public_base_url(public_base_url: &str) -> Option<String> {
+    let url = url::Url::parse(public_base_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "trycloudflare.com" || host.ends_with(".trycloudflare.com") {
+        return Some("cloudflared".to_string());
+    }
+    if host.ends_with(".ngrok-free.app") || host.ends_with(".ngrok.io") {
+        return Some("ngrok".to_string());
+    }
+    None
+}
+
+fn setup_backend_tunnel_mode(state: &UiState) -> Result<Option<String>> {
+    if let Some(mode) = crate::platform_setup::load_tunnel_artifact(&state.bundle_path)?
+        .and_then(|answers| answers.mode)
+        .map(|mode| mode.trim().to_string())
+        .filter(|mode| !mode.is_empty())
+    {
+        return Ok(Some(mode));
+    }
+
+    setup_backend_default_tunnel_mode(state)
+}
+
+fn setup_backend_default_tunnel_mode(state: &UiState) -> Result<Option<String>> {
+    if prefill_has_cloud_deployment_targets(state.prefill_answers.as_ref()) {
+        return Ok(Some("off".to_string()));
+    }
+
+    let deployment_targets =
+        crate::deployment_targets::reconcile_deployment_targets(&state.bundle_path, &[])
+            .with_context(|| {
+                format!(
+                    "resolve deployment targets for {}",
+                    state.bundle_path.display()
+                )
+            })?;
+    if deployment_targets
+        .iter()
+        .any(|record| matches!(record.target.as_str(), "aws" | "gcp" | "azure"))
+    {
+        return Ok(Some("off".to_string()));
+    }
+
+    let deployer_candidates =
+        crate::deployment_targets::discover_deployer_pack_candidates(&state.bundle_path)
+            .with_context(|| {
+                format!(
+                    "discover deployer packs for {}",
+                    state.bundle_path.display()
+                )
+            })?;
+    if deployer_candidates.is_empty() {
+        return Ok(Some("cloudflared".to_string()));
+    }
+
+    Ok(None)
+}
+
+fn setup_backend_tunnel_local_base_url(state: &UiState, tenant: &str) -> Result<String> {
+    configured_runtime_proxy_base_url()
+        .or_else(|| setup_backend_runtime_local_base_url(state, tenant))
+        .or_else(|| Some(state.local_base_url.trim_end_matches('/').to_string()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("no local base URL available for setup tunnel"))
 }
 
 fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String> {
@@ -3188,10 +4492,11 @@ fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String
     {
         return Some(value);
     }
-    if let Ok(guard) = state.setup_tunnel.lock()
-        && let Some(tunnel) = guard.as_ref()
-    {
-        return Some(tunnel.public_base_url.trim_end_matches('/').to_string());
+    if let Some(value) = setup_backend_runtime_public_base_url(state, tenant) {
+        return Some(value);
+    }
+    if let Some(value) = setup_backend_active_tunnel_public_base_url(state) {
+        return Some(value);
     }
     crate::platform_setup::load_effective_static_routes_defaults(
         &state.bundle_path,
@@ -3206,7 +4511,43 @@ fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String
     .or_else(configured_runtime_proxy_base_url)
 }
 
+fn setup_backend_active_tunnel_public_base_url(state: &UiState) -> Option<String> {
+    let mut guard = state.setup_tunnel.lock().ok()?;
+    let tunnel = guard.as_mut()?;
+    if !tunnel.is_running() {
+        *guard = None;
+        return None;
+    }
+    Some(tunnel.public_base_url.trim_end_matches('/').to_string()).filter(|value| !value.is_empty())
+}
+
+fn setup_backend_runtime_public_base_url(state: &UiState, tenant: &str) -> Option<String> {
+    if let Some(value) = setup_backend_setup_runtime_info(state)
+        .and_then(|info| info.public_base_url)
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+    crate::platform_setup::load_runtime_public_base_url(
+        &state.bundle_path,
+        tenant,
+        state.team.as_deref(),
+    )
+    .ok()
+    .flatten()
+    .map(|value| value.trim().trim_end_matches('/').to_string())
+    .filter(|value| !value.is_empty())
+}
+
 fn setup_backend_runtime_local_base_url(state: &UiState, tenant: &str) -> Option<String> {
+    if let Some(value) = setup_backend_setup_runtime_info(state)
+        .and_then(|info| info.local_base_url)
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
     crate::platform_setup::load_runtime_local_base_url(
         &state.bundle_path,
         tenant,
@@ -3218,21 +4559,137 @@ fn setup_backend_runtime_local_base_url(state: &UiState, tenant: &str) -> Option
     .filter(|value| !value.is_empty())
 }
 
-fn setup_backend_template_unresolved(value: &str) -> bool {
-    value.contains('{') && value.contains('}')
+fn setup_backend_setup_runtime_info(state: &UiState) -> Option<SetupRuntimeInfo> {
+    let guard = state.setup_runtime.lock().ok()?;
+    let runtime = guard.as_ref()?;
+    runtime.info.lock().ok().map(|info| info.clone())
 }
 
-fn setup_backend_server_owned_keys(
-    contract: &ProviderBackendContract,
-) -> std::collections::HashSet<&str> {
-    contract
-        .inline
-        .get("server_owned_config_keys")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect()
+fn setup_backend_runtime_context(
+    state: &UiState,
+    tenant: &str,
+    config: &JsonMap<String, Value>,
+) -> Value {
+    let public_base_url = setup_backend_config_str(config, "public_base_url")
+        .trim_end_matches('/')
+        .to_string();
+    let runtime_public_base_url =
+        setup_backend_runtime_public_base_url(state, tenant).filter(|value| {
+            setup_backend_public_base_url_is_external_https(value)
+                || is_ephemeral_tunnel_public_base_url(value)
+        });
+    let active_tunnel_public_base_url =
+        setup_backend_active_tunnel_public_base_url(state).or(runtime_public_base_url);
+    let runtime_local_base_url = setup_backend_runtime_local_base_url(state, tenant);
+    serde_json::json!({
+        "public_base_url": if public_base_url.is_empty() { Value::Null } else { Value::String(public_base_url.clone()) },
+        "public_base_url_is_ephemeral_tunnel": !public_base_url.is_empty() && is_ephemeral_tunnel_public_base_url(&public_base_url),
+        "active_tunnel_public_base_url": active_tunnel_public_base_url,
+        "runtime_local_base_url": runtime_local_base_url,
+    })
+}
+
+async fn setup_backend_runtime_context_blocked(
+    state: &UiState,
+    runtime_context: &Value,
+) -> Option<Value> {
+    let public_base_url = runtime_context
+        .get("public_base_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let active_tunnel_public_base_url = runtime_context
+        .get("active_tunnel_public_base_url")
+        .and_then(Value::as_str);
+    if runtime_context
+        .get("public_base_url_is_ephemeral_tunnel")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && active_tunnel_public_base_url != Some(public_base_url)
+    {
+        return Some(serde_json::json!({
+            "ok": false,
+            "blocked": true,
+            "error": "runtime/tunnel not running",
+            "reason": "public_base_url came from an ephemeral setup tunnel, but that tunnel is not active for this setup session",
+            "public_base_url": public_base_url,
+            "active_tunnel_public_base_url": active_tunnel_public_base_url,
+            "runtime_context": runtime_context,
+        }));
+    }
+    if let Some(runtime_local_base_url) = runtime_context
+        .get("runtime_local_base_url")
+        .and_then(Value::as_str)
+        && !setup_backend_runtime_base_responds(runtime_local_base_url).await
+    {
+        return Some(serde_json::json!({
+            "ok": false,
+            "blocked": true,
+            "error": "runtime/tunnel not running",
+            "reason": "runtime endpoint artifact exists, but the local runtime is not responding",
+            "runtime_local_base_url": runtime_local_base_url,
+            "setup_ui_url": state.local_base_url,
+            "runtime_context": runtime_context,
+        }));
+    }
+    None
+}
+
+async fn setup_backend_runtime_base_responds(base_url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_millis(750))
+        .build()
+    else {
+        return false;
+    };
+    client.get(base_url).send().await.is_ok()
+}
+
+async fn setup_backend_public_tunnel_responds(base_url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(base_url.trim_end_matches('/'))
+        .send()
+        .await
+        .ok()
+        .is_some_and(|response| response.status().as_u16() < 500)
+}
+
+fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    let current_public_base_url = current.get("public_base_url").and_then(Value::as_str);
+    if current
+        .get("public_base_url_is_ephemeral_tunnel")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && current
+            .get("active_tunnel_public_base_url")
+            .and_then(Value::as_str)
+            != current_public_base_url
+    {
+        return false;
+    }
+    let Some(previous) = value.get("runtime_context") else {
+        return !current
+            .get("public_base_url_is_ephemeral_tunnel")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    };
+    previous.get("public_base_url").and_then(Value::as_str) == current_public_base_url
+}
+
+fn is_ephemeral_tunnel_public_base_url(value: &str) -> bool {
+    is_ephemeral_tunnel_url(value)
+}
+
+fn setup_backend_template_unresolved(value: &str) -> bool {
+    value.contains('{') && value.contains('}')
 }
 
 fn render_setup_backend_contract_state(
@@ -3252,13 +4709,20 @@ fn render_setup_backend_contract_state(
         .get("last_setup_result")
         .cloned()
         .unwrap_or(Value::Null);
-    let values = setup_backend_render_values(&config, &stored, setup_result.clone());
+    let raw_values = setup_backend_render_values(&config, &stored, setup_result.clone());
     let teams_app = setup_backend_render_teams_app(&stored);
     let items = if contract_blocked.is_some() {
         Vec::new()
     } else {
-        setup_backend_contract_items(contract, &stored, &values)
+        setup_backend_contract_items(state, contract, tenant, &stored, &raw_values)
     };
+    let values = setup_backend_filter_stale_action_values(
+        contract,
+        &items,
+        raw_values,
+        setup_result.clone(),
+    );
+    let reset = setup_backend_values_contain_stale_marker(&values);
     let ok = items
         .iter()
         .all(|item| item.get("state").and_then(Value::as_str) == Some("done"));
@@ -3271,6 +4735,14 @@ fn render_setup_backend_contract_state(
             .and_then(Value::as_str)
             .unwrap_or("Setup backend contract is blocked.")
             .to_string()
+    } else if setup_backend_pending_device_login(&setup_result) {
+        setup_backend_device_login_next_message().to_string()
+    } else if setup_result
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "Continue setup to run the next step.".to_string()
     } else if setup_result
         .get("next")
         .and_then(Value::as_str)
@@ -3304,42 +4776,35 @@ fn render_setup_backend_contract_state(
             "blocked": blocked,
             "last_step": if ok { Value::String("complete".to_string()) } else { setup_result.get("step").cloned().unwrap_or(Value::Null) },
             "next": next,
+            "reset": reset,
         },
     })
 }
 
 fn setup_backend_blocked_from_result(setup_result: &Value) -> Option<Value> {
-    let result = setup_result.get("result")?;
-    if !result
-        .get("blocked")
+    crate::setup_backend_contract::blocked_from_result(setup_result)
+}
+
+fn setup_backend_pending_device_login(setup_result: &Value) -> bool {
+    setup_result
+        .get("result")
+        .and_then(|result| result.get("pending_device_login"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
-    {
-        return None;
-    }
-    let message = result
-        .get("error")
-        .or_else(|| setup_result.get("next"))
-        .and_then(Value::as_str)
-        .unwrap_or("Setup action is blocked.");
-    let mut blocked = JsonMap::new();
-    blocked.insert(
-        "title".to_string(),
-        Value::String("Setup action blocked".to_string()),
-    );
-    blocked.insert("summary".to_string(), Value::String(message.to_string()));
-    blocked.insert("next".to_string(), Value::String(message.to_string()));
-    if let Some(capability) = result.get("missing_host_capability").cloned() {
-        blocked.insert("missing_host_capability".to_string(), capability);
-    }
-    if let Some(config_key) = result.get("missing_config_key").cloned() {
-        blocked.insert("missing_config_key".to_string(), config_key);
-    }
-    Some(Value::Object(blocked))
+        || setup_result
+            .get("pending_device_login")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn setup_backend_device_login_next_message() -> &'static str {
+    "Open the sign-in page, enter the code, then continue setup."
 }
 
 fn setup_backend_contract_items(
+    state: &UiState,
     contract: &ProviderBackendContract,
+    tenant: &str,
     stored: &JsonMap<String, Value>,
     values: &Value,
 ) -> Vec<Value> {
@@ -3350,13 +4815,25 @@ fn setup_backend_contract_items(
         .unwrap_or_default();
     let completed: std::collections::HashSet<&str> =
         completed.iter().filter_map(Value::as_str).collect();
+    let mut previous_pending = false;
     setup_backend_required_steps(contract)
         .into_iter()
         .map(|step| {
-            let done = completed.contains(step)
-                || setup_backend_action_by_id(contract, step)
-                    .and_then(|action| action.get("completion"))
-                    .is_some_and(|completion| setup_backend_completion_met(values, completion));
+            let action = setup_backend_action_by_id(contract, step);
+            let cached_done = completed.contains(step)
+                && action.is_none_or(|action| {
+                    setup_backend_cached_completion_current(state, tenant, stored, values, action)
+                });
+            let independently_done = cached_done
+                || action.is_some_and(|action| {
+                    setup_backend_action_completion_current(state, tenant, stored, values, action)
+                });
+            let durable_done_after_pending = independently_done
+                && action.is_some_and(setup_backend_action_is_runtime_context_durable);
+            let done = independently_done && (!previous_pending || durable_done_after_pending);
+            if !done {
+                previous_pending = true;
+            }
             serde_json::json!({
                 "label": step.replace('_', " "),
                 "state": if done { "done" } else { "pending" },
@@ -3394,6 +4871,111 @@ fn setup_backend_render_values(
     Value::Object(values)
 }
 
+fn setup_backend_filter_stale_action_values(
+    contract: &ProviderBackendContract,
+    items: &[Value],
+    values: Value,
+    setup_result: Value,
+) -> Value {
+    let mut values = values;
+    let Some(values_obj) = values.as_object_mut() else {
+        return values;
+    };
+    let item_states: std::collections::HashMap<&str, &str> = items
+        .iter()
+        .filter_map(|item| {
+            Some((
+                item.get("id")?.as_str()?,
+                item.get("state")?.as_str().unwrap_or("pending"),
+            ))
+        })
+        .collect();
+    let setup_step = setup_result.get("step").and_then(Value::as_str);
+    for action in contract
+        .inline
+        .get("actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(step_id) = action.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if item_states.get(step_id) == Some(&"done") {
+            continue;
+        }
+        let current_action_is_done =
+            setup_step == Some(step_id) && item_states.get(step_id) == Some(&"done");
+        if action
+            .get("executor")
+            .and_then(|executor| executor.get("kind"))
+            .and_then(Value::as_str)
+            == Some("oauth_device_code")
+        {
+            setup_backend_mark_oauth_action_value_stale(values_obj, action, step_id);
+        }
+        if setup_backend_action_is_runtime_context_durable(action) {
+            continue;
+        }
+        let Some(state_key) = action
+            .get("executor")
+            .and_then(|executor| executor.get("state_store_key"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if current_action_is_done {
+            continue;
+        }
+        if let Some(value) = values_obj.get_mut(state_key) {
+            setup_backend_mark_action_value_stale(value, step_id);
+        }
+    }
+    values
+}
+
+fn setup_backend_mark_action_value_stale(value: &mut Value, step_id: &str) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("ok".to_string(), Value::Bool(false));
+        object.insert("stale".to_string(), Value::Bool(true));
+        object.insert("stale_step".to_string(), Value::String(step_id.to_string()));
+    }
+}
+
+fn setup_backend_mark_oauth_action_value_stale(
+    values: &mut JsonMap<String, Value>,
+    action: &Value,
+    step_id: &str,
+) {
+    let oauth_kind = action
+        .get("executor")
+        .and_then(|executor| executor.get("oauth_kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let Some(oauth) = values.get_mut("oauth").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(value) = oauth.get_mut(oauth_kind) {
+        setup_backend_mark_action_value_stale(value, step_id);
+    }
+}
+
+fn setup_backend_values_contain_stale_marker(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("stale")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || object
+                    .values()
+                    .any(setup_backend_values_contain_stale_marker)
+        }
+        Value::Array(items) => items.iter().any(setup_backend_values_contain_stale_marker),
+        _ => false,
+    }
+}
+
 fn setup_backend_public_config(config: &JsonMap<String, Value>) -> JsonMap<String, Value> {
     let mut public = config.clone();
     for key in [
@@ -3422,11 +5004,32 @@ fn setup_backend_render_teams_app(stored: &JsonMap<String, Value>) -> Value {
         .and_then(Value::as_object);
     let add_to_teams_url = install
         .and_then(|value| value.get("add_to_teams_url"))
+        .or_else(|| {
+            install.and_then(|value| {
+                value
+                    .get("response")
+                    .and_then(|response| response.get("add_to_teams_url"))
+            })
+        })
         .or_else(|| publish.and_then(|value| value.get("add_to_teams_url")))
+        .or_else(|| {
+            publish.and_then(|value| {
+                value
+                    .get("response")
+                    .and_then(|response| response.get("add_to_teams_url"))
+            })
+        })
         .cloned()
         .unwrap_or(Value::Null);
     let open_bot_chat_url = install
         .and_then(|value| value.get("open_bot_chat_url"))
+        .or_else(|| {
+            install.and_then(|value| {
+                value
+                    .get("response")
+                    .and_then(|response| response.get("open_bot_chat_url"))
+            })
+        })
         .cloned()
         .unwrap_or(Value::Null);
     serde_json::json!({
@@ -3437,44 +5040,146 @@ fn setup_backend_render_teams_app(stored: &JsonMap<String, Value>) -> Value {
 }
 
 fn setup_backend_completion_met(values: &Value, completion: &Value) -> bool {
-    let Some(path) = completion.get("state_path").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(value) = setup_backend_value_at_path(values, path) else {
-        return false;
-    };
-    if completion
-        .get("exists")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return !value.is_null()
-            && value
-                .as_str()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(true);
-    }
-    if let Some(expected) = completion.get("equals") {
-        return value == expected;
-    }
-    value.as_bool().unwrap_or(false)
+    crate::setup_backend_contract::completion_met(values, completion)
 }
 
-fn setup_backend_value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .filter(|part| !part.is_empty())
-        .try_fold(root, |current, part| current.get(part))
+fn setup_backend_action_completion_current(
+    state: &UiState,
+    tenant: &str,
+    stored: &JsonMap<String, Value>,
+    values: &Value,
+    action: &Value,
+) -> bool {
+    let Some(completion) = action.get("completion") else {
+        return false;
+    };
+    if !setup_backend_completion_met(values, completion) {
+        return false;
+    }
+    let Some(state_key) = action
+        .get("executor")
+        .and_then(|executor| executor.get("state_store_key"))
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    let Some(stored_value) = stored.get(state_key) else {
+        return true;
+    };
+    if setup_backend_last_result_matches_action(stored, action)
+        && setup_backend_action_result_runtime_context_current(state, tenant, stored, action)
+    {
+        return true;
+    }
+    if setup_backend_action_is_runtime_context_durable(action) {
+        return true;
+    }
+    let config = stored
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let current = setup_backend_runtime_context(state, tenant, &config);
+    setup_backend_runtime_context_current(stored_value, &current)
+}
+
+fn setup_backend_cached_completion_current(
+    state: &UiState,
+    tenant: &str,
+    stored: &JsonMap<String, Value>,
+    values: &Value,
+    action: &Value,
+) -> bool {
+    let Some(state_key) = action
+        .get("executor")
+        .and_then(|executor| executor.get("state_store_key"))
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    let Some(stored_value) = stored.get(state_key) else {
+        return true;
+    };
+    if setup_backend_action_is_runtime_context_durable(action) {
+        return action
+            .get("completion")
+            .is_none_or(|completion| setup_backend_completion_met(values, completion));
+    }
+    let config = stored
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let current = setup_backend_runtime_context(state, tenant, &config);
+    if !setup_backend_runtime_context_current(stored_value, &current) {
+        return false;
+    }
+    action
+        .get("completion")
+        .is_none_or(|completion| setup_backend_completion_met(values, completion))
+}
+
+fn setup_backend_action_is_runtime_context_durable(action: &Value) -> bool {
+    let action_id = action.get("id").and_then(Value::as_str);
+    let state_key = action
+        .get("executor")
+        .and_then(|executor| executor.get("state_store_key"))
+        .and_then(Value::as_str);
+    matches!(
+        action_id,
+        Some("teams_app_publish" | "teams_app_user_install")
+    ) || matches!(
+        state_key,
+        Some("last_teams_app_publish" | "last_teams_app_install")
+    )
+}
+
+fn setup_backend_last_result_matches_action(
+    stored: &JsonMap<String, Value>,
+    action: &Value,
+) -> bool {
+    let Some(action_id) = action.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(result) = stored.get("last_setup_result").and_then(Value::as_object) else {
+        return false;
+    };
+    result.get("step").and_then(Value::as_str) == Some(action_id)
+        && result.get("ok").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn setup_backend_action_result_runtime_context_current(
+    state: &UiState,
+    tenant: &str,
+    stored: &JsonMap<String, Value>,
+    action: &Value,
+) -> bool {
+    if setup_backend_action_is_runtime_context_durable(action) {
+        return true;
+    }
+    let Some(result) = stored.get("last_setup_result").and_then(Value::as_object) else {
+        return true;
+    };
+    let Some(result_body) = result.get("result") else {
+        return true;
+    };
+    let Some(result_context) = result_body.get("runtime_context") else {
+        return true;
+    };
+    let config = stored
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let current = setup_backend_runtime_context(state, tenant, &config);
+    setup_backend_runtime_context_current(
+        &serde_json::json!({ "runtime_context": result_context }),
+        &current,
+    )
 }
 
 fn setup_backend_required_steps(contract: &ProviderBackendContract) -> Vec<&str> {
-    contract
-        .inline
-        .get("required_order")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect()
+    crate::setup_backend_contract::required_steps(&contract.inline)
 }
 
 fn setup_backend_contract_blocked(
@@ -3499,11 +5204,22 @@ fn setup_backend_contract_blocked(
 }
 
 fn setup_backend_first_pending_step(
+    state: &UiState,
     contract: &ProviderBackendContract,
+    tenant: &str,
     stored: &JsonMap<String, Value>,
 ) -> String {
     if contract.load_error.is_some() || setup_backend_required_steps(contract).is_empty() {
         return "contract_blocked".to_string();
+    }
+    if let Some(token_store_key) = crate::setup_backend_contract::oauth_resume_token(stored)
+        && let Some(action) = crate::setup_backend_contract::oauth_action_by_token_store_key(
+            &contract.inline,
+            token_store_key,
+        )
+        && let Some(action_id) = action.get("id").and_then(Value::as_str)
+    {
+        return action_id.to_string();
     }
     let config = stored
         .get("config")
@@ -3515,7 +5231,7 @@ fn setup_backend_first_pending_step(
         .cloned()
         .unwrap_or(Value::Null);
     let values = setup_backend_render_values(&config, stored, setup_result);
-    setup_backend_contract_items(contract, stored, &values)
+    setup_backend_contract_items(state, contract, tenant, stored, &values)
         .into_iter()
         .find(|item| item.get("state").and_then(Value::as_str) != Some("done"))
         .and_then(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
@@ -3952,7 +5668,7 @@ async fn post_execute(
     }
 
     let setup_public_base_url = if should_start_setup_tunnel(&tunnel_mode, &answers) {
-        match ensure_setup_tunnel(&state, &tunnel_mode).await {
+        match ensure_setup_tunnel(state.as_ref(), &tunnel_mode, &state.local_base_url).await {
             Ok(url) => {
                 inject_setup_public_base_url(&mut answers, &url);
                 Some(url)
@@ -3963,7 +5679,6 @@ async fn post_execute(
                     stdout: String::new(),
                     stderr: format!("Failed to start setup tunnel: {err}"),
                     manual_steps: vec![],
-                    pending_setup_actions: vec![],
                     provider_setup_status,
                 });
             }
@@ -3982,7 +5697,6 @@ async fn post_execute(
         stdout: String::new(),
         stderr: format!("Task panicked: {e}"),
         manual_steps: vec![],
-        pending_setup_actions: vec![],
         provider_setup_status: JsonMap::new(),
     });
     result.provider_setup_status = provider_setup_status.clone();
@@ -4347,37 +6061,6 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-async fn post_oauth_device_start(
-    State(state): State<std::sync::Arc<UiState>>,
-    Json(req): Json<crate::oauth_device::OAuthDeviceStartInput>,
-) -> Json<Value> {
-    match crate::oauth_device::start_oauth_device_code(
-        &state.bundle_path,
-        &req,
-        crate::oauth_device::DEFAULT_EXTENSION_KEY,
-    ) {
-        Ok(report) => Json(serde_json::json!({ "ok": true, "report": report })),
-        Err(err) => Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
-    }
-}
-
-async fn post_oauth_device_poll(
-    State(state): State<std::sync::Arc<UiState>>,
-    Json(req): Json<crate::oauth_device::OAuthDevicePollInput>,
-) -> Json<Value> {
-    match crate::oauth_device::poll_oauth_device_code(
-        &state.bundle_path,
-        &state.env,
-        &req,
-        crate::oauth_device::DEFAULT_EXTENSION_KEY,
-    )
-    .await
-    {
-        Ok(report) => Json(serde_json::json!({ "ok": true, "report": report })),
-        Err(err) => Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
-    }
-}
-
 async fn post_shutdown(State(state): State<std::sync::Arc<UiState>>) {
     let _ = state.shutdown_tx.send(());
 }
@@ -4392,21 +6075,31 @@ fn append_line(existing: &str, line: &str) -> String {
     }
 }
 
-async fn ensure_setup_tunnel(state: &std::sync::Arc<UiState>, mode: &str) -> Result<String> {
-    {
-        let guard = state
+async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) -> Result<String> {
+    let existing = {
+        let mut guard = state
             .setup_tunnel
             .lock()
             .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
-        if let Some(tunnel) = guard.as_ref()
+        if let Some(tunnel) = guard.as_mut()
             && tunnel.mode == mode
+            && tunnel.local_base_url == local_base_url.trim_end_matches('/')
+            && tunnel.is_running()
         {
-            return Ok(tunnel.public_base_url.clone());
+            Some(tunnel.public_base_url.clone())
+        } else {
+            None
         }
+    };
+    if let Some(existing) = existing {
+        if setup_backend_public_tunnel_responds(&existing).await {
+            return Ok(existing);
+        }
+        setup_backend_clear_setup_tunnel(state);
     }
 
     let mode = mode.to_string();
-    let local_base_url = state.local_base_url.clone();
+    let local_base_url = local_base_url.trim_end_matches('/').to_string();
     let tunnel = tokio::task::spawn_blocking(move || start_setup_tunnel(&mode, &local_base_url))
         .await
         .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
@@ -4417,6 +6110,151 @@ async fn ensure_setup_tunnel(state: &std::sync::Arc<UiState>, mode: &str) -> Res
         .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
     *guard = Some(tunnel);
     Ok(public_base_url)
+}
+
+fn setup_backend_clear_setup_tunnel(state: &UiState) {
+    if let Ok(mut guard) = state.setup_tunnel.lock() {
+        *guard = None;
+    }
+}
+
+async fn ensure_setup_runtime(state: &UiState, tenant: &str) -> Result<()> {
+    if let Some(runtime_base_url) = setup_backend_setup_runtime_info(state)
+        .and_then(|info| info.local_base_url)
+        .filter(|value| !value.trim().is_empty())
+        && setup_backend_runtime_base_responds(runtime_base_url.trim_end_matches('/')).await
+    {
+        return Ok(());
+    }
+    if let Some(runtime_base_url) = crate::platform_setup::load_runtime_local_base_url(
+        &state.bundle_path,
+        tenant,
+        state.team.as_deref(),
+    )
+    .ok()
+    .flatten()
+    .map(|value| value.trim().trim_end_matches('/').to_string())
+    .filter(|value| !value.is_empty())
+        && setup_backend_runtime_base_responds(&runtime_base_url).await
+    {
+        return Ok(());
+    }
+
+    {
+        let mut guard = state
+            .setup_runtime
+            .lock()
+            .map_err(|_| anyhow!("setup runtime lock poisoned"))?;
+        if let Some(runtime) = guard.as_mut() {
+            match runtime.child.try_wait() {
+                Ok(Some(status)) => {
+                    *guard = None;
+                    eprintln!("Setup-started runtime exited before observation: {status}");
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    *guard = None;
+                    eprintln!("Could not inspect setup-started runtime: {err}");
+                }
+            }
+        }
+        if guard.is_none() {
+            let system_log_line_floor =
+                setup_runtime_system_log_line_count(&state.bundle_path).ok();
+            let mut child = Command::new("greentic-start")
+                .arg("start")
+                .arg("--bundle")
+                .arg(&state.bundle_path)
+                .arg("--cloudflared")
+                .arg("off")
+                .arg("--no-browser")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("start runtime for {}", state.bundle_path.display()))?;
+            let info = Arc::new(Mutex::new(SetupRuntimeInfo {
+                system_log_line_floor,
+                ..SetupRuntimeInfo::default()
+            }));
+            if let Some(stdout) = child.stdout.take() {
+                spawn_setup_runtime_log_reader(stdout, info.clone());
+            }
+            if let Some(stderr) = child.stderr.take() {
+                spawn_setup_runtime_log_reader(stderr, info.clone());
+            }
+            *guard = Some(SetupRuntime { child, info });
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Some(runtime_base_url) = setup_backend_setup_runtime_info(state)
+            .and_then(|info| info.local_base_url)
+            .filter(|value| !value.trim().is_empty())
+            && setup_backend_runtime_base_responds(&runtime_base_url).await
+        {
+            return Ok(());
+        }
+        {
+            let mut guard = state
+                .setup_runtime
+                .lock()
+                .map_err(|_| anyhow!("setup runtime lock poisoned"))?;
+            if let Some(runtime) = guard.as_mut()
+                && let Some(status) = runtime.child.try_wait().context("inspect setup runtime")?
+            {
+                *guard = None;
+                return Err(anyhow!(
+                    "setup-started runtime exited before it was ready: {status}"
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!("runtime did not become ready within 90 seconds"));
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+fn setup_runtime_system_log_line_count(bundle_path: &Path) -> Result<usize> {
+    let log_path = bundle_path.join("logs").join("system.log");
+    let file = match std::fs::File::open(&log_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err).with_context(|| format!("read {}", log_path.display())),
+    };
+    Ok(std::io::BufReader::new(file).lines().count())
+}
+
+fn spawn_setup_runtime_log_reader<R>(stream: R, info: Arc<Mutex<SetupRuntimeInfo>>)
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stream);
+        for line in reader.lines().map_while(std::result::Result::ok) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(mut guard) = info.lock() {
+                if let Some(value) = setup_runtime_log_value(trimmed, "HTTP:") {
+                    guard.local_base_url = Some(value);
+                }
+                if let Some(value) = setup_runtime_log_value(trimmed, "Public:") {
+                    guard.public_base_url = Some(value);
+                }
+                if trimmed.starts_with("Ready.") {
+                    guard.ready = true;
+                }
+            }
+        }
+    });
+}
+
+fn setup_runtime_log_value(line: &str, label: &str) -> Option<String> {
+    let value = line.strip_prefix(label)?.trim().trim_end_matches('/');
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn execute_setup(
@@ -4442,7 +6280,6 @@ fn execute_setup(
                 stdout: String::new(),
                 stderr: format!("Failed to normalize static routes: {e}"),
                 manual_steps: vec![],
-                pending_setup_actions: vec![],
                 provider_setup_status: JsonMap::new(),
             };
         }
@@ -4481,7 +6318,6 @@ fn execute_setup(
                 stdout: String::new(),
                 stderr: format!("Failed to build plan: {e}"),
                 manual_steps: vec![],
-                pending_setup_actions: vec![],
                 provider_setup_status: JsonMap::new(),
             };
         }
@@ -4513,7 +6349,6 @@ fn execute_setup(
                 ),
                 stderr: String::new(),
                 manual_steps,
-                pending_setup_actions: report.pending_setup_actions,
                 provider_setup_status: JsonMap::new(),
             }
         }
@@ -4522,7 +6357,6 @@ fn execute_setup(
             stdout,
             stderr: format!("Execution failed: {e}"),
             manual_steps: vec![],
-            pending_setup_actions: vec![],
             provider_setup_status: JsonMap::new(),
         },
     }
@@ -4736,9 +6570,22 @@ mod tests {
             local_base_url: "http://127.0.0.1:12345".to_string(),
             setup_session_id: "test-session".to_string(),
             setup_tunnel: Mutex::new(None),
+            setup_runtime: Mutex::new(None),
             shutdown_tx,
             result: Mutex::new(None),
         })
+    }
+
+    fn test_jwt_with_exp(exp: u64) -> String {
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"alg":"none"}"#,
+        );
+        let claims = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            format!(r#"{{"exp":{exp}}}"#),
+        );
+        format!("{header}.{claims}.")
     }
 
     fn write_pack_with_secret_requirements(
@@ -4805,6 +6652,44 @@ mod tests {
                                     "config": "object"
                                 }
                             }
+                        }
+                    }
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    fn write_pack_with_setup_machine(
+        path: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(
+            json!({
+                "pack_id": provider_id,
+                "display_name": "Machine Provider",
+                "extensions": {
+                    "greentic.setup.machine.v1": {
+                        "inline": {
+                            "version": 1,
+                            "id": "ui-machine",
+                            "display_name": "UI Machine",
+                            "entry_step": "start",
+                            "steps": [
+                                {
+                                    "id": "start",
+                                    "kind": "manual_action",
+                                    "title": "Start",
+                                    "auto_complete": true,
+                                    "on_success": "complete"
+                                }
+                            ]
                         }
                     }
                 }
@@ -5047,7 +6932,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_backend_defaults_include_provider_setup_runtime_base_url() {
+    fn setup_backend_defaults_do_not_include_provider_setup_runtime_base_url() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
 
@@ -5057,11 +6942,11 @@ mod tests {
             Some("http://127.0.0.1:9101/"),
         );
 
-        assert_eq!(config["provider_setup_base_url"], "http://127.0.0.1:9101");
+        assert!(config.get("provider_setup_base_url").is_none());
     }
 
     #[test]
-    fn setup_backend_defaults_include_provider_setup_base_from_runtime_artifact() {
+    fn setup_backend_defaults_do_not_include_provider_setup_base_from_runtime_artifact() {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_dir = temp
             .path()
@@ -5084,11 +6969,1309 @@ mod tests {
 
         let config = super::default_setup_backend_config(&state, "demo");
 
-        assert_eq!(config["provider_setup_base_url"], "http://127.0.0.1:8081");
+        assert!(config.get("provider_setup_base_url").is_none());
+    }
+
+    #[test]
+    fn setup_backend_infers_tunnel_mode_from_ephemeral_public_base_url() {
+        assert_eq!(
+            super::setup_backend_infer_tunnel_mode_from_public_base_url(
+                "https://demo.trycloudflare.com"
+            )
+            .as_deref(),
+            Some("cloudflared")
+        );
+        assert_eq!(
+            super::setup_backend_infer_tunnel_mode_from_public_base_url(
+                "https://demo.ngrok-free.app"
+            )
+            .as_deref(),
+            Some("ngrok")
+        );
+        assert_eq!(
+            super::setup_backend_infer_tunnel_mode_from_public_base_url(
+                "https://runtime.example.com"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn setup_backend_tunnel_mode_defaults_to_cloudflared_for_local_setup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+
+        let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
+
+        assert_eq!(mode.as_deref(), Some("cloudflared"));
+    }
+
+    #[test]
+    fn setup_backend_tunnel_mode_honors_persisted_off() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::platform_setup::persist_tunnel_artifact(
+            temp.path(),
+            &crate::platform_setup::TunnelAnswers {
+                mode: Some("off".to_string()),
+            },
+        )
+        .expect("persist tunnel");
+        let state = test_ui_state(temp.path());
+
+        let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
+
+        assert_eq!(mode.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn setup_backend_tunnel_mode_does_not_default_when_deployer_pack_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let packs_dir = temp.path().join("packs");
+        std::fs::create_dir_all(&packs_dir).expect("packs dir");
+        std::fs::write(packs_dir.join("terraform.gtpack"), b"placeholder").expect("pack");
+        let state = test_ui_state(temp.path());
+
+        let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
+
+        assert_eq!(mode, None);
+    }
+
+    #[test]
+    fn setup_backend_completion_rejects_stale_ephemeral_tunnel_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["register_endpoint"],
+                "actions": [{
+                    "id": "register_endpoint",
+                    "completion": {
+                        "state_path": "last_reconcile.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_reconcile"
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://old.trycloudflare.com"
+            }),
+        );
+        stored.insert("last_reconcile".to_string(), json!({"ok": true}));
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
+
+        assert_eq!(rendered["setup_status"]["ok"], false);
+        assert_eq!(rendered["setup_status"]["items"][0]["state"], "pending");
+    }
+
+    #[test]
+    fn setup_backend_completion_accepts_current_successful_action_with_ephemeral_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["register_endpoint", "publish"],
+                "actions": [{
+                    "id": "register_endpoint",
+                    "completion": {
+                        "state_path": "last_reconcile.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_reconcile"
+                    }
+                }, {
+                    "id": "publish",
+                    "completion": {
+                        "state_path": "last_publish.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_publish"
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://new.trycloudflare.com"
+            }),
+        );
+        stored.insert(
+            "last_reconcile".to_string(),
+            json!({
+                "ok": true,
+                "runtime_context": {
+                    "public_base_url": "https://new.trycloudflare.com",
+                    "public_base_url_is_ephemeral_tunnel": true,
+                    "active_tunnel_public_base_url": null
+                }
+            }),
+        );
+        stored.insert(
+            "last_setup_result".to_string(),
+            json!({
+                "step": "register_endpoint",
+                "ok": true,
+                "next": "click again"
+            }),
+        );
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
+
+        assert_eq!(rendered["setup_status"]["ok"], false);
+        assert_eq!(rendered["setup_status"]["items"][0]["state"], "done");
+        assert_eq!(rendered["setup_status"]["items"][1]["state"], "pending");
+        assert_eq!(
+            rendered["setup_status"]["next"],
+            "Continue setup to run the next step."
+        );
+    }
+
+    #[test]
+    fn setup_backend_hides_current_downstream_output_when_prior_step_pending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["register_endpoint", "publish"],
+                "actions": [{
+                    "id": "register_endpoint",
+                    "completion": {
+                        "state_path": "last_reconcile.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_reconcile"
+                    }
+                }, {
+                    "id": "publish",
+                    "completion": {
+                        "state_path": "last_publish.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_publish"
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://stale.trycloudflare.com"
+            }),
+        );
+        stored.insert(
+            "last_reconcile".to_string(),
+            json!({
+                "ok": true,
+                "runtime_context": {
+                    "public_base_url": "https://stale.trycloudflare.com",
+                    "public_base_url_is_ephemeral_tunnel": true,
+                    "active_tunnel_public_base_url": null
+                }
+            }),
+        );
+        stored.insert(
+            "last_publish".to_string(),
+            json!({"ok": true, "url": "https://example.com"}),
+        );
+        stored.insert(
+            "last_setup_result".to_string(),
+            json!({
+                "step": "publish",
+                "ok": true,
+                "next": "click again"
+            }),
+        );
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
+
+        assert_eq!(rendered["setup_status"]["items"][0]["state"], "pending");
+        assert_eq!(rendered["setup_status"]["items"][1]["state"], "pending");
+        assert_eq!(rendered["values"]["last_publish"]["ok"], false);
+        assert_eq!(rendered["values"]["last_publish"]["stale"], true);
+    }
+
+    #[test]
+    fn setup_backend_completion_rejects_changed_public_base_url_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["register_endpoint"],
+                "actions": [{
+                    "id": "register_endpoint",
+                    "completion": {
+                        "state_path": "last_reconcile.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_reconcile"
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://new.example.com"
+            }),
+        );
+        stored.insert(
+            "last_reconcile".to_string(),
+            json!({
+                "ok": true,
+                "runtime_context": {
+                    "public_base_url": "https://old.example.com"
+                }
+            }),
+        );
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
+
+        assert_eq!(rendered["setup_status"]["ok"], false);
+        assert_eq!(rendered["setup_status"]["items"][0]["state"], "pending");
+    }
+
+    #[test]
+    fn setup_backend_oauth_completion_keeps_done_when_access_token_expires() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["management_consent"],
+                "actions": [{
+                    "id": "management_consent",
+                    "completion": {
+                        "state_path": "oauth.management.ok",
+                        "exists": true
+                    },
+                    "executor": {
+                        "kind": "oauth_device_code",
+                        "oauth_kind": "management",
+                        "token_store_key": "management_access_token"
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let expired_token = test_jwt_with_exp(1);
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "management_access_token": expired_token
+            }),
+        );
+        stored.insert(
+            "oauth".to_string(),
+            json!({
+                "management": {
+                    "ok": true,
+                    "token_store_key": "management_access_token"
+                }
+            }),
+        );
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
+
+        assert_eq!(rendered["setup_status"]["ok"], true);
+        assert_eq!(rendered["setup_status"]["items"][0]["state"], "done");
+    }
+
+    #[test]
+    fn setup_backend_oauth_required_resume_routes_to_matching_oauth_action() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "generic-provider".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["auth", "publish"],
+                "actions": [{
+                    "id": "auth",
+                    "completion": {
+                        "state_path": "oauth.default.ok",
+                        "exists": true
+                    },
+                    "executor": {
+                        "kind": "oauth_device_code",
+                        "oauth_kind": "default",
+                        "token_store_key": "access_token"
+                    }
+                }, {
+                    "id": "publish",
+                    "completion": {
+                        "state_path": "last_publish.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_publish"
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "access_token": "expired-token"
+            }),
+        );
+        stored.insert(
+            "oauth".to_string(),
+            json!({
+                "default": {
+                    "ok": true,
+                    "token_store_key": "access_token"
+                }
+            }),
+        );
+        stored.insert("last_publish".to_string(), json!({"ok": true}));
+
+        let publish_action = super::setup_backend_action_by_id(&contract, "publish").unwrap();
+        let result = super::setup_backend_oauth_required_result(
+            publish_action,
+            "access_token",
+            "authenticated request failed",
+            &json!({
+                "ok": false,
+                "status": 401,
+                "body": { "error": "Lifetime validation failed, the token is expired." }
+            }),
+        )
+        .unwrap();
+        crate::setup_backend_contract::update_oauth_resume(&mut stored, &result);
+
+        let first_pending =
+            super::setup_backend_first_pending_step(&state, &contract, "demo", &stored);
+
+        assert_eq!(first_pending, "auth");
+        assert_eq!(stored["oauth_resume"]["token_store_key"], "access_token");
+        assert_eq!(stored["oauth_resume"]["resume_step"], "publish");
+    }
+
+    #[test]
+    fn setup_backend_provider_http_oauth_required_uses_token_key_from_action_body() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "generic-provider".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["management_auth", "graph_auth", "register"],
+                "actions": [{
+                    "id": "management_auth",
+                    "completion": {
+                        "state_path": "oauth.management.ok",
+                        "exists": true
+                    },
+                    "executor": {
+                        "kind": "oauth_device_code",
+                        "oauth_kind": "management",
+                        "token_store_key": "management_access_token"
+                    }
+                }, {
+                    "id": "graph_auth",
+                    "completion": {
+                        "state_path": "oauth.graph.ok",
+                        "exists": true
+                    },
+                    "executor": {
+                        "kind": "oauth_device_code",
+                        "oauth_kind": "graph",
+                        "token_store_key": "graph_access_token"
+                    }
+                }, {
+                    "id": "register",
+                    "completion": {
+                        "state_path": "last_register.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_register",
+                        "body": {
+                            "access_token": "{management_access_token}"
+                        }
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let action = super::setup_backend_action_by_id(&contract, "register").unwrap();
+        let response = json!({
+            "ok": false,
+            "response": {
+                "ok": false,
+                "blocked": true,
+                "error": "request failed (HTTP 401): token is expired"
+            }
+        });
+
+        let result =
+            super::setup_backend_provider_http_oauth_required_result(&contract, action, &response)
+                .unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "management_access_token": "expired-management-token",
+                "graph_access_token": "still-present"
+            }),
+        );
+        stored.insert(
+            "oauth".to_string(),
+            json!({
+                "management": {
+                    "ok": true,
+                    "token_store_key": "management_access_token"
+                },
+                "graph": {
+                    "ok": true,
+                    "token_store_key": "graph_access_token"
+                }
+            }),
+        );
+        crate::setup_backend_contract::update_oauth_resume(&mut stored, &result);
+
+        let first_pending =
+            super::setup_backend_first_pending_step(&state, &contract, "demo", &stored);
+
+        assert_eq!(result["result"]["error"], "oauth_required");
+        assert_eq!(
+            result["result"]["token_store_key"],
+            "management_access_token"
+        );
+        assert_eq!(first_pending, "management_auth");
+    }
+
+    #[test]
+    fn setup_backend_oauth_resume_clears_after_matching_token_refresh() {
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "oauth_resume".to_string(),
+            json!({
+                "token_store_key": "access_token",
+                "resume_step": "publish"
+            }),
+        );
+
+        super::setup_backend_clear_oauth_resume_for_token(&mut stored, "other_token");
+        assert!(stored.get("oauth_resume").is_some());
+
+        super::setup_backend_clear_oauth_resume_for_token(&mut stored, "access_token");
+        assert!(stored.get("oauth_resume").is_none());
+    }
+
+    #[test]
+    fn setup_backend_render_keeps_completed_outputs_when_token_expires() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "generic-provider".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["auth", "publish"],
+                "actions": [{
+                    "id": "auth",
+                    "completion": {
+                        "state_path": "oauth.default.ok",
+                        "exists": true
+                    },
+                    "executor": {
+                        "kind": "oauth_device_code",
+                        "token_store_key": "access_token"
+                    }
+                }, {
+                    "id": "publish",
+                    "completion": {
+                        "state_path": "last_publish.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_publish"
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "access_token": test_jwt_with_exp(1)
+            }),
+        );
+        stored.insert(
+            "oauth".to_string(),
+            json!({
+                "default": {
+                    "ok": true,
+                    "token_store_key": "access_token"
+                }
+            }),
+        );
+        stored.insert(
+            "last_publish".to_string(),
+            json!({"ok": true, "url": "https://example.com"}),
+        );
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
+
+        assert_eq!(rendered["setup_status"]["ok"], true);
+        assert_eq!(rendered["setup_status"]["items"][0]["state"], "done");
+        assert_eq!(rendered["setup_status"]["items"][1]["state"], "done");
+        assert_eq!(rendered["setup_status"]["reset"], false);
+        assert_eq!(rendered["values"]["oauth"]["default"]["ok"], true);
+        assert_eq!(rendered["values"]["last_publish"]["ok"], true);
+    }
+
+    #[test]
+    fn setup_web_component_accepts_server_reset_state() {
+        let source = r#"
+  _isStaleState(nextState) {
+    if (!this._state) return false;
+    const current = this._stateRank(this._state);
+    const next = this._stateRank(nextState);
+    if (next.done < current.done) return true;
+    return false;
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(!patched.contains("setup_status.reset === true"));
+        assert!(patched.contains("if (next.done < current.done) return true;"));
+    }
+
+    #[test]
+    fn setup_web_component_pending_device_login_is_not_error_outcome() {
+        let source = r#"
+  _outcomeMessage(result) {
+    if (!result || typeof result !== "object") return "";
+    if (result.ok === false) {
+      return this._providerSetupError(result) || result.next || result.error || this._t("actionFailed");
+    }
+    return "";
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(patched.contains("pending_device_login"));
+        assert!(patched.contains("return this._providerSetupError(result)"));
+    }
+
+    #[test]
+    fn setup_web_component_allows_retryable_blocked_action() {
+        let source = r#"
+  _currentAction() {
+    const status = this._status();
+    if (status.blocked) {
+      return {
+        kind: "blocked-refresh",
+        label: this._t("refreshAfterManualAction")
+      };
+    }
+    return { kind: "continue", label: this._t("continue") || "Continue setup" };
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(patched.contains("status.blocked && !status.blocked.retryable"));
+        assert!(patched.contains("kind: \"blocked-refresh\""));
+    }
+
+    #[test]
+    fn setup_web_component_verifies_teams_install_after_publish_without_session_flag() {
+        let source = r#"
+  _currentAction() {
+    if (publish.ok && !install.ok && addToTeamsUrl) {
+      if (this._manualActions.addToTeamsOpened) {
+        return {
+          kind: "continue",
+          label: this._t("verifyTeamsInstall")
+        };
+      }
+      return {
+        kind: "add-to-teams",
+        label: this._t("addToTeams"),
+        url: addToTeamsUrl
+      };
+    }
+  }
+
+  _actionHtml(action) {
+    return `<button type="button" class="primary" data-action="run-current">${this._escape(action.label || this._t("continue"))}</button>`;
+  }
+
+  async _executeManagedAction(action) {
+    let waitAction = action;
+    if (waitAction.kind === "continue") {
+      const result = await this._request("POST", this._endpoint("next"), this._collectConfig());
+    }
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(
+            patched.contains("greentic-setup always offers install verification after publish")
+        );
+        assert!(patched.contains("label: this._t(\"verifyTeamsInstall\")"));
+        assert!(patched.contains("stepId: \"teams_app_user_install\""));
+        assert!(patched.contains("addToTeamsUrl"));
+        assert!(patched.contains("greentic-setup can run a targeted setup action"));
+        assert!(patched.contains("/action/${encodeURIComponent(waitAction.stepId)}"));
+        assert!(patched.contains("greentic-setup exposes Add to Teams next to Verify"));
+        assert!(!patched.contains("kind: \"add-to-teams\""));
+    }
+
+    #[test]
+    fn setup_web_component_ignores_stale_runtime_observation_for_bot_chat_action() {
+        let source = r#"
+  _currentAction() {
+    const values = this._state && this._state.values || {};
+    const firstMessage = values.last_activity || values.last_webchat_conversation;
+    if (install.ok && !firstMessage && openBotChatUrl) {
+      return {
+        kind: "open-chat",
+        label: this._t("openBotChat"),
+        url: openBotChatUrl
+      };
+    }
+  }
+
+  _waitingForFirstBotMessage() {
+    const values = this._state && this._state.values || {};
+    return Boolean(
+      install.ok
+        && (installData.open_bot_chat_url || teams.open_bot_chat_url)
+        && !(values.last_activity || values.last_webchat_conversation)
+    );
+  }
+
+  _snapshot() {
+    const values = this._state && this._state.values || {};
+    return {
+      firstMessage: Boolean(values.last_activity || values.last_webchat_conversation)
+    };
+  }
+
+  async _preflightAction(action) {
+    if (!action || action.kind !== "continue") return "";
+    const pending = this._currentPendingStepId();
+    if (pending === "first_bot_framework_post") {
+      return await this._runtimeIngressPreflight();
+    }
+    return "";
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(patched.contains("greentic-setup ignores stale runtime observations"));
+        assert!(patched.contains("value && !value.stale"));
+        assert!(patched.contains("!value.stale)"));
+        assert!(
+            patched.contains("greentic-setup waits for the Bot Framework endpoint registration")
+        );
+        assert!(patched.contains("pendingStep !== \"first_bot_framework_post\""));
+        assert!(patched.contains("greentic-setup lets the backend/runtime observation path"));
+        assert!(!patched.contains("return await this._runtimeIngressPreflight();"));
+        assert!(!patched.contains(
+            "const firstMessage = values.last_activity || values.last_webchat_conversation;"
+        ));
+        assert!(!patched.contains(
+            "firstMessage: Boolean(values.last_activity || values.last_webchat_conversation)"
+        ));
+    }
+
+    #[test]
+    fn setup_web_component_suppresses_action_only_after_observed_completion() {
+        let source = r#"
+  _currentAction() {
+    const complete = items.length > 0 && items.every((item) => item.state === "done");
+    const values = this._state && this._state.values || {};
+    const firstMessage = values.last_activity || values.last_webchat_conversation;
+
+    if (install.ok && !firstMessage && openBotChatUrl) {
+      return {
+        kind: "open-chat",
+        label: this._t("openBotChat"),
+        url: openBotChatUrl
+      };
+    }
+
+    if (!complete) {
+      return {
+        kind: "continue",
+        label: this._t("continue") || "Continue setup"
+      };
+    }
+
+    if (openBotChatUrl) {
+      return {
+        kind: "open-chat",
+        label: this._t("openBotChat"),
+        url: openBotChatUrl
+      };
+    }
+
+    return {
+      kind: "refresh",
+      label: this._t("refresh")
+    };
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(patched.contains("greentic-setup has no next action after observed completion"));
+        assert!(patched.contains("if (complete && firstMessage)"));
+        assert!(patched.contains("return null;"));
+        assert!(
+            patched
+                .find("if (install.ok && !firstMessage && openBotChatUrl)")
+                .unwrap()
+                < patched.find("if (complete && firstMessage)").unwrap()
+        );
+    }
+
+    #[test]
+    fn setup_web_component_oauth_resume_keeps_device_login_action_visible() {
+        let source = r#"
+  _oauthComplete(kind) {
+    const values = this._state && this._state.values || {};
+    const oauth = values.oauth || {};
+    return Boolean(oauth[kind || "default"] && oauth[kind || "default"].ok);
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(patched.contains("greentic-setup oauth_resume keeps refreshed OAuth incomplete"));
+        assert!(patched.contains("tokenKey === \"azure_management_access_token\""));
+        assert!(patched.contains("tokenKey === \"graph_access_token\""));
+        assert!(patched.contains("return false;"));
+    }
+
+    #[test]
+    fn setup_web_component_prefers_latest_oauth_response_code_over_stale_config_code() {
+        let source = r#"
+  _pendingLoginFromState() {
+    const cfg = this._config();
+    const values = this._state && this._state.values || {};
+    const response = values.last_oauth && values.last_oauth.response || {};
+    const oauthKind = this._oauthKind();
+    const codeKey = oauthKind === "management" ? "azure_management_user_code" : "oauth_user_code";
+    const userCode = cfg[codeKey] || response.user_code || response.userCode;
+    if (!userCode) return null;
+  }
+"#;
+
+        let patched = super::patch_setup_web_component_reset_guard(source.to_string());
+
+        assert!(patched.contains("greentic-setup prefers newest OAuth response code"));
+        assert!(patched.contains("response.user_code || response.userCode || cfg[codeKey]"));
+        assert!(!patched.contains("cfg[codeKey] || response.user_code"));
+    }
+
+    #[test]
+    fn setup_backend_marks_runtime_tunnel_block_retryable() {
+        let setup_result = json!({
+            "ok": false,
+            "next": "runtime/tunnel not running",
+            "result": {
+                "blocked": true,
+                "error": "runtime/tunnel not running"
+            }
+        });
+
+        let blocked = super::setup_backend_blocked_from_result(&setup_result).unwrap();
+
+        assert_eq!(blocked["retryable"], json!(true));
+        assert_eq!(blocked["summary"], json!("runtime/tunnel not running"));
     }
 
     #[tokio::test]
-    async fn provider_http_executor_calls_declared_provider_endpoint() {
+    async fn runtime_observation_blocks_stale_ephemeral_tunnel_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["runtime_activity"]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://old.trycloudflare.com"
+            }),
+        );
+        stored.insert("last_activity".to_string(), json!({"ok": true}));
+        let action = json!({
+            "id": "runtime_activity",
+            "executor": {
+                "kind": "runtime_observation",
+                "state_store_key": "last_activity"
+            }
+        });
+
+        let result = super::setup_backend_execute_runtime_observation(
+            &state,
+            &contract,
+            "demo",
+            &mut stored,
+            &action,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["next"], "runtime/tunnel not running");
+        assert_eq!(result["result"]["error"], "runtime/tunnel not running");
+        assert_eq!(
+            stored
+                .get("config")
+                .and_then(|config| config.get("public_base_url")),
+            Some(&json!("https://old.trycloudflare.com"))
+        );
+    }
+
+    #[test]
+    fn setup_backend_state_refreshes_runtime_observation_from_logs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let logs = temp.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(
+            logs.join("system.log"),
+            r#"2026-06-19T12:00:00Z INFO [fast2flow:gate] enter tenant=demo team=Some("support")"#,
+        )
+        .expect("system log");
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-teams".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["first_bot_framework_post"],
+                "actions": [{
+                    "id": "first_bot_framework_post",
+                    "executor": {
+                        "kind": "runtime_observation",
+                        "source": "greentic-start",
+                        "event": "bot_framework_activity_received",
+                        "state_store_key": "last_activity"
+                    },
+                    "completion": {
+                        "state_path": "last_activity",
+                        "exists": true
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://runtime.example.com"
+            }),
+        );
+        super::save_setup_backend_contract_state(&state, &contract.provider_id, "demo", &stored)
+            .expect("save state");
+
+        let rendered =
+            super::setup_backend_contract_state(&state, &contract, "demo").expect("render state");
+
+        assert_eq!(rendered["setup_status"]["ok"], true);
+        assert_eq!(rendered["setup_status"]["items"][0]["state"], "done");
+        assert_eq!(
+            rendered["values"]["last_activity"]["event"],
+            "bot_framework_activity_received"
+        );
+        assert!(rendered["values"]["last_activity_received_at"].is_number());
+    }
+
+    #[test]
+    fn completed_provider_http_step_is_pending_when_runtime_context_is_stale() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-teams".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": [
+                    "bot_framework_endpoint_registration",
+                    "first_bot_framework_post"
+                ],
+                "actions": [
+                    {
+                        "id": "bot_framework_endpoint_registration",
+                        "executor": {
+                            "kind": "provider_http",
+                            "state_store_key": "last_reconcile"
+                        },
+                        "completion": {
+                            "state_path": "last_reconcile.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "first_bot_framework_post",
+                        "executor": {
+                            "kind": "runtime_observation",
+                            "state_store_key": "last_activity"
+                        },
+                        "completion": {
+                            "state_path": "last_activity",
+                            "exists": true
+                        }
+                    }
+                ]
+            }),
+            load_error: None,
+        };
+        let stored = JsonMap::from_iter([
+            (
+                "config".to_string(),
+                json!({
+                    "tenant": "demo",
+                    "team": "support",
+                    "public_base_url": "https://old.trycloudflare.com"
+                }),
+            ),
+            (
+                "completed_steps".to_string(),
+                json!([
+                    "bot_framework_endpoint_registration",
+                    "first_bot_framework_post"
+                ]),
+            ),
+            (
+                "last_reconcile".to_string(),
+                json!({
+                    "ok": true,
+                    "runtime_context": {
+                        "public_base_url": "https://old.trycloudflare.com",
+                        "public_base_url_is_ephemeral_tunnel": true,
+                        "active_tunnel_public_base_url": "https://old.trycloudflare.com"
+                    }
+                }),
+            ),
+            ("last_activity".to_string(), json!({"ok": true})),
+        ]);
+
+        let next = super::setup_backend_first_pending_step(&state, &contract, "demo", &stored);
+
+        assert_eq!(next, "bot_framework_endpoint_registration");
+    }
+
+    #[test]
+    fn teams_publish_and_install_stay_done_when_only_tunnel_context_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-teams".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": [
+                    "bot_framework_endpoint_registration",
+                    "teams_app_publish",
+                    "teams_app_user_install",
+                    "first_bot_framework_post"
+                ],
+                "actions": [
+                    {
+                        "id": "bot_framework_endpoint_registration",
+                        "executor": {
+                            "kind": "provider_http",
+                            "state_store_key": "last_reconcile"
+                        },
+                        "completion": {
+                            "state_path": "last_reconcile.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "teams_app_publish",
+                        "executor": {
+                            "kind": "provider_http",
+                            "state_store_key": "last_teams_app_publish"
+                        },
+                        "completion": {
+                            "state_path": "last_teams_app_publish.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "teams_app_user_install",
+                        "executor": {
+                            "kind": "provider_http",
+                            "state_store_key": "last_teams_app_install"
+                        },
+                        "completion": {
+                            "state_path": "last_teams_app_install.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "first_bot_framework_post",
+                        "executor": {
+                            "kind": "runtime_observation",
+                            "state_store_key": "last_activity"
+                        },
+                        "completion": {
+                            "state_path": "last_activity",
+                            "exists": true
+                        }
+                    }
+                ]
+            }),
+            load_error: None,
+        };
+        let stored = JsonMap::from_iter([
+            (
+                "config".to_string(),
+                json!({
+                    "tenant": "demo",
+                    "team": "default",
+                    "public_base_url": "https://new.example.com"
+                }),
+            ),
+            (
+                "last_reconcile".to_string(),
+                json!({
+                    "ok": true,
+                    "runtime_context": {
+                        "public_base_url": "https://new.example.com"
+                    }
+                }),
+            ),
+            (
+                "last_teams_app_publish".to_string(),
+                json!({
+                    "ok": true,
+                    "response": {
+                        "add_to_teams_url": "https://teams.microsoft.com/l/app/app-id"
+                    },
+                    "runtime_context": {
+                        "public_base_url": "https://old.example.com"
+                    }
+                }),
+            ),
+            (
+                "last_teams_app_install".to_string(),
+                json!({
+                    "ok": true,
+                    "response": {
+                        "action": "exists",
+                        "open_bot_chat_url": "https://teams.microsoft.com/l/chat/0/0"
+                    },
+                    "runtime_context": {
+                        "public_base_url": "https://old.example.com"
+                    }
+                }),
+            ),
+        ]);
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored.clone());
+        let next = super::setup_backend_first_pending_step(&state, &contract, "demo", &stored);
+
+        assert_eq!(next, "first_bot_framework_post");
+        assert_eq!(rendered["values"]["last_teams_app_publish"]["ok"], true);
+        assert_eq!(rendered["values"]["last_teams_app_install"]["ok"], true);
+        assert_eq!(
+            rendered["values"]["last_teams_app_install"]["stale"],
+            Value::Null
+        );
+        assert_eq!(
+            rendered["teams_app"]["open_bot_chat_url"],
+            "https://teams.microsoft.com/l/chat/0/0"
+        );
+    }
+
+    #[test]
+    fn teams_publish_and_install_render_done_even_when_endpoint_must_be_refreshed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-teams".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": [
+                    "bot_framework_endpoint_registration",
+                    "teams_app_publish",
+                    "teams_app_user_install",
+                    "first_bot_framework_post"
+                ],
+                "actions": [
+                    {
+                        "id": "bot_framework_endpoint_registration",
+                        "executor": {
+                            "kind": "provider_http",
+                            "state_store_key": "last_reconcile"
+                        },
+                        "completion": {
+                            "state_path": "last_reconcile.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "teams_app_publish",
+                        "executor": {
+                            "kind": "provider_http",
+                            "state_store_key": "last_teams_app_publish"
+                        },
+                        "completion": {
+                            "state_path": "last_teams_app_publish.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "teams_app_user_install",
+                        "executor": {
+                            "kind": "provider_http",
+                            "state_store_key": "last_teams_app_install"
+                        },
+                        "completion": {
+                            "state_path": "last_teams_app_install.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "first_bot_framework_post",
+                        "executor": {
+                            "kind": "runtime_observation",
+                            "state_store_key": "last_activity"
+                        },
+                        "completion": {
+                            "state_path": "last_activity",
+                            "exists": true
+                        }
+                    }
+                ]
+            }),
+            load_error: None,
+        };
+        let stored = JsonMap::from_iter([
+            (
+                "config".to_string(),
+                json!({
+                    "tenant": "demo",
+                    "team": "default",
+                    "public_base_url": "https://new.example.com"
+                }),
+            ),
+            (
+                "last_reconcile".to_string(),
+                json!({
+                    "ok": true,
+                    "runtime_context": {
+                        "public_base_url": "https://old.example.com"
+                    }
+                }),
+            ),
+            (
+                "last_teams_app_publish".to_string(),
+                json!({
+                    "ok": true,
+                    "response": {
+                        "add_to_teams_url": "https://teams.microsoft.com/l/app/app-id"
+                    }
+                }),
+            ),
+            (
+                "last_teams_app_install".to_string(),
+                json!({
+                    "ok": true,
+                    "response": {
+                        "open_bot_chat_url": "https://teams.microsoft.com/l/chat/0/0"
+                    }
+                }),
+            ),
+        ]);
+
+        let rendered =
+            super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
+        let items = rendered["setup_status"]["items"].as_array().unwrap();
+
+        assert_eq!(items[0]["state"], "pending");
+        assert_eq!(items[1]["state"], "done");
+        assert_eq!(items[2]["state"], "done");
+        assert_eq!(items[3]["state"], "pending");
+    }
+
+    #[tokio::test]
+    async fn provider_http_executor_url_template_calls_external_endpoint() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test provider");
@@ -5141,7 +8324,7 @@ mod tests {
             "id": "register_endpoint",
             "executor": {
                 "kind": "provider_http",
-                "path_template": "/v1/setup/register",
+                "url_template": "{provider_setup_base_url}/v1/setup/register",
                 "body": {
                     "provider_id": "messaging-example",
                     "bot_app_id": "{bot_app_id}",
@@ -5180,6 +8363,250 @@ mod tests {
             super::render_setup_backend_contract_state(&state, &contract, "demo", stored);
         assert_eq!(rendered["setup_status"]["ok"], true);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_http_executor_does_not_start_runtime_for_later_observation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let app = axum::Router::new().route(
+            "/v1/setup/register",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                axum::Json(json!({
+                    "ok": true,
+                    "received": body,
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider server");
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("bundle.yaml"),
+            "schema_version: 1\nbundle_id: runtime-startable\n",
+        )
+        .expect("bundle yaml");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["register_endpoint", "runtime_activity"],
+                "actions": [
+                    {
+                        "id": "register_endpoint",
+                        "executor": {
+                            "kind": "provider_http",
+                            "url_template": "{provider_setup_base_url}/v1/setup/register",
+                            "body": {
+                                "messaging_endpoint": "{public_base_url}/v1/messaging/ingress/{tenant}/{team}",
+                                "tenant": "{tenant}",
+                                "team": "{team}"
+                            },
+                            "state_store_key": "last_reconcile"
+                        },
+                        "completion": {
+                            "state_path": "last_reconcile.ok",
+                            "equals": true
+                        }
+                    },
+                    {
+                        "id": "runtime_activity",
+                        "executor": {
+                            "kind": "runtime_observation",
+                            "state_store_key": "last_activity"
+                        },
+                        "completion": {
+                            "state_path": "last_activity",
+                            "exists": true
+                        }
+                    }
+                ]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://runtime.example.com",
+                "provider_setup_base_url": base_url
+            }),
+        );
+        let action = super::setup_backend_action_by_id(&contract, "register_endpoint")
+            .expect("register action")
+            .clone();
+
+        let result = super::setup_backend_execute_provider_http(
+            &state,
+            &contract,
+            "demo",
+            &mut stored,
+            &action,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(stored["last_reconcile"]["ok"], true);
+        assert_eq!(
+            stored["last_reconcile"]["response"]["body"]["received"]["messaging_endpoint"],
+            "https://runtime.example.com/v1/messaging/ingress/demo/support"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_http_executor_path_template_requires_declared_pack_route() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-example".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["register_endpoint"],
+                "actions": [{
+                    "id": "register_endpoint",
+                    "completion": {
+                        "state_path": "last_reconcile.ok",
+                        "equals": true
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "tenant": "demo",
+                "team": "support",
+                "bot_app_id": "app-id",
+                "bot_app_password": "app-password",
+                "public_base_url": "https://runtime.example.com",
+                "provider_setup_base_url": "http://127.0.0.1:9"
+            }),
+        );
+        let action = json!({
+            "id": "register_endpoint",
+            "executor": {
+                "kind": "provider_http",
+                "path_template": "/v1/setup/register",
+                "body": {
+                    "provider_id": "messaging-example",
+                    "tenant": "{tenant}",
+                    "team": "{team}"
+                },
+                "state_store_key": "last_reconcile"
+            }
+        });
+
+        let result = super::setup_backend_execute_provider_http(
+            &state,
+            &contract,
+            "demo",
+            &mut stored,
+            &action,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(
+            result["result"]["error"],
+            "provider_http target /v1/setup/register is not declared by pack greentic.http-routes.v1"
+        );
+        assert!(stored.get("last_reconcile").is_none());
+    }
+
+    #[tokio::test]
+    async fn graph_application_executor_uses_shared_retryable_missing_token_result() {
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-teams".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "provider_id": "messaging-teams",
+            }),
+            load_error: None,
+        };
+        let action = json!({
+            "id": "register_app",
+            "executor": {
+                "kind": "microsoft_graph_application",
+                "graph_token_store_key": "graph_access_token",
+                "app_id_config_key": "bot_app_id",
+                "client_secret_config_key": "bot_client_secret",
+                "display_name_config_key": "bot_display_name"
+            }
+        });
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "bot_display_name": "Demo Bot"
+            }),
+        );
+
+        let result =
+            super::setup_backend_execute_graph_application(&contract, "demo", &mut stored, &action)
+                .await
+                .unwrap();
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(
+            result["result"]["missing_token_store_key"],
+            "graph_access_token"
+        );
+        assert_eq!(result["result"]["blocked"], true);
+        assert_eq!(result["result"]["retryable"], true);
+        assert!(stored.get("last_app_registration").is_none());
+    }
+
+    #[test]
+    fn declared_provider_http_route_matches_tenant_team_and_wildcard() {
+        let route = super::DeclaredProviderHttpRoute {
+            provider_id: "messaging-teams".to_string(),
+            pack_path: std::path::PathBuf::from("messaging-teams.gtpack"),
+            methods: vec!["POST".to_string()],
+            target: super::ProviderHttpRouteTarget::SetupComponent {
+                component_ref: "messaging-teams-setup".to_string(),
+                op: "handle_http".to_string(),
+            },
+            segments: super::parse_provider_http_route_pattern(
+                "/v1/messaging/setup/messaging-teams/{tenant}/{team}/{action*}",
+            ),
+        };
+        let request_segments = vec![
+            "v1",
+            "messaging",
+            "setup",
+            "messaging-teams",
+            "demo",
+            "support",
+            "publish",
+        ];
+
+        assert_eq!(
+            super::match_provider_http_route(&route, &request_segments, "fallback", "default"),
+            Some(("demo".to_string(), "support".to_string()))
+        );
+        assert_eq!(
+            super::match_provider_http_route(
+                &route,
+                &["v1", "messaging", "setup", "other", "demo"],
+                "fallback",
+                "default",
+            ),
+            None
+        );
     }
 
     #[test]
@@ -5272,6 +8699,90 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["setup_status"]["ok"], false);
         assert_eq!(body["setup_status"]["items"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn setup_machine_is_exposed_and_advances_through_ui_route() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_setup_machine(
+            &providers.join("messaging-machine.gtpack"),
+            "messaging-machine",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("providers response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let provider = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == "messaging-machine")
+            .expect("provider");
+        assert_eq!(
+            provider["setup_machine"]["schema_id"],
+            "greentic.setup.machine.v1"
+        );
+        assert_eq!(provider["setup_machine"]["id"], "ui-machine");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messaging/setup/messaging-machine/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("state response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["setup_status"]["ok"], false);
+        assert_eq!(body["setup_status"]["items"][0]["id"], "start");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messaging/setup/messaging-machine/demo/next")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .expect("next response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["setup_status"]["ok"], true);
+        assert_eq!(body["setup_status"]["last_step"], "complete");
+        let state = crate::setup_machine::load_setup_machine_state(
+            &crate::setup_machine::setup_machine_state_path(
+                temp.path(),
+                "demo",
+                "support",
+                "messaging-machine",
+            ),
+        )
+        .expect("machine state");
+        assert_eq!(
+            state.status,
+            crate::setup_machine::SetupMachineStatus::Complete
+        );
     }
 
     #[tokio::test]

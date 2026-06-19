@@ -50,7 +50,7 @@ treated as complete.
 The host persists contract state under the active bundle using the setup scope:
 
 ```text
-state/setup-backends/{env}/{tenant}/{team}/{provider_id}.json
+state/setup/{tenant}/{team}/{provider_id}/backend-contract.json
 ```
 
 Browser-submitted config is filtered through the contract's

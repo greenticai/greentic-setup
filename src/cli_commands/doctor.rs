@@ -2,11 +2,32 @@
 
 use anyhow::Result;
 
-use crate::cli_args::{DoctorArgs, DoctorStageArg};
+use crate::cli_args::{DoctorArgs, DoctorCommand, DoctorStageArg};
 use crate::cli_i18n::CliI18n;
 use crate::doctor::{DiagnosticSeverity, DoctorStage, run_doctor};
+use crate::setup_machine::run_provider_setup_machine_doctor;
 
 pub fn doctor(args: DoctorArgs, _i18n: &CliI18n) -> Result<()> {
+    if let Some(command) = &args.command {
+        return match command {
+            DoctorCommand::Provider(provider_args) => {
+                let report = run_provider_setup_machine_doctor(&provider_args.pack);
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_human_report(&report, args.fix_hints, args.show_info);
+                }
+                if report.error_count > 0 || args.strict && report.warn_count > 0 {
+                    anyhow::bail!("doctor found issues");
+                }
+                Ok(())
+            }
+        };
+    }
+
+    let bundle = args.bundle.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("bundle path is required unless a doctor subcommand is used")
+    })?;
     let stage = args.stage.map(|value| match value {
         DoctorStageArg::Setup => DoctorStage::Setup,
         DoctorStageArg::Cache => DoctorStage::Cache,
@@ -15,7 +36,7 @@ pub fn doctor(args: DoctorArgs, _i18n: &CliI18n) -> Result<()> {
         DoctorStageArg::Runtime => DoctorStage::Runtime,
         DoctorStageArg::Routes => DoctorStage::Routes,
     });
-    let report = run_doctor(&args.bundle, stage);
+    let report = run_doctor(bundle, stage);
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -84,7 +105,8 @@ mod tests {
 
     fn args(bundle: std::path::PathBuf) -> DoctorArgs {
         DoctorArgs {
-            bundle,
+            bundle: Some(bundle),
+            command: None,
             json: false,
             strict: false,
             fix_hints: false,
