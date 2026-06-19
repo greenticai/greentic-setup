@@ -282,6 +282,17 @@ select{cursor:pointer;appearance:none;
 .setup-action-error{
   color:#fca5a5;font-size:.8125rem;line-height:1.5;
 }
+.final-setup-action{width:100%}
+.final-action-field-label{
+  font-size:.6875rem;font-weight:700;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.05em;
+}
+.final-action-copy-row{
+  display:flex;align-items:center;gap:.5rem;width:100%;min-width:0;
+}
+.final-action-value{
+  flex:1;min-width:0;font-family:var(--mono);font-size:.75rem;
+}
 
 /* ── Import drop zone ── */
 .import-zone{

@@ -107,6 +107,8 @@ struct ProviderInfo {
     setup_backend_contract: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     setup_machine: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_actions: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -756,6 +758,7 @@ async fn get_providers(
             let setup_backend_contract =
                 load_setup_backend_contract_descriptor(p).map(|contract| contract.inline);
             let setup_machine = load_setup_machine_descriptor(p);
+            let setup_actions = load_setup_actions_descriptor(p);
             ProviderInfo {
                 provider_id: p.provider_id.clone(),
                 display_name: p.display_name.clone(),
@@ -764,6 +767,7 @@ async fn get_providers(
                 setup_web_component,
                 setup_backend_contract,
                 setup_machine,
+                setup_actions,
             }
         })
         .collect();
@@ -1083,6 +1087,27 @@ fn load_setup_machine_descriptor(provider: &discovery::DetectedProvider) -> Opti
     }))
 }
 
+fn load_setup_actions_descriptor(provider: &discovery::DetectedProvider) -> Option<Value> {
+    let extension =
+        discovery::read_pack_extension(&provider.pack_path, "greentic.setup.actions.v1").ok()??;
+    let inline = extension_inline(&extension)?.clone();
+    if inline
+        .get("schema_id")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema != "greentic.setup.actions.v1")
+    {
+        return None;
+    }
+    let provider_id = inline.get("provider_id")?.as_str()?.trim();
+    if provider_id != provider.provider_id {
+        return None;
+    }
+    if !inline.get("actions").is_some_and(Value::is_array) {
+        return None;
+    }
+    Some(inline)
+}
+
 fn load_setup_backend_contract_asset(
     provider: &discovery::DetectedProvider,
     asset: &str,
@@ -1141,6 +1166,14 @@ fn find_setup_backend_contract(
         return Ok(None);
     };
     Ok(load_setup_backend_contract_descriptor(provider))
+}
+
+fn find_setup_actions_descriptor(bundle_path: &Path, provider_id: &str) -> Result<Option<Value>> {
+    let discovered = discovery::discover(bundle_path)?;
+    let Some(provider) = discovered.find_setup_target(provider_id) else {
+        return Ok(None);
+    };
+    Ok(load_setup_actions_descriptor(provider))
 }
 
 fn extension_inline(extension: &Value) -> Option<&Value> {
@@ -2416,7 +2449,7 @@ fn setup_machine_ui_report(
     } else {
         "Run the next setup step.".to_string()
     };
-    Ok(serde_json::json!({
+    let mut report = serde_json::json!({
         "ok": true,
         "values": status.get("outputs").cloned().unwrap_or_else(|| machine_state.outputs.clone()),
         "setup_status": {
@@ -2435,7 +2468,9 @@ fn setup_machine_ui_report(
             "machine": status,
             "last_result": result,
         },
-    }))
+    });
+    attach_final_setup_actions(state, provider_id, &mut report);
+    Ok(report)
 }
 
 fn setup_machine_blocked(last_error: &Option<Value>) -> Option<Value> {
@@ -4760,7 +4795,7 @@ fn render_setup_backend_contract_state(
     let blocked = contract_blocked
         .or_else(|| stored.get("blocked").cloned())
         .or_else(|| setup_backend_blocked_from_result(&setup_result));
-    serde_json::json!({
+    let mut report = serde_json::json!({
         "ok": route_ok,
         "values": values,
         "teams_app": teams_app,
@@ -4778,7 +4813,31 @@ fn render_setup_backend_contract_state(
             "next": next,
             "reset": reset,
         },
-    })
+    });
+    attach_final_setup_actions(state, &contract.provider_id, &mut report);
+    report
+}
+
+fn attach_final_setup_actions(state: &UiState, provider_id: &str, report: &mut Value) {
+    let Ok(Some(descriptor)) = find_setup_actions_descriptor(&state.bundle_path, provider_id)
+    else {
+        return;
+    };
+    let resolved =
+        crate::setup_final_actions::resolve_final_setup_actions(provider_id, &descriptor, report);
+    if let Some(obj) = report.as_object_mut() {
+        obj.insert(
+            "final_setup_actions".to_string(),
+            serde_json::to_value(resolved.actions).unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+        if !resolved.diagnostics.is_empty() {
+            obj.insert(
+                "final_setup_action_diagnostics".to_string(),
+                serde_json::to_value(resolved.diagnostics)
+                    .unwrap_or_else(|_| Value::Array(Vec::new())),
+            );
+        }
+    }
 }
 
 fn setup_backend_blocked_from_result(setup_result: &Value) -> Option<Value> {
@@ -6690,6 +6749,44 @@ mod tests {
                                     "on_success": "complete"
                                 }
                             ]
+                        }
+                    }
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    fn write_pack_with_final_setup_actions(
+        path: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(
+            json!({
+                "pack_id": provider_id,
+                "display_name": "Action Provider",
+                "extensions": {
+                    "greentic.setup.actions.v1": {
+                        "kind": "greentic.setup.actions.v1",
+                        "inline": {
+                            "schema_id": "greentic.setup.actions.v1",
+                            "provider_id": provider_id,
+                            "actions": [{
+                                "id": "add-to-provider",
+                                "label": "Add to Provider",
+                                "kind": "deep_link",
+                                "url_template": "{add_url}",
+                                "requires": ["add_url"],
+                                "visible_when": {
+                                    "setup_status.ok": true
+                                }
+                            }]
                         }
                     }
                 }
@@ -8789,6 +8886,47 @@ mod tests {
         assert_eq!(
             state.status,
             crate::setup_machine::SetupMachineStatus::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_actions_pack_extension_is_exposed_for_setup_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_final_setup_actions(
+            &providers.join("messaging-actions.gtpack"),
+            "messaging-actions",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("providers response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let provider = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == "messaging-actions")
+            .expect("provider");
+
+        assert_eq!(
+            provider["setup_actions"]["schema_id"],
+            "greentic.setup.actions.v1"
+        );
+        assert_eq!(
+            provider["setup_actions"]["actions"][0]["url_template"],
+            "{add_url}"
         );
     }
 

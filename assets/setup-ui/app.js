@@ -1522,8 +1522,15 @@
 
         function markComplete(detail) {
           if (!detailMatchesProvider(detail, providerId)) return;
+          var publicState = detail && (detail.state || detail.setup_state || detail);
           scope.providersDone[providerId] = true;
-          scope.providerSetupStatus[providerId] = { mode: "web_component", complete: true };
+          scope.providerSetupStatus[providerId] = {
+            mode: "web_component",
+            complete: true,
+            state: publicState || {},
+            setup_status: publicState && publicState.setup_status ? publicState.setup_status : null,
+            values: publicState && publicState.values ? publicState.values : null
+          };
           status.textContent = "Provider setup complete.";
           submit.disabled = false;
           scheduleDraftSave();
@@ -2114,6 +2121,10 @@
       });
       html += '</div>';
     }
+    var finalActions = ok ? resolveFinalSetupActions() : [];
+    if (finalActions.length > 0) {
+      html += renderFinalSetupActions(finalActions);
+    }
     if (r && r.stdout) html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.output")) + '</h4><pre class="output-pre">' + esc(r.stdout) + '</pre></div>';
     if (r && r.stderr) html += '<div class="output-section"><h4 class="output-title">' + esc(t("ui.result.log")) + '</h4><pre class="output-pre stderr">' + esc(r.stderr) + '</pre></div>';
 
@@ -2137,7 +2148,163 @@
     Array.prototype.forEach.call(document.querySelectorAll(".btn-oauth-device-copy"), function (btn) {
       btn.addEventListener("click", function () { copyOAuthDeviceCode(btn.getAttribute("data-code"), btn.getAttribute("data-session-id")); });
     });
+    Array.prototype.forEach.call(document.querySelectorAll(".btn-final-action-copy"), function (btn) {
+      btn.addEventListener("click", function () {
+        copyFinalSetupActionValue(btn.getAttribute("data-copy-value"), btn);
+      });
+    });
     autoStartOAuthDeviceActions();
+  }
+
+  function resolveFinalSetupActions() {
+    var scope = cs() || {};
+    var result = state.result || {};
+    var setupStatusByProvider = result.provider_setup_status || scope.providerSetupStatus || {};
+    var resolved = [];
+    state.providers.forEach(function (provider) {
+      var descriptor = provider.setup_actions;
+      var actions = descriptor && Array.isArray(descriptor.actions) ? descriptor.actions : [];
+      var providerState = setupStatusByProvider[provider.provider_id] || {};
+      var preResolved = providerState && providerState.state && Array.isArray(providerState.state.final_setup_actions) ? providerState.state.final_setup_actions : [];
+      preResolved.forEach(function (action) {
+        if (action && action.url && action.label) {
+          resolved.push({
+            provider_id: action.provider_id || provider.provider_id,
+            action_id: action.action_id || action.id || "",
+            label: action.label,
+            url: action.url,
+            html: action.html || finalSetupActionHtml(provider.provider_id, action.action_id || action.id || "add", action.label, action.url)
+          });
+        }
+      });
+      if (!actions.length || preResolved.length) return;
+      var context = finalSetupActionContext(providerState, result, scope, provider);
+      actions.forEach(function (action) {
+        var item = resolveFinalSetupAction(provider, action, context);
+        if (item) resolved.push(item);
+      });
+    });
+    return resolved;
+  }
+
+  function finalSetupActionContext(providerState, result, scope, provider) {
+    var context = {};
+    mergeFinalSetupActionContext(context, result && result.values);
+    mergeFinalSetupActionContext(context, providerState && providerState.values);
+    mergeFinalSetupActionContext(context, providerState && providerState.state && providerState.state.values);
+    mergeFinalSetupActionContext(context, providerState && providerState.state);
+    mergeFinalSetupActionContext(context, providerState && providerState.setup_status);
+    context.setup_status = (providerState && providerState.setup_status) || (providerState && providerState.state && providerState.state.setup_status) || {};
+    context.values = (providerState && providerState.values) || (providerState && providerState.state && providerState.state.values) || {};
+    context.tenant = scope.tenant || "demo";
+    context.team = scope.team || "default";
+    context.provider_id = provider.provider_id;
+    return context;
+  }
+
+  function mergeFinalSetupActionContext(target, source) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return;
+    Object.keys(source).forEach(function (key) {
+      var value = source[key];
+      if (value === undefined || value === null) return;
+      if (isFinalSetupSecretKey(key)) return;
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        target[key] = String(value);
+      } else if (value && typeof value === "object" && !Array.isArray(value)) {
+        mergeFinalSetupActionContext(target, value);
+      }
+    });
+  }
+
+  function isFinalSetupSecretKey(key) {
+    return /(^|_)(token|secret|password|device_code|refresh_token|access_token|id_token|bot_access_token)($|_)/i.test(String(key || ""));
+  }
+
+  function resolveFinalSetupAction(provider, action, context) {
+    if (!action || action.kind !== "deep_link") return null;
+    var id = String(action.id || "").trim();
+    var label = String(action.label || "").trim();
+    var template = String(action.url_template || "").trim();
+    if (!id || !label || !template) return null;
+    if (!finalSetupActionVisible(action.visible_when, context)) return null;
+    var required = Array.isArray(action.requires) ? action.requires : [];
+    for (var i = 0; i < required.length; i++) {
+      var name = String(required[i] || "");
+      var value = deepValue(context, name);
+      if (!name || value === undefined || value === null || value === "") return null;
+    }
+    var wholePlaceholder = template.match(/^\{([A-Za-z0-9_.-]+)\}$/);
+    var unresolved = false;
+    var url = wholePlaceholder ? String(deepValue(context, wholePlaceholder[1]) || "") : template.replace(/\{([A-Za-z0-9_.-]+)\}/g, function (_, name) {
+      var value = deepValue(context, name);
+      if (value === undefined || value === null || value === "") {
+        unresolved = true;
+        return "";
+      }
+      return encodeURIComponent(String(value));
+    });
+    if (unresolved || !isSafeFinalSetupActionUrl(url)) return null;
+    return {
+      provider_id: provider.provider_id,
+      action_id: id,
+      label: label,
+      url: url,
+      html: finalSetupActionHtml(provider.provider_id, id, label, url)
+    };
+  }
+
+  function finalSetupActionVisible(visibleWhen, context) {
+    if (!visibleWhen || typeof visibleWhen !== "object" || Array.isArray(visibleWhen)) return true;
+    return Object.keys(visibleWhen).every(function (path) {
+      return deepValue(context, path) === visibleWhen[path];
+    });
+  }
+
+  function isSafeFinalSetupActionUrl(url) {
+    try {
+      var parsed = new URL(url, window.location.href);
+      return parsed.protocol === "https:";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function finalSetupActionHtml(providerId, actionId, label, url) {
+    var cls = "greentic-add-button " + sanitizeCssClass("greentic-add-" + providerId + "-" + actionId);
+    return '<a class="' + escAttr(cls) + '" href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>';
+  }
+
+  function sanitizeCssClass(value) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "greentic-add";
+  }
+
+  function renderFinalSetupActions(actions) {
+    var html = '<div class="output-section final-setup-actions">' +
+      '<h4 class="output-title">Share add buttons</h4>' +
+      '<p class="setup-action-help">Share these links directly or add the HTML buttons to an internal page.</p>';
+    actions.forEach(function (action) {
+      html += '<div class="setup-action final-setup-action">';
+      html += '<div class="setup-action-heading">' + esc(action.label) + '</div>';
+      html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + escAttr(action.url) + '">' + esc(action.label) + '</a>';
+      html += '<label class="final-action-field-label">URL</label>';
+      html += '<div class="final-action-copy-row"><input class="input final-action-value" readonly value="' + escAttr(action.url) + '"><button class="btn btn-secondary btn-final-action-copy" data-copy-value="' + escAttr(action.url) + '">Copy</button></div>';
+      html += '<label class="final-action-field-label">HTML</label>';
+      html += '<div class="final-action-copy-row"><input class="input final-action-value" readonly value="' + escAttr(action.html) + '"><button class="btn btn-secondary btn-final-action-copy" data-copy-value="' + escAttr(action.html) + '">Copy</button></div>';
+      html += '</div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
+  function copyFinalSetupActionValue(value, btn) {
+    copyTextToClipboard(value || "").then(function () {
+      if (!btn) return;
+      var old = btn.textContent;
+      btn.textContent = "Copied";
+      setTimeout(function () { btn.textContent = old; }, 1200);
+    }).catch(function (err) {
+      if (btn) btn.textContent = err.message || "Copy failed";
+    });
   }
 
   function startOAuthDeviceAction(idx) {
@@ -2423,6 +2590,10 @@
     return d.innerHTML;
   }
 
+  function escAttr(str) {
+    return esc(str);
+  }
+
   function formatProviderName(provider) {
     if (typeof provider === "object" && provider.display_name) return provider.display_name;
     return typeof provider === "object" ? provider.provider_id : provider;
@@ -2431,7 +2602,10 @@
   if (typeof window !== "undefined") {
     window.__greenticSetupTestHooks = {
       providerSetupGenericEventNames: providerSetupGenericEventNames,
-      sanitizeProviderSetupEventDetail: sanitizeProviderSetupEventDetail
+      sanitizeProviderSetupEventDetail: sanitizeProviderSetupEventDetail,
+      resolveFinalSetupAction: resolveFinalSetupAction,
+      finalSetupActionContext: finalSetupActionContext,
+      renderFinalSetupActions: renderFinalSetupActions
     };
   }
 
