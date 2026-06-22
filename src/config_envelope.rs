@@ -231,6 +231,7 @@ fn read_pack_provenance(
             })
             .unwrap_or_default(),
         config_schema: SchemaIr::Null,
+        outcomes: Vec::new(),
     };
     let describe_hash = hash_canonical(&describe)?;
 
