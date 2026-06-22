@@ -103,11 +103,12 @@
       tenant: tenant || "demo",
       env: env || "dev",
       team: team || "",
-      tunnel: state.cloudDeploy ? "off" : "cloudflared",
+      tunnel: state.defaultTunnel || (state.cloudDeploy ? "off" : "cloudflared"),
       answers: answers,
       sharedAnswers: {},
       providersDone: {},
       providerSetupStatus: {},
+      publicBaseUrlStatus: {},
       sharedAnswersDone: false,
       executed: false,
     };
@@ -122,6 +123,7 @@
     bundlePath: "",
     detectedTenant: null,
     cloudDeploy: false,
+    defaultTunnel: "cloudflared",
     // multi-scope
     scopes: [],
     currentScopeIdx: -1,
@@ -176,7 +178,8 @@
       env: scope.env,
     };
     if (scope.team) payload.team = scope.team;
-    if (Object.keys(payload.answers).length === 0) return Promise.resolve();
+    if (scope.tunnel) payload.tunnel = scope.tunnel;
+    if (Object.keys(payload.answers).length === 0 && !payload.tunnel) return Promise.resolve();
     return fetch("/api/draft", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -208,6 +211,7 @@
       case "providers": renderProviders(); break;
       case "shared": renderForm(state.sharedQuestions, t("ui.shared.title"), t("ui.shared.description"), null, submitShared); break;
       case "provider-form": renderProviderForm(); break;
+      case "provider-setup-action": renderProviderSetupAction(); break;
       case "review": renderReview(); break;
       case "executing": renderExecuting(); break;
       case "result": renderResult(); break;
@@ -267,6 +271,7 @@
         var scopeData = results[1];
         state.detectedTenant = scopeData.detected_tenant || null;
         state.cloudDeploy = !!scopeData.cloud_deploy;
+        state.defaultTunnel = scopeData.tunnel || (state.cloudDeploy ? "off" : "cloudflared");
 
         var existingScopes = existingData.scopes || [];
         if (existingScopes.length > 0) {
@@ -679,8 +684,10 @@
     document.getElementById("btn-tunnel-continue").addEventListener("click", function () {
       var selected = document.querySelector('input[name="tunnel"]:checked');
       scope.tunnel = selected ? selected.value : "cloudflared";
-      state.phase = "providers";
-      render();
+      persistDraftNow().finally(function () {
+        state.phase = "providers";
+        render();
+      });
     });
   }
 
@@ -1417,9 +1424,21 @@
       return;
     }
     if (!form || form.questions.length === 0) {
-      scope.providersDone[p.provider_id] = true;
-      advanceProvider();
+      if (providerSetupPhaseActions(p).length > 0) {
+        state.phase = "provider-setup-action";
+        render();
+        return;
+      }
+      completeProviderAndAdvance(p.provider_id);
       return;
+    }
+    if (providerNeedsGeneratedPublicBaseUrl(scope, p, form)) {
+      var publicUrlStatus = scope.publicBaseUrlStatus[p.provider_id] || {};
+      if (!publicUrlStatus.failed) {
+        if (!publicUrlStatus.running) ensureProviderPublicBaseUrl(p);
+        renderProviderPublicBaseUrlLoading(p);
+        return;
+      }
     }
     var backFn = function () {
       if (state.currentProvider > 0) { state.currentProvider--; state.phase = "provider-form"; }
@@ -1428,9 +1447,266 @@
       render();
     };
     renderForm(form.questions, form.title || formatProviderName(p), t("ui.provider.configure", [formatProviderName(p)]), null, function () {
-      scope.providersDone[p.provider_id] = true;
-      advanceProvider();
+      if (providerSetupPhaseActions(p).length > 0) {
+        persistDraftNow().finally(function () {
+          state.phase = "provider-setup-action";
+          render();
+        });
+      } else {
+        completeProviderAndAdvance(p.provider_id);
+      }
     }, backFn);
+  }
+
+  function providerNeedsGeneratedPublicBaseUrl(scope, provider, form) {
+    if (!form || !Array.isArray(form.questions)) return false;
+    if (!scope || !scope.tunnel || scope.tunnel === "off") return false;
+    var answers = scope.answers[provider.provider_id] || {};
+    var current = String(answers.public_base_url || "").trim();
+    if (current) return false;
+    return form.questions.some(function (q) {
+      return q && q.id === "public_base_url" && q.required === true;
+    });
+  }
+
+  function ensureProviderPublicBaseUrl(provider) {
+    var scope = cs();
+    scope.publicBaseUrlStatus[provider.provider_id] = { running: true };
+    fetch("/api/setup-public-url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenant: scope.tenant,
+        team: scope.team || null,
+        env: scope.env,
+        tunnel: scope.tunnel || null
+      })
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (result) {
+      if (!result.ok || !result.public_base_url) {
+        scope.publicBaseUrlStatus[provider.provider_id] = {
+          failed: true,
+          error: result.error || "Could not start setup tunnel"
+        };
+        render();
+        return;
+      }
+      var store = scope.answers[provider.provider_id] || {};
+      store.public_base_url = result.public_base_url;
+      scope.answers[provider.provider_id] = store;
+      scope.publicBaseUrlStatus[provider.provider_id] = { ok: true };
+      persistDraftNow().finally(render);
+    })
+    .catch(function (err) {
+      scope.publicBaseUrlStatus[provider.provider_id] = { failed: true, error: err.message };
+      render();
+    });
+  }
+
+  function renderProviderPublicBaseUrlLoading(provider) {
+    var scope = cs();
+    var status = scope.publicBaseUrlStatus[provider.provider_id] || {};
+    var html =
+      '<div class="fade-in center-msg">' +
+        '<p class="executing-text">Starting setup tunnel...</p>' +
+        '<p class="executing-sub">' + esc(status.error || "Preparing a public callback URL.") + '</p>' +
+      '</div>';
+    app.innerHTML = html;
+  }
+
+  function providerSetupPhaseActions(provider) {
+    var descriptor = provider && provider.setup_actions;
+    var actions = descriptor && Array.isArray(descriptor.actions) ? descriptor.actions : [];
+    return actions.filter(function (action) {
+      return action && action.kind === "oauth_install_button" && action.registration;
+    });
+  }
+
+  function completeProviderAndAdvance(providerId) {
+    var scope = cs();
+    scope.providersDone[providerId] = true;
+    persistDraftNow().finally(advanceProvider);
+  }
+
+  function renderProviderSetupAction() {
+    var scope = cs();
+    var p = state.providers[state.currentProvider];
+    var actions = providerSetupPhaseActions(p);
+    if (!actions.length) {
+      completeProviderAndAdvance(p.provider_id);
+      return;
+    }
+    var status = scope.providerSetupStatus[p.provider_id] || {};
+    var completed = status && status.ok === true;
+    var running = status && status.running;
+    var error = status && status.error;
+    var canContinue = completed || !!error;
+    var name = formatProviderName(p);
+    var html =
+      '<div class="fade-in">' +
+        '<div class="step-header">' +
+          '<button class="btn btn-ghost btn-sm btn-back" id="btn-back">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>' +
+            ' ' + esc(t("ui.back")) +
+          '</button>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="card-header">' +
+            '<h2 class="card-title">' + esc(name) + '</h2>' +
+            '<p class="card-desc">Create or update the provider app using the configuration you entered.</p>' +
+          '</div>' +
+          '<div class="card-content">';
+    actions.forEach(function (action, idx) {
+      html += '<div class="setup-action">';
+      html += '<div class="setup-action-heading">' + esc(action.label || "Create app") + '</div>';
+      if (completed) {
+        html += '<div class="setup-action-status">App setup complete.</div>';
+      } else if (running) {
+        html += '<div class="setup-action-status">Working...</div>';
+      } else {
+        html += '<button class="btn btn-primary setup-action-btn btn-run-provider-setup-action" data-action-idx="' + idx + '">' + esc(action.label || "Create app") + '</button>';
+      }
+      if (error) html += '<div class="setup-action-error">' + esc(error) + '</div>';
+      html += '</div>';
+    });
+    html +=
+          '</div>' +
+          '<div class="card-footer card-footer-split">' +
+            '<button class="btn-secondary" id="btn-prev">' + esc(t("ui.back")) + '</button>' +
+            '<button class="btn btn-primary" id="btn-submit"' + (canContinue ? '' : ' disabled') + '>' + esc(t("ui.continue")) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    app.innerHTML = html;
+    var backFn = function () {
+      if (providerHasFormQuestions(p)) {
+        state.phase = "provider-form";
+      } else if (state.currentProvider > 0) {
+        state.currentProvider--;
+        state.phase = "provider-form";
+      } else if (scope.sharedQuestions.length > 0) {
+        state.phase = "shared";
+      } else {
+        state.phase = "providers";
+      }
+      render();
+    };
+    document.getElementById("btn-back").addEventListener("click", backFn);
+    document.getElementById("btn-prev").addEventListener("click", backFn);
+    document.getElementById("btn-submit").addEventListener("click", function () {
+      completeProviderAndAdvance(p.provider_id);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".btn-run-provider-setup-action"), function (btn) {
+      btn.addEventListener("click", function () {
+        runProviderSetupAction(p, actions[Number(btn.getAttribute("data-action-idx"))]);
+      });
+    });
+  }
+
+  function providerHasFormQuestions(provider) {
+    var scope = cs();
+    var form = scope.providerForms[provider.provider_id];
+    return !!(form && Array.isArray(form.questions) && form.questions.length > 0);
+  }
+
+  function runProviderSetupAction(provider, action) {
+    var scope = cs();
+    var popup = openProviderInstallWindow();
+    scope.providerSetupStatus[provider.provider_id] = { running: true };
+    render();
+    fetch("/api/setup-action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: provider.provider_id,
+        action_id: action.id,
+        answers: scope.answers,
+        tenant: scope.tenant,
+        team: scope.team || null,
+        env: scope.env,
+        tunnel: scope.tunnel || null
+      })
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (result) {
+      if (!result.ok) {
+        closeProviderInstallWindow(popup);
+        scope.providerSetupStatus[provider.provider_id] = {
+          ok: false,
+          error: result.error || "Setup action failed"
+        };
+        render();
+        return;
+      }
+      scope.providerSetupStatus[provider.provider_id] = result;
+      if (result.values && typeof result.values === "object") {
+        scope.answers[provider.provider_id] = Object.assign({}, scope.answers[provider.provider_id] || {}, result.values);
+      }
+      var installUrl = setupActionReturnedFinalUrl(provider, result);
+      if (installUrl) {
+        navigateProviderInstallWindow(popup, installUrl);
+      } else {
+        closeProviderInstallWindow(popup);
+      }
+      render();
+    })
+    .catch(function (err) {
+      closeProviderInstallWindow(popup);
+      scope.providerSetupStatus[provider.provider_id] = { ok: false, error: err.message };
+      render();
+    });
+  }
+
+  function openProviderInstallWindow() {
+    try {
+      var popup = window.open("", "_blank");
+      if (popup && popup.document) {
+        popup.document.write("<!doctype html><title>Working...</title><body style=\"font-family:system-ui,sans-serif;margin:2rem;color:#111\">Working...</body>");
+        popup.document.close();
+      }
+      return popup;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function navigateProviderInstallWindow(popup, url) {
+    try {
+      if (popup && !popup.closed) {
+        popup.opener = null;
+        popup.location.href = url;
+        return;
+      }
+    } catch (e) {}
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+
+  function closeProviderInstallWindow(popup) {
+    try {
+      if (popup && !popup.closed) popup.close();
+    } catch (e) {}
+  }
+
+  function setupActionReturnedFinalUrl(provider, result) {
+    var descriptor = provider && provider.setup_actions;
+    var actions = descriptor && Array.isArray(descriptor.actions) ? descriptor.actions : [];
+    if (!actions.length || !result) return "";
+    var context = {};
+    mergeFinalSetupActionContext(context, result.values);
+    mergeFinalSetupActionContext(context, result.state && result.state.values);
+    mergeFinalSetupActionContext(context, result.state);
+    mergeFinalSetupActionContext(context, result.setup_status);
+    context.setup_status = result.setup_status || (result.state && result.state.setup_status) || {};
+    context.values = result.values || (result.state && result.state.values) || {};
+    context.provider_id = provider.provider_id;
+    for (var i = 0; i < actions.length; i++) {
+      var item = resolveFinalSetupAction(provider, actions[i], context);
+      if (item && item.url) return item.url;
+    }
+    var directUrl = deepValue(context, "oauth_authorize_url") || deepValue(context, "authorize_url");
+    if (directUrl) return String(directUrl);
+    return "";
   }
 
   function renderProviderWebComponent(p) {
@@ -1475,8 +1751,13 @@
     document.getElementById("btn-back").addEventListener("click", backFn);
     document.getElementById("btn-prev").addEventListener("click", backFn);
     document.getElementById("btn-submit").addEventListener("click", function () {
+      var existing = scope.providerSetupStatus[p.provider_id] || {};
       scope.providersDone[p.provider_id] = true;
-      scope.providerSetupStatus[p.provider_id] = { mode: "web_component", complete: true };
+      scope.providerSetupStatus[p.provider_id] = Object.assign({}, existing, {
+        mode: "web_component",
+        complete: existing.complete === true,
+        continued: true
+      });
       persistDraftNow().finally(advanceProvider);
     });
 
@@ -1536,6 +1817,20 @@
           scheduleDraftSave();
         }
 
+        function markCanContinue(detail) {
+          if (!detailMatchesProvider(detail, providerId)) return;
+          var publicState = detail && (detail.state || detail.setup_state || detail);
+          scope.providerSetupStatus[providerId] = {
+            mode: "web_component",
+            complete: false,
+            state: publicState || {},
+            setup_status: publicState && publicState.setup_status ? publicState.setup_status : null,
+            values: publicState && publicState.values ? publicState.values : null
+          };
+          submit.disabled = false;
+          scheduleDraftSave();
+        }
+
         function handleState(event) {
           var detail = event.detail || {};
           if (!detailMatchesProvider(detail, providerId)) return;
@@ -1543,6 +1838,8 @@
           var state = detail.state || detail;
           if (deepValue(state, statePath) === expected) {
             markComplete(detail);
+          } else {
+            markCanContinue(detail);
           }
         }
 
@@ -1607,7 +1904,9 @@
   }
 
   function detailMatchesProvider(detail, providerId) {
-    return detail && (detail.providerId === providerId || detail.provider_id === providerId);
+    if (!detail) return false;
+    var detailProviderId = detail.providerId || detail.provider_id;
+    return !detailProviderId || detailProviderId === providerId;
   }
 
   function deepValue(value, path) {
@@ -1618,6 +1917,8 @@
   }
 
   function setComponentBlocked(blocked, status, message, moduleUrl, detail) {
+    var submit = document.getElementById("btn-submit");
+    if (submit) submit.disabled = false;
     status.textContent = message;
     blocked.hidden = false;
     blocked.innerHTML =
@@ -1647,6 +1948,7 @@
             expectedPath,
             latestProviderSetupDiagnosticText(providerId, detail)
           );
+          submit.disabled = false;
         }
       };
       document.addEventListener(name, handler);
@@ -2121,7 +2423,7 @@
       });
       html += '</div>';
     }
-    var finalActions = ok ? resolveFinalSetupActions() : [];
+    var finalActions = resolveFinalSetupActions();
     if (finalActions.length > 0) {
       html += renderFinalSetupActions(finalActions);
     }
@@ -2189,6 +2491,7 @@
 
   function finalSetupActionContext(providerState, result, scope, provider) {
     var context = {};
+    mergeFinalSetupActionContext(context, scope && scope.answers && scope.answers[provider.provider_id]);
     mergeFinalSetupActionContext(context, result && result.values);
     mergeFinalSetupActionContext(context, providerState && providerState.values);
     mergeFinalSetupActionContext(context, providerState && providerState.state && providerState.state.values);
@@ -2221,7 +2524,8 @@
   }
 
   function resolveFinalSetupAction(provider, action, context) {
-    if (!action || action.kind !== "deep_link") return null;
+    if (!action) return null;
+    if (action.kind !== "deep_link") return null;
     var id = String(action.id || "").trim();
     var label = String(action.label || "").trim();
     var template = String(action.url_template || "").trim();

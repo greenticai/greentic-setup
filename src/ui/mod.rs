@@ -22,7 +22,7 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use url::Url;
 
 use crate::cli_i18n::CliI18n;
@@ -59,7 +59,9 @@ struct UiState {
     local_base_url: String,
     setup_session_id: String,
     setup_tunnel: Mutex<Option<SetupTunnel>>,
+    setup_tunnel_start: AsyncMutex<()>,
     setup_runtime: Mutex<Option<SetupRuntime>>,
+    setup_runtime_start: AsyncMutex<()>,
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
@@ -261,6 +263,35 @@ struct DraftSaveRequest {
     #[serde(default)]
     team: Option<String>,
     env: String,
+    #[serde(default)]
+    tunnel: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetupActionRequest {
+    provider_id: String,
+    action_id: String,
+    answers: JsonMap<String, Value>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    tunnel: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetupPublicUrlRequest {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    tunnel: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -270,6 +301,8 @@ struct ScopeResponse {
     env: String,
     detected_tenant: Option<String>,
     cloud_deploy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tunnel: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -376,7 +409,9 @@ pub async fn launch(
         local_base_url: url.clone(),
         setup_session_id,
         setup_tunnel: Mutex::new(None),
+        setup_tunnel_start: AsyncMutex::new(()),
         setup_runtime: Mutex::new(None),
+        setup_runtime_start: AsyncMutex::new(()),
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
     });
@@ -413,6 +448,8 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
             get(get_provider_setup_events).post(post_provider_setup_event),
         )
         .route("/api/draft", post(post_draft))
+        .route("/api/setup-public-url", post(post_setup_public_url))
+        .route("/api/setup-action", post(post_setup_action))
         .route("/api/execute", post(post_execute))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
@@ -516,6 +553,12 @@ async fn get_scope(State(state): State<std::sync::Arc<UiState>>) -> Json<ScopeRe
     let effective_tenant = cli_tenant.clone();
 
     let cloud_deploy = prefill_has_cloud_deployment_targets(state.prefill_answers.as_ref());
+    let tunnel = crate::platform_setup::load_tunnel_artifact(bundle_path)
+        .ok()
+        .flatten()
+        .and_then(|answers| answers.mode)
+        .map(|mode| mode.trim().to_string())
+        .filter(|mode| !mode.is_empty());
 
     Json(ScopeResponse {
         tenant: effective_tenant,
@@ -523,6 +566,7 @@ async fn get_scope(State(state): State<std::sync::Arc<UiState>>) -> Json<ScopeRe
         env: cli_env.clone(),
         detected_tenant,
         cloud_deploy,
+        tunnel,
     })
 }
 
@@ -832,7 +876,9 @@ async fn get_providers(
                             .get(&q.id)
                             .and_then(value_as_nonempty_string)
                     {
-                        info.saved_value = Some(val);
+                        if !info.secret {
+                            info.saved_value = Some(val);
+                        }
                         found = true;
                         break;
                     }
@@ -842,7 +888,9 @@ async fn get_providers(
             if !found {
                 for secrets in saved_secrets.values() {
                     if let Some(val) = secrets.get(&q.id) {
-                        info.saved_value = Some(val.clone());
+                        if !info.secret {
+                            info.saved_value = Some(val.clone());
+                        }
                         break;
                     }
                 }
@@ -898,8 +946,12 @@ async fn get_providers(
                             .and_then(|m| m.get(&q.id))
                             .and_then(value_as_nonempty_string)
                         {
-                            info.saved_value = Some(val);
-                        } else if let Some(val) = saved.and_then(|m| m.get(&q.id)) {
+                            if !info.secret {
+                                info.saved_value = Some(val);
+                            }
+                        } else if let Some(val) = saved.and_then(|m| m.get(&q.id))
+                            && !info.secret
+                        {
                             info.saved_value = Some(val.clone());
                         }
                         // Hydrate kind: List rows from --answers (if it
@@ -1089,23 +1141,79 @@ fn load_setup_machine_descriptor(provider: &discovery::DetectedProvider) -> Opti
 
 fn load_setup_actions_descriptor(provider: &discovery::DetectedProvider) -> Option<Value> {
     let extension =
-        discovery::read_pack_extension(&provider.pack_path, "greentic.setup.actions.v1").ok()??;
-    let inline = extension_inline(&extension)?.clone();
-    if inline
-        .get("schema_id")
-        .and_then(Value::as_str)
-        .is_some_and(|schema| schema != "greentic.setup.actions.v1")
-    {
+        discovery::read_pack_extension(&provider.pack_path, "greentic.setup.actions.v1").ok()?;
+    if let Some(extension) = extension {
+        let mut inline = extension_inline(&extension)?.clone();
+        if inline
+            .get("schema_id")
+            .and_then(Value::as_str)
+            .is_some_and(|schema| schema != "greentic.setup.actions.v1")
+        {
+            return None;
+        }
+        let provider_id = inline.get("provider_id")?.as_str()?.trim();
+        if provider_id != provider.provider_id {
+            return None;
+        }
+        if !inline.get("actions").is_some_and(Value::is_array) {
+            return None;
+        }
+        merge_legacy_setup_actions(provider, &mut inline);
+        return Some(inline);
+    }
+    load_legacy_setup_actions_descriptor(provider)
+}
+
+fn merge_legacy_setup_actions(provider: &discovery::DetectedProvider, descriptor: &mut Value) {
+    let Some(legacy) = load_legacy_setup_actions_descriptor(provider) else {
+        return;
+    };
+    let Some(legacy_actions) = legacy.get("actions").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(actions) = descriptor.get_mut("actions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut seen_ids = actions
+        .iter()
+        .filter_map(|action| action.get("id").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    for action in legacy_actions {
+        let id = action.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty() || seen_ids.insert(id.to_string()) {
+            actions.push(action.clone());
+        }
+    }
+}
+
+fn load_legacy_setup_actions_descriptor(provider: &discovery::DetectedProvider) -> Option<Value> {
+    let spec = crate::setup_input::load_setup_spec(&provider.pack_path)
+        .ok()
+        .flatten()?;
+    if spec.setup_actions.is_empty() {
         return None;
     }
-    let provider_id = inline.get("provider_id")?.as_str()?.trim();
-    if provider_id != provider.provider_id {
-        return None;
+    let mut actions = spec.setup_actions;
+    normalize_setup_action_provider_ids(&mut actions, &provider.provider_id);
+    Some(serde_json::json!({
+        "schema_id": "greentic.setup.actions.v1",
+        "provider_id": provider.provider_id,
+        "source": "legacy_setup_yaml",
+        "actions": actions,
+    }))
+}
+
+fn normalize_setup_action_provider_ids(actions: &mut [Value], provider_id: &str) {
+    for action in actions {
+        let Some(map) = action.as_object_mut() else {
+            continue;
+        };
+        map.insert(
+            "provider_id".to_string(),
+            Value::String(provider_id.to_string()),
+        );
     }
-    if !inline.get("actions").is_some_and(Value::is_array) {
-        return None;
-    }
-    Some(inline)
 }
 
 fn load_setup_backend_contract_asset(
@@ -4093,7 +4201,10 @@ fn setup_backend_response_needs_oauth(response: &Value) -> bool {
         || text.contains("token exp")
         || text.contains("lifetime validation failed")
         || text.contains("token is expired");
-    says_unauthorized && says_expired
+    let says_invalid = text.contains("invalid token")
+        || text.contains("access token is invalid")
+        || text.contains("invalid access token");
+    says_unauthorized && (says_expired || says_invalid)
 }
 
 fn setup_backend_oauth_token_key_for_action(
@@ -5894,6 +6005,19 @@ async fn post_draft(
     State(state): State<std::sync::Arc<UiState>>,
     Json(req): Json<DraftSaveRequest>,
 ) -> Json<Value> {
+    if let Some(mode) = req.tunnel.as_deref() {
+        let tunnel = crate::platform_setup::TunnelAnswers {
+            mode: Some(mode.to_string()),
+        };
+        if let Err(err) =
+            crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)
+        {
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": err.to_string(),
+            }));
+        }
+    }
     match persist_ui_draft(
         &state.bundle_path,
         &req.tenant,
@@ -5912,6 +6036,213 @@ async fn post_draft(
             "error": err.to_string(),
         })),
     }
+}
+
+async fn post_setup_action(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<SetupActionRequest>,
+) -> Json<Value> {
+    match execute_setup_action(state.as_ref(), req).await {
+        Ok(value) => Json(value),
+        Err(err) => Json(serde_json::json!({
+            "ok": false,
+            "error": err.to_string(),
+        })),
+    }
+}
+
+async fn post_setup_public_url(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<SetupPublicUrlRequest>,
+) -> Json<Value> {
+    match ensure_setup_public_url(state.as_ref(), req).await {
+        Ok(public_base_url) => Json(serde_json::json!({
+            "ok": true,
+            "public_base_url": public_base_url,
+        })),
+        Err(err) => Json(serde_json::json!({
+            "ok": false,
+            "error": err.to_string(),
+        })),
+    }
+}
+
+async fn ensure_setup_public_url(state: &UiState, req: SetupPublicUrlRequest) -> Result<String> {
+    let mode = req
+        .tunnel
+        .as_deref()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| setup_backend_tunnel_mode(state).ok().flatten())
+        .unwrap_or_else(|| "off".to_string());
+    if !matches!(mode.as_str(), "cloudflared" | "ngrok") {
+        anyhow::bail!("setup tunnel is disabled");
+    }
+    let tunnel = crate::platform_setup::TunnelAnswers {
+        mode: Some(mode.clone()),
+    };
+    crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)?;
+    let _tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
+    let _team = req.team.or_else(|| state.team.clone());
+    let _env = req.env.unwrap_or_else(|| state.env.clone());
+    ensure_setup_tunnel(state, &mode, &state.local_base_url).await
+}
+
+async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Result<Value> {
+    let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
+    let team = req.team.or_else(|| state.team.clone());
+    let env = req.env.unwrap_or_else(|| state.env.clone());
+    let mut answers = req.answers;
+    let tunnel_mode = setup_action_tunnel_mode(state, req.tunnel.as_deref())?;
+    ensure_setup_action_provider_answers(&mut answers, &req.provider_id);
+    if let Some(mode) = req.tunnel.as_deref() {
+        let tunnel = crate::platform_setup::TunnelAnswers {
+            mode: Some(mode.to_string()),
+        };
+        crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)?;
+    }
+    if should_start_setup_tunnel(&tunnel_mode, &answers) {
+        let url = ensure_setup_tunnel(state, &tunnel_mode, &state.local_base_url).await?;
+        inject_setup_public_base_url(&mut answers, &url);
+    }
+    persist_ui_draft(&state.bundle_path, &tenant, team.as_deref(), &env, &answers).await?;
+
+    let discovered = discovery::discover(&state.bundle_path)?;
+    let provider = discovered
+        .find_setup_target(&req.provider_id)
+        .ok_or_else(|| anyhow!("provider not found: {}", req.provider_id))?;
+    let descriptor = load_setup_actions_descriptor(provider)
+        .ok_or_else(|| anyhow!("provider has no setup actions: {}", req.provider_id))?;
+    let action = descriptor
+        .get("actions")
+        .and_then(Value::as_array)
+        .and_then(|actions| {
+            actions
+                .iter()
+                .find(|action| action.get("id").and_then(Value::as_str) == Some(&req.action_id))
+        })
+        .ok_or_else(|| anyhow!("setup action not found: {}", req.action_id))?;
+    if action.get("kind").and_then(Value::as_str) != Some("oauth_install_button") {
+        anyhow::bail!("setup action kind is not executable in this phase");
+    }
+    let registration = action
+        .get("registration")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("setup action missing registration metadata"))?;
+    let mut config = answers
+        .get(&req.provider_id)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    config.insert("tenant".to_string(), Value::String(tenant.clone()));
+    config.insert(
+        "team".to_string(),
+        Value::String(team.clone().unwrap_or_else(|| "default".to_string())),
+    );
+    config.insert("env".to_string(), Value::String(env.clone()));
+    setup_backend_apply_host_defaults(state, &tenant, &mut config);
+
+    let request = Value::Object(config.clone());
+    let setup_config = SetupConfig {
+        tenant: tenant.clone(),
+        team: team.clone(),
+        env: env.clone(),
+        offline: false,
+        verbose: state.advanced,
+    };
+    let output = if let Some(result) = registration
+        .get("result")
+        .or_else(|| registration.get("mock_result"))
+        .or_else(|| registration.get("outputs"))
+    {
+        result.clone()
+    } else {
+        let component_ref = registration
+            .get("component_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("setup action registration missing component_ref"))?;
+        let op = registration
+            .get("op")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("setup action registration missing op"))?;
+        invoke_setup_component_operation_blocking(
+            state.bundle_path.clone(),
+            provider.pack_path.clone(),
+            component_ref.to_string(),
+            op.to_string(),
+            request,
+            setup_config,
+        )
+        .await?
+    };
+    if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "provider_id": req.provider_id,
+            "action_id": req.action_id,
+            "error": output.get("error").and_then(Value::as_str).unwrap_or("setup action failed"),
+            "output": redact_setup_action_output(&output),
+        }));
+    }
+
+    merge_scalar_values(&mut config, &output);
+    let final_url_context = SetupActionFinalUrlContext {
+        bundle_root: &state.bundle_path,
+        tenant: &tenant,
+        team: team.as_deref(),
+        provider_id: &req.provider_id,
+        action_id: &req.action_id,
+    };
+    if let Some((key, url)) =
+        setup_action_final_url_value(&descriptor, action, &config, &final_url_context)?
+    {
+        config.insert(key, Value::String(url));
+    }
+    crate::qa::persist::persist_all_config_as_secrets(
+        &state.bundle_path,
+        &env,
+        &tenant,
+        team.as_deref(),
+        &req.provider_id,
+        &Value::Object(config.clone()),
+        Some(&provider.pack_path),
+    )
+    .await?;
+    let safe_values = public_setup_action_values(&config);
+    Ok(serde_json::json!({
+        "ok": true,
+        "provider_id": req.provider_id,
+        "action_id": req.action_id,
+        "values": safe_values,
+        "state": {
+            "values": safe_values,
+            "setup_status": { "ok": true }
+        },
+        "setup_status": { "ok": true },
+        "output": redact_setup_action_output(&output),
+    }))
+}
+
+fn setup_action_tunnel_mode(state: &UiState, requested: Option<&str>) -> Result<String> {
+    if let Some(mode) = requested
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(ToString::to_string)
+    {
+        return Ok(mode);
+    }
+    Ok(setup_backend_tunnel_mode(state)?.unwrap_or_else(|| "off".to_string()))
+}
+
+fn ensure_setup_action_provider_answers(answers: &mut JsonMap<String, Value>, provider_id: &str) {
+    answers
+        .entry(provider_id.to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
 }
 
 #[derive(Deserialize)]
@@ -6135,11 +6466,52 @@ fn append_line(existing: &str, line: &str) -> String {
 }
 
 async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) -> Result<String> {
-    let existing = {
+    if let Some(existing) = active_setup_tunnel_public_base_url(state, mode, local_base_url)? {
+        if setup_backend_public_tunnel_responds(&existing).await {
+            return Ok(existing);
+        }
+        anyhow::bail!("{mode} setup tunnel URL did not become reachable: {existing}");
+    }
+
+    let _start_guard = state.setup_tunnel_start.lock().await;
+    if let Some(existing) = active_setup_tunnel_public_base_url(state, mode, local_base_url)? {
+        if setup_backend_public_tunnel_responds(&existing).await {
+            return Ok(existing);
+        }
+        anyhow::bail!("{mode} setup tunnel URL did not become reachable: {existing}");
+    }
+
+    let local_base_url = local_base_url.trim_end_matches('/').to_string();
+    let mode_for_task = mode.to_string();
+    let local_base_url_for_task = local_base_url.clone();
+    let tunnel = tokio::task::spawn_blocking(move || {
+        start_setup_tunnel(&mode_for_task, &local_base_url_for_task)
+    })
+    .await
+    .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
+    let public_base_url = tunnel.public_base_url.clone();
+    if wait_for_setup_public_tunnel(&public_base_url).await {
         let mut guard = state
             .setup_tunnel
             .lock()
             .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
+        *guard = Some(tunnel);
+        return Ok(public_base_url);
+    }
+    drop(tunnel);
+    anyhow::bail!("{mode} setup tunnel URL did not become reachable: {public_base_url}")
+}
+
+fn active_setup_tunnel_public_base_url(
+    state: &UiState,
+    mode: &str,
+    local_base_url: &str,
+) -> Result<Option<String>> {
+    let mut guard = state
+        .setup_tunnel
+        .lock()
+        .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
+    Ok(
         if let Some(tunnel) = guard.as_mut()
             && tunnel.mode == mode
             && tunnel.local_base_url == local_base_url.trim_end_matches('/')
@@ -6148,27 +6520,8 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
             Some(tunnel.public_base_url.clone())
         } else {
             None
-        }
-    };
-    if let Some(existing) = existing {
-        if setup_backend_public_tunnel_responds(&existing).await {
-            return Ok(existing);
-        }
-        setup_backend_clear_setup_tunnel(state);
-    }
-
-    let mode = mode.to_string();
-    let local_base_url = local_base_url.trim_end_matches('/').to_string();
-    let tunnel = tokio::task::spawn_blocking(move || start_setup_tunnel(&mode, &local_base_url))
-        .await
-        .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
-    let public_base_url = tunnel.public_base_url.clone();
-    let mut guard = state
-        .setup_tunnel
-        .lock()
-        .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
-    *guard = Some(tunnel);
-    Ok(public_base_url)
+        },
+    )
 }
 
 fn setup_backend_clear_setup_tunnel(state: &UiState) {
@@ -6177,7 +6530,19 @@ fn setup_backend_clear_setup_tunnel(state: &UiState) {
     }
 }
 
+async fn wait_for_setup_public_tunnel(public_base_url: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    while tokio::time::Instant::now() < deadline {
+        if setup_backend_public_tunnel_responds(public_base_url).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
 async fn ensure_setup_runtime(state: &UiState, tenant: &str) -> Result<()> {
+    let _start_guard = state.setup_runtime_start.lock().await;
     if let Some(runtime_base_url) = setup_backend_setup_runtime_info(state)
         .and_then(|info| info.local_base_url)
         .filter(|value| !value.trim().is_empty())
@@ -6509,6 +6874,248 @@ fn value_as_nonempty_string(v: &Value) -> Option<String> {
     }
 }
 
+fn merge_scalar_values(target: &mut JsonMap<String, Value>, source: &Value) {
+    let Some(object) = source.as_object() else {
+        return;
+    };
+    for (key, value) in object {
+        match value {
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => {
+                target.insert(key.clone(), value.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn public_setup_action_values(values: &JsonMap<String, Value>) -> Value {
+    Value::Object(
+        values
+            .iter()
+            .filter(|(key, value)| {
+                !is_setup_action_secret_key(key)
+                    && matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_))
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn redact_setup_action_output(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    if is_setup_action_secret_key(key) {
+                        (key.clone(), Value::String("[redacted]".to_string()))
+                    } else {
+                        (key.clone(), redact_setup_action_output(value))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_setup_action_output).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn is_setup_action_secret_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.contains("accesstoken")
+        || normalized.contains("refreshtoken")
+        || normalized.contains("idtoken")
+        || normalized.contains("devicecode")
+        || normalized.contains("clientsecret")
+        || normalized.contains("signingsecret")
+        || normalized.contains("password")
+        || normalized.contains("secret")
+        || normalized.contains("credential")
+        || normalized.ends_with("token")
+}
+
+struct SetupActionFinalUrlContext<'a> {
+    bundle_root: &'a Path,
+    tenant: &'a str,
+    team: Option<&'a str>,
+    provider_id: &'a str,
+    action_id: &'a str,
+}
+
+fn setup_action_final_url_value(
+    descriptor: &Value,
+    action: &Value,
+    config: &JsonMap<String, Value>,
+    context: &SetupActionFinalUrlContext<'_>,
+) -> Result<Option<(String, String)>> {
+    let key = setup_action_final_url_key(descriptor);
+    if let Some(key) = key.as_deref()
+        && let Some(url) = config
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        return Ok(Some((key.to_string(), url.to_string())));
+    }
+    let Some(url) = build_oauth_install_url(
+        context.bundle_root,
+        action,
+        config,
+        context.tenant,
+        context.team,
+        context.provider_id,
+        context.action_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        key.unwrap_or_else(|| "oauth_authorize_url".to_string()),
+        url,
+    )))
+}
+
+fn setup_action_final_url_key(descriptor: &Value) -> Option<String> {
+    descriptor
+        .get("actions")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|action| action.get("kind").and_then(Value::as_str) == Some("deep_link"))
+        .find_map(|action| {
+            let template = action.get("url_template").and_then(Value::as_str)?;
+            if let Some(name) = template
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(name.to_string());
+            }
+            action
+                .get("requires")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|value| value.ends_with("_url"))
+                .map(ToString::to_string)
+        })
+}
+
+fn build_oauth_install_url(
+    bundle_root: &Path,
+    action: &Value,
+    config: &JsonMap<String, Value>,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+    action_id: &str,
+) -> Result<Option<String>> {
+    let Some(authorize_url) = config
+        .get("oauth_authorize_url")
+        .and_then(Value::as_str)
+        .or_else(|| action.get("authorize_url").and_then(Value::as_str))
+    else {
+        return Ok(None);
+    };
+    let mut parsed = Url::parse(authorize_url).context("setup action authorize_url is invalid")?;
+    if let Some(client_id_field) = action.get("client_id_field").and_then(Value::as_str)
+        && let Some(client_id) = config.get(client_id_field).and_then(Value::as_str)
+        && !client_id.trim().is_empty()
+    {
+        set_url_query_key(&mut parsed, "client_id", client_id.trim());
+    }
+    if let Some(scopes) = action.get("scopes").and_then(Value::as_array) {
+        let scopes = scopes
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if !scopes.is_empty() {
+            let separator = action
+                .get("scope_separator")
+                .and_then(Value::as_str)
+                .unwrap_or(",");
+            if !url_query_contains(&parsed, "scope") {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("scope", &scopes.join(separator));
+            }
+        }
+    }
+    if let Some(redirect_path) = action.get("redirect_path").and_then(Value::as_str)
+        && let Some(public_base_url) = config.get("public_base_url").and_then(Value::as_str)
+        && !public_base_url.trim().is_empty()
+    {
+        let redirect_uri = format!(
+            "{}{}",
+            public_base_url.trim().trim_end_matches('/'),
+            if redirect_path.starts_with('/') {
+                redirect_path.to_string()
+            } else {
+                format!("/{redirect_path}")
+            }
+        );
+        set_url_query_key(&mut parsed, "redirect_uri", &redirect_uri);
+    }
+    let mut persisted_action = action.clone();
+    let Some(object) = persisted_action.as_object_mut() else {
+        anyhow::bail!("setup action must be an object");
+    };
+    object.insert("id".to_string(), Value::String(action_id.to_string()));
+    object.insert(
+        "provider_id".to_string(),
+        Value::String(provider_id.to_string()),
+    );
+    remove_url_query_key(&mut parsed, "state");
+    object.insert(
+        "authorize_url".to_string(),
+        Value::String(parsed.to_string()),
+    );
+    let mut actions = crate::setup_actions::extract_setup_actions(
+        provider_id,
+        tenant,
+        team,
+        &serde_json::json!({ "setup_actions": [persisted_action] }),
+    )?;
+    crate::setup_actions::sign_pending_oauth_actions(bundle_root, &mut actions)?;
+    crate::setup_actions::persist_setup_actions(bundle_root, &actions)?;
+    Ok(actions.into_iter().find_map(|action| action.authorize_url))
+}
+
+fn url_query_contains(url: &Url, key: &str) -> bool {
+    url.query_pairs().any(|(candidate, _)| candidate == key)
+}
+
+fn remove_url_query_key(url: &mut Url, key: &str) {
+    replace_url_query_pairs(url, |candidate, _| candidate != key);
+}
+
+fn set_url_query_key(url: &mut Url, key: &str, value: &str) {
+    replace_url_query_pairs(url, |candidate, _| candidate != key);
+    url.query_pairs_mut().append_pair(key, value);
+}
+
+fn replace_url_query_pairs<F>(url: &mut Url, keep: F)
+where
+    F: Fn(&str, &str) -> bool,
+{
+    let pairs = url
+        .query_pairs()
+        .filter(|(candidate, value)| keep(candidate, value))
+        .map(|(candidate, value)| (candidate.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    if !pairs.is_empty() {
+        url.query_pairs_mut().extend_pairs(pairs);
+    }
+}
+
 fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> QuestionInfo {
     let visible_if = q.visible_if.as_ref().and_then(|v| match v {
         qa_spec::Expr::Eq { left, right } => {
@@ -6607,7 +7214,7 @@ mod tests {
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use greentic_secrets_lib::SecretsStore;
+    use greentic_secrets_lib::{SecretFormat, SecretsStore};
     use serde_json::{Map as JsonMap, Value, json};
     use std::io::Write;
     use std::sync::Mutex;
@@ -6629,7 +7236,9 @@ mod tests {
             local_base_url: "http://127.0.0.1:12345".to_string(),
             setup_session_id: "test-session".to_string(),
             setup_tunnel: Mutex::new(None),
+            setup_tunnel_start: tokio::sync::Mutex::new(()),
             setup_runtime: Mutex::new(None),
+            setup_runtime_start: tokio::sync::Mutex::new(()),
             shutdown_tx,
             result: Mutex::new(None),
         })
@@ -6793,6 +7402,152 @@ mod tests {
             })
             .to_string()
             .as_bytes(),
+        )?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    fn write_pack_with_legacy_setup_actions(
+        path: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(
+            json!({
+                "pack_id": provider_id,
+                "display_name": "Legacy Action Provider"
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())?;
+        zip.write_all(
+            br#"
+provider_id: generic
+version: 1
+title: Generic provider setup
+setup_actions:
+  - id: create_app
+    label: Create Provider App
+    kind: oauth_install_button
+    provider_id: provider-alias
+    authorize_url: "https://provider.example/install"
+    redirect_path: "/oauth/callback/provider"
+    client_id_field: provider_client_id
+    scopes:
+      - chat:write
+    registration:
+      component_ref: provider-setup
+      op: setup_app_registration
+      mock_result:
+        ok: true
+        provider_client_id: generated-client
+        provider_client_secret: generated-secret
+        oauth_authorize_url: https://provider.example/install?client_id=stale-client&redirect_uri=https%3A%2F%2Fold.example.test%2Fcallback&state=provider-state
+"#,
+        )?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    fn write_pack_with_final_and_legacy_setup_actions(
+        path: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(
+            json!({
+                "pack_id": provider_id,
+                "display_name": "Combined Action Provider",
+                "extensions": {
+                    "greentic.setup.actions.v1": {
+                        "kind": "greentic.setup.actions.v1",
+                        "inline": {
+                            "schema_id": "greentic.setup.actions.v1",
+                            "provider_id": provider_id,
+                            "actions": [{
+                                "id": "add-to-provider",
+                                "label": "Add to Provider",
+                                "kind": "deep_link",
+                                "url_template": "{add_url}",
+                                "requires": ["add_url"],
+                                "visible_when": {
+                                    "setup_status.ok": true
+                                }
+                            }]
+                        }
+                    }
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())?;
+        zip.write_all(
+            br#"
+provider_id: generic
+version: 1
+title: Generic provider setup
+setup_actions:
+  - id: create_app
+    label: Create Provider App
+    kind: oauth_install_button
+    provider_id: provider-alias
+    authorize_url: "https://provider.example/install"
+    redirect_path: "/oauth/callback/provider"
+    client_id_field: provider_client_id
+    scopes:
+      - chat:write
+    registration:
+      component_ref: provider-setup
+      op: setup_app_registration
+      mock_result:
+        ok: true
+        provider_client_id: generated-client
+        provider_client_secret: generated-secret
+        oauth_authorize_url: https://provider.example/install?client_id=stale-client&redirect_uri=https%3A%2F%2Fold.example.test%2Fcallback&state=provider-state
+"#,
+        )?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    fn write_pack_with_secret_and_public_questions(
+        path: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(
+            json!({
+                "pack_id": provider_id,
+                "display_name": "Question Provider"
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())?;
+        zip.write_all(
+            br#"
+provider_id: generic
+version: 1
+title: Generic provider setup
+questions:
+  - name: provider_public_field
+    title: Public field
+    kind: string
+    required: false
+  - name: provider_secret_field
+    title: Secret field
+    kind: string
+    required: true
+    secret: true
+"#,
         )?;
         zip.finish()?;
         Ok(())
@@ -7118,6 +7873,64 @@ mod tests {
         let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
 
         assert_eq!(mode.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn setup_backend_tunnel_mode_honors_persisted_ngrok() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::platform_setup::persist_tunnel_artifact(
+            temp.path(),
+            &crate::platform_setup::TunnelAnswers {
+                mode: Some("ngrok".to_string()),
+            },
+        )
+        .expect("persist tunnel");
+        let state = test_ui_state(temp.path());
+
+        let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
+
+        assert_eq!(mode.as_deref(), Some("ngrok"));
+    }
+
+    #[test]
+    fn setup_action_tunnel_mode_uses_persisted_selection_when_request_omits_tunnel() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::platform_setup::persist_tunnel_artifact(
+            temp.path(),
+            &crate::platform_setup::TunnelAnswers {
+                mode: Some("ngrok".to_string()),
+            },
+        )
+        .expect("persist tunnel");
+        let state = test_ui_state(temp.path());
+
+        assert_eq!(
+            super::setup_action_tunnel_mode(&state, None).unwrap(),
+            "ngrok"
+        );
+        assert_eq!(
+            super::setup_action_tunnel_mode(&state, Some("cloudflared")).unwrap(),
+            "cloudflared"
+        );
+    }
+
+    #[test]
+    fn setup_action_provider_answers_allow_public_base_url_injection_for_empty_request() {
+        let mut answers = JsonMap::new();
+
+        super::ensure_setup_action_provider_answers(&mut answers, "messaging-example");
+
+        assert!(crate::setup_tunnel::should_start_setup_tunnel(
+            "ngrok", &answers
+        ));
+        crate::setup_tunnel::inject_setup_public_base_url(
+            &mut answers,
+            "https://example.ngrok-free.app",
+        );
+        assert_eq!(
+            answers["messaging-example"]["public_base_url"],
+            json!("https://example.ngrok-free.app")
+        );
     }
 
     #[test]
@@ -7594,6 +8407,58 @@ mod tests {
             "management_access_token"
         );
         assert_eq!(first_pending, "management_auth");
+    }
+
+    #[test]
+    fn setup_backend_provider_http_oauth_required_handles_invalid_access_token() {
+        let contract = super::ProviderBackendContract {
+            provider_id: "generic-provider".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["auth", "discover"],
+                "actions": [{
+                    "id": "auth",
+                    "completion": {
+                        "state_path": "oauth.default.ok",
+                        "exists": true
+                    },
+                    "executor": {
+                        "kind": "oauth_device_code",
+                        "token_store_key": "access_token"
+                    }
+                }, {
+                    "id": "discover",
+                    "completion": {
+                        "state_path": "last_discover.ok",
+                        "equals": true
+                    },
+                    "executor": {
+                        "kind": "provider_http",
+                        "state_store_key": "last_discover",
+                        "body": {
+                            "access_token": "{access_token}"
+                        }
+                    }
+                }]
+            }),
+            load_error: None,
+        };
+        let action = super::setup_backend_action_by_id(&contract, "discover").unwrap();
+        let response = json!({
+            "ok": false,
+            "response": {
+                "ok": false,
+                "blocked": true,
+                "error": "Azure subscription discovery failed (HTTP 401): The access token is invalid."
+            }
+        });
+
+        let result =
+            super::setup_backend_provider_http_oauth_required_result(&contract, action, &response)
+                .expect("invalid token should require OAuth");
+
+        assert_eq!(result["result"]["error"], "oauth_required");
+        assert_eq!(result["result"]["token_store_key"], "access_token");
     }
 
     #[test]
@@ -8800,7 +9665,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["ok"], true);
+        if body["ok"] != true {
+            panic!("{body}");
+        }
         assert_eq!(body["setup_status"]["ok"], false);
         assert_eq!(body["setup_status"]["items"].as_array().unwrap().len(), 3);
     }
@@ -8928,6 +9795,456 @@ mod tests {
             provider["setup_actions"]["actions"][0]["url_template"],
             "{add_url}"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_setup_actions_are_exposed_for_setup_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_legacy_setup_actions(
+            &providers.join("messaging-legacy-actions.gtpack"),
+            "messaging-legacy-actions",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("providers response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let provider = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == "messaging-legacy-actions")
+            .expect("provider");
+
+        assert_eq!(
+            provider["setup_actions"]["schema_id"],
+            "greentic.setup.actions.v1"
+        );
+        assert_eq!(
+            provider["setup_actions"]["actions"][0]["kind"],
+            "oauth_install_button"
+        );
+        assert_eq!(
+            provider["setup_actions"]["actions"][0]["provider_id"],
+            "messaging-legacy-actions"
+        );
+        assert_eq!(
+            provider["setup_actions"]["actions"][0]["authorize_url"],
+            "https://provider.example/install"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_actions_extension_and_legacy_actions_are_both_exposed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_final_and_legacy_setup_actions(
+            &providers.join("messaging-combined-actions.gtpack"),
+            "messaging-combined-actions",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("providers response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let provider = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == "messaging-combined-actions")
+            .expect("provider");
+        let actions = provider["setup_actions"]["actions"].as_array().unwrap();
+
+        assert!(actions.iter().any(|action| {
+            action["kind"] == "oauth_install_button"
+                && action["authorize_url"] == "https://provider.example/install"
+        }));
+        assert!(actions.iter().any(|action| {
+            action["kind"] == "deep_link" && action["url_template"] == "{add_url}"
+        }));
+    }
+
+    #[tokio::test]
+    async fn setup_action_endpoint_runs_registration_and_returns_final_url_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_final_and_legacy_setup_actions(
+            &providers.join("messaging-combined-actions.gtpack"),
+            "messaging-combined-actions",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup-action")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider_id": "messaging-combined-actions",
+                            "action_id": "create_app",
+                            "tenant": "demo",
+                            "team": "support",
+                            "env": "dev",
+                            "tunnel": "off",
+                            "answers": {
+                                "messaging-combined-actions": {
+                                    "public_base_url": "https://runtime.example.test"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("setup action response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(body["ok"] == true, "{body}");
+        let add_url = body["values"]["add_url"].as_str().expect("add url");
+        assert!(add_url.starts_with("https://provider.example/install?"));
+        assert!(add_url.contains("client_id=generated-client"));
+        assert!(!add_url.contains("client_id=stale-client"));
+        assert!(add_url.contains("scope=chat%3Awrite"));
+        assert!(add_url.contains(
+            "redirect_uri=https%3A%2F%2Fruntime.example.test%2Foauth%2Fcallback%2Fprovider"
+        ));
+        assert!(!add_url.contains("old.example.test"));
+        assert!(add_url.contains("state="));
+        assert!(body["values"].get("provider_client_secret").is_none());
+        assert_eq!(
+            body["output"]["provider_client_secret"],
+            Value::String("[redacted]".to_string())
+        );
+        let action = crate::setup_actions::load_setup_action(
+            temp.path(),
+            "demo",
+            "support",
+            "messaging-combined-actions",
+            "create_app",
+        )
+        .unwrap()
+        .expect("persisted setup action");
+        assert_eq!(
+            action.status,
+            crate::setup_actions::SetupActionStatus::Pending
+        );
+        assert!(action.state.is_some());
+        assert_eq!(action.authorize_url.as_deref(), Some(add_url));
+        assert_eq!(action.provider_id, "messaging-combined-actions");
+        let state = url::Url::parse(add_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .expect("signed state");
+        assert_ne!(state, "provider-state");
+        let key = crate::setup_actions::load_or_create_signing_key(temp.path()).unwrap();
+        let payload = crate::setup_actions::validate_oauth_state(
+            &state,
+            &key,
+            Some("messaging-combined-actions"),
+            Some("demo"),
+            Some("support"),
+            crate::setup_actions::current_epoch_secs(),
+        )
+        .unwrap();
+        assert_eq!(payload.action_id, "create_app");
+    }
+
+    #[tokio::test]
+    async fn setup_action_endpoint_returns_oauth_url_without_deep_link_action() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_legacy_setup_actions(
+            &providers.join("messaging-legacy-actions.gtpack"),
+            "messaging-legacy-actions",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup-action")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider_id": "messaging-legacy-actions",
+                            "action_id": "create_app",
+                            "tenant": "demo",
+                            "team": "support",
+                            "env": "dev",
+                            "tunnel": "off",
+                            "answers": {
+                                "messaging-legacy-actions": {
+                                    "public_base_url": "https://runtime.example.test"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("setup action response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(body["ok"] == true, "{body}");
+        let add_url = body["values"]["oauth_authorize_url"]
+            .as_str()
+            .expect("oauth authorize url");
+        assert!(add_url.starts_with("https://provider.example/install?"));
+        assert!(add_url.contains("client_id=generated-client"));
+        assert!(!add_url.contains("client_id=stale-client"));
+        assert!(add_url.contains("scope=chat%3Awrite"));
+        assert!(add_url.contains(
+            "redirect_uri=https%3A%2F%2Fruntime.example.test%2Foauth%2Fcallback%2Fprovider"
+        ));
+        assert!(!add_url.contains("old.example.test"));
+        assert!(add_url.contains("state="));
+        assert!(!add_url.contains("provider-state"));
+        let action = crate::setup_actions::load_setup_action(
+            temp.path(),
+            "demo",
+            "support",
+            "messaging-legacy-actions",
+            "create_app",
+        )
+        .unwrap()
+        .expect("persisted setup action");
+        assert_eq!(action.authorize_url.as_deref(), Some(add_url));
+    }
+
+    #[tokio::test]
+    async fn draft_endpoint_persists_selected_tunnel_without_answers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let app = build_router(test_ui_state(temp.path()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/draft")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant": "demo",
+                            "team": "support",
+                            "env": "dev",
+                            "tunnel": "ngrok",
+                            "answers": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("draft response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["ok"] == true, "{body}");
+
+        let tunnel = crate::platform_setup::load_tunnel_artifact(temp.path())
+            .unwrap()
+            .expect("tunnel artifact");
+        assert_eq!(tunnel.mode.as_deref(), Some("ngrok"));
+    }
+
+    #[tokio::test]
+    async fn provider_api_does_not_return_saved_values_for_secret_questions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_secret_and_public_questions(
+            &providers.join("messaging-question-provider.gtpack"),
+            "messaging-question-provider",
+        )
+        .expect("pack");
+
+        let store = open_dev_store(temp.path()).expect("open store");
+        store
+            .put(
+                &crate::canonical_secret_uri(
+                    "dev",
+                    "demo",
+                    Some("support"),
+                    "messaging-question-provider",
+                    "provider_public_field",
+                ),
+                SecretFormat::Text,
+                b"public-value",
+            )
+            .await
+            .expect("store public");
+        store
+            .put(
+                &crate::canonical_secret_uri(
+                    "dev",
+                    "demo",
+                    Some("support"),
+                    "messaging-question-provider",
+                    "provider_secret_field",
+                ),
+                SecretFormat::Text,
+                b"secret-value",
+            )
+            .await
+            .expect("store secret");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("providers response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let questions = body["provider_forms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|form| form["provider_id"] == "messaging-question-provider")
+            .expect("provider form")["questions"]
+            .as_array()
+            .unwrap();
+        let public = questions
+            .iter()
+            .find(|question| question["id"] == "provider_public_field")
+            .expect("public question");
+        let secret = questions
+            .iter()
+            .find(|question| question["id"] == "provider_secret_field")
+            .expect("secret question");
+
+        assert_eq!(public["saved_value"], "public-value");
+        assert!(secret.get("saved_value").is_none());
+    }
+
+    #[test]
+    fn setup_ui_resolves_final_actions_even_when_setup_result_failed() {
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(app_js.contains("var finalActions = resolveFinalSetupActions();"));
+        assert!(!app_js.contains("var finalActions = ok ? resolveFinalSetupActions() : [];"));
+    }
+
+    #[test]
+    fn setup_ui_resolves_final_actions_from_provider_answers() {
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(
+            app_js.contains(
+                "mergeFinalSetupActionContext(context, scope && scope.answers && scope.answers[provider.provider_id]);"
+            ),
+            "final setup actions must see provider form answers such as bot_username and bot_email"
+        );
+    }
+
+    #[test]
+    fn setup_ui_opens_returned_install_url_after_provider_setup_action() {
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(app_js.contains("var popup = openProviderInstallWindow();"));
+        assert!(app_js.contains("var installUrl = setupActionReturnedFinalUrl(provider, result);"));
+        assert!(app_js.contains("navigateProviderInstallWindow(popup, installUrl);"));
+    }
+
+    #[test]
+    fn setup_ui_provider_setup_action_back_and_continue_do_not_trap_admin() {
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(app_js.contains("var canContinue = completed || !!error;"));
+        assert!(app_js.contains("providerHasFormQuestions(p)"));
+        assert!(app_js.contains("state.phase = \"providers\";"));
+    }
+
+    #[test]
+    fn setup_ui_serializes_setup_tunnel_start_without_retrying_new_tunnels() {
+        let ui_rs = include_str!("mod.rs");
+        assert!(ui_rs.contains("setup_tunnel_start: AsyncMutex<()>"));
+        assert!(ui_rs.contains("let _start_guard = state.setup_tunnel_start.lock().await;"));
+        assert!(ui_rs.contains("Duration::from_secs(45)"));
+    }
+
+    #[test]
+    fn setup_ui_persists_selected_tunnel_before_provider_steps() {
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(app_js.contains("state.defaultTunnel = scopeData.tunnel ||"));
+        assert!(app_js.contains("if (scope.tunnel) payload.tunnel = scope.tunnel;"));
+        assert!(app_js.contains("Object.keys(payload.answers).length === 0 && !payload.tunnel"));
+        assert!(app_js.contains(
+            "persistDraftNow().finally(function () {\n        state.phase = \"providers\";"
+        ));
+    }
+
+    #[test]
+    fn setup_ui_web_component_continue_is_not_blocked_by_partial_or_failed_setup() {
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(app_js.contains("function markCanContinue(detail)"));
+        assert!(app_js.contains("markCanContinue(detail);"));
+        assert!(app_js.contains("if (submit) submit.disabled = false;"));
+        assert!(app_js.contains("complete: existing.complete === true"));
+        assert!(app_js.contains("continued: true"));
+        assert!(app_js.contains("return !detailProviderId || detailProviderId === providerId;"));
+    }
+
+    #[test]
+    fn setup_runtime_start_is_serialized() {
+        let ui_rs = include_str!("mod.rs");
+        assert!(ui_rs.contains("setup_runtime_start: AsyncMutex<()>"));
+        assert!(ui_rs.contains("let _start_guard = state.setup_runtime_start.lock().await;"));
+    }
+
+    #[test]
+    fn setup_ui_prefills_required_public_base_url_from_selected_tunnel() {
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(app_js.contains("providerNeedsGeneratedPublicBaseUrl(scope, p, form)"));
+        assert!(app_js.contains("fetch(\"/api/setup-public-url\""));
+        assert!(app_js.contains("store.public_base_url = result.public_base_url;"));
+        assert!(app_js.contains("q.id === \"public_base_url\" && q.required === true"));
+    }
+
+    #[test]
+    fn setup_public_url_endpoint_reuses_setup_tunnel_lifecycle() {
+        let ui_rs = include_str!("mod.rs");
+        assert!(ui_rs.contains(".route(\"/api/setup-public-url\", post(post_setup_public_url))"));
+        assert!(ui_rs.contains("async fn ensure_setup_public_url"));
+        assert!(ui_rs.contains("ensure_setup_tunnel(state, &mode, &state.local_base_url).await"));
     }
 
     #[tokio::test]
