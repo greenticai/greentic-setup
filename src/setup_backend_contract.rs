@@ -7,11 +7,14 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use serde_json::{Map as JsonMap, Value};
 use url::Url;
+
+const REDACTED_SECRET_MARKER: &str = "[redacted:dev-secret]";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredProviderHttpRoute {
@@ -1598,7 +1601,10 @@ fn response_needs_oauth(response: &Value) -> bool {
         || text.contains("token exp")
         || text.contains("lifetime validation failed")
         || text.contains("token is expired");
-    says_unauthorized && says_expired
+    let says_invalid = text.contains("invalid token")
+        || text.contains("access token is invalid")
+        || text.contains("invalid access token");
+    says_unauthorized && (says_expired || says_invalid)
 }
 
 fn odata_string(value: &str) -> String {
@@ -2507,13 +2513,16 @@ pub fn reset_backend_state(
 
 pub fn load_backend_state(
     bundle_root: &Path,
-    _env: &str,
+    env: &str,
     tenant: &str,
     team: &str,
     provider_id: &str,
 ) -> anyhow::Result<JsonMap<String, Value>> {
     let path = backend_state_path(bundle_root, tenant, team, provider_id)?;
-    Ok(read_state_file(&path)?.unwrap_or_default())
+    let mut stored = read_state_file(&path)?.unwrap_or_default();
+    hydrate_redacted_backend_config(bundle_root, env, tenant, team, provider_id, &mut stored)?;
+    repair_redacted_display_codes(&mut stored);
+    Ok(stored)
 }
 
 pub fn save_backend_state(
@@ -2528,9 +2537,253 @@ pub fn save_backend_state(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create setup backend state dir {}", parent.display()))?;
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(stored)?)
+    let env = backend_state_env(stored);
+    persist_sensitive_backend_config(bundle_root, &env, tenant, team, provider_id, stored)?;
+    let redacted = redact_backend_state_for_disk(stored);
+    std::fs::write(&path, serde_json::to_vec_pretty(&redacted)?)
         .with_context(|| format!("write setup backend state {}", path.display()))?;
     Ok(path)
+}
+
+fn backend_state_env(stored: &JsonMap<String, Value>) -> String {
+    stored
+        .get("config")
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("env"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("dev")
+        .to_string()
+}
+
+fn persist_sensitive_backend_config(
+    bundle_root: &Path,
+    env: &str,
+    tenant: &str,
+    team: &str,
+    provider_id: &str,
+    stored: &JsonMap<String, Value>,
+) -> anyhow::Result<()> {
+    let Some(config) = stored.get("config").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let sensitive: JsonMap<String, Value> = config
+        .iter()
+        .filter(|(key, value)| {
+            is_sensitive_backend_state_key(key) && !value_is_redacted_marker(value)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if sensitive.is_empty() {
+        return Ok(());
+    }
+    let config = Value::Object(sensitive);
+    let bundle_root = bundle_root.to_path_buf();
+    let env = env.to_string();
+    let tenant = tenant.to_string();
+    let team = team.to_string();
+    let provider_id = provider_id.to_string();
+    block_on_backend_secret_task(async move {
+        crate::qa::persist::persist_all_config_as_secrets(
+            &bundle_root,
+            &env,
+            &tenant,
+            Some(&team),
+            &provider_id,
+            &config,
+            None,
+        )
+        .await
+    })
+    .map(|_| ())
+}
+
+fn hydrate_redacted_backend_config(
+    bundle_root: &Path,
+    env: &str,
+    tenant: &str,
+    team: &str,
+    provider_id: &str,
+    stored: &mut JsonMap<String, Value>,
+) -> anyhow::Result<()> {
+    let Some(config) = stored.get_mut("config").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let keys: Vec<String> = config
+        .iter()
+        .filter(|(key, value)| {
+            is_sensitive_backend_state_key(key) && value_is_redacted_marker(value)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let bundle_root = bundle_root.to_path_buf();
+    let env = env.to_string();
+    let tenant = tenant.to_string();
+    let team = team.to_string();
+    let provider_id = provider_id.to_string();
+    let hydrated = block_on_backend_secret_task(async move {
+        use greentic_secrets_lib::SecretsStore;
+
+        let store = crate::secrets::open_dev_store(&bundle_root)?;
+        let mut values = JsonMap::new();
+        for key in keys {
+            let uri = crate::canonical_secret_uri(&env, &tenant, Some(&team), &provider_id, &key);
+            if let Ok(bytes) = store.get(&uri).await
+                && let Ok(text) = String::from_utf8(bytes)
+                && !text.is_empty()
+            {
+                values.insert(key, Value::String(text));
+            }
+        }
+        Ok::<_, anyhow::Error>(values)
+    })?;
+    for (key, value) in hydrated {
+        config.insert(key, value);
+    }
+    Ok(())
+}
+
+fn redact_backend_state_for_disk(stored: &JsonMap<String, Value>) -> JsonMap<String, Value> {
+    stored
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                redact_backend_state_value(Some(key.as_str()), value),
+            )
+        })
+        .collect()
+}
+
+fn redact_backend_state_value(key: Option<&str>, value: &Value) -> Value {
+    if let Some(key) = key
+        && is_sensitive_backend_state_key(key)
+        && !value.is_null()
+    {
+        return Value::String(REDACTED_SECRET_MARKER.to_string());
+    }
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        redact_backend_state_value(Some(key.as_str()), value),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_backend_state_value(None, item))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn is_sensitive_backend_state_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if normalized.ends_with("url") {
+        return false;
+    }
+    normalized.contains("accesstoken")
+        || normalized.contains("refreshtoken")
+        || normalized.contains("idtoken")
+        || normalized.contains("devicecode")
+        || normalized.contains("password")
+        || normalized.contains("secret")
+        || normalized.contains("credential")
+        || normalized.ends_with("token")
+}
+
+fn value_is_redacted_marker(value: &Value) -> bool {
+    value.as_str() == Some(REDACTED_SECRET_MARKER)
+}
+
+fn repair_redacted_display_codes(stored: &mut JsonMap<String, Value>) {
+    for value in stored.values_mut() {
+        repair_redacted_display_codes_in_value(value);
+    }
+}
+
+fn repair_redacted_display_codes_in_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let fallback_code = object
+                .values()
+                .filter_map(Value::as_str)
+                .filter(|text| *text != REDACTED_SECRET_MARKER)
+                .find_map(extract_display_code_from_text);
+            for (key, child) in object.iter_mut() {
+                if is_display_code_key(key) && value_is_redacted_marker(child) {
+                    if let Some(code) = fallback_code.as_ref() {
+                        *child = Value::String(code.clone());
+                    }
+                } else {
+                    repair_redacted_display_codes_in_value(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                repair_redacted_display_codes_in_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_display_code_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized == "usercode" || normalized.ends_with("usercode")
+}
+
+fn extract_display_code_from_text(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let code_at = lower.find("code")?;
+    let after_code = text.get(code_at + "code".len()..)?;
+    after_code
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .map(str::trim)
+        .filter(|token| {
+            let len = token.len();
+            (4..=32).contains(&len)
+                && token.chars().any(|ch| ch.is_ascii_alphabetic())
+                && token.chars().any(|ch| ch.is_ascii_digit())
+        })
+        .map(ToString::to_string)
+        .next()
+}
+
+fn block_on_backend_secret_task<F, T>(future: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build setup backend secret runtime")?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| anyhow!("setup backend secret task panicked"))?
 }
 
 fn read_state_file(path: &Path) -> anyhow::Result<Option<JsonMap<String, Value>>> {
@@ -2941,6 +3194,29 @@ mod tests {
             }),
         );
         assert_eq!(blocked_from_result(&oauth).unwrap()["retryable"], true);
+    }
+
+    #[test]
+    fn oauth_required_result_treats_invalid_access_token_as_reauth() {
+        let action = json!({"id": "discover"});
+        let result = oauth_required_result(
+            &action,
+            "access_token",
+            "authenticated request failed",
+            &json!({
+                "ok": false,
+                "status": 401,
+                "body": {
+                    "error": "Azure subscription discovery failed (HTTP 401): The access token is invalid."
+                }
+            }),
+        )
+        .expect("invalid token should require OAuth");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["result"]["error"], "oauth_required");
+        assert_eq!(result["result"]["token_store_key"], "access_token");
+        assert_eq!(blocked_from_result(&result).unwrap()["retryable"], true);
     }
 
     #[test]
@@ -3435,6 +3711,81 @@ mod tests {
             new_path.strip_prefix(temp.path()).unwrap(),
             Path::new("state/setup/demo/default/messaging-teams/backend-contract.json")
         );
+    }
+
+    #[test]
+    fn backend_state_redacts_secret_config_on_disk_and_hydrates_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "env": "dev",
+                "service_access_token": "access-secret",
+                "client_password": "password-secret",
+                "oauth_token_url": "https://login.example/token",
+                "public_base_url": "https://runtime.example.com"
+            }),
+        );
+        stored.insert(
+            "last_oauth".to_string(),
+            json!({
+                "response": {
+                    "user_code": "SECRET-CODE",
+                    "verification_uri": "https://login.example/device"
+                }
+            }),
+        );
+
+        let path = save_backend_state(temp.path(), "demo", "default", "messaging-generic", &stored)
+            .expect("save state");
+        let raw = std::fs::read_to_string(&path).expect("read state");
+
+        assert!(!raw.contains("access-secret"));
+        assert!(!raw.contains("password-secret"));
+        assert!(raw.contains("SECRET-CODE"));
+        assert!(raw.contains(REDACTED_SECRET_MARKER));
+        assert!(raw.contains("https://login.example/token"));
+        assert!(raw.contains("https://runtime.example.com"));
+
+        let loaded = load_backend_state(temp.path(), "dev", "demo", "default", "messaging-generic")
+            .expect("load state");
+        assert_eq!(loaded["config"]["service_access_token"], "access-secret");
+        assert_eq!(loaded["config"]["client_password"], "password-secret");
+        assert_eq!(
+            loaded["config"]["oauth_token_url"],
+            "https://login.example/token"
+        );
+        assert_eq!(loaded["last_oauth"]["response"]["user_code"], "SECRET-CODE");
+    }
+
+    #[test]
+    fn backend_state_repairs_redacted_display_code_from_device_login_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = backend_state_path(temp.path(), "demo", "default", "messaging-generic")
+            .expect("state path");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("state dir");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "config": {
+                    "env": "dev"
+                },
+                "last_oauth": {
+                    "response": {
+                        "message": "Open the verification page and enter the code LKZE33H3X to continue.",
+                        "user_code": REDACTED_SECRET_MARKER,
+                        "verification_uri": "https://login.example/device"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write state");
+
+        let loaded = load_backend_state(temp.path(), "dev", "demo", "default", "messaging-generic")
+            .expect("load state");
+        assert_eq!(loaded["last_oauth"]["response"]["user_code"], "LKZE33H3X");
     }
 
     #[test]
