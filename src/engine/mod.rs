@@ -447,6 +447,586 @@ setup_answers:
     }
 
     #[test]
+    fn execute_persists_static_routes_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: None,
+            env: "prod".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut metadata = build_metadata(&empty_request(bundle_root.clone()), Vec::new(), vec![]);
+        metadata.static_routes = StaticRoutesPolicy {
+            public_web_enabled: true,
+            public_base_url: Some("https://example.com".into()),
+            public_surface_policy: "enabled".into(),
+            default_route_prefix_policy: "pack_declared".into(),
+            tenant_path_policy: "pack_declared".into(),
+            ..StaticRoutesPolicy::default()
+        };
+
+        execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        let artifact = static_routes_artifact_path(&bundle_root);
+        assert!(artifact.exists());
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(artifact).unwrap()).unwrap();
+        assert_eq!(stored["public_web_enabled"], json!(true));
+    }
+
+    #[test]
+    fn setup_actions_are_persisted_and_stripped_from_provider_config() {
+        // Focused coverage for the setup-actions handling that
+        // `execute_apply_pack_setup` performs before writing provider config:
+        // an `oauth_install_button` answer is extracted into a pending action,
+        // persisted to the per-provider actions state file, and removed from
+        // the answers that get written as provider config.
+        //
+        // This deliberately exercises the `setup_actions` module directly
+        // rather than the full `execute_apply_pack_setup` path: that path is
+        // gated by the B12a fail-closed secret-classification contract (a pack
+        // with no setup metadata is refused), which is covered by the unit
+        // tests in `engine::executors`.
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().to_path_buf();
+
+        let answers = json!({
+            "bot_token": "secret",
+            "setup_actions": [{
+                "id": "install",
+                "kind": "oauth_install_button",
+                "label": "Add to Example",
+                "authorize_url": "https://example.com/oauth"
+            }]
+        });
+
+        let actions = crate::setup_actions::extract_setup_actions(
+            "messaging-example",
+            "demo",
+            Some("default"),
+            &answers,
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].kind,
+            crate::setup_actions::SetupActionKind::OauthInstallButton
+        );
+
+        crate::setup_actions::persist_setup_actions(&bundle_root, &actions).unwrap();
+        let action_path = crate::setup_actions::setup_actions_state_path(
+            &bundle_root,
+            "demo",
+            "default",
+            "messaging-example",
+        );
+        assert!(action_path.exists());
+        let state: crate::setup_actions::SetupActionStateFile =
+            serde_json::from_str(&std::fs::read_to_string(&action_path).unwrap()).unwrap();
+        assert_eq!(state.actions.len(), 1);
+        assert_eq!(state.actions[0].id, "install");
+
+        // Provider config keeps real answers but drops the setup-action payload.
+        let persisted = crate::setup_actions::strip_setup_actions(&answers);
+        assert!(persisted.get("setup_actions").is_none());
+        assert_eq!(persisted["bot_token"], json!("secret"));
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_persists_pack_declared_setup_actions() {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        let providers_dir = bundle_root.join("providers/messaging");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        let pack_path = providers_dir.join("messaging-slack.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options).unwrap();
+        writer
+            .write_all(
+                json!({
+                    "pack_id": "messaging-slack",
+                    "display_name": "Slack"
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.start_file("assets/setup.yaml", options).unwrap();
+        writer
+            .write_all(
+                br#"
+title: Slack
+questions: []
+setup_actions:
+  - id: add_to_slack
+    label: Add to Slack
+    kind: oauth_install_button
+    provider_id: slack
+    authorize_url: https://slack.example/install
+"#,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let request = empty_request(bundle_root.clone());
+        let plan = engine.plan(SetupMode::Create, &request, false).unwrap();
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.kind == crate::plan::SetupStepKind::ApplyPackSetup),
+            "pack-declared setup actions should schedule ApplyPackSetup"
+        );
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        assert_eq!(report.pending_setup_actions.len(), 1);
+        assert_eq!(report.pending_setup_actions[0].id, "add_to_slack");
+        assert_eq!(report.pending_setup_actions[0].label, "Add to Slack");
+        assert_eq!(
+            report.pending_setup_actions[0].provider_id,
+            "messaging-slack"
+        );
+        let action_path = crate::setup_actions::setup_actions_state_path(
+            &bundle_root,
+            "demo",
+            "default",
+            "messaging-slack",
+        );
+        assert!(action_path.exists());
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_hydrates_oauth_install_url_from_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        // A pack with classifiable setup metadata so B12a can resolve a form
+        // spec for `messaging-example`; the install action itself is
+        // answer-provided, which is the behavior under test.
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions:
+  - name: workspace_name
+    kind: string
+"#,
+            json!({"operations": {}}),
+        );
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request.setup_answers.insert(
+            "messaging-example".into(),
+            json!({
+                "slack_client_id": "client-123",
+                "setup_actions": [{
+                    "id": "install",
+                    "kind": "oauth_install_button",
+                    "label": "Add",
+                    "authorize_url": "https://slack.com/oauth/v2/authorize",
+                    "client_id_field": "slack_client_id",
+                    "scopes": ["chat:write", "channels:read"]
+                }]
+            }),
+        );
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        let url = report.pending_setup_actions[0]
+            .authorize_url
+            .as_deref()
+            .unwrap();
+        assert!(url.contains("client_id=client-123"), "{url}");
+        assert!(
+            url.contains("scope=chat%3Awrite%2Cchannels%3Aread"),
+            "{url}"
+        );
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_runs_pack_declared_registration_before_oauth_hydration() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions:
+  - name: workspace_name
+    kind: string
+setup_actions:
+  - id: install
+    label: Add
+    kind: oauth_install_button
+    authorize_url: https://example.com/oauth
+    client_id_source: registration
+    client_id_field: oauth_client_id
+    registration:
+      component_ref: components/registration.json
+      op: register
+      app_name_field: app_name
+      client_id_output: registered_client_id
+      client_secret_output: registered_client_secret
+      app_id_output: registered_app_id
+"#,
+            json!({
+                "operations": {
+                    "register": {
+                        "result": {
+                            "registered_client_id": "client-from-registration",
+                            "registered_client_secret": "secret-from-registration",
+                            "registered_app_id": "app-from-registration"
+                        }
+                    }
+                }
+            }),
+        );
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request
+            .setup_answers
+            .insert("messaging-example".into(), json!({"app_name": "Demo App"}));
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        let url = report.pending_setup_actions[0]
+            .authorize_url
+            .as_deref()
+            .unwrap();
+        // The hydrated `client_id` proves the pack-declared registration ran
+        // and produced the OAuth client id BEFORE the install URL was built —
+        // the unique coverage of this test. Where those registration outputs
+        // land (setup-answers.json vs the dev secrets store) is the B12a
+        // redaction concern, covered by the `engine::executors` unit tests, so
+        // we don't re-assert it here.
+        assert!(url.contains("client_id=client-from-registration"), "{url}");
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_skips_actions_for_disabled_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions: []
+setup_actions:
+  - id: install
+    label: Add
+    kind: oauth_install_button
+    authorize_url: https://example.com/oauth
+    client_id_source: registration
+    client_id_field: oauth_client_id
+    registration:
+      component_ref: components/registration.json
+      op: register
+      client_id_output: registered_client_id
+"#,
+            json!({
+                "operations": {
+                    "register": {
+                        "result": {
+                            "registered_client_id": "client-from-registration"
+                        }
+                    }
+                }
+            }),
+        );
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request
+            .setup_answers
+            .insert("messaging-example".into(), json!({"enabled": false}));
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+
+        assert!(report.pending_setup_actions.is_empty());
+        assert!(
+            !bundle_root
+                .join("state/config/setup-actions/demo/default/messaging-example.json")
+                .exists()
+        );
+        let setup_answers_path =
+            bundle_root.join("state/config/messaging-example/setup-answers.json");
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(setup_answers_path).unwrap()).unwrap();
+        assert_eq!(stored["enabled"], json!(false));
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_uses_bundle_name_for_registration_app_name_template() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions:
+  - name: workspace_name
+    kind: string
+setup_actions:
+  - id: install
+    label: Add
+    kind: oauth_install_button
+    authorize_url: https://example.com/oauth
+    client_id_source: registration
+    client_id_field: oauth_client_id
+    app_name_template: "{{ bundle_name }} Slack"
+    default_app_name: "Greentic Slack"
+    registration:
+      component_ref: components/registration.json
+      op: register
+      app_name_field: slack_app_name
+      config_access_token_field: access_token
+      client_id_output: app_name
+      app_id_output: slack_app_name
+"#,
+            json!({
+                "operations": {
+                    "register": {
+                        "echo_request": true
+                    }
+                }
+            }),
+        );
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request.bundle_name = Some("Acme Support".into());
+        request
+            .setup_answers
+            .insert("messaging-example".into(), json!({"access_token": "token"}));
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+
+        // The registration echoes the templated app name into both
+        // `app_name` and `slack_app_name`. Post-B12a these registration
+        // outputs are persisted to the dev secrets store (every config value
+        // is readable via the secrets API), not written back into
+        // setup-answers.json, so assert against the store. `canonical_secret_uri`
+        // collapses the literal "default" team into the `_` wildcard segment.
+        use greentic_secrets_lib::SecretsStore as _;
+        let store = crate::secrets::open_dev_store(&bundle_root).expect("open dev store");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // setup uses the A4b `dev` -> `local` env alias for the secrets URI.
+        let env = crate::resolve_env(Some("dev"));
+        let read = |key: &str| -> String {
+            let uri = crate::canonical_secret_uri(
+                &env,
+                "demo",
+                Some("default"),
+                "messaging-example",
+                key,
+            );
+            let bytes = rt
+                .block_on(async { store.get(&uri).await })
+                .unwrap_or_else(|_| panic!("missing dev-store key: {key}"));
+            String::from_utf8(bytes).expect("utf8")
+        };
+        assert_eq!(read("slack_app_name"), "Acme Support Slack");
+        assert_eq!(read("app_name"), "Acme Support Slack");
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_registration_failure_does_not_persist_broken_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions: []
+setup_actions:
+  - id: install
+    label: Add
+    kind: oauth_install_button
+    authorize_url: https://example.com/oauth
+    client_id_source: registration
+    registration:
+      component_ref: components/registration.json
+      op: register
+      config_access_token_field: config_token
+      client_id_output: client_id
+"#,
+            json!({"operations": {}}),
+        );
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request
+            .setup_answers
+            .insert("messaging-example".into(), json!({"config_token": "token"}));
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let err = execute_apply_pack_setup(&bundle_root, &metadata, engine.config())
+            .expect_err("registration failure should fail setup");
+        assert!(
+            err.to_string()
+                .contains("failed to run setup action registration"),
+            "{err:#}"
+        );
+        let action_path = crate::setup_actions::setup_actions_state_path(
+            &bundle_root,
+            "demo",
+            "default",
+            "messaging-example",
+        );
+        assert!(!action_path.exists());
+    }
+
+    #[test]
+    fn execute_apply_pack_setup_registration_passes_original_input_field_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions:
+  - name: workspace_name
+    kind: string
+setup_actions:
+  - id: install
+    label: Add
+    kind: oauth_install_button
+    authorize_url: https://example.com/oauth
+    client_id_source: registration
+    registration:
+      component_ref: components/registration.json
+      op: register
+      config_access_token_field: provider_specific_token
+      client_id_output: provider_specific_token
+"#,
+            json!({
+                "operations": {
+                    "register": {
+                        "echo_request": true
+                    }
+                }
+            }),
+        );
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        request.setup_answers.insert(
+            "messaging-example".into(),
+            json!({"provider_specific_token": "client-from-original-field"}),
+        );
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        let url = report.pending_setup_actions[0]
+            .authorize_url
+            .as_deref()
+            .unwrap();
+        assert!(
+            url.contains("client_id=client-from-original-field"),
+            "{url}"
+        );
+    }
+
+    fn write_registration_test_pack(
+        bundle_root: &std::path::Path,
+        setup_yaml: &str,
+        registration_component: serde_json::Value,
+    ) {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let providers_dir = bundle_root.join("providers/messaging");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        let pack_path = providers_dir.join("messaging-example.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options).unwrap();
+        writer
+            .write_all(
+                json!({
+                    "pack_id": "messaging-example",
+                    "display_name": "Example"
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.start_file("assets/setup.yaml", options).unwrap();
+        writer.write_all(setup_yaml.as_bytes()).unwrap();
+        writer
+            .start_file("components/registration.json", options)
+            .unwrap();
+        writer
+            .write_all(registration_component.to_string().as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
     fn execute_create_persists_platform_metadata_without_provider_steps() {
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");

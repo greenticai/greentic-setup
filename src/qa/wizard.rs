@@ -72,7 +72,9 @@ pub fn run_qa_setup(
         if spec.questions.is_empty() {
             Value::Object(JsonMap::new())
         } else if interactive {
-            do_prompt_answers(spec, provider_id, advanced)?
+            // Provider-setup flow opts out of wizard localization (None) — its
+            // prompt chrome stays in English, unchanged by the env-wizard work.
+            do_prompt_answers(spec, provider_id, advanced, None)?
         } else {
             return Err(anyhow!(
                 "setup answers required for {provider_id} but run is non-interactive"
@@ -207,8 +209,9 @@ pub fn run_qa_setup_with_shared(
         if spec.questions.is_empty() {
             Value::Object(JsonMap::new())
         } else if interactive {
-            // Prompt with merged initial answers (shared + provider-specific)
-            do_prompt_with_existing(spec, provider_id, advanced, &merged_initial)?
+            // Prompt with merged initial answers (shared + provider-specific).
+            // None: provider-setup flow keeps English prompt chrome.
+            do_prompt_with_existing(spec, provider_id, advanced, &merged_initial, None)?
         } else {
             // Non-interactive: check for missing required fields
             let mut answers = crate::setup_input::ensure_object(merged_initial)?;
@@ -289,7 +292,7 @@ fn prompt_for_missing_fields(
             }
         }
 
-        if let Some(value) = prompt_question(question)? {
+        if let Some(value) = prompt_question(question, None)? {
             answers.insert(question.id.clone(), value);
         }
     }

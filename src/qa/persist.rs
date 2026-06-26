@@ -1,17 +1,30 @@
 //! Persist config and secrets from QA apply-answers output.
 //!
 //! After a provider's `apply-answers` op returns a config object, this module:
-//! - Extracts all fields (WASM components read both secret and non-secret config
-//!   values via the secrets API) and writes them to the dev secrets store.
+//! - Writes every visible answer to the dev secrets store under
+//!   `secrets://<env>/<tenant>/<team>/<provider>/<key>` (legacy universal
+//!   write — WASM components have historically read both secret and
+//!   non-secret config values through the secrets API).
+//! - Emits a new sibling `pack-config-input.v1` file via
+//!   [`emit_pack_config_input`] when the wizard scope is known. This is the
+//!   C7 producer for the `pack-config.v1.non_secret` channel: the greentic-
+//!   deployer picks up the file at revision-create, stamps the active
+//!   `revision_id`, and writes the final `pack-config.v1` that
+//!   [`RuntimeConfigHost`](https://docs.rs/greentic-interfaces-wasmtime)
+//!   reads (C4). The universal DevStore write stays alive for one release as
+//!   the C4.2 compatibility shim — runtime reads of non-secret keys fall back
+//!   to it with a once-per-process deprecation warning.
 //! - Provides filtering to separate secret from non-secret fields.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use greentic_secrets_lib::{
     ApplyOptions, DevStore, SecretFormat, SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed,
 };
 use qa_spec::{FormSpec, VisibilityMode, resolve_visibility};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 
 use crate::canonical_secret_uri;
@@ -252,7 +265,10 @@ pub async fn persist_all_config_as_secrets(
 
 /// Convenience function to persist both secrets and config from QA results.
 ///
-/// Creates a `DevStore` from the bundle root and persists both.
+/// Creates a `DevStore` from the bundle root and persists every answer there
+/// (legacy universal-write — see module docs). Additionally emits a
+/// `pack-config-input.v1` file (C7) so the deployer can populate the
+/// `pack-config.v1.non_secret` channel at revision-create.
 #[allow(clippy::too_many_arguments)]
 pub async fn persist_qa_results(
     bundle_root: &Path,
@@ -265,7 +281,39 @@ pub async fn persist_qa_results(
     let env = crate::resolve_env(None);
     let store = crate::secrets::open_dev_store(bundle_root)?;
 
-    persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await
+    let keys =
+        persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await?;
+
+    let bundle_id = infer_bundle_id(bundle_root);
+    if let Err(err) = emit_pack_config_input(
+        bundle_root,
+        &env,
+        &bundle_id,
+        provider_id,
+        config,
+        form_spec,
+    ) {
+        // Soft-fail: the C4.2 compatibility shim still serves these keys
+        // from DevStore (already populated above), so a wizard run does not
+        // regress on emit failure. The deployer (C7 PR4) will report
+        // missing-input at revision-create.
+        tracing::warn!(
+            provider_id,
+            env = %env,
+            bundle_id = %bundle_id,
+            bundle_root = %bundle_root.display(),
+            error = %err,
+            "pack-config-input emission failed; runtime falls back to legacy DevStore reads via C4.2 compat shim",
+        );
+    }
+
+    Ok(keys)
+}
+
+/// Re-export of [`crate::bundle::infer_bundle_id`] for callers that don't
+/// have an explicit `bundle_id` field in their context.
+pub(crate) fn infer_bundle_id(root: &Path) -> String {
+    crate::bundle::infer_bundle_id(root)
 }
 
 /// OAuth authorization stub.
@@ -348,6 +396,163 @@ fn value_to_text(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+// ── pack-config-input.v1 emitter (C7) ──────────────────────────────────────
+
+/// Schema tag for the wizard-emitted intermediate file consumed by the
+/// greentic-deployer at revision-create.
+pub const PACK_CONFIG_INPUT_SCHEMA: &str = "greentic.pack-config-input.v1";
+
+/// Directory under `bundle_root` where wizard-emitted pack-config inputs land.
+/// The deployer joins on `<bundle_root>/<PACK_CONFIG_INPUT_DIR>/<pack_id>.json`
+/// at revision-create.
+pub const PACK_CONFIG_INPUT_DIR: &str = "state/pack-configs";
+
+/// Wizard-emitted intermediate file the deployer picks up at revision-create
+/// (C7). The deployer stamps the active `revision_id` and writes the final
+/// `pack-config.v1` referenced by `pack_config_refs` in `runtime-config.v1`.
+/// We keep `revision_id` OUT of this shape on purpose: revisions are minted
+/// by the deployer, not the wizard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackConfigInput {
+    pub schema: String,
+    pub pack_id: String,
+    pub env_id: String,
+    pub bundle_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub non_secret: BTreeMap<String, Value>,
+    /// `secret://<env>/<bundle>/<pack>/<question>` URIs (kept as plain
+    /// strings here — `greentic-deploy-spec::SecretRef` validates at the
+    /// deployer side when it materializes the final `pack-config.v1`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_refs: BTreeMap<String, String>,
+}
+
+/// Emit a `pack-config-input.v1` file at
+/// `<bundle_root>/state/pack-configs/<pack_id>.json` carrying the FormSpec-
+/// split of one provider's QA answers (C7). Idempotent: overwrites in place
+/// so re-running the wizard produces the same on-disk shape.
+///
+/// Secret-marked answers are recorded as `secret://<env>/<bundle>/<pack>/<key>`
+/// URI references (no plaintext); non-secret answers stay inline. Empty
+/// `config` is a no-op (no file written).
+///
+/// Calling this directly from greentic-setup callers gives them a stable
+/// public API surface; the existing `persist_qa_secrets` /
+/// `persist_all_config_as_secrets` keep their universal DevStore writes as
+/// the C4.2 compatibility-shim path until the deployer is fully wired and a
+/// follow-up drops the redundant writes.
+pub fn emit_pack_config_input(
+    bundle_root: &Path,
+    env_id: &str,
+    bundle_id: &str,
+    pack_id: &str,
+    config: &Value,
+    form_spec: &FormSpec,
+) -> Result<Option<std::path::PathBuf>> {
+    validate_segment("env_id", env_id)?;
+    validate_segment("bundle_id", bundle_id)?;
+    validate_segment("pack_id", pack_id)?;
+
+    let Some(config_map) = config.as_object() else {
+        return Ok(None);
+    };
+    if config_map.is_empty() {
+        return Ok(None);
+    }
+
+    // Apply the same visibility filter that `persist_qa_secrets` uses so
+    // that conditionally-invisible answers do not leak into the
+    // pack-config-input file (and from there into runtime config).
+    let visibility = resolve_visibility(form_spec, config, VisibilityMode::Visible);
+
+    let secret_ids: std::collections::HashSet<&str> = form_spec
+        .questions
+        .iter()
+        .filter(|q| q.secret)
+        .map(|q| q.id.as_str())
+        .collect();
+
+    let visible_ids: std::collections::HashSet<&str> = form_spec
+        .questions
+        .iter()
+        .filter(|q| visibility.get(&q.id).copied().unwrap_or(true))
+        .map(|q| q.id.as_str())
+        .collect();
+
+    let mut non_secret = BTreeMap::new();
+    let mut secret_refs = BTreeMap::new();
+    for (key, value) in config_map {
+        // Skip keys that are not visible according to the form spec's
+        // visibility rules (matches `persist_qa_secrets` behavior).
+        if !visible_ids.contains(key.as_str()) {
+            continue;
+        }
+        let text = value_to_text(value);
+        if text.is_empty() || text == "null" {
+            continue;
+        }
+        if secret_ids.contains(key.as_str()) {
+            validate_segment("question.id", key)?;
+            let uri = format!("secret://{env_id}/{bundle_id}/{pack_id}/{key}");
+            secret_refs.insert(key.clone(), uri);
+        } else {
+            non_secret.insert(key.clone(), value.clone());
+        }
+    }
+
+    if non_secret.is_empty() && secret_refs.is_empty() {
+        return Ok(None);
+    }
+
+    let input = PackConfigInput {
+        schema: PACK_CONFIG_INPUT_SCHEMA.to_string(),
+        pack_id: pack_id.to_string(),
+        env_id: env_id.to_string(),
+        bundle_id: bundle_id.to_string(),
+        non_secret,
+        secret_refs,
+    };
+
+    let dir = bundle_root.join(PACK_CONFIG_INPUT_DIR);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create pack-config-input dir {}", dir.display()))?;
+    let path = dir.join(format!("{pack_id}.json"));
+    let body = serde_json::to_string_pretty(&input).context("serialize pack-config-input.v1")?;
+    std::fs::write(&path, format!("{body}\n"))
+        .with_context(|| format!("write pack-config-input {}", path.display()))?;
+
+    tracing::debug!(
+        pack_id,
+        env_id,
+        bundle_id,
+        non_secret_count = input.non_secret.len(),
+        secret_ref_count = input.secret_refs.len(),
+        path = %path.display(),
+        "wizard emitted pack-config-input.v1 (C7) for deployer pickup",
+    );
+    Ok(Some(path))
+}
+
+/// Reject empty or `/`-bearing identifiers — these would silently corrupt the
+/// `secret://<env>/<bundle>/<pack>/<question>` path structure or the
+/// `<dir>/<pack_id>.json` file path.
+fn validate_segment(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} must not be empty for pack-config-input emission");
+    }
+    if value.contains('/') {
+        anyhow::bail!(
+            "{label} `{value}` contains '/' which would corrupt the pack-config-input layout"
+        );
+    }
+    if value == "." || value == ".." {
+        anyhow::bail!(
+            "{label} `{value}` is a relative path component and would corrupt the pack-config-input layout"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -547,5 +752,173 @@ mod tests {
             oauth_authorize_stub("messaging-slack", Some("https://auth.example.com")).is_none()
         );
         assert!(oauth_authorize_stub("messaging-slack", None).is_none());
+    }
+
+    // ── C7: pack-config-input.v1 emitter ──────────────────────────────────
+
+    /// Secrets land as `secret://` URI refs (no plaintext); non-secrets stay
+    /// inline. Empty config → no file written.
+    #[test]
+    fn emit_pack_config_input_splits_secret_vs_non_secret() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let form = make_form_spec(vec![
+            question("enabled", false),
+            question("bot_token", true),
+            question("public_url", false),
+        ]);
+        let config = json!({
+            "enabled": true,
+            "bot_token": "shhh",
+            "public_url": "https://example.com",
+        });
+        let path =
+            emit_pack_config_input(root, "local", "test-bundle", "provider-a", &config, &form)
+                .expect("emit")
+                .expect("path");
+        assert!(path.exists());
+        let bytes = std::fs::read(&path).expect("read");
+        let parsed: PackConfigInput = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(parsed.schema, PACK_CONFIG_INPUT_SCHEMA);
+        assert_eq!(parsed.pack_id, "provider-a");
+        assert_eq!(parsed.env_id, "local");
+        assert_eq!(parsed.bundle_id, "test-bundle");
+        assert_eq!(
+            parsed.non_secret.get("enabled"),
+            Some(&Value::Bool(true)),
+            "non-secret inline"
+        );
+        assert_eq!(
+            parsed.non_secret.get("public_url"),
+            Some(&Value::String("https://example.com".into())),
+        );
+        assert!(
+            !parsed.non_secret.contains_key("bot_token"),
+            "secret must not be in non_secret"
+        );
+        assert_eq!(
+            parsed.secret_refs.get("bot_token").map(String::as_str),
+            Some("secret://local/test-bundle/provider-a/bot_token"),
+            "secret recorded as URI ref"
+        );
+        // No plaintext for the secret anywhere in the file.
+        let body = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !body.contains("shhh"),
+            "plaintext secret leaked into pack-config-input: {body}"
+        );
+    }
+
+    /// Same answers + same bundle_id + same provider_id, different env_id →
+    /// different secret_refs. Pins the env-segment integrity of the URI.
+    #[test]
+    fn emit_pack_config_input_secret_refs_discriminate_on_env_id() {
+        let tmp_a = tempfile::TempDir::new().expect("tempdir-a");
+        let tmp_b = tempfile::TempDir::new().expect("tempdir-b");
+        let form = make_form_spec(vec![question("api_token", true)]);
+        let cfg = json!({"api_token": "x"});
+        let pa = emit_pack_config_input(tmp_a.path(), "local", "b", "p", &cfg, &form)
+            .expect("emit-a")
+            .expect("path-a");
+        let pb = emit_pack_config_input(tmp_b.path(), "staging", "b", "p", &cfg, &form)
+            .expect("emit-b")
+            .expect("path-b");
+        let parsed_a: PackConfigInput =
+            serde_json::from_slice(&std::fs::read(&pa).unwrap()).unwrap();
+        let parsed_b: PackConfigInput =
+            serde_json::from_slice(&std::fs::read(&pb).unwrap()).unwrap();
+        assert_eq!(
+            parsed_a.secret_refs.get("api_token").map(String::as_str),
+            Some("secret://local/b/p/api_token")
+        );
+        assert_eq!(
+            parsed_b.secret_refs.get("api_token").map(String::as_str),
+            Some("secret://staging/b/p/api_token")
+        );
+    }
+
+    /// Empty config → no file written (caller treats `Ok(None)` as no-op,
+    /// not as a soft error). Matches the existing `persist_qa_secrets`
+    /// short-circuit semantics.
+    #[test]
+    fn emit_pack_config_input_skips_empty_config() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let form = make_form_spec(vec![question("enabled", false)]);
+        let empty = json!({});
+        assert!(
+            emit_pack_config_input(root, "local", "b", "p", &empty, &form)
+                .expect("emit")
+                .is_none()
+        );
+        assert!(!root.join(PACK_CONFIG_INPUT_DIR).exists());
+    }
+
+    /// Reject `/`-bearing or empty path segments — `secret://` URI integrity
+    /// + on-disk `<dir>/<pack_id>.json` layout depend on it.
+    #[test]
+    fn emit_pack_config_input_rejects_invalid_segments() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let form = make_form_spec(vec![question("k", false)]);
+        let cfg = json!({"k": "v"});
+        assert!(
+            emit_pack_config_input(root, "", "b", "p", &cfg, &form).is_err(),
+            "empty env_id rejected"
+        );
+        assert!(
+            emit_pack_config_input(root, "local", "b", "../p", &cfg, &form).is_err(),
+            "pack_id with `/` rejected"
+        );
+        assert!(
+            emit_pack_config_input(root, "local", "b/c", "p", &cfg, &form).is_err(),
+            "bundle_id with `/` rejected"
+        );
+        assert!(
+            emit_pack_config_input(root, "local", "b", "..", &cfg, &form).is_err(),
+            "pack_id `..` rejected"
+        );
+        assert!(
+            emit_pack_config_input(root, ".", "b", "p", &cfg, &form).is_err(),
+            "env_id `.` rejected"
+        );
+    }
+
+    /// Invisible questions (conditional `visible_if` that evaluates to false)
+    /// must not leak into the pack-config-input file.
+    #[test]
+    fn emit_pack_config_input_respects_visibility() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let form = make_form_spec(vec![question("mode", false), {
+            let mut q = question("advanced_url", false);
+            q.visible_if = Some(qa_spec::Expr::Eq {
+                left: Box::new(qa_spec::Expr::Answer {
+                    path: "mode".into(),
+                }),
+                right: Box::new(qa_spec::Expr::Literal {
+                    value: Value::String("advanced".into()),
+                }),
+            });
+            q
+        }]);
+        // mode=basic → advanced_url should be invisible
+        let config = json!({
+            "mode": "basic",
+            "advanced_url": "https://should-be-hidden.example.com",
+        });
+        let path = emit_pack_config_input(root, "local", "b", "p", &config, &form)
+            .expect("emit")
+            .expect("path");
+        let parsed: PackConfigInput =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            !parsed.non_secret.contains_key("advanced_url"),
+            "invisible question should not appear in non_secret: {parsed:?}"
+        );
+        assert_eq!(
+            parsed.non_secret.get("mode"),
+            Some(&Value::String("basic".into())),
+        );
     }
 }
