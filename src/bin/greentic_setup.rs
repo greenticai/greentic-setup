@@ -22,7 +22,6 @@
 //! - `bundle status` - Show bundle status
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use std::fs;
 
 use greentic_setup::cli_args::{BundleCommand, Cli, Command};
