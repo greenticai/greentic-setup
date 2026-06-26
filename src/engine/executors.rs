@@ -1809,12 +1809,12 @@ mod tests {
         // the wildcard segment `_` (via `greentic_secrets_lib::normalize_team`).
         assert_eq!(
             map["api_key"].as_str(),
-            Some("secrets://dev/demo/_/openai-llm/api_key"),
+            Some("secrets://dev/demo/_/openai_llm/api_key"),
             "secret value must be replaced with canonical secrets:// URI",
         );
         assert_eq!(
             map["oauth_client_secret"].as_str(),
-            Some("secrets://dev/demo/_/openai-llm/oauth_client_secret"),
+            Some("secrets://dev/demo/_/openai_llm/oauth_client_secret"),
         );
 
         let json = serde_json::to_string(&redacted).expect("serialize");
@@ -1923,7 +1923,7 @@ mod tests {
         );
         assert_eq!(
             envelope["bot_token"].as_str(),
-            Some("secrets://dev/demo/_/messaging-webex/bot_token"),
+            Some("secrets://dev/demo/_/messaging_webex/bot_token"),
         );
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(!json.contains("T0K3N-MUST-NOT-LEAK"));

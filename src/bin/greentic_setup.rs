@@ -260,12 +260,25 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     }
 
     let is_dry_run = cli.dry_run || cli.emit_answers.is_some();
+    let mut no_ui_oauth_server = if !is_dry_run {
+        Some(
+            greentic_setup::no_ui_oauth::start_callback_server(&bundle_dir, &env)
+                .context("failed to start no-UI OAuth callback server")?,
+        )
+    } else {
+        None
+    };
     let _setup_tunnel = if !is_dry_run {
-        let local_base_url = "http://127.0.0.1:1";
+        let local_base_url = no_ui_oauth_server
+            .as_ref()
+            .map(|server| server.local_base_url.as_str())
+            .unwrap_or("http://127.0.0.1:1");
         let tunnel = maybe_start_cli_setup_tunnel(&mut loaded_answers, local_base_url)
             .context("failed to start setup tunnel")?;
         if let Some(tunnel) = tunnel.as_ref() {
             println!("Setup tunnel public_base_url: {}", tunnel.public_base_url);
+        } else {
+            no_ui_oauth_server = None;
         }
         tunnel
     } else {
@@ -347,7 +360,18 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     let report = engine
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
-    let _ = (report, env);
+    cli_commands::print_pending_setup_actions(&report.pending_setup_actions);
+    cli_commands::wait_for_pending_oauth_callbacks(
+        no_ui_oauth_server,
+        &report.pending_setup_actions,
+    )?;
+    if !cli.non_interactive {
+        cli_commands::execute_pending_oauth_device_actions(
+            &bundle_dir,
+            &env,
+            &report.pending_setup_actions,
+        )?;
+    }
 
     if let Some(output_target) = setup_output_target(&bundle_path)? {
         match output_target {

@@ -22,10 +22,10 @@ use crate::platform_setup::{
 pub use answers::{emit_answers, encrypt_secret_answers, load_answers, prompt_secret_answers};
 pub use executors::{
     auto_install_provider_packs, domain_from_provider_id, execute_add_packs_to_bundle,
-    execute_build_flow_index, execute_copy_resolved_manifests, execute_create_bundle,
-    execute_remove_provider_artifacts, execute_resolve_packs, execute_validate_bundle,
-    execute_write_gmap_rules, find_provider_pack_source, get_pack_target_dir,
-    invoke_setup_component_operation,
+    execute_apply_pack_setup, execute_build_flow_index, execute_copy_resolved_manifests,
+    execute_create_bundle, execute_remove_provider_artifacts, execute_resolve_packs,
+    execute_validate_bundle, execute_write_gmap_rules, find_provider_pack_source,
+    get_pack_target_dir, invoke_setup_component_operation,
 };
 pub use plan_builders::{
     apply_create, apply_remove, apply_update, build_metadata, build_metadata_with_ops,
@@ -83,6 +83,7 @@ impl SetupEngine {
             resolved_packs: Vec::new(),
             resolved_manifests: Vec::new(),
             provider_updates: 0,
+            pending_setup_actions: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -134,6 +135,17 @@ impl SetupEngine {
                             cap_report.checked,
                             cap_report.upgraded.len()
                         );
+                    }
+                }
+                SetupStepKind::ApplyPackSetup => {
+                    let setup_report =
+                        execute_apply_pack_setup(bundle, &plan.metadata, &self.config)?;
+                    report.provider_updates += setup_report.provider_updates;
+                    report
+                        .pending_setup_actions
+                        .extend(setup_report.pending_setup_actions);
+                    if self.config.verbose {
+                        println!("  [done] {}", step.description);
                     }
                 }
                 SetupStepKind::WriteGmapRules => {

@@ -915,7 +915,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     Ok(())
 }
 
-fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
+pub fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]) {
     let visible_actions: Vec<_> = actions
         .iter()
         .filter(|action| {
@@ -971,7 +971,7 @@ pub(crate) fn bootstrap_local_environment(i18n: &CliI18n) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_pending_oauth_callbacks(
+pub fn wait_for_pending_oauth_callbacks(
     server: Option<crate::no_ui_oauth::NoUiOAuthCallbackServer>,
     actions: &[crate::setup_actions::SetupAction],
 ) -> Result<()> {
@@ -988,7 +988,7 @@ fn wait_for_pending_oauth_callbacks(
     Ok(())
 }
 
-fn execute_pending_oauth_device_actions(
+pub fn execute_pending_oauth_device_actions(
     bundle_dir: &std::path::Path,
     env: &str,
     actions: &[crate::setup_actions::SetupAction],
