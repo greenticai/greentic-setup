@@ -28,7 +28,7 @@ greentic-i18n = "0.5"
 greentic-secrets-lib = { version = "=1.2.0-research.0", features = ["providers-dev"] }
 greentic-types = { version = "=1.2.0-research.1", features = ["serde"] }
 hmac = "0.13"
-qa-spec = "=1.2.0-research.1"
+qa-spec = "=1.2.0-research.0"
 regex = "1"
 dialoguer = "0.12"
 rpassword = "7"
