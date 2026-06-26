@@ -269,7 +269,9 @@ pub fn execute_add_packs_to_bundle(
         std::fs::create_dir_all(&target_dir)?;
 
         let target_path = target_dir.join(format!("{}.gtpack", pack.pack_id));
-        if pack.cached_path.exists() && !target_path.exists() {
+        let source_path = pack.cached_path.canonicalize().ok();
+        let existing_target_path = target_path.canonicalize().ok();
+        if pack.cached_path.exists() && source_path != existing_target_path {
             std::fs::copy(&pack.cached_path, &target_path).with_context(|| {
                 format!(
                     "failed to copy pack {} to {}",
@@ -990,19 +992,19 @@ fn invoke_registration_operation(
 ) -> anyhow::Result<Value> {
     let registration_obj = registration
         .as_object()
-        .ok_or_else(|| anyhow!("setup action registration must be an object"))?;
+        .ok_or_else(|| anyhow!("setup component invocation must be an object"))?;
     let component_ref = registration_obj
         .get("component_ref")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("setup action registration missing component_ref"))?;
+        .ok_or_else(|| anyhow!("setup component invocation missing component_ref"))?;
     let op = registration_obj
         .get("op")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("setup action registration missing op"))?;
+        .ok_or_else(|| anyhow!("setup component invocation missing op"))?;
 
     if let Some(result) = registration_obj
         .get("result")
@@ -1046,7 +1048,7 @@ impl greentic_secrets_lib::SecretsManager for SetupRegistrationSecrets {
     async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
         let values = self.values.lock().map_err(|_| {
             greentic_secrets_lib::SecretError::Backend(
-                "setup registration secrets lock poisoned".into(),
+                "setup component secrets lock poisoned".into(),
             )
         })?;
         values
@@ -1058,7 +1060,7 @@ impl greentic_secrets_lib::SecretsManager for SetupRegistrationSecrets {
     async fn write(&self, path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
         let mut values = self.values.lock().map_err(|_| {
             greentic_secrets_lib::SecretError::Backend(
-                "setup registration secrets lock poisoned".into(),
+                "setup component secrets lock poisoned".into(),
             )
         })?;
         values.insert(path.to_string(), bytes.to_vec());
@@ -1068,7 +1070,7 @@ impl greentic_secrets_lib::SecretsManager for SetupRegistrationSecrets {
     async fn delete(&self, path: &str) -> greentic_secrets_lib::Result<()> {
         let mut values = self.values.lock().map_err(|_| {
             greentic_secrets_lib::SecretError::Backend(
-                "setup registration secrets lock poisoned".into(),
+                "setup component secrets lock poisoned".into(),
             )
         })?;
         values.remove(path);
@@ -1097,7 +1099,7 @@ fn invoke_wasm_registration_component(
     let bindings_path = bundle_path
         .join("state")
         .join("config")
-        .join("setup-registration-bindings.yaml");
+        .join("setup-component-bindings.yaml");
     if let Some(parent) = bindings_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1107,7 +1109,7 @@ fn invoke_wasm_registration_component(
             r#"tenant: {}
 flow_type_bindings:
   messaging:
-    adapter: setup-registration
+    adapter: setup-component
     config: {{}}
     secrets: []
 rate_limits: {{}}
@@ -1142,7 +1144,7 @@ timers: []
         false,
         ComponentResolution::default(),
     ))
-    .with_context(|| format!("load registration pack {}", pack_path.display()))?;
+    .with_context(|| format!("load setup component pack {}", pack_path.display()))?;
 
     let exec_ctx = ComponentExecCtx {
         tenant: ComponentTenantCtx {
@@ -1151,13 +1153,13 @@ timers: []
             user: None,
             trace_id: None,
             i18n_id: None,
-            correlation_id: Some(format!("setup-action-registration:{component_ref}:{op}")),
+            correlation_id: Some(format!("setup-component:{component_ref}:{op}")),
             deadline_unix_ms: None,
             attempt: 1,
-            idempotency_key: Some(format!("setup-action-registration:{component_ref}:{op}")),
+            idempotency_key: Some(format!("setup-component:{component_ref}:{op}")),
         },
         i18n_id: None,
-        flow_id: format!("setup-action-registration/{op}"),
+        flow_id: format!("setup-component/{op}"),
         node_id: Some(component_ref.to_string()),
     };
     let input_json = serde_json::to_vec(request)?;
@@ -1188,7 +1190,7 @@ timers: []
             ))
             .with_context(|| {
                 format!(
-                    "invoke registration component '{component_ref}' op '{op}' (provider path failed: {provider_err})"
+                    "invoke setup component '{component_ref}' op '{op}' (provider path failed: {provider_err})"
                 )
             })
         }
@@ -1211,17 +1213,17 @@ fn read_registration_component(pack_path: &Path, component_ref: &str) -> anyhow:
                 let mut raw = String::new();
                 entry
                     .read_to_string(&mut raw)
-                    .with_context(|| format!("read registration component {candidate}"))?;
+                    .with_context(|| format!("read setup component {candidate}"))?;
                 return serde_json::from_str(&raw)
                     .or_else(|_| serde_yaml_bw::from_str(&raw))
-                    .with_context(|| format!("parse registration component {candidate}"));
+                    .with_context(|| format!("parse setup component {candidate}"));
             }
             Err(ZipError::FileNotFound) => continue,
             Err(err) => return Err(err.into()),
         }
     }
     anyhow::bail!(
-        "registration component_ref '{}' not found in {}",
+        "setup component_ref '{}' not found in {}",
         component_ref,
         pack_path.display()
     )
@@ -1807,12 +1809,12 @@ mod tests {
         // the wildcard segment `_` (via `greentic_secrets_lib::normalize_team`).
         assert_eq!(
             map["api_key"].as_str(),
-            Some("secrets://dev/demo/_/openai-llm/api_key"),
+            Some("secrets://dev/demo/_/openai_llm/api_key"),
             "secret value must be replaced with canonical secrets:// URI",
         );
         assert_eq!(
             map["oauth_client_secret"].as_str(),
-            Some("secrets://dev/demo/_/openai-llm/oauth_client_secret"),
+            Some("secrets://dev/demo/_/openai_llm/oauth_client_secret"),
         );
 
         let json = serde_json::to_string(&redacted).expect("serialize");
@@ -1921,7 +1923,7 @@ mod tests {
         );
         assert_eq!(
             envelope["bot_token"].as_str(),
-            Some("secrets://dev/demo/_/messaging-webex/bot_token"),
+            Some("secrets://dev/demo/_/messaging_webex/bot_token"),
         );
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(!json.contains("T0K3N-MUST-NOT-LEAK"));

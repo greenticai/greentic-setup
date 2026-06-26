@@ -1,0 +1,8 @@
+warning: unused import: `clap::Parser`
+  --> src/bin/greentic_setup.rs:25:5
+   |
+25 | use clap::Parser;
+   |     ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+

@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.greentic.ai/setup-backend-contract/v1",
+  "title": "Greentic Provider Setup Backend Contract v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_id", "provider_id", "required_order", "actions"],
+  "properties": {
+    "schema_id": {
+      "const": "greentic.setup.backend-contract.v1"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "provider_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_path": {
+      "type": "string"
+    },
+    "routes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "server_owned_config_keys": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "required_order": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "actions_schema_id": {
+      "const": "greentic.setup.actions.v1"
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/action"
+      }
+    },
+    "guards": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "default": []
+    },
+    "state_shape": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "action": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "executor"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "executor": {
+          "$ref": "#/$defs/executor"
+        },
+        "completion": {
+          "type": "object"
+        }
+      }
+    },
+    "executor": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "oauth_device_code",
+            "microsoft_graph_application",
+            "provider_http",
+            "microsoft_graph_teams_app_catalog_publish",
+            "microsoft_graph_teams_app_user_install",
+            "runtime_observation"
+          ]
+        },
+        "authority_url_template": {
+          "type": "string"
+        },
+        "client_id_config_key": {
+          "type": "string"
+        },
+        "oauth_kind": {
+          "type": "string"
+        },
+        "token_store_key": {
+          "type": "string"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "graph_token_store_key": {
+          "type": "string"
+        },
+        "display_name_config_key": {
+          "type": "string"
+        },
+        "app_id_config_key": {
+          "type": "string"
+        },
+        "client_secret_config_key": {
+          "type": "string"
+        },
+        "path_template": {
+          "type": "string"
+        },
+        "target_path_template": {
+          "type": "string"
+        },
+        "url_template": {
+          "type": "string"
+        },
+        "target_url_template": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "event": {
+          "type": "string"
+        },
+        "state_store_key": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

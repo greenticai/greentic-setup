@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "config"]
 
 [features]
 default = ["oci", "squashfs", "ui"]
-ui = ["axum", "open"]
+ui = ["axum", "open", "reqwest"]
 oci = ["greentic-distributor-client"]
 squashfs = ["backhand"]
 
@@ -24,6 +24,7 @@ async-trait = "0.1"
 backhand = { version = "0.25", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
 # Floor pinned to the publish that adds the env-aware `manifest_form_spec_for_env`
 # (deployer#326): the wizard threads its target env so the `webchat_gui` question
 # defaults match the runtime resolver (on for `local`, off elsewhere). That publish
@@ -38,6 +39,7 @@ hmac = "0.13"
 qa-spec = ">=1.1.0-dev.27541005498, <1.2.0-0"
 regex = "1"
 dialoguer = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 rpassword = "7"
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -61,6 +63,7 @@ path = "src/bin/greentic_setup.rs"
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.8"
+tower = "0.5"
 
 [[bench]]
 name = "perf"

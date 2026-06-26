@@ -93,6 +93,23 @@ body.has-wide-form .container{max-width:1380px}
 }
 .card-footer-split{justify-content:space-between}
 
+.setup-component-host{display:block;min-height:10rem}
+.setup-component-blocked{
+  padding:.875rem 1rem;margin-bottom:1rem;
+  border:1px solid rgba(239,68,68,.35);border-radius:calc(var(--radius) - 2px);
+  background:var(--destructive-muted);color:var(--fg);
+}
+.blocked-title{font-size:.8125rem;font-weight:600;color:#fecaca}
+.blocked-detail{font-size:.72rem;color:var(--muted);line-height:1.45;margin-top:.35rem;word-break:break-word}
+.blocked-detail code{font-family:var(--mono);font-size:.7rem;color:var(--fg)}
+.setup-diagnostics{margin-top:1rem;border-top:1px solid var(--card-border);padding-top:.75rem}
+.setup-diagnostics summary{cursor:pointer;font-size:.8125rem;font-weight:600;color:var(--muted)}
+.setup-diagnostics-list{display:grid;gap:.5rem;margin-top:.625rem}
+.setup-diagnostic-entry{border:1px solid var(--card-border);border-radius:calc(var(--radius) - 2px);padding:.5rem .625rem;background:var(--muted-bg)}
+.setup-diagnostic-title{font-size:.75rem;font-weight:700;color:var(--fg)}
+.setup-diagnostic-meta,.setup-diagnostic-error{margin-top:.25rem;overflow-wrap:anywhere;font-size:.72rem;line-height:1.4;color:var(--muted)}
+.setup-diagnostic-error{color:#fecaca}
+
 /* ── Step header ── */
 .step-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem}
 .step-badge{
@@ -264,6 +281,17 @@ select{cursor:pointer;appearance:none;
 }
 .setup-action-error{
   color:#fca5a5;font-size:.8125rem;line-height:1.5;
+}
+.final-setup-action{width:100%}
+.final-action-field-label{
+  font-size:.6875rem;font-weight:700;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.05em;
+}
+.final-action-copy-row{
+  display:flex;align-items:center;gap:.5rem;width:100%;min-width:0;
+}
+.final-action-value{
+  flex:1;min-width:0;font-family:var(--mono);font-size:.75rem;
 }
 
 /* ── Import drop zone ── */

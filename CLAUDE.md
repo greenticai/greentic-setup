@@ -1,11 +1,99 @@
-# CLAUDE.md
+# CLAUDE.md — greentic-setup
 
-Agent-specific repo guidance now lives in
-[docs/coding-agents.md](docs/coding-agents.md).
+Bundle setup engine and CLI — pack discovery, QA-driven configuration wizards,
+secrets persistence, config-envelope emission, environment manifests, and hot
+reload. Invoked via `gtc setup` (delegation chain) or directly as
+`greentic-setup`.
 
-Read that document before:
+For wizard-replay semantics, cross-repo ownership rules, and agent documentation
+conventions see [docs/coding-agents.md](docs/coding-agents.md).
 
-- changing code in this repository
-- debugging a multi-repo workflow
-- deciding whether a bug belongs in `greentic-setup`, `greentic-bundle`,
-  `greentic-pack`, `greentic-start`, `gtc`, `greentic-dev`, or the runner
+## Crate Info
+
+Single crate (no workspace). Version `1.1.0-dev.0`, edition 2024,
+`rust-version = "1.95"`. Toolchain pinned to 1.95.0 via `rust-toolchain.toml`.
+
+Binary: `src/bin/greentic_setup.rs`.
+
+## Cargo Features
+
+| Feature | Default | What it gates |
+|---------|---------|---------------|
+| `oci` | yes | OCI/distributor pack fetching via `greentic-distributor-client` |
+| `squashfs` | yes | SquashFS `.gtbundle` read/write via `backhand` |
+| `ui` | yes | Local Axum web UI for browser-driven setup (`axum`, `open`) |
+
+## Source Layout (`src/`)
+
+| Module | What it does |
+|--------|-------------|
+| `engine/` | Setup engine: plan builders, executors, answer loading/encryption, type definitions. Main entry `SetupEngine` |
+| `admin/` | mTLS admin API types (routes, TLS config). Server lives in `greentic-start` |
+| `cli_commands/` | Clap subcommands: `setup`, `doctor`, `inspect`, `lifecycle` |
+| `cli_helpers/` | CLI utilities: bundle source resolution, env-var handling, prompts |
+| `cli_args.rs` | Top-level Clap arg definitions |
+| `cli_i18n.rs` | CLI i18n facade |
+| `answers_crypto.rs` | AES-GCM-SIV encryption for secret answers on disk |
+| `config_envelope.rs` | CBOR config envelope: provider config + `secrets://` URI refs (no plaintext after B12a) |
+| `discovery.rs` | Pack discovery and resolution from bundle projects |
+| `deployment_targets.rs` | Deployment target definitions |
+| `doctor.rs` | Bundle health diagnostics |
+| `env_mode.rs` | `env-manifest.v1` routing: `--answers <manifest>` porcelain over deployer env-apply |
+| `env_wizard.rs` | `--env` interactive wizard: author/gap-fill env-manifest, persist, hand off to deployer |
+| `flow.rs` | Flow inspection and validation |
+| `gtbundle.rs` | `.gtbundle` SquashFS read/write/inspection |
+| `no_ui_oauth.rs`, `oauth_callback.rs`, `oauth_device.rs` | OAuth flows: device-code grant, callback server, headless fallback |
+| `plan.rs` | `SetupPlan`, `SetupStep`, `SetupMode` — deterministic plan-then-execute |
+| `platform_setup/` | Platform persistence: static routes, tunnel config, URL helpers |
+| `provider_state.rs` | Per-provider setup state tracking |
+| `qa/` | QA subsystem: FormSpec bridge, wizard prompts, shared questions, answer persistence |
+| `reload.rs` | Hot-reload watcher for live setup changes |
+| `secrets.rs`, `secret_name.rs` | Secrets persistence (via `greentic-secrets-lib`) and naming |
+| `setup_actions.rs` | Concrete setup action implementations |
+| `setup_input.rs` | Setup input loading and validation |
+| `setup_to_formspec/` | Conversion: setup inputs to FormSpec (inference, pack handling) |
+| `setup_tunnel.rs` | Tunnel configuration for provider callbacks |
+| `tenant_config.rs` | Tenant/team configuration management |
+| `ui/` | Browser-based setup UI (Axum, feature-gated on `ui`) |
+| `webhook/` | Webhook instruction rendering |
+| `bundle.rs`, `bundle_source.rs` | Bundle model and source resolution |
+| `capabilities.rs` | Capability extraction and validation |
+| `card_setup.rs` | Adaptive Card setup wizard |
+
+## Build and Test
+
+```bash
+cargo build --all-features                                 # build with all features
+cargo test --all-features                                  # test
+cargo clippy --all-features --all-targets -- -D warnings   # lint
+cargo fmt --all -- --check                                 # format check
+bash ci/local_check.sh                                     # full local CI gate
+```
+
+## Key Dependencies and Invariants
+
+- **serde_yaml_gtc** (imported as `serde_yaml_bw`): Hardened YAML fork. Never
+  use upstream `serde_yaml`.
+- **greentic-deployer**: Env-manifest routing delegates to the deployer's
+  env-apply engine. Setup is porcelain; deployer owns the plan/execute logic.
+- **greentic-runner-host**: Runtime host types for pack/flow execution context.
+- **greentic-secrets-lib** (`providers-dev` feature): Secret storage backends.
+- **greentic-types** (`serde` feature): Shared domain primitives.
+- **qa-spec**: QA specification types consumed by the FormSpec bridge.
+- **Config envelopes**: CBOR-serialized, carry `secrets://` URI refs for
+  secret-marked keys (no plaintext after B12a). Consumers dereference via
+  `SecretsManager`.
+- **Answers encryption**: `answers_crypto.rs` uses AES-GCM-SIV; encrypted
+  answers written to the setup-state directory.
+- **Plan-execute separation**: `SetupPlan` is deterministic; execution is a
+  separate concern driven by `engine/executors.rs`.
+
+## CLI Quick Reference
+
+```bash
+greentic-setup --help                    # top-level
+greentic-setup setup --help              # run setup wizard
+greentic-setup doctor --help             # diagnose bundle health
+greentic-setup --env <name> --help       # environment wizard
+greentic-setup --answers <file> --help   # apply answers non-interactively
+```

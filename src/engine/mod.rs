@@ -108,6 +108,12 @@ impl SetupEngine {
                     }
                 }
                 SetupStepKind::AddPacksToBundle => {
+                    if !plan.metadata.providers_remove.is_empty() {
+                        report.provider_updates += execute_remove_provider_artifacts(
+                            bundle,
+                            &plan.metadata.providers_remove,
+                        )?;
+                    }
                     execute_add_packs_to_bundle(bundle, &report.resolved_packs)?;
                     let _ = crate::deployment_targets::persist_explicit_deployment_targets(
                         bundle,

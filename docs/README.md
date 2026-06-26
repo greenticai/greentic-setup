@@ -29,6 +29,10 @@ This directory contains the maintained documents for `greentic-setup`.
   Metadata conventions for device-code setup, discovery selection, and
   provider-specific interaction instructions.
 
+- [provider-setup-web-components.md](./provider-setup-web-components.md)
+  Generic provider setup web-component mounting, event logging, redaction, and
+  audit log locations.
+
 - [mtls-setup.md](./mtls-setup.md)
   mTLS certificate setup guidance.
 

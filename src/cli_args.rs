@@ -98,7 +98,9 @@ pub enum Command {
 pub struct DoctorArgs {
     /// Bundle path (.gtbundle file or directory)
     #[arg(value_name = "BUNDLE")]
-    pub bundle: PathBuf,
+    pub bundle: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: Option<DoctorCommand>,
     /// Emit stable machine-readable JSON
     #[arg(long = "json")]
     pub json: bool,
@@ -114,6 +116,19 @@ pub struct DoctorArgs {
     /// Limit checks to one stage
     #[arg(long = "stage", value_enum)]
     pub stage: Option<DoctorStageArg>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DoctorCommand {
+    /// Validate a provider pack's setup contract
+    Provider(DoctorProviderArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DoctorProviderArgs {
+    /// Provider pack path (.gtpack)
+    #[arg(value_name = "PACK")]
+    pub pack: PathBuf,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +151,16 @@ pub enum BundleCommand {
     Setup(BundleSetupArgs),
     /// Update a provider's configuration in a bundle
     Update(BundleSetupArgs),
+    /// Show persisted generic provider setup status
+    SetupStatus(BundleSetupStatusArgs),
+    /// Inspect and record the next generic provider setup step
+    SetupNext(BundleSetupNextArgs),
+    /// Clear retry-blocking state for a generic provider setup step
+    SetupRetry(BundleSetupRetryArgs),
+    /// Reset persisted generic provider setup state
+    SetupReset(BundleSetupResetArgs),
+    /// Migrate legacy provider setup state into the generic setup state layout
+    SetupMigrate(BundleSetupMigrateArgs),
     /// Remove a provider from a bundle
     Remove(BundleRemoveArgs),
     /// Build a portable bundle (copy + resolve)
@@ -230,6 +255,122 @@ pub struct BundleSetupArgs {
     /// Advanced mode — show all questions including optional ones
     #[arg(long = "advanced")]
     pub advanced: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BundleSetupStatusArgs {
+    /// Provider ID to inspect
+    #[arg(value_name = "PROVIDER_ID")]
+    pub provider_id: String,
+    /// Bundle directory (default: current directory)
+    #[arg(long = "bundle", short = 'b')]
+    pub bundle: Option<PathBuf>,
+    /// Tenant identifier
+    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    pub tenant: String,
+    /// Team identifier
+    #[arg(long = "team")]
+    pub team: Option<String>,
+    /// Environment (dev/staging/prod)
+    #[arg(long = "env", short = 'e', default_value = "dev")]
+    pub env: String,
+    /// Output format: text or json
+    #[arg(long = "format", default_value = "text")]
+    pub format: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BundleSetupNextArgs {
+    /// Provider ID to advance
+    #[arg(value_name = "PROVIDER_ID")]
+    pub provider_id: String,
+    /// Bundle directory (default: current directory)
+    #[arg(long = "bundle", short = 'b')]
+    pub bundle: Option<PathBuf>,
+    /// Tenant identifier
+    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    pub tenant: String,
+    /// Team identifier
+    #[arg(long = "team")]
+    pub team: Option<String>,
+    /// Environment (dev/staging/prod)
+    #[arg(long = "env", short = 'e', default_value = "dev")]
+    pub env: String,
+    /// Output format: text or json
+    #[arg(long = "format", default_value = "text")]
+    pub format: String,
+    /// Only report the next action; do not write state or events
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BundleSetupRetryArgs {
+    /// Provider ID to retry
+    #[arg(value_name = "PROVIDER_ID")]
+    pub provider_id: String,
+    /// Bundle directory (default: current directory)
+    #[arg(long = "bundle", short = 'b')]
+    pub bundle: Option<PathBuf>,
+    /// Tenant identifier
+    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    pub tenant: String,
+    /// Team identifier
+    #[arg(long = "team")]
+    pub team: Option<String>,
+    /// Environment (dev/staging/prod)
+    #[arg(long = "env", short = 'e', default_value = "dev")]
+    pub env: String,
+    /// Optional step to retry; defaults to the last recorded setup step
+    #[arg(long = "step")]
+    pub step: Option<String>,
+    /// Emit stable machine-readable JSON
+    #[arg(long = "json")]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BundleSetupResetArgs {
+    /// Provider ID to reset
+    #[arg(value_name = "PROVIDER_ID")]
+    pub provider_id: String,
+    /// Bundle directory (default: current directory)
+    #[arg(long = "bundle", short = 'b')]
+    pub bundle: Option<PathBuf>,
+    /// Tenant identifier
+    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    pub tenant: String,
+    /// Team identifier
+    #[arg(long = "team")]
+    pub team: Option<String>,
+    /// Confirm destructive reset of setup progress
+    #[arg(long = "yes")]
+    pub yes: bool,
+    /// Emit stable machine-readable JSON
+    #[arg(long = "json")]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BundleSetupMigrateArgs {
+    /// Provider ID to migrate
+    #[arg(value_name = "PROVIDER_ID")]
+    pub provider_id: String,
+    /// Bundle directory (default: current directory)
+    #[arg(long = "bundle", short = 'b')]
+    pub bundle: Option<PathBuf>,
+    /// Tenant identifier
+    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    pub tenant: String,
+    /// Team identifier
+    #[arg(long = "team")]
+    pub team: Option<String>,
+    /// Environment (dev/staging/prod)
+    #[arg(long = "env", short = 'e', default_value = "dev")]
+    pub env: String,
+    /// Emit stable machine-readable JSON
+    #[arg(long = "json")]
+    pub json: bool,
 }
 
 #[derive(Args, Debug, Clone)]

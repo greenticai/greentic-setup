@@ -634,6 +634,7 @@ mod tests {
     use super::*;
     use crate::engine::execute_add_packs_to_bundle;
     use crate::plan::ResolvedPackInfo;
+    use std::io::Read;
     use std::io::Write;
     use zip::write::{FileOptions, ZipWriter};
 
@@ -654,6 +655,36 @@ mod tests {
             )
             .unwrap();
         writer.finish().unwrap();
+    }
+
+    fn write_pack_with_marker(path: &Path, pack_id: &str, marker: &str) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options).unwrap();
+        writer
+            .write_all(
+                serde_json::json!({
+                    "pack_id": pack_id,
+                    "display_name": pack_id,
+                    "marker": marker,
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    fn read_pack_marker(path: &Path) -> String {
+        let file = std::fs::File::open(path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut manifest = zip.by_name("pack.manifest.json").unwrap();
+        let mut text = String::new();
+        manifest.read_to_string(&mut text).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["marker"].as_str().unwrap().to_string()
     }
 
     #[test]
@@ -818,6 +849,40 @@ mod tests {
             !root.join("packs").join("default.gtpack").exists(),
             "scaffold welcome pack should be removed once an explicit app pack is added"
         );
+    }
+
+    #[test]
+    fn add_packs_replaces_existing_provider_pack_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle-workspace");
+        create_demo_bundle_structure(&root, Some("weather-demo")).unwrap();
+
+        let target = root
+            .join("providers")
+            .join("messaging")
+            .join("messaging-telegram.gtpack");
+        write_pack_with_marker(&target, "messaging-telegram", "old");
+
+        let source_dir = temp.path().join("src-packs");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let provider_pack = source_dir.join("messaging-telegram.gtpack");
+        write_pack_with_marker(&provider_pack, "messaging-telegram", "new");
+
+        execute_add_packs_to_bundle(
+            &root,
+            &[ResolvedPackInfo {
+                source_ref: provider_pack.display().to_string(),
+                mapped_ref: provider_pack.display().to_string(),
+                resolved_digest: "sha256:new".to_string(),
+                pack_id: "messaging-telegram".to_string(),
+                entry_flows: Vec::new(),
+                cached_path: provider_pack,
+                output_path: target.clone(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(read_pack_marker(&target), "new");
     }
 
     #[test]
