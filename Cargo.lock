@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "1.2.0-dev.0"
+version = "1.2.0-research.0"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
