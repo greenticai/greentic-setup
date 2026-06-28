@@ -73,6 +73,22 @@ struct OauthPending {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    pkce_verifier: String,
+}
+
+/// Generate a PKCE (RFC 7636) verifier and its S256 code challenge.
+///
+/// HubSpot (and many providers) require PKCE for authorization-code flows. The
+/// verifier is kept server-side in [`OauthPending`] and replayed at the token
+/// exchange; only the challenge is sent on the authorize redirect.
+fn generate_pkce() -> (String, String) {
+    use base64::Engine;
+    use sha2::Digest;
+    let bytes: [u8; 32] = core::array::from_fn(|_| rand::random::<u8>());
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let digest = sha2::Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    (verifier, challenge)
 }
 
 #[derive(Serialize)]
@@ -903,12 +919,15 @@ async fn post_oauth_start(
     let pending_len = state.oauth_pending.lock().unwrap().len();
     let state_token = format!("{provider}-{pending_len}-{counter}");
 
+    let (pkce_verifier, pkce_challenge) = generate_pkce();
+
     let built_authorize_url = format!(
-        "{authorize_url}?client_id={client_id}&redirect_uri={redirect}&scope={scope}&response_type=code&state={state_token}",
+        "{authorize_url}?client_id={client_id}&redirect_uri={redirect}&scope={scope}&response_type=code&state={state_token}&code_challenge={challenge}&code_challenge_method=S256",
         client_id = encode(&req.client_id),
         redirect = encode(&redirect_uri),
         scope = encode(&scopes),
         state_token = encode(&state_token),
+        challenge = encode(&pkce_challenge),
     );
 
     state.oauth_pending.lock().unwrap().insert(
@@ -923,6 +942,7 @@ async fn post_oauth_start(
             client_id: req.client_id,
             client_secret: req.client_secret,
             redirect_uri,
+            pkce_verifier,
         },
     );
 
@@ -970,11 +990,12 @@ async fn get_oauth_callback(
     // Exchange the code for tokens using blocking ureq off the async runtime.
     let token_url = pending.token_url.clone();
     let body = format!(
-        "grant_type=authorization_code&client_id={client_id}&client_secret={client_secret}&redirect_uri={redirect}&code={code}",
+        "grant_type=authorization_code&client_id={client_id}&client_secret={client_secret}&redirect_uri={redirect}&code={code}&code_verifier={verifier}",
         client_id = encode(&pending.client_id),
         client_secret = encode(&pending.client_secret),
         redirect = encode(&pending.redirect_uri),
         code = encode(&code),
+        verifier = encode(&pending.pkce_verifier),
     );
     let exchange = tokio::task::spawn_blocking(move || -> Result<(u16, String), String> {
         // Keep non-2xx responses (instead of an error) so we can show the body.
