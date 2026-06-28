@@ -11,6 +11,27 @@ readme = "README.md"
 keywords = ["greentic", "setup", "bundle", "qa", "secrets"]
 categories = ["command-line-utilities", "config"]
 
+# cargo-binstall pulls the pre-built binary from the GitHub release tagged
+# `v{version}` (produced by release-binaries.yml). Unlike greentic-start,
+# greentic-setup has no git/private deps, so its research builds also reach
+# crates.io — `cargo binstall greentic-setup` resolves there. This block makes
+# the asset URL and archive layout explicit and deterministic instead of relying
+# on cargo-binstall's default URL templates.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tgz"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+# Only the targets release-binaries.yml actually builds. There is no
+# x86_64-apple-darwin (Intel-mac) asset, so Intel-mac users fall back to a
+# source build; add that triple here if the release matrix gains it.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
+
 [features]
 default = ["oci", "squashfs", "ui"]
 ui = ["axum", "open"]
