@@ -65,7 +65,7 @@ Binary: `src/bin/greentic_setup.rs`.
 ```bash
 cargo build --all-features                                 # build with all features
 cargo test --all-features                                  # test
-cargo clippy --all-features --all-targets -- -D warnings   # lint
+cargo clippy --all-targets --all-features -- -D warnings   # lint
 cargo fmt --all -- --check                                 # format check
 bash ci/local_check.sh                                     # full local CI gate
 ```
@@ -87,6 +87,36 @@ bash ci/local_check.sh                                     # full local CI gate
   answers written to the setup-state directory.
 - **Plan-execute separation**: `SetupPlan` is deterministic; execution is a
   separate concern driven by `engine/executors.rs`.
+
+## Tests and Benchmarks
+
+```bash
+cargo test --all-features                      # all unit + integration tests
+cargo bench                                    # Criterion benchmarks (benches/perf.rs)
+```
+
+Integration tests in `tests/`:
+- `env_wizard_locale_catalog.rs` — locale catalog coverage for the env wizard
+- `perf_scaling.rs` — setup scaling characteristics
+- `perf_timeout.rs` — timeout behavior under load
+
+Helper scripts in `scripts/`: `demo.sh` (end-to-end demo run), `test_provider.sh`
+(provider setup smoke test). `tools/i18n.sh` regenerates i18n catalogs.
+
+## i18n
+
+66 locale JSON files under `i18n/` (Arabic variants, Bengali, Chinese, Czech, …).
+CLI strings go through `cli_i18n.rs`; regenerate catalogs with `tools/i18n.sh`.
+
+## CI Gate Detail
+
+`ci/local_check.sh` runs 6 steps beyond the basics listed above:
+1. `cargo fmt --all -- --check`
+2. `cargo clippy --all-targets --all-features -- -D warnings`
+3. `cargo test --all-features`
+4. `cargo build --all-features`
+5. `cargo doc --no-deps --all-features`
+6. `cargo package` + `cargo publish --dry-run` (per publishable crate)
 
 ## CLI Quick Reference
 
