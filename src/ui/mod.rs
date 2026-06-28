@@ -89,6 +89,8 @@ struct QuestionInfo {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    widget: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -102,6 +104,7 @@ struct SetupQuestionExtras {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    widget: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -207,6 +210,8 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/execute", post(post_execute))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
+        .route("/api/oauth/start", post(post_oauth_start))
+        .route("/api/oauth/status", get(get_oauth_status))
         .route("/api/shutdown", post(post_shutdown))
         .with_state(state)
 }
@@ -518,6 +523,11 @@ async fn get_providers(
                         placeholder: q.placeholder.clone(),
                         group: q.group.clone(),
                         docs_url: q.docs_url.clone(),
+                        widget: if q.kind == "oauth_connect" {
+                            Some("oauth_connect".to_string())
+                        } else {
+                            None
+                        },
                     },
                 );
             }
@@ -600,6 +610,7 @@ async fn get_providers(
                             }
                             info.group = ext.group.clone();
                             info.docs_url = ext.docs_url.clone();
+                            info.widget = ext.widget.clone();
                         }
                         // --answers prefill takes priority over saved secrets
                         if let Some(val) = answers
@@ -785,6 +796,106 @@ async fn post_decrypt(Json(req): Json<DecryptRequest>) -> Json<Value> {
     match crate::answers_crypto::decrypt_tree(&req.doc, &req.key) {
         Ok(decrypted) => Json(serde_json::json!({ "ok": true, "doc": decrypted })),
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+// ── OAuth connect (live broker) ──
+
+/// Resolve the OAuth broker base URL from the environment.
+///
+/// Reads `GREENTIC_OAUTH_BROKER_URL`, defaulting to the local broker address.
+fn broker_base() -> String {
+    std::env::var("GREENTIC_OAUTH_BROKER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+
+#[derive(Deserialize)]
+struct OauthStartRequest {
+    provider: String,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+/// Build the broker authorize URL for an OAuth provider.
+///
+/// The browser opens the returned URL directly; the broker owns its own fixed
+/// callback (no `redirect_uri` is passed here).
+async fn post_oauth_start(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<OauthStartRequest>,
+) -> Json<Value> {
+    let env = req.env.unwrap_or_else(|| state.env.clone());
+    let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
+    let team = req.team.or_else(|| state.team.clone());
+    let provider = req.provider;
+
+    let base = broker_base();
+    let mut authorize_url = format!(
+        "{base}/{env}/{tenant}/{provider}/start?owner_kind=service&owner_id={tenant}&flow_id=setup"
+    );
+    if let Some(team) = team.as_deref() {
+        authorize_url.push_str(&format!("&team={team}"));
+    }
+
+    Json(serde_json::json!({ "authorize_url": authorize_url }))
+}
+
+#[derive(Deserialize)]
+struct OauthStatusQuery {
+    provider: String,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+/// Poll the broker for whether a provider connection has been established.
+///
+/// Returns `{ connected, count }` on success or `{ connected: false, error }`
+/// on transport failure (HTTP 200 either way so the SPA keeps polling).
+async fn get_oauth_status(
+    State(state): State<std::sync::Arc<UiState>>,
+    axum::extract::Query(query): axum::extract::Query<OauthStatusQuery>,
+) -> Json<Value> {
+    let env = query.env.unwrap_or_else(|| state.env.clone());
+    let tenant = query.tenant.unwrap_or_else(|| state.tenant.clone());
+    let team = query.team.or_else(|| state.team.clone());
+    let provider = query.provider;
+
+    let base = broker_base();
+    let mut status_url = format!("{base}/status/{env}/{tenant}/{provider}");
+    if let Some(team) = team.as_deref() {
+        status_url.push_str(&format!("?team={team}"));
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let response = ureq::get(&status_url)
+            .call()
+            .map_err(|err| err.to_string())?;
+        let body = response
+            .into_body()
+            .read_to_string()
+            .map_err(|err| err.to_string())?;
+        serde_json::from_str::<Value>(&body).map_err(|err| err.to_string())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(value)) => {
+            let count = value.as_array().map(Vec::len).unwrap_or(0);
+            let connected = count > 0;
+            Json(serde_json::json!({ "connected": connected, "count": count }))
+        }
+        Ok(Err(msg)) => Json(serde_json::json!({ "connected": false, "error": msg })),
+        Err(join_err) => {
+            Json(serde_json::json!({ "connected": false, "error": join_err.to_string() }))
+        }
     }
 }
 
@@ -1036,6 +1147,7 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         placeholder: None,
         group: None,
         docs_url: None,
+        widget: None,
     }
 }
 

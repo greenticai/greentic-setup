@@ -173,6 +173,20 @@ select{cursor:pointer;appearance:none;
 .btn-ghost{background:transparent;color:var(--muted)}
 .btn-ghost:hover{background:var(--muted-bg);color:var(--fg)}
 
+/* ── OAuth connect widget ── */
+.btn-oauth-connect{
+  display:inline-flex;align-items:center;justify-content:center;gap:.375rem;
+  height:2.25rem;padding:0 1rem;
+  font-size:.8125rem;font-weight:500;font-family:var(--font);line-height:1;
+  border-radius:calc(var(--radius) - 2px);border:none;cursor:pointer;
+  transition:all .15s;white-space:nowrap;
+  background:var(--primary);color:var(--primary-fg);align-self:flex-start;
+}
+.btn-oauth-connect:hover{background:var(--primary-hover)}
+.btn-oauth-connect:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.oauth-status{font-size:.75rem;color:var(--muted);margin-top:.375rem}
+.oauth-status.connected{color:var(--primary);font-weight:500}
+
 /* ── Review ── */
 .review-group{margin-bottom:1.25rem}
 .review-group:last-child{margin-bottom:0}
