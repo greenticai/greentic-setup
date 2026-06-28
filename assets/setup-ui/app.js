@@ -840,11 +840,30 @@
   function startOauthConnect(qid, provider) {
     var scope = cs();
     var statusEl = document.getElementById("oauth-status-" + qid);
+    var clientIdEl = document.getElementById("f-oauth_client_id");
+    var clientSecretEl = document.getElementById("f-oauth_client_secret");
+    var clientId = clientIdEl ? clientIdEl.value.trim() : "";
+    var clientSecret = clientSecretEl ? clientSecretEl.value.trim() : "";
+    if (!clientId || !clientSecret) {
+      if (statusEl) statusEl.textContent = "Enter Client ID and Client Secret first";
+      return;
+    }
+    var packProvider = "";
+    var current = state.providers[state.currentProvider];
+    if (current) packProvider = current.provider_id;
     if (statusEl) statusEl.textContent = "Opening HubSpot…";
     fetch("/api/oauth/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider: provider, tenant: scope.tenant, env: scope.env, team: scope.team || null })
+      body: JSON.stringify({
+        provider: provider,
+        pack_provider: packProvider,
+        client_id: clientId,
+        client_secret: clientSecret,
+        tenant: scope.tenant,
+        env: scope.env,
+        team: scope.team || null
+      })
     })
     .then(function (r) { return r.json(); })
     .then(function (d) {
