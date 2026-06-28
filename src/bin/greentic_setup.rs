@@ -375,6 +375,7 @@ fn run_ui_mode(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         cli.locale.as_deref(),
         prefill_answers,
         scope_from_answers,
+        cli.port,
     ))
 }
 

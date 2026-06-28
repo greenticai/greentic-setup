@@ -80,6 +80,10 @@ pub struct Cli {
     #[arg(long = "non-interactive", global = true)]
     pub non_interactive: bool,
 
+    /// Fixed port for the setup UI server (default: random)
+    #[arg(long = "port", value_name = "PORT", global = true)]
+    pub port: Option<u16>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -193,6 +197,9 @@ pub struct BundleSetupArgs {
     /// Advanced mode — show all questions including optional ones
     #[arg(long = "advanced")]
     pub advanced: bool,
+    /// Fixed port for the setup UI server (default: random)
+    #[arg(long = "port", value_name = "PORT")]
+    pub port: Option<u16>,
 }
 
 #[derive(Args, Debug, Clone)]
