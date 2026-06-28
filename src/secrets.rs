@@ -546,10 +546,7 @@ mod tests {
                 C::Map(BTreeMap::from([entry("secrets", C::Array(vec![secret]))])),
             ),
         ]));
-        let manifest = C::Map(BTreeMap::from([entry(
-            "extensions",
-            C::Array(vec![ext]),
-        )]));
+        let manifest = C::Map(BTreeMap::from([entry("extensions", C::Array(vec![ext]))]));
         let bytes = serde_cbor::to_vec(&manifest).expect("encode manifest");
 
         let temp = tempfile::tempdir().expect("tempdir");
