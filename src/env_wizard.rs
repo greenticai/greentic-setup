@@ -1029,6 +1029,8 @@ mod tests {
                         team: "support".to_string(),
                     }),
                 }),
+                bundle_source_uri: None,
+                bundle_digest: None,
             }],
             // No form questions for packs/extensions; default empty.
             packs: Vec::new(),
