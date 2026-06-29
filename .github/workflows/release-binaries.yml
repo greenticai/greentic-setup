@@ -20,6 +20,7 @@ jobs:
       package: greentic-setup
       binary: greentic-setup
       windows-archive-format: zip
+      include-macos-intel: true
       extra-files: |
         README.md
         LICENSE
