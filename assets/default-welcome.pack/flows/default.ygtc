@@ -1,0 +1,20 @@
+id: default
+title: Default Welcome
+description: Renders a welcome Adaptive Card when a user first enters the channel.
+type: messaging
+start: welcome
+nodes:
+  welcome:
+    routing: out
+    card:
+      card_spec:
+        inline_json:
+          type: AdaptiveCard
+          version: "1.5"
+          $schema: http://adaptivecards.io/schemas/adaptive-card.json
+          body:
+            - type: TextBlock
+              text: "👋 Welcome to Greentic!"
+              size: Large
+              weight: Bolder
+              wrap: true
