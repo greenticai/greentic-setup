@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn version_is_correct() {
-        assert!(version().starts_with("1."));
+        assert!(version().starts_with("1.1"));
     }
 
     #[test]
