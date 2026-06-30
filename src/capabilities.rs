@@ -355,17 +355,38 @@ mod tests {
 
     /// Write a minimal gtpack zip with a CBOR manifest.
     fn write_test_gtpack(path: &Path, with_capabilities: bool) {
+        write_test_gtpack_manifest(path, "test-provider", with_capabilities, &[], &[], true);
+    }
+
+    fn write_test_gtpack_manifest(
+        path: &Path,
+        pack_id: &str,
+        with_extension: bool,
+        capabilities: &[&str],
+        dependencies: &[(&str, &[&str])],
+        include_manifest: bool,
+    ) {
+        let file = File::create(path).expect("create file");
+        let mut zip = ZipWriter::new(file);
+        if !include_manifest {
+            zip.start_file("README.txt", FileOptions::<()>::default())
+                .expect("start file");
+            zip.write_all(b"no manifest").expect("write placeholder");
+            zip.finish().expect("finish zip");
+            return;
+        }
+
         let mut map = BTreeMap::new();
         map.insert(
             CV::Text("schema_version".into()),
             CV::Text("pack-v1".into()),
         );
-        map.insert(CV::Text("pack_id".into()), CV::Text("test-provider".into()));
+        map.insert(CV::Text("pack_id".into()), CV::Text(pack_id.into()));
         map.insert(CV::Text("version".into()), CV::Text("0.1.0".into()));
         map.insert(CV::Text("kind".into()), CV::Text("provider".into()));
         map.insert(CV::Text("publisher".into()), CV::Text("test".into()));
 
-        if with_capabilities {
+        if with_extension {
             let mut ext_inner = BTreeMap::new();
             ext_inner.insert(
                 CV::Text("kind".into()),
@@ -378,10 +399,41 @@ mod tests {
             map.insert(CV::Text("extensions".into()), CV::Map(exts));
         }
 
+        if !capabilities.is_empty() {
+            let caps = capabilities
+                .iter()
+                .map(|cap| {
+                    CV::Map(BTreeMap::from([(
+                        CV::Text("name".into()),
+                        CV::Text((*cap).into()),
+                    )]))
+                })
+                .collect();
+            map.insert(CV::Text("capabilities".into()), CV::Array(caps));
+        }
+
+        if !dependencies.is_empty() {
+            let deps = dependencies
+                .iter()
+                .map(|(pack, caps)| {
+                    let req_caps = caps
+                        .iter()
+                        .map(|cap| CV::Text((*cap).into()))
+                        .collect::<Vec<_>>();
+                    CV::Map(BTreeMap::from([
+                        (CV::Text("pack_id".into()), CV::Text((*pack).into())),
+                        (
+                            CV::Text("required_capabilities".into()),
+                            CV::Array(req_caps),
+                        ),
+                    ]))
+                })
+                .collect();
+            map.insert(CV::Text("dependencies".into()), CV::Array(deps));
+        }
+
         let manifest = CV::Map(map);
         let bytes = serde_cbor::to_vec(&manifest).expect("encode cbor");
-        let file = File::create(path).expect("create file");
-        let mut zip = ZipWriter::new(file);
         zip.start_file("manifest.cbor", FileOptions::<()>::default())
             .expect("start file");
         zip.write_all(&bytes).expect("write manifest");
@@ -409,6 +461,14 @@ mod tests {
         assert!(!has_capabilities_extension(Path::new(
             "/nonexistent.gtpack"
         )));
+    }
+
+    #[test]
+    fn has_capabilities_returns_false_without_manifest_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("test.gtpack");
+        write_test_gtpack_manifest(&pack, "test-provider", false, &[], &[], false);
+        assert!(!has_capabilities_extension(&pack));
     }
 
     #[test]
@@ -452,30 +512,33 @@ mod tests {
     }
 
     #[test]
-    fn find_replacement_from_messaging_providers_build_dir() {
+    fn find_replacement_from_ancestor_pack_output() {
         let root = tempfile::tempdir().unwrap();
-        let project_root = root.path().join("workspace");
-        let bundle = project_root.join("bundle");
-        std::fs::create_dir_all(bundle.join("providers").join("messaging")).unwrap();
+        let nested = root.path().join("workspace").join("team").join("bundle");
+        std::fs::create_dir_all(nested.join("providers").join("messaging")).unwrap();
         write_test_gtpack(
-            &bundle
+            &nested
                 .join("providers")
                 .join("messaging")
                 .join("messaging-test.gtpack"),
             false,
         );
 
-        // greentic-messaging-providers/target/packs at workspace root
-        let build_dir = project_root
+        let pack_output = root
+            .path()
+            .join("workspace")
             .join("greentic-messaging-providers")
             .join("target")
             .join("packs");
-        std::fs::create_dir_all(&build_dir).unwrap();
-        write_test_gtpack(&build_dir.join("messaging-test.gtpack"), true);
+        std::fs::create_dir_all(&pack_output).unwrap();
+        let replacement = pack_output.join("messaging-test.gtpack");
+        write_test_gtpack(&replacement, true);
 
-        let replacement = find_replacement_pack("messaging-test.gtpack", &bundle, "messaging")
-            .expect("replacement should be found in build output");
-        assert!(replacement.ends_with("messaging-test.gtpack"));
+        let result = find_replacement_pack("messaging-test.gtpack", &nested, "messaging");
+        assert_eq!(
+            result.as_deref().map(canonicalize_or_path),
+            Some(canonicalize_or_path(&replacement))
+        );
     }
 
     #[test]
@@ -501,153 +564,178 @@ mod tests {
     }
 
     #[test]
-    fn validate_and_upgrade_packs_warns_when_no_replacement_available() {
-        let dir = tempfile::tempdir().unwrap();
-        let providers = dir.path().join("providers").join("messaging");
+    fn validate_and_upgrade_packs_warns_when_no_replacement_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("bundle");
+        let providers = bundle.join("providers").join("messaging");
         std::fs::create_dir_all(&providers).unwrap();
-        write_test_gtpack(&providers.join("legacy.gtpack"), false);
+        let pack = providers.join("messaging-test.gtpack");
+        write_test_gtpack_manifest(&pack, "messaging-test", false, &[], &[], true);
 
-        let report = validate_and_upgrade_packs(dir.path()).unwrap();
+        let report = validate_and_upgrade_packs(&bundle).unwrap();
         assert_eq!(report.checked, 1);
         assert!(report.upgraded.is_empty());
         assert_eq!(report.warnings.len(), 1);
-        assert!(report.warnings[0].message.contains("legacy.gtpack"));
+        assert_eq!(report.warnings[0].provider_id, "messaging-test");
+        assert!(
+            report.warnings[0]
+                .message
+                .contains("Replace with a newer build")
+        );
+        assert!(!pack.with_extension("gtpack.bak").exists());
     }
 
     #[test]
-    fn validate_and_upgrade_packs_upgrades_from_sibling_bundle() {
+    fn validate_and_upgrade_packs_replaces_pack_and_writes_backup() {
         let root = tempfile::tempdir().unwrap();
-
-        // Bundle A: legacy pack without capabilities
         let bundle_a = root.path().join("bundle-a");
         let providers_a = bundle_a.join("providers").join("messaging");
         std::fs::create_dir_all(&providers_a).unwrap();
-        let pack_a = providers_a.join("messaging-test.gtpack");
-        write_test_gtpack(&pack_a, false);
+        let original_pack = providers_a.join("messaging-test.gtpack");
+        write_test_gtpack_manifest(&original_pack, "messaging-test", false, &[], &[], true);
 
-        // Bundle B: same pack name with capabilities
         let bundle_b = root.path().join("bundle-b");
         let providers_b = bundle_b.join("providers").join("messaging");
         std::fs::create_dir_all(&providers_b).unwrap();
-        write_test_gtpack(&providers_b.join("messaging-test.gtpack"), true);
+        let replacement_pack = providers_b.join("messaging-test.gtpack");
+        write_test_gtpack_manifest(
+            &replacement_pack,
+            "messaging-test",
+            true,
+            &["cap.messaging"],
+            &[],
+            true,
+        );
 
         let report = validate_and_upgrade_packs(&bundle_a).unwrap();
         assert_eq!(report.checked, 1);
         assert_eq!(report.upgraded.len(), 1);
         assert!(report.warnings.is_empty());
-        // Backup file was written next to the original pack.
-        assert!(pack_a.with_extension("gtpack.bak").exists());
-        // Original pack now has capabilities.
-        assert!(has_capabilities_extension(&pack_a));
-    }
-
-    /// Write a gtpack with explicit `capabilities` and `dependencies` arrays.
-    fn write_pack_with_capabilities_and_deps(
-        path: &Path,
-        pack_id: &str,
-        capabilities: &[&str],
-        dependencies: &[(&str, &[&str])],
-    ) {
-        let mut map = BTreeMap::new();
-        map.insert(
-            CV::Text("schema_version".into()),
-            CV::Text("pack-v1".into()),
+        assert_eq!(report.upgraded[0].provider_id, "messaging-test");
+        assert_eq!(
+            canonicalize_or_path(&report.upgraded[0].source_path),
+            canonicalize_or_path(&replacement_pack)
         );
-        map.insert(CV::Text("pack_id".into()), CV::Text(pack_id.into()));
-        map.insert(CV::Text("version".into()), CV::Text("0.1.0".into()));
-        map.insert(CV::Text("kind".into()), CV::Text("provider".into()));
-
-        let cap_array: Vec<CV> = capabilities
-            .iter()
-            .map(|name| {
-                let mut cap = BTreeMap::new();
-                cap.insert(CV::Text("name".into()), CV::Text((*name).into()));
-                CV::Map(cap)
-            })
-            .collect();
-        map.insert(CV::Text("capabilities".into()), CV::Array(cap_array));
-
-        let dep_array: Vec<CV> = dependencies
-            .iter()
-            .map(|(dep_pack_id, required)| {
-                let mut dep = BTreeMap::new();
-                dep.insert(CV::Text("pack_id".into()), CV::Text((*dep_pack_id).into()));
-                dep.insert(
-                    CV::Text("required_capabilities".into()),
-                    CV::Array(
-                        required
-                            .iter()
-                            .map(|name| CV::Text((*name).into()))
-                            .collect(),
-                    ),
-                );
-                CV::Map(dep)
-            })
-            .collect();
-        map.insert(CV::Text("dependencies".into()), CV::Array(dep_array));
-
-        let bytes = serde_cbor::to_vec(&CV::Map(map)).expect("encode cbor");
-        let file = File::create(path).expect("create file");
-        let mut zip = ZipWriter::new(file);
-        zip.start_file("manifest.cbor", FileOptions::<()>::default())
-            .expect("start file");
-        zip.write_all(&bytes).expect("write manifest");
-        zip.finish().expect("finish zip");
+        assert!(original_pack.with_extension("gtpack.bak").exists());
+        assert!(has_capabilities_extension(&original_pack));
     }
 
     #[test]
-    fn validate_dependency_capabilities_marks_satisfied_and_missing() {
+    fn read_pack_capabilities_returns_declared_names() {
         let dir = tempfile::tempdir().unwrap();
-        let providers = dir.path().join("providers").join("messaging");
+        let pack = dir.path().join("provider.gtpack");
+        write_test_gtpack_manifest(
+            &pack,
+            "provider-a",
+            true,
+            &["cap.alpha", "cap.beta"],
+            &[],
+            true,
+        );
+
+        let caps = read_pack_capabilities(&pack).unwrap();
+        assert_eq!(caps, vec!["cap.alpha".to_string(), "cap.beta".to_string()]);
+    }
+
+    #[test]
+    fn read_pack_dependencies_ignores_incomplete_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("provider.gtpack");
+        write_test_gtpack_manifest(
+            &pack,
+            "provider-a",
+            false,
+            &[],
+            &[
+                ("pack-a", &["cap.alpha"]),
+                ("", &["cap.skip"]),
+                ("pack-b", &[]),
+            ],
+            true,
+        );
+
+        let deps = read_pack_dependencies(&pack).unwrap();
+        assert_eq!(
+            deps,
+            vec![("pack-a".to_string(), vec!["cap.alpha".to_string()])]
+        );
+    }
+
+    #[test]
+    fn validate_dependency_capabilities_tracks_satisfied_and_missing_caps() {
+        let root = tempfile::tempdir().unwrap();
+        let providers = root
+            .path()
+            .join("bundle")
+            .join("providers")
+            .join("messaging");
         std::fs::create_dir_all(&providers).unwrap();
 
-        // Provider A offers `cap.A`. Provider B requires `cap.A` (satisfied)
-        // and `cap.MISSING` (not provided by anyone).
-        write_pack_with_capabilities_and_deps(
+        write_test_gtpack_manifest(
             &providers.join("provider-a.gtpack"),
             "provider-a",
-            &["cap.A"],
+            true,
+            &["cap.shared"],
             &[],
+            true,
         );
-        write_pack_with_capabilities_and_deps(
+        write_test_gtpack_manifest(
             &providers.join("provider-b.gtpack"),
             "provider-b",
+            true,
             &[],
-            &[("provider-z", &["cap.A", "cap.MISSING"])],
+            &[("external-pack", &["cap.shared", "cap.missing"])],
+            true,
+        );
+        write_test_gtpack_manifest(
+            &providers.join("provider-c.gtpack"),
+            "provider-c",
+            true,
+            &[],
+            &[("provider-a", &["cap.shared"])],
+            true,
         );
 
-        let report = validate_dependency_capabilities(dir.path()).unwrap();
-        assert!(
-            report
-                .satisfied
-                .iter()
-                .any(|s| s.capability == "cap.A" && s.provided_by == "provider-a")
-        );
-        assert!(report.missing.iter().any(|m| m.capability == "cap.MISSING"));
+        let report = validate_dependency_capabilities(&root.path().join("bundle")).unwrap();
+        assert_eq!(report.satisfied.len(), 1);
+        assert_eq!(report.satisfied[0].capability, "cap.shared");
+        assert_eq!(report.satisfied[0].required_by, "provider-b");
+        assert_eq!(report.satisfied[0].provided_by, "provider-a");
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].capability, "cap.missing");
+        assert_eq!(report.missing[0].required_by, "provider-b");
     }
 
     #[test]
     fn validate_dependency_capabilities_skips_dependency_present_in_bundle() {
-        let dir = tempfile::tempdir().unwrap();
-        let providers = dir.path().join("providers").join("messaging");
+        let root = tempfile::tempdir().unwrap();
+        let providers = root
+            .path()
+            .join("bundle")
+            .join("providers")
+            .join("messaging");
         std::fs::create_dir_all(&providers).unwrap();
 
         // Pack X declares a dependency on pack-id "provider-y" — and provider-y
         // is present in the bundle. The dep should be skipped entirely.
-        write_pack_with_capabilities_and_deps(
+        write_test_gtpack_manifest(
             &providers.join("provider-x.gtpack"),
             "provider-x",
+            true,
             &[],
             &[("provider-y", &["whatever.cap"])],
+            true,
         );
-        write_pack_with_capabilities_and_deps(
+        write_test_gtpack_manifest(
             &providers.join("provider-y.gtpack"),
             "provider-y",
+            true,
             &[],
             &[],
+            true,
         );
 
-        let report = validate_dependency_capabilities(dir.path()).unwrap();
+        let report = validate_dependency_capabilities(&root.path().join("bundle")).unwrap();
         assert!(report.satisfied.is_empty());
         assert!(report.missing.is_empty());
     }

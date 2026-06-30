@@ -20,6 +20,7 @@ pub fn apply_create(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
 
     let pack_refs = dedup_sorted(&request.pack_refs);
     let tenants = normalize_tenants(&request.tenants);
+    let pack_setup_action_count = pack_setup_action_provider_count(&request.bundle);
 
     let mut steps = Vec::new();
     if !pack_refs.is_empty() {
@@ -51,12 +52,29 @@ pub fn apply_create(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             "Validate provider packs have capabilities extension",
             [("check", "greentic.ext.capabilities.v1".to_string())],
         ));
-    } else if !request.setup_answers.is_empty() {
+        steps.push(step(
+            SetupStepKind::ApplyPackSetup,
+            "Apply pack-declared setup outputs through internal setup hooks",
+            [("status", "planned".to_string())],
+        ));
+    } else if !request.setup_answers.is_empty() || pack_setup_action_count > 0 {
         // No new packs to fetch, but answers were provided for existing packs
         steps.push(step(
             SetupStepKind::ValidateCapabilities,
             "Validate provider packs have capabilities extension",
             [("check", "greentic.ext.capabilities.v1".to_string())],
+        ));
+        steps.push(step(
+            SetupStepKind::ApplyPackSetup,
+            "Apply setup answers to existing bundle packs",
+            [(
+                "providers",
+                request
+                    .setup_answers
+                    .len()
+                    .max(pack_setup_action_count)
+                    .to_string(),
+            )],
         ));
     } else {
         steps.push(step(
@@ -158,13 +176,20 @@ pub fn apply_update(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             ));
         }
     }
-    if ops.contains(&UpdateOp::ProvidersAdd) && request.providers.is_empty() && pack_refs.is_empty()
-    {
-        steps.push(step(
-            SetupStepKind::NoOp,
-            "providers_add selected without providers or new packs",
-            [("reason", "empty_providers_add".to_string())],
-        ));
+    if ops.contains(&UpdateOp::ProvidersAdd) {
+        if request.providers.is_empty() && pack_refs.is_empty() {
+            steps.push(step(
+                SetupStepKind::NoOp,
+                "providers_add selected without providers or new packs",
+                [("reason", "empty_providers_add".to_string())],
+            ));
+        } else {
+            steps.push(step(
+                SetupStepKind::ApplyPackSetup,
+                "Enable providers in providers/providers.json",
+                [("count", request.providers.len().to_string())],
+            ));
+        }
     }
     if ops.contains(&UpdateOp::ProvidersRemove) {
         if request.providers_remove.is_empty() {
@@ -175,8 +200,8 @@ pub fn apply_update(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             ));
         } else {
             steps.push(step(
-                SetupStepKind::AddPacksToBundle,
-                "Remove provider artifacts and config",
+                SetupStepKind::ApplyPackSetup,
+                "Disable/remove providers in providers/providers.json",
                 [("count", request.providers_remove.len().to_string())],
             ));
         }
@@ -312,8 +337,8 @@ pub fn apply_remove(request: &SetupRequest, dry_run: bool) -> anyhow::Result<Set
             ));
         } else {
             steps.push(step(
-                SetupStepKind::AddPacksToBundle,
-                "Remove provider artifacts and config",
+                SetupStepKind::ApplyPackSetup,
+                "Remove provider entries from providers/providers.json",
                 [("count", request.providers_remove.len().to_string())],
             ));
         }
@@ -492,6 +517,22 @@ pub fn build_metadata_with_ops(
     let mut meta = build_metadata(request, pack_refs, tenants);
     meta.update_ops = ops;
     meta
+}
+
+fn pack_setup_action_provider_count(bundle: &std::path::Path) -> usize {
+    let Ok(discovered) = crate::discovery::discover(bundle) else {
+        return 0;
+    };
+    discovered
+        .setup_targets()
+        .into_iter()
+        .filter(|provider| {
+            crate::setup_input::load_setup_spec(&provider.pack_path)
+                .ok()
+                .flatten()
+                .is_some_and(|spec| !spec.setup_actions.is_empty())
+        })
+        .count()
 }
 
 /// Compute a simple hash for a string (used for digest placeholders).

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "flow": "default.ygtc",
+  "nodes": {
+    "welcome": {
+      "component_id": "ai.greentic.component-adaptive-card",
+      "source": {
+        "kind": "local",
+        "path": "../components/ai.greentic.component-adaptive-card/component.wasm"
+      },
+      "digest": "sha256:2e6e53657107cb3456443a88d9be1a9419bd38f7b44f6d9df255b794e1a2c69f",
+      "manifest": {
+        "world": "greentic:component/component-v0-v6-v0@0.6.0",
+        "version": "0.6.0"
+      }
+    }
+  }
+}

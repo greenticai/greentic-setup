@@ -2,6 +2,12 @@
 //!
 //! Writes provider configuration to disk as a CBOR envelope containing the
 //! config payload, component metadata, and contract hashes for drift detection.
+//!
+//! After B12a, the envelope's `config` carries **non-secret** values and
+//! `secrets://<env>/<tenant>/<team>/<provider>/<key>` URI references for
+//! secret-marked keys (no plaintext). Consumers dereference the references via
+//! `SecretsManager`. The envelope itself remains a transitional config sink
+//! until `pack-config.v1` ships.
 
 use std::fs::File;
 use std::io::Read as _;
@@ -225,6 +231,7 @@ fn read_pack_provenance(
             })
             .unwrap_or_default(),
         config_schema: SchemaIr::Null,
+        outcomes: Vec::new(),
     };
     let describe_hash = hash_canonical(&describe)?;
 

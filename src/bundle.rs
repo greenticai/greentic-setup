@@ -508,7 +508,7 @@ fn prune_scaffold_default_pack(root: &Path, workspace: &YamlValue) -> anyhow::Re
     Ok(())
 }
 
-fn infer_bundle_id(root: &Path) -> String {
+pub(crate) fn infer_bundle_id(root: &Path) -> String {
     root.file_name()
         .and_then(|value| value.to_str())
         .map(ToOwned::to_owned)

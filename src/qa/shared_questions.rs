@@ -235,7 +235,8 @@ pub fn prompt_shared_questions(
             println!("  Used by: {providers_str}");
         }
 
-        if let Some(value) = ask_form_spec_question(question)? {
+        // None: shared-question prompts keep English chrome (provider-setup flow).
+        if let Some(value) = ask_form_spec_question(question, None)? {
             answers.insert(question.id.clone(), value);
         }
     }

@@ -2,6 +2,7 @@
 //!
 //! Handles user input collection, validation, and formatting for FormSpec questions.
 
+use std::borrow::Cow;
 use std::io::{self, Write as _};
 
 use anyhow::{Result, anyhow};
@@ -10,8 +11,40 @@ use qa_spec::{FormSpec, QuestionSpec, QuestionType, VisibilityMode, resolve_visi
 use rpassword::prompt_password;
 use serde_json::{Map as JsonMap, Value};
 
+use crate::cli_i18n::{CliI18n, format_template};
 use crate::qa::bridge;
 use crate::setup_to_formspec;
+
+/// Translate a chrome (prompt-loop scaffolding) string. When an `i18n` handle
+/// is supplied the localized catalog value is used, falling back to the inline
+/// English `default`; when it is `None` the `default` is returned verbatim, so
+/// callers that opt out (the provider-setup flow) keep the English prompt loop
+/// byte-for-byte. Question titles/descriptions are localized upstream on the
+/// spec, not here — this is only for the loop's own scaffolding text.
+fn ct(i18n: Option<&CliI18n>, key: &str, default: &str) -> String {
+    match i18n {
+        Some(i) => i.t_or(key, default),
+        None => default.to_string(),
+    }
+}
+
+/// [`ct`] with `{}` placeholders substituted from `args`.
+fn ctf(i18n: Option<&CliI18n>, key: &str, default: &str, args: &[&str]) -> String {
+    match i18n {
+        Some(i) => i.tf_or(key, default, args),
+        None => format_template(default, args),
+    }
+}
+
+/// The localized ` (required)` / ` (optional)` suffix appended to a question
+/// title in the prompt header.
+fn required_marker(question: &QuestionSpec, i18n: Option<&CliI18n>) -> String {
+    if question.required {
+        ct(i18n, "setup.qa.prompt.required_marker", " (required)")
+    } else {
+        ct(i18n, "setup.qa.prompt.optional_marker", " (optional)")
+    }
+}
 
 /// Interactively prompt the user using FormSpec questions.
 ///
@@ -21,12 +54,14 @@ pub fn prompt_form_spec_answers(
     spec: &FormSpec,
     provider_id: &str,
     advanced: bool,
+    i18n: Option<&CliI18n>,
 ) -> Result<Value> {
     prompt_form_spec_answers_with_existing(
         spec,
         provider_id,
         advanced,
         &Value::Object(JsonMap::new()),
+        i18n,
     )
 }
 
@@ -38,10 +73,21 @@ pub fn prompt_form_spec_answers_with_existing(
     provider_id: &str,
     advanced: bool,
     initial_answers: &Value,
+    i18n: Option<&CliI18n>,
 ) -> Result<Value> {
     let display = setup_to_formspec::strip_domain_prefix(provider_id);
-    let mode_label = if advanced { " (advanced)" } else { "" };
-    println!("\nConfiguring {display}: {}{mode_label}", spec.title);
+    let mode_label = if advanced {
+        ct(i18n, "setup.qa.prompt.mode_advanced", " (advanced)")
+    } else {
+        String::new()
+    };
+    let head = ctf(
+        i18n,
+        "setup.qa.prompt.configuring",
+        "Configuring {}: {}",
+        &[display.as_ref(), spec.title.as_str()],
+    );
+    println!("\n{head}{mode_label}");
     if let Some(ref pres) = spec.presentation
         && let Some(ref intro) = pres.intro
     {
@@ -77,7 +123,7 @@ pub fn prompt_form_spec_answers_with_existing(
         if !advanced && !question.required && question.kind != QuestionType::List {
             continue;
         }
-        if let Some(value) = ask_form_spec_question(question)? {
+        if let Some(value) = ask_form_spec_question(question, i18n)? {
             answers.insert(question.id.clone(), value);
         }
     }
@@ -127,7 +173,10 @@ pub fn answer_satisfies_question(question: &QuestionSpec, value: &Value) -> bool
 }
 
 /// Prompt for a single FormSpec question and return the answer.
-pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> {
+pub fn ask_form_spec_question(
+    question: &QuestionSpec,
+    i18n: Option<&CliI18n>,
+) -> Result<Option<Value>> {
     // Table / repeating-row questions (kind: List) get a dedicated row loop
     // — see `ask_list_question` for the prompt protocol. Falls through to
     // the scalar path if the question is List-typed but missing its
@@ -135,15 +184,11 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
     if question.kind == QuestionType::List
         && let Some(ref list) = question.list
     {
-        return ask_list_question(question, list);
+        return ask_list_question(question, list, i18n);
     }
 
     // Print question header
-    let marker = if question.required {
-        " (required)"
-    } else {
-        " (optional)"
-    };
+    let marker = required_marker(question, i18n);
     println!();
     println!("  {}{marker}", question.title);
 
@@ -162,7 +207,7 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
     }
 
     loop {
-        let prompt = build_form_spec_prompt(question);
+        let prompt = build_form_spec_prompt(question, i18n);
         let input = read_input(&prompt, question.secret)?;
         let trimmed = input.trim();
 
@@ -171,7 +216,14 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
                 return Ok(Some(parse_typed_value(question.kind, default)));
             }
             if question.required {
-                println!("  This field is required.");
+                println!(
+                    "  {}",
+                    ct(
+                        i18n,
+                        "setup.qa.prompt.field_required",
+                        "This field is required."
+                    )
+                );
                 continue;
             }
             return Ok(None);
@@ -183,7 +235,15 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
             && let Some(ref pattern) = constraint.pattern
             && !matches_pattern(&normalized, pattern)
         {
-            println!("  Invalid format. Expected pattern: {pattern}");
+            println!(
+                "  {}",
+                ctf(
+                    i18n,
+                    "setup.qa.prompt.invalid_format",
+                    "Invalid format. Expected pattern: {}",
+                    &[pattern],
+                )
+            );
             continue;
         }
 
@@ -196,13 +256,52 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
                 return Ok(Some(Value::String(choice.clone())));
             }
             if !choices.contains(&normalized) {
-                println!("  Invalid choice. Options: {}", choices.join(", "));
+                println!(
+                    "  {}",
+                    ctf(
+                        i18n,
+                        "setup.qa.prompt.invalid_choice",
+                        "Invalid choice. Options: {}",
+                        &[&choices.join(", ")],
+                    )
+                );
                 continue;
             }
         }
 
         return Ok(Some(parse_typed_value(question.kind, &normalized)));
     }
+}
+
+/// Resolve a row column's effective question for prompting.
+///
+/// When a column carries a `computed` expression *and* is
+/// `computed_overridable`, evaluate the expression against the row collected
+/// so far and surface the result as the column's `default_value` — so the
+/// operator sees a derived suggestion (e.g. route tenant defaulting to the
+/// bundle id) and accepts it with Enter or types their own. Columns without
+/// an overridable computed expression, and columns whose expression yields
+/// nothing for the current row, are returned untouched so their own
+/// `default_value` (if any) still applies.
+fn resolve_row_column_default<'a>(
+    column: &'a QuestionSpec,
+    row_so_far: &JsonMap<String, Value>,
+) -> Cow<'a, QuestionSpec> {
+    if !column.computed_overridable {
+        return Cow::Borrowed(column);
+    }
+    let Some(expr) = column.computed.as_ref() else {
+        return Cow::Borrowed(column);
+    };
+    let ctx = qa_spec::build_expression_context(&Value::Object(row_so_far.clone()));
+    let derived = match expr.evaluate_value(&ctx) {
+        Some(Value::String(text)) if !text.trim().is_empty() => text,
+        Some(Value::String(_)) | None => return Cow::Borrowed(column),
+        Some(other) => other.to_string(),
+    };
+    let mut resolved = column.clone();
+    resolved.default_value = Some(derived);
+    Cow::Owned(resolved)
 }
 
 /// Prompt for a `QuestionType::List` (repeating-row) question. Loops
@@ -215,12 +314,12 @@ pub fn ask_form_spec_question(question: &QuestionSpec) -> Result<Option<Value>> 
 ///   no rows were collected, we re-prompt instead of returning `None`.
 /// - Rows whose required columns are all empty are dropped silently
 ///   (lets the operator type a blank line and "step out" mid-table).
-fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<Value>> {
-    let marker = if question.required {
-        " (required)"
-    } else {
-        " (optional)"
-    };
+fn ask_list_question(
+    question: &QuestionSpec,
+    list: &ListSpec,
+    i18n: Option<&CliI18n>,
+) -> Result<Option<Value>> {
+    let marker = required_marker(question, i18n);
     println!();
     println!("  {}{marker}", question.title);
     if let Some(ref desc) = question.description
@@ -237,24 +336,52 @@ fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<
         if let Some(cap) = max
             && rows.len() >= cap
         {
-            println!("  (max {} rows reached)", cap);
+            println!(
+                "  {}",
+                ctf(
+                    i18n,
+                    "setup.qa.list.max_reached",
+                    "(max {} rows reached)",
+                    &[&cap.to_string()]
+                )
+            );
             break;
         }
 
-        // Ask whether to add another row.
+        // Ask whether to add another row. `item_label` lets the spec name
+        // the row noun (e.g. "bundle" ⇒ "Add bundle?"); falls back to "row".
+        // The `[y/N]` token and the literal `y` reply stay canonical — the
+        // reply parser only understands those, not localized words.
+        let label = list.item_label.as_deref().unwrap_or("row");
         let prompt = if rows.is_empty() {
-            "  > Add a row? [y/N] "
+            format!(
+                "  > {}",
+                ctf(i18n, "setup.qa.list.add_first", "Add {}? [y/N] ", &[label])
+            )
         } else {
-            "  > Add another row? [y/N] "
+            format!(
+                "  > {}",
+                ctf(
+                    i18n,
+                    "setup.qa.list.add_more",
+                    "Add another {}? [y/N] ",
+                    &[label]
+                )
+            )
         };
-        let input = read_input(prompt, false)?;
+        let input = read_input(&prompt, false)?;
         let trimmed = input.trim().to_ascii_lowercase();
         let yes = matches!(trimmed.as_str(), "y" | "yes" | "1" | "true");
         if !yes {
             if rows.len() < min {
                 println!(
-                    "  At least {min} row(s) required — got {}. Type 'y' to add another.",
-                    rows.len()
+                    "  {}",
+                    ctf(
+                        i18n,
+                        "setup.qa.list.min_required",
+                        "At least {} row(s) required — got {}. Type 'y' to add another.",
+                        &[&min.to_string(), &rows.len().to_string()],
+                    )
                 );
                 continue;
             }
@@ -262,10 +389,22 @@ fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<
         }
 
         // Prompt each column for the new row.
-        println!("  Row #{}:", rows.len() + 1);
+        println!(
+            "  {}",
+            ctf(
+                i18n,
+                "setup.qa.list.row_header",
+                "Row #{}:",
+                &[&(rows.len() + 1).to_string()]
+            )
+        );
         let mut row_obj = JsonMap::new();
         for column in &list.fields {
-            if let Some(value) = ask_form_spec_question(column)? {
+            // A column may derive its default from earlier columns in the
+            // same row (e.g. route_tenant ⇐ bundle_id). Resolve it against
+            // the row collected so far before prompting.
+            let column = resolve_row_column_default(column, &row_obj);
+            if let Some(value) = ask_form_spec_question(&column, i18n)? {
                 row_obj.insert(column.id.clone(), value);
             }
         }
@@ -280,7 +419,14 @@ fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<
                     .unwrap_or(false)
         });
         if !row_has_required_content {
-            println!("  (row dropped — required columns were empty)");
+            println!(
+                "  {}",
+                ct(
+                    i18n,
+                    "setup.qa.list.row_dropped",
+                    "(row dropped — required columns were empty)",
+                )
+            );
             continue;
         }
 
@@ -289,7 +435,14 @@ fn ask_list_question(question: &QuestionSpec, list: &ListSpec) -> Result<Option<
 
     if rows.is_empty() {
         if question.required {
-            println!("  This field is required — at least one row needed.");
+            println!(
+                "  {}",
+                ct(
+                    i18n,
+                    "setup.qa.list.field_required_row",
+                    "This field is required — at least one row needed.",
+                )
+            );
             return Ok(None);
         }
         return Ok(None);
@@ -311,7 +464,12 @@ fn is_empty_answer(v: &Value) -> bool {
 }
 
 /// Build the prompt string for a FormSpec question.
-fn build_form_spec_prompt(question: &QuestionSpec) -> String {
+///
+/// The type-hint tokens (`[yes/no]`, `[number]`, `[choice]`) stay canonical:
+/// the answer parser only understands those literals, so localizing them would
+/// invite input that no longer validates. Only the `(default: …)` prose is
+/// localized.
+fn build_form_spec_prompt(question: &QuestionSpec, i18n: Option<&CliI18n>) -> String {
     let mut prompt = String::from("  > ");
     match question.kind {
         QuestionType::Boolean => prompt.push_str("[yes/no] "),
@@ -322,7 +480,12 @@ fn build_form_spec_prompt(question: &QuestionSpec) -> String {
     if let Some(ref default) = question.default_value
         && !default.is_empty()
     {
-        prompt.push_str(&format!("(default: {default}) "));
+        prompt.push_str(&ctf(
+            i18n,
+            "setup.qa.prompt.default",
+            "(default: {}) ",
+            &[default],
+        ));
     }
     prompt
 }
@@ -411,5 +574,89 @@ mod tests {
         assert!(matches_pattern("http://localhost:8080", r"^https?://\S+"));
         assert!(!matches_pattern("not-a-url", r"^https?://\S+"));
         assert!(!matches_pattern("https://", r"^https?://\S+")); // too short
+    }
+
+    fn column(value: Value) -> QuestionSpec {
+        serde_json::from_value(value).expect("question spec")
+    }
+
+    fn row(pairs: &[(&str, &str)]) -> JsonMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect()
+    }
+
+    #[test]
+    fn row_column_default_derives_overridable_computed_from_siblings() {
+        let legal = row(&[("bundle_id", "legal")]);
+
+        // Copy of a sibling answer (route_tenant ⇐ bundle_id).
+        let tenant = column(json!({
+            "id": "route_tenant", "type": "string", "title": "Route tenant",
+            "computed": {"op": "var", "path": "bundle_id"},
+            "computed_overridable": true,
+        }));
+        assert_eq!(
+            resolve_row_column_default(&tenant, &legal)
+                .default_value
+                .as_deref(),
+            Some("legal")
+        );
+
+        // String concat (route_path_prefixes ⇐ "/" + bundle_id).
+        let prefixes = column(json!({
+            "id": "route_path_prefixes", "type": "string", "title": "Route path prefixes",
+            "computed": {"op": "concat", "parts": [
+                {"op": "literal", "value": "/"},
+                {"op": "var", "path": "bundle_id"}
+            ]},
+            "computed_overridable": true,
+        }));
+        assert_eq!(
+            resolve_row_column_default(&prefixes, &legal)
+                .default_value
+                .as_deref(),
+            Some("/legal")
+        );
+    }
+
+    #[test]
+    fn row_column_default_left_untouched_when_inapplicable() {
+        let legal = row(&[("bundle_id", "legal")]);
+
+        // Non-overridable computed → wizard does not surface a default.
+        let forced = column(json!({
+            "id": "x", "type": "string", "title": "X",
+            "computed": {"op": "var", "path": "bundle_id"},
+            "computed_overridable": false,
+        }));
+        assert!(matches!(
+            resolve_row_column_default(&forced, &legal),
+            Cow::Borrowed(_)
+        ));
+
+        // Overridable computed but the source is absent → no default.
+        let tenant = column(json!({
+            "id": "route_tenant", "type": "string", "title": "Route tenant",
+            "computed": {"op": "var", "path": "bundle_id"},
+            "computed_overridable": true,
+        }));
+        assert_eq!(
+            resolve_row_column_default(&tenant, &JsonMap::new()).default_value,
+            None
+        );
+
+        // No computed expression → the column's own static default survives.
+        let team = column(json!({
+            "id": "route_team", "type": "string", "title": "Route team",
+            "default_value": "default",
+        }));
+        assert_eq!(
+            resolve_row_column_default(&team, &legal)
+                .default_value
+                .as_deref(),
+            Some("default")
+        );
     }
 }
