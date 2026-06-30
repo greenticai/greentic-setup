@@ -2599,6 +2599,114 @@ fn persist_sensitive_backend_config(
     .map(|_| ())
 }
 
+/// Persist a completed backend-contract's declared `runtime_outputs` so the
+/// runtime provider can read them: non-secret values are merged into the
+/// provider's `setup-answers.json`, secret values are written to the dev secret
+/// store under the declared key names. A no-op when the contract declares no
+/// `runtime_outputs`.
+pub fn apply_runtime_outputs(
+    bundle_root: &Path,
+    tenant: &str,
+    team: &str,
+    provider_id: &str,
+    contract: &Value,
+    stored: &JsonMap<String, Value>,
+) -> anyhow::Result<()> {
+    let Some(outputs) = contract.get("runtime_outputs").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let config = stored
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(map) = outputs.get("config").and_then(Value::as_object) {
+        let mut answers = JsonMap::new();
+        for (target, source) in map {
+            if let Some(value) = resolve_runtime_output(source, &config) {
+                answers.insert(target.clone(), value);
+            }
+        }
+        if !answers.is_empty() {
+            merge_setup_answers(bundle_root, provider_id, answers)?;
+        }
+    }
+
+    if let Some(map) = outputs.get("secrets").and_then(Value::as_object) {
+        let mut secrets = JsonMap::new();
+        for (target, source) in map {
+            if let Some(value) = resolve_runtime_output(source, &config) {
+                secrets.insert(target.clone(), value);
+            }
+        }
+        if !secrets.is_empty() {
+            let env = backend_state_env(stored);
+            let bundle_root = bundle_root.to_path_buf();
+            let tenant = tenant.to_string();
+            let team = team.to_string();
+            let provider_id = provider_id.to_string();
+            let config = Value::Object(secrets);
+            block_on_backend_secret_task(async move {
+                crate::qa::persist::persist_all_config_as_secrets(
+                    &bundle_root,
+                    &env,
+                    &tenant,
+                    Some(&team),
+                    &provider_id,
+                    &config,
+                    None,
+                )
+                .await
+            })
+            .map(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one `runtime_outputs` mapping value: a bare string is a source config
+/// key; an object may carry `{"const": ...}` or `{"source": "<key>"}`.
+fn resolve_runtime_output(source: &Value, config: &JsonMap<String, Value>) -> Option<Value> {
+    match source {
+        Value::String(key) => config.get(key).cloned().filter(|value| !value.is_null()),
+        Value::Object(map) => {
+            if let Some(constant) = map.get("const") {
+                Some(constant.clone())
+            } else if let Some(Value::String(key)) = map.get("source") {
+                config.get(key).cloned().filter(|value| !value.is_null())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn merge_setup_answers(
+    bundle_root: &Path,
+    provider_id: &str,
+    new_answers: JsonMap<String, Value>,
+) -> anyhow::Result<()> {
+    let dir = bundle_root.join("state").join("config").join(provider_id);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create setup answers dir {}", dir.display()))?;
+    let path = dir.join("setup-answers.json");
+    let mut current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| Value::Object(JsonMap::new()));
+    let obj = current
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
+    for (key, value) in new_answers {
+        obj.insert(key, value);
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&current)?)
+        .with_context(|| format!("write setup answers {}", path.display()))?;
+    Ok(())
+}
+
 fn hydrate_redacted_backend_config(
     bundle_root: &Path,
     env: &str,
@@ -3832,5 +3940,59 @@ mod tests {
         assert!(!repeated.setup_actions_removed);
         assert!(repeated.archive_path.is_none());
         assert!(repeated.setup_actions_archive_path.is_none());
+    }
+
+    #[test]
+    fn apply_runtime_outputs_writes_non_secret_config_to_setup_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let contract = serde_json::json!({
+            "runtime_outputs": {
+                "config": {
+                    "enabled": { "const": true },
+                    "setup_mode": { "const": "bot_framework" },
+                    "tenant_id": "tenant",
+                    "client_id": "bot_app_id",
+                    "ms_bot_app_id": "bot_app_id",
+                    "absent": "missing_key"
+                }
+            }
+        });
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            serde_json::json!({
+                "tenant": "contoso.onmicrosoft.com",
+                "bot_app_id": "11111111-2222-3333-4444-555555555555",
+                "bot_app_password": "super-secret"
+            }),
+        );
+
+        apply_runtime_outputs(
+            temp.path(),
+            "demo",
+            "default",
+            "messaging-teams",
+            &contract,
+            &stored,
+        )
+        .unwrap();
+
+        let answers_path = temp
+            .path()
+            .join("state/config/messaging-teams/setup-answers.json");
+        let answers: Value =
+            serde_json::from_str(&std::fs::read_to_string(&answers_path).unwrap()).unwrap();
+        assert_eq!(answers["enabled"], serde_json::json!(true));
+        assert_eq!(answers["setup_mode"], "bot_framework");
+        assert_eq!(answers["tenant_id"], "contoso.onmicrosoft.com");
+        assert_eq!(answers["client_id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            answers["ms_bot_app_id"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+        // Unmapped/missing source keys are skipped, and the password is never
+        // written to the non-secret answers file.
+        assert!(answers.get("absent").is_none());
+        assert!(answers.get("bot_app_password").is_none());
     }
 }

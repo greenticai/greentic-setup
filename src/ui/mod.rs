@@ -2661,6 +2661,21 @@ async fn setup_backend_contract_next(
         result.clone(),
     )?;
     let state_after = render_setup_backend_contract_state(state, contract, tenant, stored.clone());
+    if state_after
+        .get("setup_status")
+        .and_then(|status| status.get("ok"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        crate::setup_backend_contract::apply_runtime_outputs(
+            &state.bundle_path,
+            tenant,
+            state.team.as_deref().unwrap_or("default"),
+            &contract.provider_id,
+            &contract.inline,
+            &stored,
+        )?;
+    }
     let _ = persist_setup_backend_next_diagnostic(
         state,
         contract,
@@ -3241,6 +3256,7 @@ async fn setup_backend_execute_oauth_device_code_complete(
             "token_store_key": token_store_key,
         }),
     );
+    setup_backend_fund_linked_resource(stored, executor, &client_id, &token_url, &body).await?;
     Ok(setup_backend_step_result(
         action,
         true,
@@ -3250,6 +3266,91 @@ async fn setup_backend_execute_oauth_device_code_complete(
             "persisted_keys": [token_store_key],
         }),
     ))
+}
+
+/// One sign-in funds both Microsoft tokens: if the just-completed device-code
+/// executor declares `also_fund`, exchange its refresh token for the linked
+/// resource token (e.g. Azure management) and mark that step's oauth state done,
+/// so a second device login is unnecessary. Silent no-op on any failure — the
+/// linked step then falls back to its own device-code login.
+async fn setup_backend_fund_linked_resource(
+    stored: &mut JsonMap<String, Value>,
+    executor: &Value,
+    client_id: &str,
+    token_url: &str,
+    token_response: &Value,
+) -> Result<()> {
+    let Some(also) = executor.get("also_fund").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(refresh_token) = token_response.get("refresh_token").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let scopes = also
+        .get("scopes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let token_store_key = also
+        .get("token_store_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let oauth_kind = also
+        .get("oauth_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    if scopes.trim().is_empty()
+        || token_store_key.is_empty()
+        || client_id.is_empty()
+        || token_url.is_empty()
+    {
+        return Ok(());
+    }
+    let client = reqwest::Client::new();
+    let Ok(response) = client
+        .post(token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+            ("scope", scopes.as_str()),
+        ])
+        .send()
+        .await
+    else {
+        return Ok(());
+    };
+    let Ok(body) = response.json::<Value>().await else {
+        return Ok(());
+    };
+    let Some(access_token) = body.get("access_token").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let config = setup_backend_config_mut(stored)?;
+    config.insert(
+        token_store_key.clone(),
+        Value::String(access_token.to_string()),
+    );
+    let oauth = stored
+        .entry("oauth".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("stored oauth state is not an object"))?;
+    oauth.insert(
+        oauth_kind,
+        serde_json::json!({
+            "ok": true,
+            "completed_at": setup_backend_timestamp_ms(),
+            "token_store_key": token_store_key,
+            "funded_by_refresh": true,
+        }),
+    );
+    Ok(())
 }
 
 async fn setup_backend_execute_graph_application(
@@ -4492,6 +4593,13 @@ fn setup_backend_refresh_ephemeral_public_base_url(
     else {
         return;
     };
+    // Never downgrade a configured ephemeral tunnel to a non-public (e.g.
+    // localhost) runtime base — an externally supplied tunnel stays authoritative.
+    if !setup_backend_public_base_url_is_external_https(&active)
+        && !is_ephemeral_tunnel_public_base_url(&active)
+    {
+        return;
+    }
     if active != current.trim_end_matches('/') {
         config.insert("public_base_url".to_string(), Value::String(active));
     }
@@ -4503,6 +4611,15 @@ async fn setup_backend_refresh_public_tunnel_if_needed(
     config: &mut JsonMap<String, Value>,
 ) -> Result<Option<String>> {
     let current = setup_backend_config_str(config, "public_base_url");
+    // Honor an already-reachable public base URL (e.g. an operator-supplied
+    // tunnel) instead of starting and probing a fresh one.
+    if !current.is_empty()
+        && (is_ephemeral_tunnel_public_base_url(&current)
+            || setup_backend_public_base_url_is_external_https(&current))
+        && setup_backend_public_tunnel_responds(&current).await
+    {
+        return Ok(None);
+    }
     let Some(mode) = setup_backend_tunnel_mode(state)?
         .or_else(|| setup_backend_infer_tunnel_mode_from_public_base_url(&current))
     else {
