@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -30,13 +30,13 @@ flate2 = "1"
 # defaults match the runtime resolver (on for `local`, off elsewhere). That publish
 # also carries `ManifestEnvironment.gui_enabled` + the `webchat_gui` question
 # (deployer#322) that `manifest_to_answers` maps back for edit-mode pre-fill.
-greentic-deployer = { version = ">=1.1.0-dev.27640381592, <1.2.0-0", default-features = false }
-greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
-greentic-runner-host = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false }
-greentic-secrets-lib = { version = ">=1.1.0-dev.27563392344, <1.2.0-0", features = ["providers-dev"] }
-greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }
+greentic-deployer = { version = ">=1.1.0-0, <1.2.0-0", default-features = false }
+greentic-distributor-client = { version = ">=1.1.0-0, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
+greentic-runner-host = { version = ">=1.1.0-0, <1.2.0-0", default-features = false }
+greentic-secrets-lib = { version = ">=1.1.0-0, <1.2.0-0", features = ["providers-dev"] }
+greentic-types = { version = ">=1.1.0-0, <1.2.0-0", features = ["serde"] }
 hmac = "0.13"
-qa-spec = ">=1.1.0-dev.27541005498, <1.2.0-0"
+qa-spec = ">=1.1.0-0, <1.2.0-0"
 regex = "1"
 dialoguer = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
