@@ -143,6 +143,10 @@ struct QuestionInfo {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    /// Link to where the operator can create this credential (provider dev
+    /// portal), surfaced from the component QA spec's `help_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    create_url: Option<String>,
     /// Column schema for `kind: List` (table) questions. Each entry tells
     /// the front-end how to render one cell per row. Absent for scalar
     /// kinds.
@@ -186,6 +190,7 @@ struct SetupQuestionExtras {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    create_url: Option<String>,
     /// Per-column metadata for `kind: table` questions. Maps column `key`
     /// → multilingual flag. Used by the UI to render i18n-aware cells.
     /// Empty for non-table questions.
@@ -837,11 +842,24 @@ async fn get_providers(
                         placeholder: q.placeholder.clone(),
                         group: q.group.clone(),
                         docs_url: q.docs_url.clone(),
+                        create_url: q.create_url.clone(),
                         column_multilingual,
                     },
                 );
             }
             extras_by_provider.insert(provider.provider_id.clone(), map);
+        }
+    }
+
+    // Guided create/help links from each pack's component QA spec (help_url).
+    let mut help_urls_by_provider: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
+    for provider in &setup_targets {
+        let links = setup_to_formspec::pack_help_urls(&provider.pack_path);
+        if !links.is_empty() {
+            help_urls_by_provider.insert(provider.provider_id.clone(), links);
         }
     }
 
@@ -866,6 +884,10 @@ async fn get_providers(
         .filter(|q| !HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()))
         .map(|q| {
             let mut info = form_question_to_info(q, Some(&i18n));
+            info.create_url = help_urls_by_provider
+                .values()
+                .find_map(|m| m.get(&q.id))
+                .cloned();
             // First try --answers prefill (check all providers for the shared question)
             let mut found = false;
             if let Some(answers) = prefill {
@@ -918,12 +940,21 @@ async fn get_providers(
                     .filter(|q| !HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()))
                     .map(|q| {
                         let mut info = form_question_to_info(q, Some(&i18n));
+                        info.create_url = help_urls_by_provider
+                            .get(&pfs.provider_id)
+                            .and_then(|m| m.get(&q.id))
+                            .cloned();
                         if let Some(ext) = extras.and_then(|m| m.get(&q.id)) {
                             if info.placeholder.is_none() {
                                 info.placeholder = ext.placeholder.clone();
                             }
                             info.group = ext.group.clone();
                             info.docs_url = ext.docs_url.clone();
+                            // setup.yaml create_url takes precedence over the
+                            // component QA help_url when both are declared.
+                            if ext.create_url.is_some() {
+                                info.create_url = ext.create_url.clone();
+                            }
                             // Overlay per-column multilingual flags onto the
                             // table-rendering metadata (qa-spec QuestionSpec
                             // has no slot for this hint, so we carry it
@@ -4629,6 +4660,19 @@ fn setup_backend_tunnel_local_base_url(state: &UiState, tenant: &str) -> Result<
         .ok_or_else(|| anyhow!("no local base URL available for setup tunnel"))
 }
 
+/// An operator-supplied public base URL (managed tunnel) from the environment.
+/// When present, provider setup honors it instead of spinning its own ephemeral
+/// setup tunnel — which otherwise blocks the setup action when that tunnel can't
+/// come up. Accepts ephemeral hosts (ngrok/trycloudflare) since the operator
+/// chose them explicitly.
+fn injected_setup_public_base_url() -> Option<String> {
+    std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
+        .ok()
+        .or_else(|| std::env::var("GREENTIC_PUBLIC_BASE_URL").ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"))
+}
+
 fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String> {
     if let Some(value) = std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
         .ok()
@@ -4750,6 +4794,7 @@ async fn setup_backend_runtime_context_blocked(
         .get("public_base_url_is_ephemeral_tunnel")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        && active_tunnel_public_base_url.is_some()
         && active_tunnel_public_base_url != Some(public_base_url)
     {
         return Some(serde_json::json!({
@@ -4810,14 +4855,18 @@ fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool
         return false;
     }
     let current_public_base_url = current.get("public_base_url").and_then(Value::as_str);
+    let active_tunnel = current
+        .get("active_tunnel_public_base_url")
+        .and_then(Value::as_str);
+    // Only a setup-MANAGED tunnel that has drifted disqualifies currency. An
+    // operator-supplied external tunnel (no managed tunnel present) stays
+    // authoritative and is validated by the public_base_url comparison below.
     if current
         .get("public_base_url_is_ephemeral_tunnel")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && current
-            .get("active_tunnel_public_base_url")
-            .and_then(Value::as_str)
-            != current_public_base_url
+        && active_tunnel.is_some()
+        && active_tunnel != current_public_base_url
     {
         return false;
     }
@@ -5837,7 +5886,12 @@ async fn post_execute(
         let _ = crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel);
     }
 
-    let setup_public_base_url = if should_start_setup_tunnel(&tunnel_mode, &answers) {
+    let setup_public_base_url = if let Some(url) = injected_setup_public_base_url() {
+        // Operator supplied a public URL (e.g. a managed ngrok/cloudflared tunnel);
+        // honor it instead of spinning — and blocking on — our own setup tunnel.
+        inject_setup_public_base_url(&mut answers, &url);
+        Some(url)
+    } else if should_start_setup_tunnel(&tunnel_mode, &answers) {
         match ensure_setup_tunnel(state.as_ref(), &tunnel_mode, &state.local_base_url).await {
             Ok(url) => {
                 inject_setup_public_base_url(&mut answers, &url);
@@ -6102,7 +6156,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         };
         crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)?;
     }
-    if should_start_setup_tunnel(&tunnel_mode, &answers) {
+    if let Some(url) = injected_setup_public_base_url() {
+        // Operator supplied a public URL; honor it instead of spinning our own tunnel.
+        inject_setup_public_base_url(&mut answers, &url);
+    } else if should_start_setup_tunnel(&tunnel_mode, &answers) {
         let url = ensure_setup_tunnel(state, &tunnel_mode, &state.local_base_url).await?;
         inject_setup_public_base_url(&mut answers, &url);
     }
@@ -7198,6 +7255,7 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         placeholder: None,
         group: None,
         docs_url: None,
+        create_url: None,
         list_columns,
         min_rows,
         max_rows,
