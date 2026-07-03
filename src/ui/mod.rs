@@ -4794,7 +4794,6 @@ async fn setup_backend_runtime_context_blocked(
         .get("public_base_url_is_ephemeral_tunnel")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && active_tunnel_public_base_url.is_some()
         && active_tunnel_public_base_url != Some(public_base_url)
     {
         return Some(serde_json::json!({
@@ -4858,14 +4857,13 @@ fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool
     let active_tunnel = current
         .get("active_tunnel_public_base_url")
         .and_then(Value::as_str);
-    // Only a setup-MANAGED tunnel that has drifted disqualifies currency. An
-    // operator-supplied external tunnel (no managed tunnel present) stays
-    // authoritative and is validated by the public_base_url comparison below.
+    // An ephemeral public base is current only while a live tunnel still serves
+    // that exact URL. A gone tunnel (active_tunnel absent) or a drifted one both
+    // disqualify it; a live tunnel reports the matching base via the runtime.
     if current
         .get("public_base_url_is_ephemeral_tunnel")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && active_tunnel.is_some()
         && active_tunnel != current_public_base_url
     {
         return false;
