@@ -14,7 +14,7 @@ pub use inference::{
     capitalize, extract_default_from_help, infer_default_for_id, infer_question_properties,
     strip_domain_prefix,
 };
-pub use pack::pack_to_form_spec;
+pub use pack::{pack_help_urls, pack_to_form_spec};
 
 #[cfg(test)]
 mod tests {
@@ -190,6 +190,40 @@ mod tests {
         assert_eq!(form.questions.len(), 2);
         assert_eq!(form.questions[0].id, "redis_url");
         assert!(form.questions[1].visible_if.is_some());
+    }
+
+    #[test]
+    fn pack_help_urls_extracts_component_qa_links() {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let qa_json = json!({
+            "mode": "setup",
+            "questions": [
+                {"id": "bot_token", "label": "Bot token", "required": true,
+                 "help_url": "https://developer.webex.com/my-apps/new/bot"},
+                {"id": "bot_email", "label": "Bot email", "required": true}
+            ]
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pack_path = temp_dir.path().join("messaging-webex.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("qa/webex-setup.json", options).unwrap();
+        writer
+            .write_all(serde_json::to_string(&qa_json).unwrap().as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let links = pack_help_urls(&pack_path);
+        assert_eq!(
+            links.get("bot_token").map(String::as_str),
+            Some("https://developer.webex.com/my-apps/new/bot")
+        );
+        assert!(!links.contains_key("bot_email"));
     }
 
     #[test]

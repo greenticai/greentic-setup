@@ -73,6 +73,60 @@ fn load_qa_form_spec_from_pack(pack_path: &Path, provider_id: &str) -> Option<Fo
     None
 }
 
+/// Extract per-question guided create/help links (`help_url`) from a pack's
+/// `qa/*.json`, keyed by question id. Empty when the pack declares none.
+///
+/// The QA JSON has no fixed nesting (mode wrappers, question arrays), so this
+/// walks the tree and collects every object carrying both `id` and `help_url`.
+pub fn pack_help_urls(pack_path: &Path) -> HashMap<String, String> {
+    let mut links = HashMap::new();
+    let Ok(file) = File::open(pack_path) else {
+        return links;
+    };
+    let Ok(mut archive) = ZipArchive::new(file) else {
+        return links;
+    };
+    let qa_entries: Vec<String> = (0..archive.len())
+        .filter_map(|i| {
+            let name = archive.by_index(i).ok()?.name().to_string();
+            (name.starts_with("qa/") && name.ends_with(".json")).then_some(name)
+        })
+        .collect();
+    for entry_name in qa_entries {
+        if let Ok(mut entry) = archive.by_name(&entry_name) {
+            let mut contents = String::new();
+            if entry.read_to_string(&mut contents).is_ok()
+                && let Ok(qa_value) = serde_json::from_str::<serde_json::Value>(&contents)
+            {
+                collect_help_urls(&qa_value, &mut links);
+            }
+        }
+    }
+    links
+}
+
+fn collect_help_urls(value: &serde_json::Value, out: &mut HashMap<String, String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let (Some(id), Some(url)) = (
+                map.get("id").and_then(|v| v.as_str()),
+                map.get("help_url").and_then(|v| v.as_str()),
+            ) {
+                out.entry(id.to_string()).or_insert_with(|| url.to_string());
+            }
+            for v in map.values() {
+                collect_help_urls(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_help_urls(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn augment_with_secret_requirements(
     form_spec: Option<FormSpec>,
     pack_path: &Path,
