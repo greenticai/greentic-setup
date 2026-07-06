@@ -90,6 +90,9 @@
 
   function makeScope(tenant, env, team) {
     var answers = {};
+    // Packs with no questions need no user input — mark them done up front so
+    // they don't sit as "Pending" forever and don't block the "all done" gate.
+    var providersDone = {};
     state.providers.forEach(function (p) {
       answers[p.provider_id] = {};
       var form = state.providerForms[p.provider_id];
@@ -97,6 +100,9 @@
         form.questions.forEach(function (q) {
           if (q.saved_value) answers[p.provider_id][q.id] = q.saved_value;
         });
+        if ((form.questions || []).length === 0 && !p.setup_web_component) {
+          providersDone[p.provider_id] = true;
+        }
       }
     });
     return {
@@ -106,7 +112,7 @@
       tunnel: state.defaultTunnel || (state.cloudDeploy ? "off" : "cloudflared"),
       answers: answers,
       sharedAnswers: {},
-      providersDone: {},
+      providersDone: providersDone,
       providerSetupStatus: {},
       publicBaseUrlStatus: {},
       sharedAnswersDone: false,
@@ -713,9 +719,13 @@
 
     state.providers.forEach(function (p, idx) {
       var enabled = providerEnabled(scope, p.provider_id);
-      var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
+      // Hide packs with nothing to configure — no questions and no web setup
+      // component. They are auto-done (see makeScope); a "0 questions" card
+      // stuck on Pending only confuses.
+      if (qCount === 0 && !p.setup_web_component) return;
+      var done = scope.providersDone[p.provider_id];
       var setupKind = p.setup_web_component ? "web setup" : qCount + ' ' + esc(t("ui.questions"));
       var displayName = formatProviderName(p);
       html +=
