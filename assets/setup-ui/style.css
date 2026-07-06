@@ -288,6 +288,13 @@ select{cursor:pointer;appearance:none;
 .setup-action-error{
   color:#fca5a5;font-size:.8125rem;line-height:1.5;
 }
+.setup-action-warning{
+  margin:.5rem 0;padding:.6rem .75rem;border-radius:.4rem;
+  color:#dc2626;background:rgba(220,38,38,.08);
+  border:1px solid rgba(220,38,38,.5);border-left:3px solid #dc2626;
+  font-size:.8125rem;line-height:1.5;font-weight:600;
+}
+.setup-action-warning code{color:#dc2626;font-weight:700}
 .final-setup-action{width:100%}
 .final-action-field-label{
   font-size:.6875rem;font-weight:700;color:var(--muted);
