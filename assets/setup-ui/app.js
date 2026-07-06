@@ -73,6 +73,9 @@
 
   function makeScope(tenant, env, team) {
     var answers = {};
+    // Packs with no questions need no user input — mark them done up front so
+    // they don't sit as "Pending" forever and don't block the "all done" gate.
+    var providersDone = {};
     state.providers.forEach(function (p) {
       answers[p.provider_id] = {};
       var form = state.providerForms[p.provider_id];
@@ -80,6 +83,7 @@
         form.questions.forEach(function (q) {
           if (q.saved_value) answers[p.provider_id][q.id] = q.saved_value;
         });
+        if ((form.questions || []).length === 0) providersDone[p.provider_id] = true;
       }
     });
     return {
@@ -89,7 +93,7 @@
       tunnel: "cloudflared",
       answers: answers,
       sharedAnswers: {},
-      providersDone: {},
+      providersDone: providersDone,
       sharedAnswersDone: false,
       executed: false,
     };
@@ -647,9 +651,11 @@
         '<div class="provider-list">';
 
     state.providers.forEach(function (p, idx) {
-      var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
+      // Hide packs with nothing to configure — they are auto-done (see makeScope).
+      if (qCount === 0) return;
+      var done = scope.providersDone[p.provider_id];
       var displayName = formatProviderName(p);
       html +=
         '<div class="provider-card clickable" data-prov-idx="' + idx + '">' +
@@ -667,8 +673,14 @@
     if (state.sharedQuestions.length > 0 && !scope.sharedAnswersDone) {
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
     } else {
-      // Always offer sequential edit starting from the first provider
-      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="0" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[0])])) + '</button>';
+      // Start sequential edit at the first provider that actually has questions
+      // (0-question packs are auto-done and hidden).
+      var firstIdx = state.providers.findIndex(function (p) {
+        var f = state.providerForms[p.provider_id];
+        return f && (f.questions || []).length > 0;
+      });
+      if (firstIdx < 0) firstIdx = 0;
+      html += '<button class="btn btn-primary btn-lg" id="btn-next-prov" data-idx="' + firstIdx + '" style="width:100%">' + esc(t("ui.configure", [formatProviderName(state.providers[firstIdx])])) + '</button>';
     }
 
     html +=
