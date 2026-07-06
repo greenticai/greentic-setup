@@ -9,19 +9,35 @@ pub struct SetupTunnel {
     pub mode: String,
     pub local_base_url: String,
     pub public_base_url: String,
-    child: Child,
+    /// `None` when reusing a tunnel recorded by another Greentic process
+    /// (the shared record owns it, not this setup session).
+    child: Option<Child>,
+    /// Cloudflared tunnels deliberately OUTLIVE setup so the runtime they
+    /// were configured against keeps a live public URL (greentic-start adopts
+    /// them via the shared record). ngrok keeps the old kill-on-drop
+    /// semantics until it gets the same shared-record treatment.
+    kill_on_drop: bool,
 }
 
 impl Drop for SetupTunnel {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if self.kill_on_drop
+            && let Some(child) = self.child.as_mut()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 impl SetupTunnel {
     pub fn is_running(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_none()
+        match self.child.as_mut() {
+            Some(child) => child.try_wait().ok().flatten().is_none(),
+            // Reused shared-record tunnel: not our child. Liveness is
+            // enforced by the URL probes callers already run.
+            None => true,
+        }
     }
 }
 
@@ -43,6 +59,70 @@ pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -
 }
 
 pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunnel> {
+    match mode {
+        "cloudflared" => start_cloudflared_shared(local_base_url),
+        "ngrok" => {
+            let (child, url) = spawn_tunnel_process(mode, local_base_url)?;
+            Ok(SetupTunnel {
+                mode: mode.to_string(),
+                local_base_url: local_base_url.trim_end_matches('/').to_string(),
+                public_base_url: url,
+                child: Some(child),
+                kill_on_drop: true,
+            })
+        }
+        other => Err(anyhow!("unsupported setup tunnel mode: {other}")),
+    }
+}
+
+/// Acquire the machine-wide shared cloudflared tunnel for the port behind
+/// `local_base_url`: reuse the recorded one when it still serves, otherwise
+/// spawn a fresh cloudflared and publish it so greentic-start adopts the same
+/// tunnel instead of racing it (see [`crate::shared_tunnel`]).
+fn start_cloudflared_shared(local_base_url: &str) -> Result<SetupTunnel> {
+    let mode = "cloudflared";
+    let port = crate::shared_tunnel::local_port_from_base_url(local_base_url)
+        .ok_or_else(|| anyhow!("cannot derive a local port from {local_base_url}"))?;
+    let paths = crate::shared_tunnel::shared_tunnel_paths(port);
+    let _lock =
+        crate::shared_tunnel::TunnelLock::acquire(&paths.lock_path, Duration::from_secs(45))?;
+
+    let (recorded_pid, recorded_url) = crate::shared_tunnel::read_record(&paths);
+    if let Some(url) = recorded_url {
+        if crate::shared_tunnel::probe_tunnel_alive(&url) {
+            eprintln!("Reusing shared {mode} tunnel: {url}");
+            return Ok(SetupTunnel {
+                mode: mode.to_string(),
+                local_base_url: local_base_url.trim_end_matches('/').to_string(),
+                public_base_url: url,
+                child: None,
+                kill_on_drop: false,
+            });
+        }
+        // Recorded tunnel no longer serves. It is ours to replace: the pid
+        // came from the shared record, never from a process-name match.
+        if let Some(pid) = recorded_pid {
+            crate::shared_tunnel::terminate_recorded_pid(pid);
+        }
+    }
+    crate::shared_tunnel::clear_record(&paths);
+
+    let (child, url) = spawn_tunnel_process(mode, local_base_url)?;
+    if let Err(err) = crate::shared_tunnel::write_record(&paths, child.id(), &url) {
+        eprintln!("warning: could not publish shared tunnel record: {err:#}");
+    }
+    Ok(SetupTunnel {
+        mode: mode.to_string(),
+        local_base_url: local_base_url.trim_end_matches('/').to_string(),
+        public_base_url: url,
+        child: Some(child),
+        kill_on_drop: false,
+    })
+}
+
+/// Spawn the tunnel binary and read its stdout/stderr until it publishes an
+/// https:// URL for its mode.
+fn spawn_tunnel_process(mode: &str, local_base_url: &str) -> Result<(Child, String)> {
     let mut command = match mode {
         "cloudflared" => {
             let binary = resolve_tunnel_binary(mode)?;
@@ -81,12 +161,7 @@ pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunne
             Ok(line) => {
                 if let Some(url) = extract_tunnel_https_url(mode, &line) {
                     eprintln!("Setup tunnel started via {mode}: {url}");
-                    return Ok(SetupTunnel {
-                        mode: mode.to_string(),
-                        local_base_url: local_base_url.trim_end_matches('/').to_string(),
-                        public_base_url: url,
-                        child,
-                    });
+                    return Ok((child, url));
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
