@@ -147,6 +147,12 @@ body.has-wide-form .container{max-width:1380px}
   white-space:nowrap;flex-shrink:0;
 }
 .field-docs:hover{text-decoration:underline}
+.field-create{
+  font-size:.7rem;color:var(--primary);text-decoration:none;font-weight:600;
+  white-space:nowrap;flex-shrink:0;
+}
+.field-create:hover{text-decoration:underline}
+.setup-action-desc{font-size:.8rem;color:var(--muted);line-height:1.5;margin:.25rem 0 .75rem}
 .required{color:var(--primary);margin-left:.125rem}
 
 input[type="text"],input[type="password"],select{

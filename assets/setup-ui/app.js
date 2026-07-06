@@ -931,9 +931,10 @@
       } else {
         html += '<input type="text" id="f-' + esc(q.id) + '" name="' + esc(q.id) + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : '') + ' />';
       }
-      if (q.help || q.docs_url) {
+      if (q.help || q.docs_url || q.create_url) {
         html += '<div class="field-meta">';
         if (q.help) html += '<p class="field-help">' + esc(q.help) + '</p>';
+        if (q.create_url) html += '<a class="field-create" href="' + esc(q.create_url) + '" target="_blank" rel="noopener">Don\'t have one? Create it ↗</a>';
         if (q.docs_url) html += '<a class="field-docs" href="' + esc(q.docs_url) + '" target="_blank" rel="noopener">Setup Guide ↗</a>';
         html += '</div>';
       }
@@ -1560,8 +1561,9 @@
     actions.forEach(function (action, idx) {
       html += '<div class="setup-action">';
       html += '<div class="setup-action-heading">' + esc(action.label || "Create app") + '</div>';
+      if (action.description) html += '<p class="setup-action-desc">' + esc(action.description) + '</p>';
       if (completed) {
-        html += '<div class="setup-action-status">App setup complete.</div>';
+        html += '<div class="setup-action-status">App setup complete. Its Event Subscriptions &amp; Interactivity request URLs are now linked to this bundle’s message endpoint — send your bot a message to test. If the bundle’s public URL later changes, re-run this step to update them.</div>';
       } else if (running) {
         html += '<div class="setup-action-status">Working...</div>';
       } else {

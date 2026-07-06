@@ -112,6 +112,10 @@ pub struct SetupQuestion {
     /// URL to external setup documentation.
     #[serde(default)]
     pub docs_url: Option<String>,
+    /// URL to where the operator can create this credential (provider dev
+    /// portal). Rendered as a guided "Create it" link next to the field.
+    #[serde(default)]
+    pub create_url: Option<String>,
     /// Column definitions for `kind: table` questions. Each row's answer is a
     /// JSON object whose keys match the columns' `key` field.
     #[serde(default)]
