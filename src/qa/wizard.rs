@@ -53,12 +53,25 @@ pub fn run_qa_setup(
         if let Some(value) = input.answers_for_provider(provider_id) {
             let mut answers = crate::setup_input::ensure_object(value.clone())?;
             if let Some(ref spec) = form_spec {
-                // Check for missing required fields and prompt if needed
                 let missing = find_missing_required_fields(spec, &answers);
                 if !missing.is_empty() {
                     let display = setup_to_formspec::strip_domain_prefix(provider_id);
-                    println!("\n⚠️  Missing required fields for {display}. Please provide values:");
-                    answers = prompt_for_missing_fields(spec, &answers, &missing)?;
+                    if interactive {
+                        println!(
+                            "\n⚠️  Missing required fields for {display}. Please provide values:"
+                        );
+                        answers = prompt_for_missing_fields(spec, &answers, &missing)?;
+                    } else {
+                        // Never prompt in non-interactive mode — a hidden TTY
+                        // prompt on closed stdin fails with "Device not
+                        // configured". Fail with an actionable error instead.
+                        anyhow::bail!(
+                            "missing required setup answer(s) for {display} in non-interactive \
+                             mode: {}. Provide them in the --answers file (or drop \
+                             --non-interactive to be prompted).",
+                            missing.join(", ")
+                        );
+                    }
                 }
                 validate_answers_against_form_spec(spec, &answers)?;
             }
@@ -213,15 +226,19 @@ pub fn run_qa_setup_with_shared(
             // None: provider-setup flow keeps English prompt chrome.
             do_prompt_with_existing(spec, provider_id, advanced, &merged_initial, None)?
         } else {
-            // Non-interactive: check for missing required fields
-            let mut answers = crate::setup_input::ensure_object(merged_initial)?;
+            // Non-interactive: never prompt (a hidden TTY prompt on closed
+            // stdin fails with "Device not configured"). Report missing
+            // required fields as a clear, actionable error instead.
+            let answers = crate::setup_input::ensure_object(merged_initial)?;
             let missing = find_missing_required_fields(spec, &answers);
 
             if !missing.is_empty() {
-                // Prompt for missing required fields
                 let display = setup_to_formspec::strip_domain_prefix(provider_id);
-                println!("\n⚠️  Missing required fields for {display}. Please provide values:");
-                answers = prompt_for_missing_fields(spec, &answers, &missing)?;
+                anyhow::bail!(
+                    "missing required setup answer(s) for {display} in non-interactive mode: {}. \
+                     Provide them in the --answers file (or drop --non-interactive to be prompted).",
+                    missing.join(", ")
+                );
             }
 
             validate_answers_against_form_spec(spec, &answers)?;
