@@ -307,12 +307,27 @@ fn extract_https_urls(line: &str) -> Vec<String> {
 }
 
 pub fn inject_setup_public_base_url(answers: &mut JsonMap<String, Value>, public_base_url: &str) {
+    // The OAuth *callback* (developer app-install) is served by the setup server,
+    // not the runtime, so provider ops that register OAuth redirect URLs need the
+    // setup server's public URL — separate from the messaging `public_base_url`.
+    // Injected only when `GREENTIC_SETUP_PUBLIC_BASE_URL` is set; otherwise ops
+    // fall back to `public_base_url` for back-compat.
+    let oauth_callback_base_url = std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"));
     for provider_answers in answers.values_mut() {
         let Some(obj) = provider_answers.as_object_mut() else {
             continue;
         };
         if !crate::provider_state::provider_enabled_from_map(obj) {
             continue;
+        }
+        if let Some(ref callback_base) = oauth_callback_base_url {
+            obj.insert(
+                "oauth_callback_base_url".to_string(),
+                Value::String(callback_base.clone()),
+            );
         }
         if obj
             .get("public_base_url")

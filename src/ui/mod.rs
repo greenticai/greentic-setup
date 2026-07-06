@@ -397,7 +397,15 @@ pub async fn launch(
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    // Bind an ephemeral port by default. When GREENTIC_SETUP_BIND_PORT is set,
+    // bind that stable port instead so the setup server is reachable at a fixed
+    // address — required to tunnel the OAuth developer-install callback (paired
+    // with GREENTIC_SETUP_PUBLIC_BASE_URL). Falls back to ephemeral on bad input.
+    let bind_port = std::env::var("GREENTIC_SETUP_BIND_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", bind_port)).await?;
     let port = listener.local_addr()?.port();
     let url = format!("http://127.0.0.1:{port}");
     let setup_session_id = format!("setup-{port}-{}", unix_timestamp_millis());
@@ -4669,6 +4677,23 @@ fn injected_setup_public_base_url() -> Option<String> {
     std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
         .ok()
         .or_else(|| std::env::var("GREENTIC_PUBLIC_BASE_URL").ok())
+        // `PUBLIC_BASE_URL` is the runtime (`greentic-start`) override; accept it
+        // here too so a single export drives both setup actions and start,
+        // instead of a provider action erroring on a URL the operator already set.
+        .or_else(|| std::env::var("PUBLIC_BASE_URL").ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"))
+}
+
+/// The setup server's own public HTTPS base URL for OAuth *callbacks* (the
+/// developer app-install flow handled here by `/oauth/callback/<provider>`),
+/// distinct from the messaging `public_base_url` that targets the runtime for
+/// webhook ingress. Set `GREENTIC_SETUP_PUBLIC_BASE_URL` to the setup server's
+/// public tunnel. `None` (unset/non-https) → callers fall back to the messaging
+/// `public_base_url`.
+fn setup_oauth_callback_base_url() -> Option<String> {
+    std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
+        .ok()
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| value.starts_with("https://"))
 }
@@ -4677,6 +4702,9 @@ fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String
     if let Some(value) = std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
         .ok()
         .or_else(|| std::env::var("GREENTIC_PUBLIC_BASE_URL").ok())
+        // Also honor the runtime override so one `PUBLIC_BASE_URL` export covers
+        // both setup and start (see injected_setup_public_base_url).
+        .or_else(|| std::env::var("PUBLIC_BASE_URL").ok())
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
     {
@@ -7103,20 +7131,30 @@ fn build_oauth_install_url(
             }
         }
     }
-    if let Some(redirect_path) = action.get("redirect_path").and_then(Value::as_str)
-        && let Some(public_base_url) = config.get("public_base_url").and_then(Value::as_str)
-        && !public_base_url.trim().is_empty()
-    {
-        let redirect_uri = format!(
-            "{}{}",
-            public_base_url.trim().trim_end_matches('/'),
-            if redirect_path.starts_with('/') {
-                redirect_path.to_string()
-            } else {
-                format!("/{redirect_path}")
-            }
-        );
-        set_url_query_key(&mut parsed, "redirect_uri", &redirect_uri);
+    if let Some(redirect_path) = action.get("redirect_path").and_then(Value::as_str) {
+        // The OAuth callback (developer app-install) is served by THIS setup
+        // server via `/oauth/callback/<provider>` + `complete_oauth_callback`,
+        // NOT the runtime. Prefer the setup server's own public URL; fall back to
+        // the messaging `public_base_url` (the runtime) only when unset.
+        let callback_base = setup_oauth_callback_base_url().or_else(|| {
+            config
+                .get("public_base_url")
+                .and_then(Value::as_str)
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+        });
+        if let Some(callback_base) = callback_base {
+            let redirect_uri = format!(
+                "{}{}",
+                callback_base,
+                if redirect_path.starts_with('/') {
+                    redirect_path.to_string()
+                } else {
+                    format!("/{redirect_path}")
+                }
+            );
+            set_url_query_key(&mut parsed, "redirect_uri", &redirect_uri);
+        }
     }
     let mut persisted_action = action.clone();
     let Some(object) = persisted_action.as_object_mut() else {
