@@ -2100,9 +2100,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.0-dev.28356133129"
+version = "1.1.3-dev.28777598365"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4858ab6d874df9a085f3d154e4a0320412005e652f8ac75a94a6df3cd0c4183c"
+checksum = "dfdd4ba985b9a45fab474de3473e068d3054b7cd8a7c20d70c7a7642d92962a6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2120,6 +2120,7 @@ dependencies = [
  "greentic-secrets-lib",
  "greentic-telemetry",
  "greentic-types",
+ "greentic-update",
  "hex",
  "indexmap 2.14.0",
  "jsonschema 0.46.6",
@@ -2547,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "1.1.3"
+version = "1.1.3-dev.0"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -2667,6 +2668,27 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "greentic-update"
+version = "0.1.28607531727"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd32a91765c9ec536cdbdd98274a70f08f521fff2518c41bf2e32a3611c0c4b7"
+dependencies = [
+ "chrono",
+ "fs4",
+ "greentic-distributor-client",
+ "hex",
+ "rcgen",
+ "reqwest 0.13.4",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "x509-parser",
 ]
 
 [[package]]
