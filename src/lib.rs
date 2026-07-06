@@ -40,6 +40,7 @@ pub mod setup_input;
 pub mod setup_machine;
 pub mod setup_to_formspec;
 pub mod setup_tunnel;
+pub mod shared_tunnel;
 pub mod tenant_config;
 pub mod webhook;
 
