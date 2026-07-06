@@ -107,10 +107,11 @@ fn start_cloudflared_shared(local_base_url: &str) -> Result<SetupTunnel> {
     }
     crate::shared_tunnel::clear_record(&paths);
 
-    let (child, url) = spawn_tunnel_process(mode, local_base_url)?;
+    let (child, url) = spawn_cloudflared_logged(local_base_url, &paths.log_path)?;
     if let Err(err) = crate::shared_tunnel::write_record(&paths, child.id(), &url) {
         eprintln!("warning: could not publish shared tunnel record: {err:#}");
     }
+    eprintln!("Setup tunnel started via {mode}: {url}");
     Ok(SetupTunnel {
         mode: mode.to_string(),
         local_base_url: local_base_url.trim_end_matches('/').to_string(),
@@ -118,6 +119,58 @@ fn start_cloudflared_shared(local_base_url: &str) -> Result<SetupTunnel> {
         child: Some(child),
         kill_on_drop: false,
     })
+}
+
+/// Spawn cloudflared with stdout/stderr redirected to the shared log file and
+/// discover the tunnel URL by polling that file.
+///
+/// Deliberately NOT piped: cloudflared is a Go binary, and Go processes die
+/// on SIGPIPE when writing logs to a closed stdout/stderr pipe — a piped
+/// tunnel would be killed the moment setup exits, defeating the
+/// outlive-setup handoff. A log file keeps it alive and doubles as
+/// greentic-start's fallback URL-discovery source.
+fn spawn_cloudflared_logged(local_base_url: &str, log_path: &Path) -> Result<(Child, String)> {
+    let binary = resolve_tunnel_binary("cloudflared")?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create tunnel log dir {}", parent.display()))?;
+    }
+    // Truncate: URL discovery must not read a previous tunnel's URL.
+    let log = std::fs::File::create(log_path)
+        .with_context(|| format!("create tunnel log {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .with_context(|| format!("clone tunnel log handle {}", log_path.display()))?;
+
+    let mut child = Command::new(binary)
+        .args(["tunnel", "--url", local_base_url, "--no-autoupdate"])
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .with_context(|| "start cloudflared setup tunnel")?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Err(anyhow!(
+                "cloudflared exited before publishing a URL: {status} (log: {})",
+                log_path.display()
+            ));
+        }
+        if let Ok(contents) = std::fs::read_to_string(log_path)
+            && let Some(url) = extract_tunnel_https_url("cloudflared", &contents)
+        {
+            return Ok((child, url));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(anyhow!(
+        "cloudflared did not publish an https:// URL within 25 seconds (log: {})",
+        log_path.display()
+    ))
 }
 
 /// Spawn the tunnel binary and read its stdout/stderr until it publishes an
