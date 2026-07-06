@@ -158,10 +158,20 @@ fn answers_have_content(answers: &Value) -> bool {
     let Some(map) = answers.as_object() else {
         return false;
     };
-    map.values().any(|v| match v {
-        Value::String(s) => !s.is_empty(),
-        Value::Null => false,
-        _ => true,
+    map.iter().any(|(key, v)| {
+        // Host-injected base URLs are never secrets. Exclude them so a pack whose
+        // *only* answer is an injected `public_base_url`/`oauth_callback_base_url`
+        // (e.g. an app pack with no setup metadata that merely received the base
+        // URL during injection) does not trip the B12a fail-closed guard and block
+        // the whole setup. Real secret material still triggers fail-closed.
+        if matches!(key.as_str(), "public_base_url" | "oauth_callback_base_url") {
+            return false;
+        }
+        match v {
+            Value::String(s) => !s.is_empty(),
+            Value::Null => false,
+            _ => true,
+        }
     })
 }
 
