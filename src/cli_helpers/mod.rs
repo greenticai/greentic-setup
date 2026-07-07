@@ -34,7 +34,13 @@ pub use prompts::{SetupParams, prompt_setup_params};
 
 /// Start a setup-time tunnel for non-UI setup and inject its public URL into
 /// provider answers that need `public_base_url`.
+///
+/// Persists a [`crate::platform_setup::TunnelHandoff`] recording the local
+/// port this tunnel targets, so a later `gtc start` can bind its gateway to
+/// the same port and adopt this same tunnel via the shared record instead of
+/// minting a disconnected second one on its own default/fallback port.
 pub fn maybe_start_cli_setup_tunnel(
+    bundle_root: &Path,
     loaded: &mut LoadedAnswers,
     local_base_url: &str,
 ) -> Result<Option<SetupTunnel>> {
@@ -51,7 +57,27 @@ pub fn maybe_start_cli_setup_tunnel(
 
     let tunnel = crate::setup_tunnel::start_setup_tunnel(&mode, local_base_url)?;
     inject_setup_public_base_url(&mut loaded.setup_answers, &tunnel.public_base_url);
+    persist_tunnel_handoff(bundle_root, &tunnel);
     Ok(Some(tunnel))
+}
+
+/// Persist a [`crate::platform_setup::TunnelHandoff`] for `tunnel`, best
+/// effort — a write failure here should never fail setup itself, it only
+/// means `greentic-start` falls back to its own port selection.
+fn persist_tunnel_handoff(bundle_root: &Path, tunnel: &SetupTunnel) {
+    let Some(local_port) = crate::shared_tunnel::local_port_from_base_url(&tunnel.local_base_url)
+    else {
+        return;
+    };
+    let handoff = crate::platform_setup::TunnelHandoff {
+        service: tunnel.mode.clone(),
+        local_port,
+        public_base_url: tunnel.public_base_url.clone(),
+    };
+    if let Err(err) = crate::platform_setup::persist_tunnel_handoff_artifact(bundle_root, &handoff)
+    {
+        tracing::warn!("failed to persist setup tunnel handoff: {err:#}");
+    }
 }
 
 /// Resolve tenant/team/env for setup.

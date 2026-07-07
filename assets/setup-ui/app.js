@@ -1530,7 +1530,7 @@
     var descriptor = provider && provider.setup_actions;
     var actions = descriptor && Array.isArray(descriptor.actions) ? descriptor.actions : [];
     return actions.filter(function (action) {
-      return action && action.kind === "oauth_install_button" && action.registration;
+      return action && (action.kind === "oauth_install_button" || action.kind === "open_url") && action.registration;
     });
   }
 
@@ -1572,6 +1572,9 @@
       html += '<div class="setup-action">';
       html += '<div class="setup-action-heading">' + esc(action.label || "Create app") + '</div>';
       if (action.description) html += '<p class="setup-action-desc">' + esc(action.description) + '</p>';
+      if (action.kind === "oauth_install_button" || action.registration) {
+        html += '<div class="setup-action-warning">⚠️ Event Subscriptions are REQUIRED. After this step the app’s Event Subscriptions Request URL must be <strong>Verified &amp; Saved</strong> (pointing at your public tunnel), and <code>message.im</code> / <code>app_mention</code> subscribed — otherwise the bot receives nothing. If your tunnel URL changes, re-save it.</div>';
+      }
       if (completed) {
         html += '<div class="setup-action-status">App setup complete. Its Event Subscriptions &amp; Interactivity request URLs are now linked to this bundle’s message endpoint — send your bot a message to test. If the bundle’s public URL later changes, re-run this step to update them.</div>';
       } else if (running) {
@@ -2385,6 +2388,12 @@
         html += '<div class="setup-action">';
         html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.authorize_url) + '">' + esc(action.label || "Open") + '</a>';
         html += '</div>';
+          return;
+        }
+        if (action.kind === "open_url" && action.url) {
+          html += '<div class="setup-action">';
+          html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.url) + '">' + esc(action.label || "Open") + '</a>';
+          html += '</div>';
           return;
         }
         if (action.kind === "oauth_device_code") {
