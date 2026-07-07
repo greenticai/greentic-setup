@@ -1624,6 +1624,9 @@
 
   function runProviderSetupAction(provider, action) {
     var scope = cs();
+    var actionTag = "[setup-action " + provider.provider_id + "/" + action.id + "]";
+    console.info(actionTag + " clicked; opening placeholder popup and POSTing /api/setup-action (tunnel=" + (scope.tunnel || "default") + ")");
+    var startedAt = Date.now();
     var popup = openProviderInstallWindow();
     scope.providerSetupStatus[provider.provider_id] = { running: true };
     render();
@@ -1642,7 +1645,9 @@
     })
     .then(function (r) { return r.json(); })
     .then(function (result) {
+      var elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
       if (!result.ok) {
+        console.error(actionTag + " failed after " + elapsed + "s: " + (result.error || "Setup action failed"), result);
         closeProviderInstallWindow(popup);
         scope.providerSetupStatus[provider.provider_id] = {
           ok: false,
@@ -1651,19 +1656,23 @@
         render();
         return;
       }
+      console.info(actionTag + " succeeded in " + elapsed + "s; values: " + Object.keys(result.values || {}).join(", "));
       scope.providerSetupStatus[provider.provider_id] = result;
       if (result.values && typeof result.values === "object") {
         scope.answers[provider.provider_id] = Object.assign({}, scope.answers[provider.provider_id] || {}, result.values);
       }
       var installUrl = setupActionReturnedFinalUrl(provider, result);
       if (installUrl) {
+        console.info(actionTag + " navigating install popup to " + installUrl);
         navigateProviderInstallWindow(popup, installUrl);
       } else {
+        console.info(actionTag + " no install URL resolved; closing placeholder popup");
         closeProviderInstallWindow(popup);
       }
       render();
     })
     .catch(function (err) {
+      console.error(actionTag + " request error after " + ((Date.now() - startedAt) / 1000).toFixed(1) + "s: " + err.message);
       closeProviderInstallWindow(popup);
       scope.providerSetupStatus[provider.provider_id] = { ok: false, error: err.message };
       render();

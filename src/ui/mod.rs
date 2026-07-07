@@ -6183,6 +6183,12 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     let env = req.env.unwrap_or_else(|| state.env.clone());
     let mut answers = req.answers;
     let tunnel_mode = setup_action_tunnel_mode(state, req.tunnel.as_deref())?;
+    eprintln!(
+        "[setup-action {}/{}] started (tenant={tenant} team={} env={env} tunnel_mode={tunnel_mode})",
+        req.provider_id,
+        req.action_id,
+        team.as_deref().unwrap_or("default"),
+    );
     ensure_setup_action_provider_answers(&mut answers, &req.provider_id);
     if let Some(mode) = req.tunnel.as_deref() {
         let tunnel = crate::platform_setup::TunnelAnswers {
@@ -6192,10 +6198,27 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     }
     if let Some(url) = injected_setup_public_base_url() {
         // Operator supplied a public URL; honor it instead of spinning our own tunnel.
+        eprintln!(
+            "[setup-action {}/{}] using operator-supplied public_base_url {url}",
+            req.provider_id, req.action_id
+        );
         inject_setup_public_base_url(&mut answers, &url);
     } else if should_start_setup_tunnel(&tunnel_mode, &answers) {
+        eprintln!(
+            "[setup-action {}/{}] acquiring {tunnel_mode} tunnel for public_base_url...",
+            req.provider_id, req.action_id
+        );
         let url = ensure_setup_tunnel(state, &tunnel_mode, &state.local_base_url).await?;
+        eprintln!(
+            "[setup-action {}/{}] tunnel ready, public_base_url={url}",
+            req.provider_id, req.action_id
+        );
         inject_setup_public_base_url(&mut answers, &url);
+    } else {
+        eprintln!(
+            "[setup-action {}/{}] no tunnel needed (mode={tunnel_mode} or public_base_url already set)",
+            req.provider_id, req.action_id
+        );
     }
     persist_ui_draft(&state.bundle_path, &tenant, team.as_deref(), &env, &answers).await?;
 
@@ -6257,6 +6280,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         .or_else(|| registration.get("mock_result"))
         .or_else(|| registration.get("outputs"))
     {
+        eprintln!(
+            "[setup-action {}/{}] using inline registration result (no component invocation)",
+            req.provider_id, req.action_id
+        );
         result.clone()
     } else {
         let component_ref = registration
@@ -6271,7 +6298,15 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("setup action registration missing op"))?;
-        invoke_setup_component_operation_blocking(
+        eprintln!(
+            "[setup-action {}/{}] invoking WASM registration op {component_ref}::{op} \
+             (pack: {}) — this is where the provider's own API gets called",
+            req.provider_id,
+            req.action_id,
+            provider.pack_path.display()
+        );
+        let started = Instant::now();
+        let output = invoke_setup_component_operation_blocking(
             state.bundle_path.clone(),
             provider.pack_path.clone(),
             component_ref.to_string(),
@@ -6279,9 +6314,29 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             request,
             setup_config,
         )
-        .await?
+        .await?;
+        eprintln!(
+            "[setup-action {}/{}] registration op returned in {:.1}s (ok={})",
+            req.provider_id,
+            req.action_id,
+            started.elapsed().as_secs_f32(),
+            output
+                .get("ok")
+                .and_then(Value::as_bool)
+                .map_or("unknown".to_string(), |ok| ok.to_string()),
+        );
+        output
     };
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        eprintln!(
+            "[setup-action {}/{}] FAILED: {}",
+            req.provider_id,
+            req.action_id,
+            output
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("setup action failed")
+        );
         return Ok(serde_json::json!({
             "ok": false,
             "provider_id": req.provider_id,
@@ -6302,7 +6357,16 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     if let Some((key, url)) =
         setup_action_final_url_value(&descriptor, action, &config, &final_url_context)?
     {
+        eprintln!(
+            "[setup-action {}/{}] resolved final install URL ({key}): {url}",
+            req.provider_id, req.action_id
+        );
         config.insert(key, Value::String(url));
+    } else {
+        eprintln!(
+            "[setup-action {}/{}] no final install URL resolved (browser resolves deep_link templates from returned values instead)",
+            req.provider_id, req.action_id
+        );
     }
     crate::qa::persist::persist_all_config_as_secrets(
         &state.bundle_path,
@@ -6314,6 +6378,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         Some(&provider.pack_path),
     )
     .await?;
+    eprintln!(
+        "[setup-action {}/{}] complete: outputs persisted as secrets, returning values to the UI",
+        req.provider_id, req.action_id
+    );
     let safe_values = public_setup_action_values(&config);
     Ok(serde_json::json!({
         "ok": true,
