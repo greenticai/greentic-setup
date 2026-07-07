@@ -224,6 +224,10 @@ fn read_pack_provenance(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        // greentic-types 1.2.0-research added `outcomes` to ComponentDescribe
+        // (flow-builder component outcomes). This synthesised provider describe
+        // declares none — outcomes are only meaningful for flow-node components.
+        outcomes: Default::default(),
         config_schema: SchemaIr::Null,
     };
     let describe_hash = hash_canonical(&describe)?;

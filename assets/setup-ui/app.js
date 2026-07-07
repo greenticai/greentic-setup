@@ -765,6 +765,15 @@
       el.addEventListener("change", handler);
     });
 
+    app.querySelectorAll(".btn-oauth-connect").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var qid = btn.getAttribute("data-qid");
+        var wrap = document.getElementById("field-" + qid);
+        var provider = wrap ? wrap.getAttribute("data-oauth-provider") : "hubspot";
+        startOauthConnect(qid, provider);
+      });
+    });
+
     var goBack = backFn || function () { state.phase = backPhase || "providers"; render(); };
     document.getElementById("btn-back").addEventListener("click", function () {
       collectFormValues(questions);
@@ -785,6 +794,16 @@
     var visAttr = "";
     if (q.visible_if) {
       visAttr = ' data-vis-field="' + esc(q.visible_if.field) + '" data-vis-eq="' + esc(q.visible_if.eq || "") + '"';
+    }
+    if (q.widget === "oauth_connect") {
+      var prov = esc(q.default_value || "hubspot");
+      var h = '<div class="field" id="field-' + esc(q.id) + '"' + visAttr + ' data-oauth-provider="' + prov + '">';
+      h += '<label class="field-label">' + esc(q.title) + '</label>';
+      h += '<button type="button" class="btn-oauth-connect" id="f-' + esc(q.id) + '" data-qid="' + esc(q.id) + '">Connect ' + prov + '</button>';
+      h += '<span class="oauth-status" id="oauth-status-' + esc(q.id) + '"></span>';
+      if (q.help) h += '<div class="field-meta"><p class="field-help">' + esc(q.help) + '</p></div>';
+      h += '</div>';
+      return h;
     }
     var html = '<div class="field" id="field-' + esc(q.id) + '"' + visAttr + '>';
     if (q.kind === "Boolean") {
@@ -818,6 +837,64 @@
     return html;
   }
 
+  function startOauthConnect(qid, provider) {
+    var scope = cs();
+    var statusEl = document.getElementById("oauth-status-" + qid);
+    var clientIdEl = document.getElementById("f-oauth_client_id");
+    var clientSecretEl = document.getElementById("f-oauth_client_secret");
+    var clientId = clientIdEl ? clientIdEl.value.trim() : "";
+    var clientSecret = clientSecretEl ? clientSecretEl.value.trim() : "";
+    if (!clientId || !clientSecret) {
+      if (statusEl) statusEl.textContent = "Enter Client ID and Client Secret first";
+      return;
+    }
+    var packProvider = "";
+    var current = state.providers[state.currentProvider];
+    if (current) packProvider = current.provider_id;
+    if (statusEl) statusEl.textContent = "Opening HubSpot…";
+    fetch("/api/oauth/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: provider,
+        pack_provider: packProvider,
+        client_id: clientId,
+        client_secret: clientSecret,
+        tenant: scope.tenant,
+        env: scope.env,
+        team: scope.team || null
+      })
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d.authorize_url) { if (statusEl) statusEl.textContent = "Could not start connect"; return; }
+      window.open(d.authorize_url, "hubspot_oauth", "width=620,height=760");
+      pollOauthStatus(qid, provider, 0);
+    })
+    .catch(function () { if (statusEl) statusEl.textContent = "Connect failed"; });
+  }
+
+  function pollOauthStatus(qid, provider, attempts) {
+    var scope = cs();
+    var statusEl = document.getElementById("oauth-status-" + qid);
+    if (attempts > 150) { if (statusEl) statusEl.textContent = "Timed out — try again"; return; }
+    if (statusEl && attempts === 0) statusEl.textContent = "Waiting for authorization…";
+    var qs = "provider=" + encodeURIComponent(provider) + "&tenant=" + encodeURIComponent(scope.tenant || "") + "&env=" + encodeURIComponent(scope.env || "");
+    if (scope.team) qs += "&team=" + encodeURIComponent(scope.team);
+    fetch("/api/oauth/status?" + qs)
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.connected) {
+          if (statusEl) { statusEl.textContent = "Connected ✓"; statusEl.className = "oauth-status connected"; }
+          var wrap = document.getElementById("field-" + qid);
+          if (wrap) wrap.dataset.oauthValue = "oauth";
+        } else {
+          setTimeout(function () { pollOauthStatus(qid, provider, attempts + 1); }, 2000);
+        }
+      })
+      .catch(function () { setTimeout(function () { pollOauthStatus(qid, provider, attempts + 1); }, 2000); });
+  }
+
   function restoreFormValues(questions) {
     var scope = cs();
     var store = state.phase === "shared" ? scope.sharedAnswers :
@@ -840,6 +917,14 @@
     var store = state.phase === "shared" ? scope.sharedAnswers :
       (scope.answers[state.providers[state.currentProvider].provider_id] || {});
     questions.forEach(function (q) {
+      if (q.widget === "oauth_connect") {
+        var oauthWrap = document.getElementById("field-" + q.id);
+        var oauthHidden = oauthWrap && oauthWrap.style.display === "none";
+        if (oauthWrap && !oauthHidden && oauthWrap.dataset.oauthValue) {
+          store[q.id] = oauthWrap.dataset.oauthValue;
+        }
+        return;
+      }
       var el = document.getElementById("f-" + q.id);
       if (!el) return;
       var fieldDiv = document.getElementById("field-" + q.id);
@@ -876,6 +961,7 @@
     clearErrors();
     var firstErr = null;
     questions.forEach(function (q) {
+      if (q.widget === "oauth_connect") return;
       if (q.kind === "Boolean") return;
       var group = document.getElementById("field-" + q.id);
       if (group && group.style.display === "none") return;

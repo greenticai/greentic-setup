@@ -281,6 +281,148 @@ fn default_required() -> bool {
     true
 }
 
+/// A host-generated secret declared by a pack's `greentic.generated-secrets.v1`
+/// extension (e.g. the webchat `jwt_signing_key`). Unlike a regular secret
+/// requirement, the user never enters it — the host seeds a missing required
+/// secret with a value produced per `policy`. See
+/// greentic-messaging-providers `docs/generated-runtime-secrets.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedSecret {
+    pub key: String,
+    pub required: bool,
+    /// Generation strategy; currently only `"random"`.
+    pub policy: String,
+    /// Output length for text encodings.
+    pub length: usize,
+    /// `raw_text` | `base64url` | `hex`.
+    pub encoding: String,
+    /// When false, an existing value is left untouched.
+    pub regenerate_if_present: bool,
+    /// Storage team segment from `scope.team` (e.g. `"_"` for tenant-level).
+    pub scope_team: Option<String>,
+}
+
+/// Read `greentic.generated-secrets.v1` declarations from a `.gtpack` manifest.
+/// Returns an empty vec when the pack declares none.
+pub fn load_generated_secrets_from_pack(pack_path: &Path) -> Result<Vec<GeneratedSecret>> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut out = Vec::new();
+    for index in 0..archive.len() {
+        let name = {
+            let entry = archive.by_index(index)?;
+            entry.name().to_string()
+        };
+        if name != "manifest.cbor" && !name.ends_with(".manifest.cbor") {
+            continue;
+        }
+        let mut entry = archive.by_name(&name)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+        let value: CborValue = serde_cbor::from_slice(&bytes)?;
+        collect_generated_secrets_from_cbor(&value, &mut out);
+    }
+    Ok(out)
+}
+
+fn collect_generated_secrets_from_cbor(value: &CborValue, out: &mut Vec<GeneratedSecret>) {
+    match value {
+        CborValue::Array(values) => {
+            for value in values {
+                collect_generated_secrets_from_cbor(value, out);
+            }
+        }
+        CborValue::Map(map) => {
+            if let Some(CborValue::Text(kind)) = map.get(&CborValue::Text("kind".to_string()))
+                && kind == "greentic.generated-secrets.v1"
+                && let Some(CborValue::Map(inline)) =
+                    map.get(&CborValue::Text("inline".to_string()))
+                && let Some(CborValue::Array(secrets)) =
+                    inline.get(&CborValue::Text("secrets".to_string()))
+            {
+                for secret in secrets {
+                    if let CborValue::Map(secret_map) = secret
+                        && let Some(generated) = parse_generated_secret_map(secret_map)
+                    {
+                        out.push(generated);
+                    }
+                }
+            }
+            for value in map.values() {
+                collect_generated_secrets_from_cbor(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_generated_secret_map(map: &BTreeMap<CborValue, CborValue>) -> Option<GeneratedSecret> {
+    let get = |key: &str| map.get(&CborValue::Text(key.to_string()));
+    let key = match get("key") {
+        Some(CborValue::Text(value)) => value.clone(),
+        _ => return None,
+    };
+    let required = match get("required") {
+        Some(CborValue::Bool(value)) => *value,
+        _ => true,
+    };
+    let policy = match get("policy") {
+        Some(CborValue::Text(value)) => value.clone(),
+        _ => "random".to_string(),
+    };
+    let length = match get("length") {
+        Some(CborValue::Integer(value)) if *value > 0 => *value as usize,
+        _ => 32,
+    };
+    let encoding = match get("encoding") {
+        Some(CborValue::Text(value)) => value.clone(),
+        _ => "raw_text".to_string(),
+    };
+    let regenerate_if_present = matches!(get("regenerate_if_present"), Some(CborValue::Bool(true)));
+    let scope_team = match get("scope") {
+        Some(CborValue::Map(scope)) => match scope.get(&CborValue::Text("team".to_string())) {
+            Some(CborValue::Text(team)) => Some(team.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    Some(GeneratedSecret {
+        key,
+        required,
+        policy,
+        length,
+        encoding,
+        regenerate_if_present,
+        scope_team,
+    })
+}
+
+/// Produce a value for a host-generated secret. `random` policy fills the value
+/// with cryptographically-random bytes encoded per `encoding`; any other policy
+/// is treated as `random` (the only strategy defined today).
+pub fn generate_secret_value(_policy: &str, length: usize, encoding: &str) -> String {
+    use base64::Engine as _;
+    use rand::Rng as _;
+
+    let count = if length == 0 { 32 } else { length };
+    let mut bytes = vec![0u8; count];
+    rand::rng().fill_bytes(&mut bytes);
+    match encoding {
+        "base64url" => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes),
+        "hex" => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        // `raw_text` (default): map each random byte to a URL-safe alphanumeric
+        // char so the value is `length` printable characters.
+        _ => {
+            const CHARSET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            bytes
+                .iter()
+                .map(|byte| CHARSET[(*byte as usize) % CHARSET.len()] as char)
+                .collect()
+        }
+    }
+}
+
 fn dedup_requirements(reqs: Vec<PackSecretRequirement>) -> Vec<PackSecretRequirement> {
     let mut by_key = BTreeMap::new();
     for req in reqs {
@@ -379,6 +521,71 @@ mod tests {
         let path = ensure_path(&bundle).expect("ensure path");
         assert!(path.ends_with(".greentic/dev/.dev.secrets.env"));
         assert!(path.parent().expect("parent").exists());
+    }
+
+    #[test]
+    fn loads_generated_secrets_from_manifest_cbor() {
+        use serde_cbor::Value as C;
+        let entry = |k: &str, v: C| (C::Text(k.to_string()), v);
+        let secret = C::Map(BTreeMap::from([
+            entry("key", C::Text("jwt_signing_key".into())),
+            entry("required", C::Bool(true)),
+            entry("policy", C::Text("random".into())),
+            entry("length", C::Integer(20)),
+            entry("encoding", C::Text("raw_text".into())),
+            entry("regenerate_if_present", C::Bool(false)),
+            entry(
+                "scope",
+                C::Map(BTreeMap::from([entry("team", C::Text("_".into()))])),
+            ),
+        ]));
+        let ext = C::Map(BTreeMap::from([
+            entry("kind", C::Text("greentic.generated-secrets.v1".into())),
+            entry(
+                "inline",
+                C::Map(BTreeMap::from([entry("secrets", C::Array(vec![secret]))])),
+            ),
+        ]));
+        let manifest = C::Map(BTreeMap::from([entry("extensions", C::Array(vec![ext]))]));
+        let bytes = serde_cbor::to_vec(&manifest).expect("encode manifest");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pack = temp.path().join("p.gtpack");
+        let file = std::fs::File::create(&pack).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", SimpleFileOptions::default())
+            .expect("start file");
+        zip.write_all(&bytes).expect("write");
+        zip.finish().expect("finish");
+
+        let secrets = load_generated_secrets_from_pack(&pack).expect("load");
+        assert_eq!(secrets.len(), 1);
+        let secret = &secrets[0];
+        assert_eq!(secret.key, "jwt_signing_key");
+        assert!(secret.required);
+        assert_eq!(secret.policy, "random");
+        assert_eq!(secret.length, 20);
+        assert_eq!(secret.encoding, "raw_text");
+        assert!(!secret.regenerate_if_present);
+        assert_eq!(secret.scope_team.as_deref(), Some("_"));
+    }
+
+    #[test]
+    fn generate_secret_value_respects_length_and_encoding() {
+        let raw = generate_secret_value("random", 20, "raw_text");
+        assert_eq!(raw.len(), 20);
+        assert!(raw.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        let hex = generate_secret_value("random", 16, "hex");
+        assert_eq!(hex.len(), 32); // 16 random bytes → 32 hex chars
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+
+        assert!(!generate_secret_value("random", 24, "base64url").is_empty());
+        // Cryptographic randomness: two draws must differ.
+        assert_ne!(
+            generate_secret_value("random", 32, "raw_text"),
+            generate_secret_value("random", 32, "raw_text")
+        );
     }
 
     #[test]

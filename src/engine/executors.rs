@@ -231,6 +231,30 @@ pub fn execute_apply_pack_setup(
             }
         }
 
+        // Seed host-generated runtime secrets the pack declares via
+        // `greentic.generated-secrets.v1` (e.g. the webchat `jwt_signing_key`):
+        // the user is never asked for these, so without this the provider's
+        // runtime endpoints fail with a missing-secret error.
+        if let Some(pack_path) = pack_path {
+            let generated = rt
+                .block_on(crate::qa::persist::seed_generated_secrets(
+                    bundle_path,
+                    &env,
+                    &config.tenant,
+                    config.team.as_deref(),
+                    provider_id,
+                    pack_path,
+                ))
+                .unwrap_or_default();
+            if config.verbose && !generated.is_empty() {
+                println!(
+                    "  [secrets] generated {} runtime secret(s) for {provider_id}: {:?}",
+                    generated.len(),
+                    generated
+                );
+            }
+        }
+
         // Materialize a provider config envelope so runtime/provider ingest
         // paths can read setup-applied config, not just raw setup answers.
         if let Some(pack_path) = pack_path {

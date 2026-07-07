@@ -44,6 +44,7 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
         backup,
         skip_secrets_init,
         best_effort,
+        port: _,
     } = args;
 
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;

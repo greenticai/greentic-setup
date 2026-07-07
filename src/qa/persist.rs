@@ -224,6 +224,73 @@ pub async fn persist_all_config_as_secrets(
     Ok(saved_keys)
 }
 
+/// Seed the required `greentic.generated-secrets.v1` secrets a pack declares
+/// (e.g. the webchat `jwt_signing_key`) with host-generated random values when
+/// missing from the dev store. Returns the keys that were generated.
+///
+/// This is what lets `gtc setup` provision secrets the user is never asked for.
+/// Without it the webchat Direct Line `/token` endpoint fails at runtime with a
+/// `secret_error` because the signing key was never created.
+pub async fn seed_generated_secrets(
+    bundle_root: &Path,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+    pack_path: &Path,
+) -> Result<Vec<String>> {
+    let declared = crate::secrets::load_generated_secrets_from_pack(pack_path).unwrap_or_default();
+    if declared.is_empty() {
+        return Ok(vec![]);
+    }
+    let store = crate::secrets::open_dev_store(bundle_root)?;
+
+    let mut entries = Vec::new();
+    let mut generated = Vec::new();
+    for secret in declared {
+        if !secret.required {
+            continue;
+        }
+        // The descriptor's `scope.team` is authoritative for where the provider
+        // reads the secret: an explicit `_` (or none) means tenant-level, so the
+        // setup team is ignored and the URI uses the `_` wildcard.
+        let scope_team = match secret.scope_team.as_deref() {
+            Some(value) if !value.is_empty() && value != "_" => Some(value),
+            Some(_) => None,
+            None => team,
+        };
+        let uri = canonical_secret_uri(env, tenant, scope_team, provider_id, &secret.key);
+        if !secret.regenerate_if_present && store.get(&uri).await.is_ok() {
+            continue;
+        }
+        let value =
+            crate::secrets::generate_secret_value(&secret.policy, secret.length, &secret.encoding);
+        entries.push(SeedEntry {
+            uri,
+            format: SecretFormat::Text,
+            value: SeedValue::Text { text: value },
+            description: Some(format!(
+                "host-generated ({}) runtime secret for {provider_id}",
+                secret.policy
+            )),
+        });
+        generated.push(secret.key);
+    }
+
+    if entries.is_empty() {
+        return Ok(vec![]);
+    }
+    let report = apply_seed(&store, &SeedDoc { entries }, ApplyOptions::default()).await;
+    if !report.failed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "failed to seed {} generated secret(s): {:?}",
+            report.failed.len(),
+            report.failed
+        ));
+    }
+    Ok(generated)
+}
+
 /// Convenience function to persist both secrets and config from QA results.
 ///
 /// Creates a `DevStore` from the bundle root and persists both.

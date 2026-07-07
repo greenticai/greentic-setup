@@ -6,8 +6,10 @@
 
 mod assets;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use axum::extract::State;
@@ -15,6 +17,7 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use greentic_secrets_lib::{ApplyOptions, SecretFormat, SeedDoc, SeedEntry, SeedValue, apply_seed};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use tokio::sync::broadcast;
@@ -46,6 +49,46 @@ struct UiState {
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
+    /// The actual port this server is bound to (known before `UiState` is built).
+    /// Used to construct the embedded OAuth callback `redirect_uri`.
+    self_port: u16,
+    /// In-flight OAuth authorization-code exchanges, keyed by `state` token.
+    oauth_pending: Mutex<HashMap<String, OauthPending>>,
+    /// Connected provider keys (`"{provider}:{env}:{tenant}"`).
+    oauth_connected: Mutex<HashSet<String>>,
+}
+
+/// Server-side data for an in-flight OAuth authorization-code exchange.
+///
+/// Stored when `/api/oauth/start` is called and consumed by the embedded
+/// `/api/oauth/callback` handler. The `client_secret` is kept here and never
+/// returned to the browser.
+struct OauthPending {
+    provider: String,
+    pack_provider: String,
+    env: String,
+    tenant: String,
+    team: Option<String>,
+    token_url: String,
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    pkce_verifier: String,
+}
+
+/// Generate a PKCE (RFC 7636) verifier and its S256 code challenge.
+///
+/// HubSpot (and many providers) require PKCE for authorization-code flows. The
+/// verifier is kept server-side in [`OauthPending`] and replayed at the token
+/// exchange; only the challenge is sent on the authorize redirect.
+fn generate_pkce() -> (String, String) {
+    use base64::Engine;
+    use sha2::Digest;
+    let bytes: [u8; 32] = core::array::from_fn(|_| rand::random::<u8>());
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let digest = sha2::Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    (verifier, challenge)
 }
 
 #[derive(Serialize)]
@@ -89,6 +132,8 @@ struct QuestionInfo {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    widget: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -102,6 +147,7 @@ struct SetupQuestionExtras {
     placeholder: Option<String>,
     group: Option<String>,
     docs_url: Option<String>,
+    widget: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -159,8 +205,15 @@ pub async fn launch(
     locale: Option<&str>,
     prefill_answers: Option<JsonMap<String, Value>>,
     scope_from_answers: bool,
+    port: Option<u16>,
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    // Bind first so the embedded OAuth callback can know its own URL: use the
+    // fixed port when provided, otherwise a random free port.
+    let bind_addr = format!("127.0.0.1:{}", port.unwrap_or(0));
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let bound_port = listener.local_addr()?.port();
 
     let state = std::sync::Arc::new(UiState {
         bundle_path: bundle_path.to_path_buf(),
@@ -173,13 +226,14 @@ pub async fn launch(
         scope_from_answers,
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
+        self_port: bound_port,
+        oauth_pending: Mutex::new(HashMap::new()),
+        oauth_connected: Mutex::new(HashSet::new()),
     });
 
     let router = build_router(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let url = format!("http://127.0.0.1:{port}");
+    let url = format!("http://127.0.0.1:{bound_port}");
 
     eprintln!("Setup UI started at: {url}");
     let _ = open::that(&url);
@@ -207,6 +261,9 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/execute", post(post_execute))
         .route("/api/export", post(post_export))
         .route("/api/decrypt", post(post_decrypt))
+        .route("/api/oauth/start", post(post_oauth_start))
+        .route("/api/oauth/callback", get(get_oauth_callback))
+        .route("/api/oauth/status", get(get_oauth_status))
         .route("/api/shutdown", post(post_shutdown))
         .with_state(state)
 }
@@ -518,6 +575,11 @@ async fn get_providers(
                         placeholder: q.placeholder.clone(),
                         group: q.group.clone(),
                         docs_url: q.docs_url.clone(),
+                        widget: if q.kind == "oauth_connect" {
+                            Some("oauth_connect".to_string())
+                        } else {
+                            None
+                        },
                     },
                 );
             }
@@ -600,6 +662,7 @@ async fn get_providers(
                             }
                             info.group = ext.group.clone();
                             info.docs_url = ext.docs_url.clone();
+                            info.widget = ext.widget.clone();
                         }
                         // --answers prefill takes priority over saved secrets
                         if let Some(val) = answers
@@ -786,6 +849,367 @@ async fn post_decrypt(Json(req): Json<DecryptRequest>) -> Json<Value> {
         Ok(decrypted) => Json(serde_json::json!({ "ok": true, "doc": decrypted })),
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
     }
+}
+
+// ── OAuth connect (embedded authorization-code flow) ──
+
+/// Default authorize endpoint when the request omits one (HubSpot).
+const DEFAULT_AUTHORIZE_URL: &str = "https://app.hubspot.com/oauth/authorize";
+/// Default token endpoint when the request omits one (HubSpot).
+const DEFAULT_TOKEN_URL: &str = "https://api.hubapi.com/oauth/v1/token";
+/// Default scopes requested when the request omits them (HubSpot CRM).
+const DEFAULT_SCOPES: &str = "oauth crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read crm.objects.companies.write crm.objects.deals.read crm.objects.deals.write tickets";
+
+/// Monotonic counter used to make embedded OAuth `state` tokens unique within a
+/// single setup session (predictable is acceptable on localhost, single user).
+static OAUTH_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Deserialize)]
+struct OauthStartRequest {
+    provider: String,
+    pack_provider: String,
+    client_id: String,
+    client_secret: String,
+    #[serde(default)]
+    authorize_url: Option<String>,
+    #[serde(default)]
+    token_url: Option<String>,
+    #[serde(default)]
+    scopes: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+/// Begin the embedded OAuth authorization-code flow.
+///
+/// Stores the (server-side only) `client_secret` plus exchange parameters keyed
+/// by a generated `state` token, then returns the provider authorize URL the
+/// browser should open. The redirect points back at this same server's
+/// `/api/oauth/callback` endpoint — no external broker process is involved.
+async fn post_oauth_start(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<OauthStartRequest>,
+) -> Json<Value> {
+    let env = req.env.unwrap_or_else(|| state.env.clone());
+    let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
+    let team = req.team.or_else(|| state.team.clone());
+    let provider = req.provider;
+
+    let authorize_url = req
+        .authorize_url
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_AUTHORIZE_URL.to_string());
+    let token_url = req
+        .token_url
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string());
+    let scopes = req
+        .scopes
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_SCOPES.to_string());
+
+    let redirect_uri = format!("http://localhost:{}/api/oauth/callback", state.self_port);
+
+    // Unique-but-predictable state token (localhost single-user setup flow).
+    let counter = OAUTH_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pending_len = state.oauth_pending.lock().unwrap().len();
+    let state_token = format!("{provider}-{pending_len}-{counter}");
+
+    let (pkce_verifier, pkce_challenge) = generate_pkce();
+
+    let built_authorize_url = format!(
+        "{authorize_url}?client_id={client_id}&redirect_uri={redirect}&scope={scope}&response_type=code&state={state_token}&code_challenge={challenge}&code_challenge_method=S256",
+        client_id = encode(&req.client_id),
+        redirect = encode(&redirect_uri),
+        scope = encode(&scopes),
+        state_token = encode(&state_token),
+        challenge = encode(&pkce_challenge),
+    );
+
+    state.oauth_pending.lock().unwrap().insert(
+        state_token,
+        OauthPending {
+            provider,
+            pack_provider: req.pack_provider,
+            env,
+            tenant,
+            team,
+            token_url,
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            redirect_uri,
+            pkce_verifier,
+        },
+    );
+
+    Json(serde_json::json!({ "authorize_url": built_authorize_url }))
+}
+
+#[derive(Deserialize)]
+struct OauthCallbackQuery {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Embedded OAuth redirect target.
+///
+/// Exchanges the authorization `code` for tokens at the provider token endpoint,
+/// persists the resulting tokens (plus `auth_mode=oauth`) as dev-store secrets,
+/// marks the provider connected, and returns an HTML page for the popup window.
+/// Never logs or echoes the client secret or any token.
+async fn get_oauth_callback(
+    State(state): State<std::sync::Arc<UiState>>,
+    axum::extract::Query(query): axum::extract::Query<OauthCallbackQuery>,
+) -> impl IntoResponse {
+    if let Some(error) = query.error.as_deref().filter(|value| !value.is_empty()) {
+        return oauth_html(400, &format!("Authorization failed: {}", esc_html(error)));
+    }
+    let Some(code) = query.code.filter(|value| !value.is_empty()) else {
+        return oauth_html(400, "Missing authorization code.");
+    };
+    let Some(state_token) = query.state.filter(|value| !value.is_empty()) else {
+        return oauth_html(400, "Missing state parameter.");
+    };
+
+    let pending = state.oauth_pending.lock().unwrap().remove(&state_token);
+    let Some(pending) = pending else {
+        return oauth_html(
+            400,
+            "Unknown or expired state. Please retry the connection.",
+        );
+    };
+
+    // Exchange the code for tokens using blocking ureq off the async runtime.
+    let token_url = pending.token_url.clone();
+    let body = format!(
+        "grant_type=authorization_code&client_id={client_id}&client_secret={client_secret}&redirect_uri={redirect}&code={code}&code_verifier={verifier}",
+        client_id = encode(&pending.client_id),
+        client_secret = encode(&pending.client_secret),
+        redirect = encode(&pending.redirect_uri),
+        code = encode(&code),
+        verifier = encode(&pending.pkce_verifier),
+    );
+    let exchange = tokio::task::spawn_blocking(move || -> Result<(u16, String), String> {
+        // Keep non-2xx responses (instead of an error) so we can show the body.
+        let response = ureq::post(&token_url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send(body.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let status = response.status().as_u16();
+        let text = response
+            .into_body()
+            .read_to_string()
+            .map_err(|err| err.to_string())?;
+        Ok((status, text))
+    })
+    .await;
+
+    let token_body = match exchange {
+        Ok(Ok((status, body))) if (200..300).contains(&status) => body,
+        Ok(Ok((status, body))) => {
+            return oauth_html(
+                502,
+                &format!(
+                    "Token exchange failed (HTTP {status}): {}",
+                    esc_html(&truncate(&body, 300))
+                ),
+            );
+        }
+        Ok(Err(msg)) => {
+            return oauth_html(
+                502,
+                &format!("Token exchange failed: {}", esc_html(&truncate(&msg, 300))),
+            );
+        }
+        Err(join_err) => {
+            return oauth_html(
+                500,
+                &format!(
+                    "Token exchange task failed: {}",
+                    esc_html(&join_err.to_string())
+                ),
+            );
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&token_body) {
+        Ok(value) => value,
+        Err(err) => {
+            return oauth_html(
+                502,
+                &format!("Invalid token response: {}", esc_html(&err.to_string())),
+            );
+        }
+    };
+
+    let access_token = parsed
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let refresh_token = parsed
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if access_token.is_empty() && refresh_token.is_empty() {
+        return oauth_html(
+            502,
+            &format!(
+                "Token response missing tokens: {}",
+                esc_html(&truncate(&token_body, 300))
+            ),
+        );
+    }
+
+    if let Err(err) = persist_oauth_secrets(&state, &pending, &access_token, &refresh_token).await {
+        return oauth_html(
+            500,
+            &format!(
+                "Failed to store credentials: {}",
+                esc_html(&err.to_string())
+            ),
+        );
+    }
+
+    let key = format!("{}:{}:{}", pending.provider, pending.env, pending.tenant);
+    state.oauth_connected.lock().unwrap().insert(key);
+
+    oauth_html(
+        200,
+        "✓ HubSpot connected — token stored. You can close this window.",
+    )
+}
+
+/// Persist OAuth credentials to the dev secrets store under the pack provider.
+async fn persist_oauth_secrets(
+    state: &UiState,
+    pending: &OauthPending,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<()> {
+    let store = crate::secrets::open_dev_store(&state.bundle_path)?;
+
+    let pairs: [(&str, &str); 5] = [
+        ("auth_mode", "oauth"),
+        ("oauth_refresh_token", refresh_token),
+        ("oauth_client_id", &pending.client_id),
+        ("oauth_client_secret", &pending.client_secret),
+        ("access_token", access_token),
+    ];
+
+    let entries: Vec<SeedEntry> = pairs
+        .iter()
+        .map(|(key, value)| SeedEntry {
+            uri: crate::canonical_secret_uri(
+                &pending.env,
+                &pending.tenant,
+                pending.team.as_deref(),
+                &pending.pack_provider,
+                key,
+            ),
+            format: SecretFormat::Text,
+            value: SeedValue::Text {
+                text: (*value).to_string(),
+            },
+            description: Some(format!("embedded OAuth for {}", pending.pack_provider)),
+        })
+        .collect();
+
+    let report = apply_seed(&store, &SeedDoc { entries }, ApplyOptions::default()).await;
+    if !report.failed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "failed to persist {} OAuth secret(s)",
+            report.failed.len()
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct OauthStatusQuery {
+    provider: String,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+/// Report whether the embedded OAuth flow has completed for a provider.
+///
+/// Returns `{ connected }` based on the in-memory connected set; the SPA polls
+/// this after opening the authorize popup.
+async fn get_oauth_status(
+    State(state): State<std::sync::Arc<UiState>>,
+    axum::extract::Query(query): axum::extract::Query<OauthStatusQuery>,
+) -> Json<Value> {
+    let env = query.env.unwrap_or_else(|| state.env.clone());
+    let tenant = query.tenant.unwrap_or_else(|| state.tenant.clone());
+    // team is resolved for parity with `start` but is not part of the status key.
+    let _team = query.team.or_else(|| state.team.clone());
+    let provider = query.provider;
+
+    let key = format!("{provider}:{env}:{tenant}");
+    let connected = state.oauth_connected.lock().unwrap().contains(&key);
+    Json(serde_json::json!({ "connected": connected }))
+}
+
+/// Percent-encode a query/body component using the `url` crate's form encoder.
+fn encode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+/// Minimal HTML-escape for text interpolated into the callback page.
+fn esc_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Truncate a string to `max` bytes (on a char boundary) for error display.
+fn truncate(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
+/// Build a dark-themed HTML response page for the OAuth popup window.
+fn oauth_html(status: u16, message: &str) -> axum::response::Response {
+    let status_code =
+        axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK);
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Greentic OAuth</title>\
+<style>html,body{{height:100%;margin:0}}body{{display:flex;align-items:center;justify-content:center;\
+background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}\
+.card{{max-width:440px;padding:2rem;text-align:center;line-height:1.5}}</style></head>\
+<body><div class=\"card\"><p>{}</p></div></body></html>",
+        message
+    );
+    (
+        status_code,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 async fn post_shutdown(State(state): State<std::sync::Arc<UiState>>) {
@@ -1036,6 +1460,7 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
         placeholder: None,
         group: None,
         docs_url: None,
+        widget: None,
     }
 }
 
