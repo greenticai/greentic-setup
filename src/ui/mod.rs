@@ -6553,7 +6553,11 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
         if setup_backend_public_tunnel_responds(&existing).await {
             return Ok(existing);
         }
-        anyhow::bail!("{mode} setup tunnel URL did not become reachable: {existing}");
+        // Stale in-session tunnel: fall through and re-acquire. For
+        // cloudflared, start_setup_tunnel consults the shared record and
+        // replaces the dead tunnel; bailing here would strand setup on a
+        // URL that stopped serving.
+        setup_backend_clear_setup_tunnel(state);
     }
 
     let _start_guard = state.setup_tunnel_start.lock().await;
@@ -6561,7 +6565,7 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
         if setup_backend_public_tunnel_responds(&existing).await {
             return Ok(existing);
         }
-        anyhow::bail!("{mode} setup tunnel URL did not become reachable: {existing}");
+        setup_backend_clear_setup_tunnel(state);
     }
 
     let local_base_url = local_base_url.trim_end_matches('/').to_string();
@@ -6668,12 +6672,20 @@ async fn ensure_setup_runtime(state: &UiState, tenant: &str) -> Result<()> {
         if guard.is_none() {
             let system_log_line_floor =
                 setup_runtime_system_log_line_count(&state.bundle_path).ok();
+            // When setup runs a cloudflared tunnel, hand the runtime off with
+            // the tunnel ON: greentic-start adopts the same tunnel via the
+            // machine-wide shared record (same port -> same URL), so the URL
+            // configured during setup stays live after setup exits.
+            let runtime_cloudflared = match setup_backend_tunnel_mode(state) {
+                Ok(Some(mode)) if mode == "cloudflared" => "on",
+                _ => "off",
+            };
             let mut child = Command::new("greentic-start")
                 .arg("start")
                 .arg("--bundle")
                 .arg(&state.bundle_path)
                 .arg("--cloudflared")
-                .arg("off")
+                .arg(runtime_cloudflared)
                 .arg("--no-browser")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
