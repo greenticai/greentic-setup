@@ -193,6 +193,68 @@ mod tests {
     }
 
     #[test]
+    fn pack_to_form_spec_present_but_empty_metadata_is_classifiable() {
+        // B12a regression: a pack that ships setup.yaml (`questions: []`) and
+        // secret-requirements.json (`[]`) explicitly declares zero secrets — it
+        // must resolve to `Some(empty form)`, NOT `None`. `None` is reserved for
+        // packs shipping no classifiable metadata at all, which the fail-closed
+        // guard refuses to write non-empty answers for (e.g. stock state-memory).
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pack_path = temp_dir.path().join("state-memory.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        writer.start_file("assets/setup.yaml", options).unwrap();
+        writer
+            .write_all(b"provider_id: state-memory\nversion: 1\ntitle: In-Memory State Provider setup\nquestions: []\n")
+            .unwrap();
+        writer
+            .start_file("assets/secret-requirements.json", options)
+            .unwrap();
+        writer.write_all(b"[]").unwrap();
+        writer.finish().unwrap();
+
+        let form = pack_to_form_spec(&pack_path, "state-memory")
+            .expect("present-but-empty setup metadata must be classifiable (Some, not None)");
+        assert!(
+            form.questions.is_empty(),
+            "a zero-question pack yields an empty form, not None"
+        );
+    }
+
+    #[test]
+    fn pack_to_form_spec_no_metadata_is_none() {
+        // Counterpart to the above: a pack that ships NO setup metadata at all
+        // must still resolve to `None` so the B12a guard fails closed.
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pack_path = temp_dir.path().join("bare.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/pack.extensions.json", options)
+            .unwrap();
+        writer
+            .write_all(b"{\"version\":1,\"extensions\":[]}")
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert!(
+            pack_to_form_spec(&pack_path, "bare").is_none(),
+            "a pack with no setup.yaml / qa / secret-requirements must resolve to None"
+        );
+    }
+
+    #[test]
     fn pack_help_urls_extracts_component_qa_links() {
         use std::io::Write;
         use zip::write::{FileOptions, ZipWriter};

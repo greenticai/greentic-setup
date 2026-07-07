@@ -21,11 +21,18 @@ use crate::setup_to_formspec::inference::{capitalize, strip_domain_prefix};
 pub fn pack_to_form_spec(pack_path: &Path, provider_id: &str) -> Option<FormSpec> {
     let mut form_spec = None;
 
-    // Try legacy setup.yaml first
-    if let Ok(Some(spec)) = load_setup_spec(pack_path)
+    // A present setup.yaml is classifiable metadata even when it declares zero
+    // questions — the pack explicitly has nothing to configure. Track its
+    // presence so a present-but-empty spec stays distinguishable from a pack
+    // that ships no metadata at all (which the B12a guard must fail closed on).
+    let setup_spec = load_setup_spec(pack_path).ok().flatten();
+    let has_setup_metadata = setup_spec.is_some();
+
+    // Prefer setup.yaml when it declares questions.
+    if let Some(ref spec) = setup_spec
         && !spec.questions.is_empty()
     {
-        form_spec = Some(setup_spec_to_form_spec(&spec, provider_id));
+        form_spec = Some(setup_spec_to_form_spec(spec, provider_id));
     }
 
     // Fallback: try qa/*.json from inside the pack
@@ -33,7 +40,14 @@ pub fn pack_to_form_spec(pack_path: &Path, provider_id: &str) -> Option<FormSpec
         form_spec = load_qa_form_spec_from_pack(pack_path, provider_id);
     }
 
-    augment_with_secret_requirements(form_spec, pack_path, provider_id)
+    let augmented = augment_with_secret_requirements(form_spec, pack_path, provider_id);
+
+    // B12a: a present setup.yaml (even with zero questions) means the pack
+    // declares its setup surface. Return an empty form so callers distinguish
+    // "declares zero secrets" from "ships no classifiable metadata" (None).
+    // Without this a stock 0-config pack (e.g. state-memory: `questions: []` +
+    // `secret-requirements.json` `[]`) would false-trip the fail-closed guard.
+    augmented.or_else(|| has_setup_metadata.then(|| empty_form_spec(provider_id)))
 }
 
 /// Read `qa/*.json` files from inside a `.gtpack` ZIP archive and convert
