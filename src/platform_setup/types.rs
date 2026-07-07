@@ -57,6 +57,24 @@ pub struct TunnelAnswers {
     pub mode: Option<String>,
 }
 
+/// Handoff record for the tunnel `greentic-setup` speculatively started
+/// during setup, so `greentic-start` can bind its gateway to the same local
+/// port and adopt the same tunnel via the shared record instead of minting
+/// a second one on a different port.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelHandoff {
+    /// `"cloudflared"` or `"ngrok"` — must match the tunnel service so
+    /// `greentic-start` looks up the correct shared record.
+    pub service: String,
+    /// Local port the setup tunnel targets. `greentic-start` should bind its
+    /// gateway here on first boot instead of falling back to its own default.
+    pub local_port: u16,
+    /// The tunnel's resolved public URL, for logging/diagnostics — the
+    /// authoritative value `greentic-start` uses still comes from the shared
+    /// tunnel record and/or `static-routes.json`, not this field.
+    pub public_base_url: String,
+}
+
 /// User-provided answers for static routes configuration.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StaticRoutesAnswers {

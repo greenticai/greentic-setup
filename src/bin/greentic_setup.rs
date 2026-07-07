@@ -272,7 +272,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             .as_ref()
             .map(|server| server.local_base_url.as_str())
             .unwrap_or("http://127.0.0.1:1");
-        let tunnel = maybe_start_cli_setup_tunnel(&mut loaded_answers, local_base_url)
+        let tunnel = maybe_start_cli_setup_tunnel(&bundle_dir, &mut loaded_answers, local_base_url)
             .context("failed to start setup tunnel")?;
         if let Some(tunnel) = tunnel.as_ref() {
             println!("Setup tunnel public_base_url: {}", tunnel.public_base_url);

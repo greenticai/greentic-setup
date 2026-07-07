@@ -814,9 +814,24 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
 
     let is_dry_run = dry_run || emit_answers.is_some();
     let _setup_tunnel = if !is_dry_run {
-        let local_base_url = "http://127.0.0.1:1";
-        let tunnel = maybe_start_cli_setup_tunnel(&mut loaded_answers, local_base_url)
-            .context("failed to start setup tunnel")?;
+        // Prefer the runtime's actual gateway port (persisted by a prior
+        // `gtc start`) so this setup pass keys into the SAME shared tunnel
+        // record (shared_tunnel.rs, keyed by local port) that the runtime
+        // already uses or will use — otherwise a bogus placeholder port
+        // spawns its own untracked tunnel, and the URL registered with
+        // providers like Slack never matches what the runtime actually
+        // serves once started.
+        let local_base_url = crate::platform_setup::load_runtime_local_base_url(
+            &bundle_dir,
+            &tenant,
+            team.as_deref(),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "http://127.0.0.1:1".to_string());
+        let tunnel =
+            maybe_start_cli_setup_tunnel(&bundle_dir, &mut loaded_answers, &local_base_url)
+                .context("failed to start setup tunnel")?;
         if let Some(tunnel) = tunnel.as_ref() {
             println!("Setup tunnel public_base_url: {}", tunnel.public_base_url);
         }
@@ -904,7 +919,8 @@ fn setup_or_update(args: BundleSetupArgs, mode: SetupMode, i18n: &CliI18n) -> Re
     let report = engine
         .execute(&plan)
         .context(i18n.t("cli.error.failed_execute_plan"))?;
-    let _ = (report, non_interactive, env);
+    print_pending_setup_actions(&report.pending_setup_actions);
+    let _ = (non_interactive, env);
 
     let done_key = match mode {
         SetupMode::Update => "cli.bundle.update.complete",
@@ -922,6 +938,7 @@ pub fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]
             matches!(
                 action.kind,
                 crate::setup_actions::SetupActionKind::OauthInstallButton
+                    | crate::setup_actions::SetupActionKind::OpenUrl
             ) && action.status == crate::setup_actions::SetupActionStatus::Pending
         })
         .collect();
@@ -931,13 +948,23 @@ pub fn print_pending_setup_actions(actions: &[crate::setup_actions::SetupAction]
 
     println!();
     for action in visible_actions {
-        if let Some(url) = action.authorize_url.as_deref() {
-            println!("{url}");
-        }
-        if action.callback_path.is_some() {
-            println!(
-                "After completing the OAuth flow, re-run setup if the callback was not handled automatically."
-            );
+        match action.kind {
+            crate::setup_actions::SetupActionKind::OauthInstallButton => {
+                if let Some(url) = action.authorize_url.as_deref() {
+                    println!("{url}");
+                }
+                if action.callback_path.is_some() {
+                    println!(
+                        "After completing the OAuth flow, re-run setup if the callback was not handled automatically."
+                    );
+                }
+            }
+            crate::setup_actions::SetupActionKind::OpenUrl => {
+                if let Some(url) = action.extra.get("url").and_then(serde_json::Value::as_str) {
+                    println!("{url}");
+                }
+            }
+            _ => {}
         }
         println!();
     }

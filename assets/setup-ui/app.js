@@ -1530,7 +1530,7 @@
     var descriptor = provider && provider.setup_actions;
     var actions = descriptor && Array.isArray(descriptor.actions) ? descriptor.actions : [];
     return actions.filter(function (action) {
-      return action && action.kind === "oauth_install_button" && action.registration;
+      return action && (action.kind === "oauth_install_button" || action.kind === "open_url") && action.registration;
     });
   }
 
@@ -2388,6 +2388,12 @@
         html += '<div class="setup-action">';
         html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.authorize_url) + '">' + esc(action.label || "Open") + '</a>';
         html += '</div>';
+          return;
+        }
+        if (action.kind === "open_url" && action.url) {
+          html += '<div class="setup-action">';
+          html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.url) + '">' + esc(action.label || "Open") + '</a>';
+          html += '</div>';
           return;
         }
         if (action.kind === "oauth_device_code") {

@@ -6206,7 +6206,17 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
                 .find(|action| action.get("id").and_then(Value::as_str) == Some(&req.action_id))
         })
         .ok_or_else(|| anyhow!("setup action not found: {}", req.action_id))?;
-    if action.get("kind").and_then(Value::as_str) != Some("oauth_install_button") {
+    // `oauth_install_button` additionally builds an authorize_url (client_id,
+    // scopes, redirect_uri) after registration; `open_url` is a plain link
+    // whose target is resolved entirely from registration output via the
+    // generic `install-to-workspace`-style deep_link action in the pack's
+    // `greentic.setup.actions.v1` extension (see setup_final_actions.rs) —
+    // it just needs registration to run, nothing more, and
+    // `setup_action_final_url_value` already no-ops gracefully for it.
+    if !matches!(
+        action.get("kind").and_then(Value::as_str),
+        Some("oauth_install_button" | "open_url")
+    ) {
         anyhow::bail!("setup action kind is not executable in this phase");
     }
     let registration = action
@@ -6578,6 +6588,7 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
     let public_base_url = tunnel.public_base_url.clone();
     if wait_for_setup_public_tunnel(&public_base_url).await {
+        persist_setup_tunnel_handoff(&state.bundle_path, &tunnel);
         let mut guard = state
             .setup_tunnel
             .lock()
@@ -6587,6 +6598,26 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     }
     drop(tunnel);
     anyhow::bail!("{mode} setup tunnel URL did not become reachable: {public_base_url}")
+}
+
+/// Persist a [`crate::platform_setup::TunnelHandoff`] for `tunnel`, best
+/// effort — a write failure here should never fail setup itself, it only
+/// means `greentic-start` falls back to its own port selection. See
+/// `cli_helpers::persist_tunnel_handoff` for the CLI-side counterpart.
+fn persist_setup_tunnel_handoff(bundle_path: &Path, tunnel: &crate::setup_tunnel::SetupTunnel) {
+    let Some(local_port) = crate::shared_tunnel::local_port_from_base_url(&tunnel.local_base_url)
+    else {
+        return;
+    };
+    let handoff = crate::platform_setup::TunnelHandoff {
+        service: tunnel.mode.clone(),
+        local_port,
+        public_base_url: tunnel.public_base_url.clone(),
+    };
+    if let Err(err) = crate::platform_setup::persist_tunnel_handoff_artifact(bundle_path, &handoff)
+    {
+        tracing::warn!("failed to persist setup tunnel handoff: {err:#}");
+    }
 }
 
 fn active_setup_tunnel_public_base_url(
@@ -10154,6 +10185,100 @@ questions:
         assert_eq!(action.authorize_url.as_deref(), Some(add_url));
     }
 
+    fn write_pack_with_open_url_setup_action(
+        path: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(
+            json!({
+                "pack_id": provider_id,
+                "display_name": "Open URL Action Provider"
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())?;
+        zip.write_all(
+            br#"
+provider_id: generic
+version: 1
+title: Generic provider setup
+setup_actions:
+  - id: create_app
+    label: Create Provider App
+    kind: open_url
+    provider_id: provider-alias
+    url_template: "https://provider.example/apps/{resolved_app_id}/install-on-team?"
+    registration:
+      component_ref: provider-setup
+      op: setup_app_registration
+      app_id_output: resolved_app_id
+      mock_result:
+        ok: true
+        resolved_app_id: app-from-registration
+"#,
+        )?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_action_endpoint_runs_registration_for_open_url_action() {
+        // Slack's "Setup Slack App" action has no client_id to drive an
+        // oauth_install_button (Slack's apps.manifest.update never returns
+        // one on reuse), so it uses a plain open_url action instead. The
+        // registration must still run — the setup-action endpoint used to
+        // hard-reject any kind other than oauth_install_button.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_open_url_setup_action(
+            &providers.join("messaging-open-url-action.gtpack"),
+            "messaging-open-url-action",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup-action")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider_id": "messaging-open-url-action",
+                            "action_id": "create_app",
+                            "tenant": "demo",
+                            "team": "support",
+                            "env": "dev",
+                            "tunnel": "off",
+                            "answers": {
+                                "messaging-open-url-action": {
+                                    "public_base_url": "https://runtime.example.test"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("setup action response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(body["ok"] == true, "{body}");
+        assert_eq!(
+            body["values"]["resolved_app_id"],
+            Value::String("app-from-registration".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn draft_endpoint_persists_selected_tunnel_without_answers() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -10280,6 +10405,22 @@ questions:
                 "mergeFinalSetupActionContext(context, scope && scope.answers && scope.answers[provider.provider_id]);"
             ),
             "final setup actions must see provider form answers such as bot_username and bot_email"
+        );
+    }
+
+    #[test]
+    fn setup_ui_provider_setup_phase_accepts_open_url_registration_actions() {
+        // A provider whose "run registration" setup action is a plain
+        // `open_url` link (e.g. Slack's install-on-team button, which has no
+        // client_id to drive an oauth_install_button) must still surface as a
+        // runnable step — not be silently filtered out, which would skip the
+        // whole provider-setup-action phase and never invoke registration.
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(
+            app_js.contains(
+                r#"return action && (action.kind === "oauth_install_button" || action.kind === "open_url") && action.registration;"#
+            ),
+            "providerSetupPhaseActions must accept open_url registration actions alongside oauth_install_button"
         );
     }
 

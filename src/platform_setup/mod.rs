@@ -9,15 +9,17 @@ mod url;
 pub use persistence::{
     load_effective_static_routes_defaults, load_runtime_local_base_url,
     load_runtime_public_base_url, load_static_routes_artifact, load_telemetry_artifact,
-    load_tunnel_artifact, persist_static_routes_artifact, persist_telemetry_artifact,
-    persist_tunnel_artifact, static_routes_artifact_path, telemetry_artifact_path,
-    tunnel_artifact_path,
+    load_tunnel_artifact, load_tunnel_handoff_artifact, persist_static_routes_artifact,
+    persist_telemetry_artifact, persist_tunnel_artifact, persist_tunnel_handoff_artifact,
+    static_routes_artifact_path, telemetry_artifact_path, tunnel_artifact_path,
+    tunnel_handoff_artifact_path,
 };
 pub use prompts::{
     prompt_static_routes_policy, prompt_static_routes_policy_with_answers, prompt_tunnel_mode,
 };
 pub use types::{
     PlatformSetupAnswers, StaticRoutesAnswers, StaticRoutesPolicy, TelemetryAnswers, TunnelAnswers,
+    TunnelHandoff,
 };
 
 #[cfg(test)]
@@ -29,7 +31,8 @@ mod tests {
     };
     use super::{
         load_effective_static_routes_defaults, load_runtime_local_base_url,
-        persist_static_routes_artifact,
+        load_tunnel_handoff_artifact, persist_static_routes_artifact,
+        persist_tunnel_handoff_artifact, tunnel_handoff_artifact_path,
     };
 
     #[test]
@@ -200,6 +203,32 @@ mod tests {
         assert_eq!(
             load_runtime_local_base_url(temp.path(), "demo", Some("default")).unwrap(),
             Some("http://127.0.0.1:8081".to_string())
+        );
+    }
+
+    #[test]
+    fn tunnel_handoff_round_trips_through_the_bundle_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(load_tunnel_handoff_artifact(temp.path()).unwrap(), None);
+
+        let handoff = super::TunnelHandoff {
+            service: "cloudflared".to_string(),
+            local_port: 8080,
+            public_base_url: "https://survey-revenues.trycloudflare.com".to_string(),
+        };
+        persist_tunnel_handoff_artifact(temp.path(), &handoff).unwrap();
+
+        assert_eq!(
+            load_tunnel_handoff_artifact(temp.path()).unwrap(),
+            Some(handoff)
+        );
+        // Same directory as static-routes.json — greentic-start reads both
+        // as bundle-scoped config, not the machine-wide `.greentic/` dir.
+        assert!(
+            tunnel_handoff_artifact_path(temp.path())
+                .parent()
+                .unwrap()
+                .ends_with("state/config/platform")
         );
     }
 

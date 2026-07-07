@@ -749,11 +749,45 @@ fn defer_registration_actions_missing_inputs(
     answers: &Value,
 ) {
     actions.retain(|action| {
-        !(action.kind == crate::setup_actions::SetupActionKind::OauthInstallButton
-            && action.extra.get("registration").is_some()
-            && client_id_for_action(action, answers).is_none()
-            && !registration_has_any_declared_input(action.extra.get("registration"), answers))
+        if action.extra.get("registration").is_none() {
+            return true;
+        }
+        let registration_satisfied = match action.kind {
+            crate::setup_actions::SetupActionKind::OauthInstallButton => {
+                client_id_for_action(action, answers).is_some()
+            }
+            crate::setup_actions::SetupActionKind::OpenUrl => {
+                !registration_output_missing(action, answers)
+            }
+            _ => return true,
+        };
+        registration_satisfied
+            || registration_has_any_declared_input(action.extra.get("registration"), answers)
     });
+}
+
+/// Whether an action's registration op has *not yet* produced any of its
+/// declared `*_output` fields — i.e. whether registration still needs to run.
+/// Used by kinds (like `open_url`) that have no `client_id` to key off of.
+fn registration_output_missing(
+    action: &crate::setup_actions::SetupAction,
+    answers: &Value,
+) -> bool {
+    let Some(registration_obj) = action.extra.get("registration").and_then(Value::as_object) else {
+        return true;
+    };
+    let Some(answers_obj) = answers.as_object() else {
+        return true;
+    };
+    !registration_obj.iter().any(|(key, field_value)| {
+        key.ends_with("_output")
+            && field_value
+                .as_str()
+                .map(str::trim)
+                .filter(|field_name| !field_name.is_empty())
+                .and_then(|field_name| answers_obj.get(field_name))
+                .is_some_and(|value| !is_empty_value(value))
+    })
 }
 
 fn registration_has_any_declared_input(registration: Option<&Value>, answers: &Value) -> bool {
@@ -809,6 +843,17 @@ fn run_setup_action_registrations(ctx: SetupActionRegistrationContext<'_>) -> an
 
     for action in actions {
         if !needs_setup_action_registration(action, answers) {
+            // Registration may already have run in a prior setup pass (its
+            // `*_output` fields are already in `answers`), but `action.extra`
+            // is rebuilt fresh from the pack's setup.yaml on every run, so an
+            // `open_url` action's resolved `url` never carries over. Recompute
+            // it from the already-known answers instead of re-invoking
+            // registration.
+            if action.kind == crate::setup_actions::SetupActionKind::OpenUrl
+                && action.extra.get("registration").is_some()
+            {
+                resolve_open_url_action(action, answers)?;
+            }
             continue;
         }
         let registration = action
@@ -846,13 +891,21 @@ fn run_setup_action_registrations(ctx: SetupActionRegistrationContext<'_>) -> an
             );
         }
         merge_registration_output(action, answers, &registration, &output)?;
-        if client_id_for_action(action, answers).is_none()
-            && !authorize_url_has_query_key(action.authorize_url.as_deref(), "client_id")
-        {
-            anyhow::bail!(
-                "setup action registration {} did not produce a client_id",
-                action.id
-            );
+        match action.kind {
+            crate::setup_actions::SetupActionKind::OauthInstallButton => {
+                if client_id_for_action(action, answers).is_none()
+                    && !authorize_url_has_query_key(action.authorize_url.as_deref(), "client_id")
+                {
+                    anyhow::bail!(
+                        "setup action registration {} did not produce a client_id",
+                        action.id
+                    );
+                }
+            }
+            crate::setup_actions::SetupActionKind::OpenUrl => {
+                resolve_open_url_action(action, answers)?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -862,10 +915,84 @@ fn needs_setup_action_registration(
     action: &crate::setup_actions::SetupAction,
     answers: &Value,
 ) -> bool {
-    action.kind == crate::setup_actions::SetupActionKind::OauthInstallButton
-        && action.extra.get("registration").is_some()
-        && client_id_for_action(action, answers).is_none()
-        && !authorize_url_has_query_key(action.authorize_url.as_deref(), "client_id")
+    if action.extra.get("registration").is_none() {
+        return false;
+    }
+    match action.kind {
+        crate::setup_actions::SetupActionKind::OauthInstallButton => {
+            client_id_for_action(action, answers).is_none()
+                && !authorize_url_has_query_key(action.authorize_url.as_deref(), "client_id")
+        }
+        crate::setup_actions::SetupActionKind::OpenUrl => {
+            registration_output_missing(action, answers)
+        }
+        _ => false,
+    }
+}
+
+/// Resolve an `open_url` action's `url_template` (e.g.
+/// `https://api.slack.com/apps/{slack_app_id}/install-on-team?`) against the
+/// answers merged in by `merge_registration_output`, storing the result as
+/// `action.extra["url"]` for the setup UI to render as a plain link.
+fn resolve_open_url_action(
+    action: &mut crate::setup_actions::SetupAction,
+    answers: &Value,
+) -> anyhow::Result<()> {
+    let Some(template) = action
+        .extra
+        .get("url_template")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if !template.starts_with("https://") {
+        anyhow::bail!(
+            "setup action {} url_template must be an https:// URL",
+            action.id
+        );
+    }
+    let placeholder = regex::Regex::new(r"\{([A-Za-z0-9_.-]+)\}")
+        .expect("static url template placeholder regex is valid");
+    let answers_obj = answers.as_object();
+    let mut unresolved = false;
+    let resolved = placeholder.replace_all(template, |caps: &regex::Captures<'_>| {
+        let name = &caps[1];
+        let value = answers_obj
+            .and_then(|obj| obj.get(name))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match value {
+            Some(value) => percent_encode_url_component(value),
+            None => {
+                unresolved = true;
+                String::new()
+            }
+        }
+    });
+    if !unresolved {
+        action
+            .extra
+            .insert("url".into(), Value::String(resolved.into_owned()));
+    }
+    Ok(())
+}
+
+/// Percent-encodes a value for embedding in a URL path/query segment,
+/// matching JavaScript's `encodeURIComponent` unreserved-character set.
+fn percent_encode_url_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn authorize_url_has_query_key(url: Option<&str>, key: &str) -> bool {

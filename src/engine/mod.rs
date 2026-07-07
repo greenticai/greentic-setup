@@ -747,6 +747,77 @@ setup_actions:
     }
 
     #[test]
+    fn execute_apply_pack_setup_resolves_open_url_action_even_when_already_registered() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
+        write_registration_test_pack(
+            &bundle_root,
+            r#"
+title: Example
+questions:
+  - name: workspace_name
+    kind: string
+setup_actions:
+  - id: install
+    label: Install
+    kind: open_url
+    url_template: "https://example.com/apps/{app_id}/install-on-team?"
+    registration:
+      component_ref: components/registration.json
+      op: register
+      app_id_output: registered_app_id
+"#,
+            json!({
+                "operations": {
+                    "register": {
+                        // If registration re-ran on this pass it would return
+                        // this app id instead of the pre-existing one below —
+                        // asserting on the pre-existing value proves the op
+                        // was NOT re-invoked.
+                        "result": {
+                            "registered_app_id": "app-from-a-fresh-registration-call"
+                        }
+                    }
+                }
+            }),
+        );
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".into(),
+            team: Some("default".into()),
+            env: "dev".into(),
+            offline: false,
+            verbose: false,
+        });
+        let mut request = empty_request(bundle_root.clone());
+        // Simulate a prior successful setup run: the registration output is
+        // already present in the persisted answers (as both the registration
+        // mapping's source key and the generic `app_id` key merge_registration_output
+        // writes), so a re-run should skip invoking `register` again.
+        request.setup_answers.insert(
+            "messaging-example".into(),
+            json!({
+                "workspace_name": "Demo App",
+                "app_id": "preexisting-app-id",
+                "registered_app_id": "preexisting-app-id"
+            }),
+        );
+        let metadata = build_metadata(&request, Vec::new(), vec![]);
+
+        let report = execute_apply_pack_setup(&bundle_root, &metadata, engine.config()).unwrap();
+        let url = report.pending_setup_actions[0]
+            .extra
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://example.com/apps/preexisting-app-id/install-on-team?"
+        );
+    }
+
+    #[test]
     fn execute_apply_pack_setup_skips_actions_for_disabled_provider() {
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
