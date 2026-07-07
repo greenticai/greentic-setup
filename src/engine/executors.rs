@@ -892,15 +892,17 @@ fn run_setup_action_registrations(ctx: SetupActionRegistrationContext<'_>) -> an
         }
         merge_registration_output(action, answers, &registration, &output)?;
         match action.kind {
-            crate::setup_actions::SetupActionKind::OauthInstallButton => {
+            crate::setup_actions::SetupActionKind::OauthInstallButton
                 if client_id_for_action(action, answers).is_none()
-                    && !authorize_url_has_query_key(action.authorize_url.as_deref(), "client_id")
-                {
-                    anyhow::bail!(
-                        "setup action registration {} did not produce a client_id",
-                        action.id
-                    );
-                }
+                    && !authorize_url_has_query_key(
+                        action.authorize_url.as_deref(),
+                        "client_id",
+                    ) =>
+            {
+                anyhow::bail!(
+                    "setup action registration {} did not produce a client_id",
+                    action.id
+                );
             }
             crate::setup_actions::SetupActionKind::OpenUrl => {
                 resolve_open_url_action(action, answers)?;
