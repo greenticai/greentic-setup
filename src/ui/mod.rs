@@ -11,7 +11,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::{Body, Bytes, to_bytes};
@@ -60,6 +60,13 @@ struct UiState {
     setup_session_id: String,
     setup_tunnel: Mutex<Option<SetupTunnel>>,
     setup_tunnel_start: AsyncMutex<()>,
+    /// Set when a setup tunnel was spawned but never became externally
+    /// reachable (e.g. cloudflared quick tunnels are unroutable on this
+    /// network's DNS path). Acts as a circuit breaker: while set and within
+    /// [`TUNNEL_FAILURE_COOLDOWN`], `ensure_setup_tunnel` returns the
+    /// recorded error immediately instead of spawning yet another tunnel
+    /// that would just fail the same reachability check again.
+    tunnel_failure_cooldown: Mutex<Option<Instant>>,
     setup_runtime: Mutex<Option<SetupRuntime>>,
     setup_runtime_start: AsyncMutex<()>,
     shutdown_tx: broadcast::Sender<()>,
@@ -423,6 +430,7 @@ pub async fn launch(
         setup_session_id,
         setup_tunnel: Mutex::new(None),
         setup_tunnel_start: AsyncMutex::new(()),
+        tunnel_failure_cooldown: Mutex::new(None),
         setup_runtime: Mutex::new(None),
         setup_runtime_start: AsyncMutex::new(()),
         shutdown_tx: shutdown_tx.clone(),
@@ -6558,6 +6566,14 @@ fn append_line(existing: &str, line: &str) -> String {
     }
 }
 
+/// How long `ensure_setup_tunnel` refuses to spawn another tunnel after one
+/// failed to become reachable. Without this, a network that can't route the
+/// tunnel provider's hostnames at all (e.g. cloudflared quick tunnels being
+/// unroutable on some networks' DNS path) causes every single call to spawn
+/// yet another doomed tunnel: the reuse-if-alive check always sees the prior
+/// one as dead (it never became reachable) and replaces it, forever.
+const TUNNEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(20);
+
 async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) -> Result<String> {
     if let Some(existing) = active_setup_tunnel_public_base_url(state, mode, local_base_url)? {
         if setup_backend_public_tunnel_responds(&existing).await {
@@ -6578,7 +6594,23 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
         setup_backend_clear_setup_tunnel(state);
     }
 
+    if let Some(remaining) = setup_backend_tunnel_cooldown_remaining(state)? {
+        eprintln!(
+            "Setup tunnel circuit breaker: refusing to spawn another {mode} tunnel, \
+             {}s left in cooldown after the last attempt never became reachable",
+            remaining.as_secs()
+        );
+        anyhow::bail!(
+            "{mode} setup tunnel is unavailable: the last attempt never became reachable \
+             (this usually means the tunnel provider's hostnames aren't routable from this \
+             network). Not retrying for another {}s to avoid spawning another doomed tunnel \
+             — switch tunnel.mode if this persists.",
+            remaining.as_secs()
+        );
+    }
+
     let local_base_url = local_base_url.trim_end_matches('/').to_string();
+    eprintln!("Setup tunnel: spawning {mode} tunnel for {local_base_url}");
     let mode_for_task = mode.to_string();
     let local_base_url_for_task = local_base_url.clone();
     let tunnel = tokio::task::spawn_blocking(move || {
@@ -6587,17 +6619,40 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     .await
     .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
     let public_base_url = tunnel.public_base_url.clone();
+    eprintln!("Setup tunnel: probing reachability of {public_base_url}");
     if wait_for_setup_public_tunnel(&public_base_url).await {
+        eprintln!("Setup tunnel: {public_base_url} is reachable, using it");
         persist_setup_tunnel_handoff(&state.bundle_path, &tunnel);
         let mut guard = state
             .setup_tunnel
             .lock()
             .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
         *guard = Some(tunnel);
+        if let Ok(mut cooldown) = state.tunnel_failure_cooldown.lock() {
+            *cooldown = None;
+        }
         return Ok(public_base_url);
     }
+    eprintln!(
+        "Setup tunnel: {public_base_url} never became reachable; entering {}s cooldown \
+         before another {mode} tunnel may be spawned",
+        TUNNEL_FAILURE_COOLDOWN.as_secs()
+    );
     drop(tunnel);
+    if let Ok(mut cooldown) = state.tunnel_failure_cooldown.lock() {
+        *cooldown = Some(Instant::now());
+    }
     anyhow::bail!("{mode} setup tunnel URL did not become reachable: {public_base_url}")
+}
+
+/// Remaining cooldown after a tunnel failed to become reachable, or `None`
+/// if there was no recent failure (or the cooldown has already elapsed).
+fn setup_backend_tunnel_cooldown_remaining(state: &UiState) -> Result<Option<Duration>> {
+    let guard = state
+        .tunnel_failure_cooldown
+        .lock()
+        .map_err(|_| anyhow!("tunnel failure cooldown lock poisoned"))?;
+    Ok(guard.and_then(|failed_at| TUNNEL_FAILURE_COOLDOWN.checked_sub(failed_at.elapsed())))
 }
 
 /// Persist a [`crate::platform_setup::TunnelHandoff`] for `tunnel`, best
@@ -7344,9 +7399,10 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderSetupEventRequest, UiState, build_router, persist_provider_setup_event,
-        persist_ui_draft, prefill_has_cloud_deployment_targets, read_provider_setup_events,
-        redact_provider_setup_event_detail,
+        ProviderSetupEventRequest, TUNNEL_FAILURE_COOLDOWN, UiState, build_router,
+        persist_provider_setup_event, persist_ui_draft, prefill_has_cloud_deployment_targets,
+        read_provider_setup_events, redact_provider_setup_event_detail,
+        setup_backend_tunnel_cooldown_remaining,
     };
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
@@ -7374,11 +7430,40 @@ mod tests {
             setup_session_id: "test-session".to_string(),
             setup_tunnel: Mutex::new(None),
             setup_tunnel_start: tokio::sync::Mutex::new(()),
+            tunnel_failure_cooldown: Mutex::new(None),
             setup_runtime: Mutex::new(None),
             setup_runtime_start: tokio::sync::Mutex::new(()),
             shutdown_tx,
             result: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn tunnel_cooldown_blocks_immediately_after_a_failure_then_clears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+
+        assert_eq!(
+            setup_backend_tunnel_cooldown_remaining(&state).unwrap(),
+            None,
+            "no failure recorded yet, so no cooldown"
+        );
+
+        *state.tunnel_failure_cooldown.lock().unwrap() = Some(std::time::Instant::now());
+        let remaining = setup_backend_tunnel_cooldown_remaining(&state)
+            .unwrap()
+            .expect("should be in cooldown right after a recorded failure");
+        assert!(remaining <= TUNNEL_FAILURE_COOLDOWN && remaining > std::time::Duration::ZERO);
+
+        // A failure recorded further in the past than the cooldown window
+        // has already elapsed, so it should read as no-longer-blocking.
+        let long_ago = std::time::Instant::now() - (TUNNEL_FAILURE_COOLDOWN * 2);
+        *state.tunnel_failure_cooldown.lock().unwrap() = Some(long_ago);
+        assert_eq!(
+            setup_backend_tunnel_cooldown_remaining(&state).unwrap(),
+            None,
+            "cooldown window has already elapsed"
+        );
     }
 
     fn test_jwt_with_exp(exp: u64) -> String {
