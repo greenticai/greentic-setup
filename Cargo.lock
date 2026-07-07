@@ -1200,9 +1200,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.19"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4279b0f31df31b4add8aeae57d40f3b5e53aad2b531e89b982bd75ed1898851d"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2142,7 +2142,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "greentic-bundle-reader",
- "greentic-deploy-spec",
+ "greentic-deploy-spec 0.1.28794087594",
  "greentic-distributor-client",
  "greentic-qa-lib",
  "hex",
@@ -2228,10 +2228,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "greentic-deployer"
-version = "1.1.3"
+name = "greentic-deploy-spec"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68d8e58664e1fee92669b0529c31cf3dc627bddbeb3cf323b0aded6546c70751"
+checksum = "f90f145d14d357a015f282811d82e18fa229addaf49e6cc41f2c333b19e758ab"
+dependencies = [
+ "chrono",
+ "greentic-config-types",
+ "greentic-secrets-spec",
+ "greentic-types",
+ "hex",
+ "http",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml_gtc",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "ulid",
+]
+
+[[package]]
+name = "greentic-deployer"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe25a2ab5bc5b44d75a2c9e996033983295c3bd646e30c1127df778da22bad4a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2243,7 +2264,7 @@ dependencies = [
  "greentic-bundle",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec",
+ "greentic-deploy-spec 0.2.0",
  "greentic-distributor-client",
  "greentic-operator-trust",
  "greentic-secrets-lib",
@@ -2426,13 +2447,13 @@ dependencies = [
 
 [[package]]
 name = "greentic-operator-trust"
-version = "0.1.28794087594"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77b4260eed7bfce5be3fc3d3eac8b131304faeecc8ae75be9e9a4576cd1828c8"
+checksum = "4dd3d049801e60c4dbd9825b4b261cbf1f311deeff35e8da35c21677a3c2676c"
 dependencies = [
  "chrono",
  "ed25519-dalek",
- "greentic-deploy-spec",
+ "greentic-deploy-spec 0.2.0",
  "greentic-distributor-client",
  "hex",
  "libc",
@@ -2512,7 +2533,7 @@ dependencies = [
  "futures",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec",
+ "greentic-deploy-spec 0.1.28794087594",
  "greentic-distributor-client",
  "greentic-flow",
  "greentic-interfaces",
@@ -2680,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
