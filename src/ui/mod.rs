@@ -2697,6 +2697,7 @@ async fn setup_backend_contract_next(
             "result": { "ok": true }
         })
     } else {
+        setup_backend_record_step_attempt(&mut stored, &next_step);
         setup_backend_execute_action(state, contract, tenant, &mut stored, &next_step).await?
     };
     crate::setup_backend_contract::record_action_result(
@@ -2726,6 +2727,59 @@ async fn setup_backend_contract_next(
     ))
 }
 
+/// Track and log repeated executions of the same setup step. Returns the
+/// attempt number (1-based; resets when `config.public_base_url` changes,
+/// since a URL change makes a re-run legitimate). A step re-running with an
+/// unchanged public_base_url is making no progress — from attempt 3 on this
+/// logs loudly: that pattern is the signature of a staleness/currency check
+/// comparing the wrong tunnel, not of a genuine retry.
+fn setup_backend_record_step_attempt(stored: &mut JsonMap<String, Value>, step: &str) -> u64 {
+    let public_base_url = stored
+        .get("config")
+        .and_then(|config| config.get("public_base_url"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    let attempts = stored
+        .entry("step_attempts".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
+    let Some(map) = attempts.as_object_mut() else {
+        return 1;
+    };
+    let previous = map.get(step);
+    let same_url = previous
+        .and_then(|entry| entry.get("public_base_url"))
+        .and_then(Value::as_str)
+        == Some(public_base_url.as_str());
+    let count = if same_url {
+        previous
+            .and_then(|entry| entry.get("count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+    map.insert(
+        step.to_string(),
+        serde_json::json!({"count": count, "public_base_url": public_base_url}),
+    );
+    if count >= 3 {
+        eprintln!(
+            "[setup] step {step} is re-running for the {count}th time with an unchanged \
+             public_base_url ({public_base_url}) — it keeps being treated as not-done. This \
+             usually means a staleness/currency check is comparing the wrong tunnel (see \
+             any [setup runtime-context] mismatch lines above)"
+        );
+    } else {
+        eprintln!(
+            "[setup] executing step {step} (attempt {count}, public_base_url={public_base_url})"
+        );
+    }
+    count
+}
+
 async fn setup_backend_contract_action(
     state: &UiState,
     contract: &ProviderBackendContract,
@@ -2748,6 +2802,7 @@ async fn setup_backend_contract_action(
         .cloned()
         .unwrap_or(Value::Null);
     let result = if action.is_some() {
+        setup_backend_record_step_attempt(&mut stored, step);
         setup_backend_execute_action(state, contract, tenant, &mut stored, step).await?
     } else {
         setup_backend_action_error(
@@ -4747,6 +4802,47 @@ fn setup_backend_active_tunnel_public_base_url(state: &UiState) -> Option<String
     Some(tunnel.public_base_url.trim_end_matches('/').to_string()).filter(|value| !value.is_empty())
 }
 
+/// Public URL of the tunnel fronting `port`: the in-session slot when it
+/// fronts that exact port, else the machine-wide shared tunnel record.
+///
+/// The in-session slot (`state.setup_tunnel`) is last-writer-wins across
+/// flows that tunnel *different* ports (runtime ingress vs the Setup UI), so
+/// reading it port-blind reports whichever tunnel was acquired most recently
+/// — comparing that against a runtime-ingress URL is what made the Teams
+/// reconcile step permanently "stale". Keying by port restores one identity
+/// per tunnel. Record read only — no probing here (this runs on every status
+/// render); liveness is enforced by the acquire paths, and a dead-but-still-
+/// recorded tunnel self-heals on the next acquire (record changes → one
+/// legitimate re-register).
+fn setup_backend_tunnel_public_base_url_for_port(state: &UiState, port: u16) -> Option<String> {
+    setup_backend_tunnel_public_base_url_for_port_at(state, port, None)
+}
+
+/// Testable seam for [`setup_backend_tunnel_public_base_url_for_port`]:
+/// `record_root` overrides the shared tunnel state root (tests use a temp dir
+/// instead of mutating `GREENTIC_TUNNEL_STATE_DIR`, which races across
+/// parallel tests).
+fn setup_backend_tunnel_public_base_url_for_port_at(
+    state: &UiState,
+    port: u16,
+    record_root: Option<&Path>,
+) -> Option<String> {
+    if let Ok(mut guard) = state.setup_tunnel.lock()
+        && let Some(tunnel) = guard.as_mut()
+        && crate::shared_tunnel::local_port_from_base_url(&tunnel.local_base_url) == Some(port)
+        && tunnel.is_running()
+    {
+        return Some(tunnel.public_base_url.trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+    }
+    let paths = match record_root {
+        Some(root) => crate::shared_tunnel::shared_tunnel_paths_at(root, port),
+        None => crate::shared_tunnel::shared_tunnel_paths(port),
+    };
+    let (_pid, url) = crate::shared_tunnel::read_record(&paths);
+    url
+}
+
 fn setup_backend_runtime_public_base_url(state: &UiState, tenant: &str) -> Option<String> {
     if let Some(value) = setup_backend_setup_runtime_info(state)
         .and_then(|info| info.public_base_url)
@@ -4804,9 +4900,29 @@ fn setup_backend_runtime_context(
             setup_backend_public_base_url_is_external_https(value)
                 || is_ephemeral_tunnel_public_base_url(value)
         });
-    let active_tunnel_public_base_url =
-        setup_backend_active_tunnel_public_base_url(state).or(runtime_public_base_url);
     let runtime_local_base_url = setup_backend_runtime_local_base_url(state, tenant);
+    // runtime_context describes the RUNTIME, so its active tunnel must be the
+    // one fronting the runtime-ingress port — never the Setup-UI tunnel that
+    // may currently occupy the port-blind in-session slot.
+    let ingress_port = runtime_local_base_url
+        .as_deref()
+        .and_then(crate::shared_tunnel::local_port_from_base_url);
+    let active_tunnel_public_base_url = ingress_port
+        .and_then(|port| setup_backend_tunnel_public_base_url_for_port(state, port))
+        // Legacy fallback for sessions with no runtime yet: the slot, then the
+        // runtime-reported public base.
+        .or_else(|| setup_backend_active_tunnel_public_base_url(state))
+        .or(runtime_public_base_url);
+    if !public_base_url.is_empty()
+        && is_ephemeral_tunnel_public_base_url(&public_base_url)
+        && active_tunnel_public_base_url.as_deref() != Some(public_base_url.as_str())
+    {
+        eprintln!(
+            "[setup runtime-context] ingress tunnel mismatch: config public_base_url={public_base_url} \
+             vs active tunnel={active_tunnel_public_base_url:?} (ingress_port={ingress_port:?}, \
+             runtime_local_base_url={runtime_local_base_url:?}) — dependent steps will be treated as stale"
+        );
+    }
     serde_json::json!({
         "public_base_url": if public_base_url.is_empty() { Value::Null } else { Value::String(public_base_url.clone()) },
         "public_base_url_is_ephemeral_tunnel": !public_base_url.is_empty() && is_ephemeral_tunnel_public_base_url(&public_base_url),
@@ -5266,6 +5382,15 @@ fn setup_backend_filter_stale_action_values(
 
 fn setup_backend_mark_action_value_stale(value: &mut Value, step_id: &str) {
     if let Some(object) = value.as_object_mut() {
+        // Log only the fresh→stale transition, not the idempotent re-mark on
+        // every render, so a stuck step shows one line per invalidation.
+        if object.get("stale").and_then(Value::as_bool) != Some(true) {
+            eprintln!(
+                "[setup] marking stored result for step {step_id} as stale (step is not \
+                 done under the current runtime context); its completion will not count \
+                 until the step re-runs"
+            );
+        }
         object.insert("ok".to_string(), Value::Bool(false));
         object.insert("stale".to_string(), Value::Bool(true));
         object.insert("stale_step".to_string(), Value::String(step_id.to_string()));
@@ -6767,11 +6892,27 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     eprintln!("Setup tunnel: probing reachability of {public_base_url}");
     if wait_for_setup_public_tunnel(&public_base_url).await {
         eprintln!("Setup tunnel: {public_base_url} is reachable, using it");
-        persist_setup_tunnel_handoff(&state.bundle_path, &tunnel);
+        persist_setup_tunnel_handoff(&state.bundle_path, &state.local_base_url, &tunnel);
         let mut guard = state
             .setup_tunnel
             .lock()
             .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
+        // The slot is last-writer-wins across flows that tunnel different
+        // ports (runtime ingress vs Setup UI) — make each takeover visible.
+        match guard.as_ref() {
+            Some(previous) if previous.local_base_url != tunnel.local_base_url => eprintln!(
+                "[setup tunnel-slot] now fronts {} → {} (was {} → {}); port-keyed lookups \
+                 still resolve the previous tunnel via the shared record",
+                tunnel.local_base_url,
+                tunnel.public_base_url,
+                previous.local_base_url,
+                previous.public_base_url
+            ),
+            _ => eprintln!(
+                "[setup tunnel-slot] now fronts {} → {}",
+                tunnel.local_base_url, tunnel.public_base_url
+            ),
+        }
         *guard = Some(tunnel);
         if let Ok(mut cooldown) = state.tunnel_failure_cooldown.lock() {
             *cooldown = None;
@@ -6804,11 +6945,32 @@ fn setup_backend_tunnel_cooldown_remaining(state: &UiState) -> Result<Option<Dur
 /// effort — a write failure here should never fail setup itself, it only
 /// means `greentic-start` falls back to its own port selection. See
 /// `cli_helpers::persist_tunnel_handoff` for the CLI-side counterpart.
-fn persist_setup_tunnel_handoff(bundle_path: &Path, tunnel: &crate::setup_tunnel::SetupTunnel) {
+fn persist_setup_tunnel_handoff(
+    bundle_path: &Path,
+    setup_ui_local_base_url: &str,
+    tunnel: &crate::setup_tunnel::SetupTunnel,
+) {
     let Some(local_port) = crate::shared_tunnel::local_port_from_base_url(&tunnel.local_base_url)
     else {
         return;
     };
+    // greentic-start binds its gateway to the handoff's local_port (so a
+    // pre-created tunnel keeps fronting the runtime). The Setup-UI port is
+    // occupied by this very process — handing it off would make the next
+    // `greentic-start` try to bind a taken port and point the gateway at the
+    // wrong tunnel. Only runtime-facing tunnels may be handed off.
+    if crate::shared_tunnel::local_port_from_base_url(setup_ui_local_base_url) == Some(local_port) {
+        eprintln!(
+            "[setup tunnel-handoff] skipping handoff for {url}: port {local_port} is the \
+             Setup-UI port, not a runtime ingress port",
+            url = tunnel.public_base_url
+        );
+        return;
+    }
+    eprintln!(
+        "[setup tunnel-handoff] persisting handoff: port {local_port} → {url}",
+        url = tunnel.public_base_url
+    );
     let handoff = crate::platform_setup::TunnelHandoff {
         service: tunnel.mode.clone(),
         local_port,
@@ -7545,9 +7707,11 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 mod tests {
     use super::{
         ProviderSetupEventRequest, TUNNEL_FAILURE_COOLDOWN, UiState, build_router,
-        persist_provider_setup_event, persist_ui_draft, prefill_has_cloud_deployment_targets,
-        read_provider_setup_events, redact_provider_setup_event_detail,
-        setup_backend_tunnel_cooldown_remaining,
+        persist_provider_setup_event, persist_setup_tunnel_handoff, persist_ui_draft,
+        prefill_has_cloud_deployment_targets, read_provider_setup_events,
+        redact_provider_setup_event_detail, setup_backend_record_step_attempt,
+        setup_backend_runtime_context_current, setup_backend_tunnel_cooldown_remaining,
+        setup_backend_tunnel_public_base_url_for_port_at,
     };
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
@@ -7581,6 +7745,146 @@ mod tests {
             shutdown_tx,
             result: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn port_keyed_tunnel_resolution_prefers_slot_then_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record_root = tempfile::tempdir().expect("record root");
+        let state = test_ui_state(temp.path());
+
+        // Plant a Setup-UI-port tunnel in the in-session slot (port 12345
+        // matches test_ui_state's local_base_url).
+        *state.setup_tunnel.lock().unwrap() = Some(crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:12345",
+            "https://ui-tunnel.trycloudflare.com",
+        ));
+        // Publish a runtime-ingress record for port 8080 at the temp root.
+        let paths = crate::shared_tunnel::shared_tunnel_paths_at(record_root.path(), 8080);
+        crate::shared_tunnel::write_record(&paths, 4242, "https://ingress.trycloudflare.com")
+            .expect("write record");
+
+        // Slot port match → slot URL, even though a record root is supplied.
+        assert_eq!(
+            setup_backend_tunnel_public_base_url_for_port_at(
+                &state,
+                12345,
+                Some(record_root.path())
+            )
+            .as_deref(),
+            Some("https://ui-tunnel.trycloudflare.com"),
+        );
+        // Different port → the slot must NOT answer; the shared record does.
+        assert_eq!(
+            setup_backend_tunnel_public_base_url_for_port_at(
+                &state,
+                8080,
+                Some(record_root.path())
+            )
+            .as_deref(),
+            Some("https://ingress.trycloudflare.com"),
+        );
+        // No slot match, no record → None.
+        assert_eq!(
+            setup_backend_tunnel_public_base_url_for_port_at(
+                &state,
+                9999,
+                Some(record_root.path())
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn runtime_context_current_matches_ingress_tunnel_not_setup_ui_tunnel() {
+        let ingress = "https://ingress.trycloudflare.com";
+        let stored = serde_json::json!({
+            "runtime_context": { "public_base_url": ingress }
+        });
+        // Post-fix shape: the active tunnel resolved for the INGRESS port
+        // matches the registered public_base_url → the step stays done.
+        let current_ok = serde_json::json!({
+            "public_base_url": ingress,
+            "public_base_url_is_ephemeral_tunnel": true,
+            "active_tunnel_public_base_url": ingress,
+        });
+        assert!(setup_backend_runtime_context_current(&stored, &current_ok));
+        // The pre-fix failure: the port-blind slot reported the Setup-UI
+        // tunnel instead → permanently stale. The gate itself must still
+        // reject a genuine mismatch (that is what triggers a re-register).
+        let current_mismatch = serde_json::json!({
+            "public_base_url": ingress,
+            "public_base_url_is_ephemeral_tunnel": true,
+            "active_tunnel_public_base_url": "https://ui-tunnel.trycloudflare.com",
+        });
+        assert!(!setup_backend_runtime_context_current(
+            &stored,
+            &current_mismatch
+        ));
+    }
+
+    #[test]
+    fn tunnel_handoff_never_persists_the_setup_ui_port() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        let setup_ui = "http://127.0.0.1:12345";
+        let handoff_path = bundle
+            .path()
+            .join("state/config/platform/tunnel-handoff.json");
+
+        // Setup-UI-port tunnel: skipped — greentic-start would try to bind
+        // its gateway to a port this process already occupies.
+        let ui_tunnel = crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            setup_ui,
+            "https://ui-tunnel.trycloudflare.com",
+        );
+        persist_setup_tunnel_handoff(bundle.path(), setup_ui, &ui_tunnel);
+        assert!(
+            !handoff_path.exists(),
+            "Setup-UI-port tunnel must not be handed off"
+        );
+
+        // Runtime-ingress tunnel: persisted with its own port.
+        let ingress_tunnel = crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:8080",
+            "https://ingress.trycloudflare.com",
+        );
+        persist_setup_tunnel_handoff(bundle.path(), setup_ui, &ingress_tunnel);
+        let handoff: Value =
+            serde_json::from_str(&std::fs::read_to_string(&handoff_path).expect("handoff written"))
+                .expect("valid json");
+        assert_eq!(
+            handoff.get("local_port").and_then(Value::as_u64),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn step_attempt_counter_increments_and_resets_on_url_change() {
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            serde_json::json!({"public_base_url": "https://a.trycloudflare.com"}),
+        );
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 1);
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 2);
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 3);
+        // Independent step tracks separately.
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "publish"), 1);
+        // A changed public_base_url makes a re-run legitimate → reset.
+        stored.insert(
+            "config".to_string(),
+            serde_json::json!({"public_base_url": "https://b.trycloudflare.com"}),
+        );
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 1);
+        // Counter round-trips through the stored map.
+        assert_eq!(
+            stored["step_attempts"]["reg"]["count"].as_u64(),
+            Some(1),
+            "persisted counter reflects the reset"
+        );
     }
 
     #[test]

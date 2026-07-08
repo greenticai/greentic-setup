@@ -51,7 +51,7 @@ pub fn shared_tunnel_paths(port: u16) -> SharedTunnelPaths {
     shared_tunnel_paths_at(&tunnel_state_root(), port)
 }
 
-fn shared_tunnel_paths_at(root: &Path, port: u16) -> SharedTunnelPaths {
+pub(crate) fn shared_tunnel_paths_at(root: &Path, port: u16) -> SharedTunnelPaths {
     let state = root.join("state");
     let key = format!("shared.cloudflared-{port}");
     SharedTunnelPaths {

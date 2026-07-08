@@ -39,6 +39,18 @@ impl SetupTunnel {
             None => true,
         }
     }
+
+    /// Handle for a tunnel owned elsewhere (the shared record, or tests):
+    /// no child process, never killed on drop.
+    pub(crate) fn detached(mode: &str, local_base_url: &str, public_base_url: &str) -> Self {
+        Self {
+            mode: mode.to_string(),
+            local_base_url: local_base_url.trim_end_matches('/').to_string(),
+            public_base_url: public_base_url.to_string(),
+            child: None,
+            kill_on_drop: false,
+        }
+    }
 }
 
 pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -> bool {
@@ -79,13 +91,7 @@ pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunne
 /// is no child to own and nothing to kill on drop — the tunnel deliberately
 /// outlives this setup process so the runtime it configures keeps the same URL.
 fn reuse_shared_tunnel(mode: &str, local_base_url: &str, public_base_url: String) -> SetupTunnel {
-    SetupTunnel {
-        mode: mode.to_string(),
-        local_base_url: local_base_url.trim_end_matches('/').to_string(),
-        public_base_url,
-        child: None,
-        kill_on_drop: false,
-    }
+    SetupTunnel::detached(mode, local_base_url, &public_base_url)
 }
 
 /// Acquire the machine-wide shared cloudflared tunnel for the port behind
