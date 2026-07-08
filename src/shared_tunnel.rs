@@ -18,15 +18,13 @@
 //! terminated — never by name.
 
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// A lock file untouched for this long belongs to a crashed process and may
 /// be reclaimed. Spawn + URL discovery hold the lock for well under a minute.
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(120);
-
-/// Probe budget when deciding whether a recorded tunnel still serves.
-const REUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// On-disk paths of the shared cloudflared record for one local port.
 #[derive(Clone, Debug)]
@@ -138,28 +136,173 @@ pub fn terminate_recorded_pid(pid: u32) {
     }
 }
 
-/// One HEAD probe. `true` = the edge routed to a live origin (2xx/3xx, or any
-/// error status other than Cloudflare's 530 tunnel-down page — a 404 from the
-/// origin still proves the tunnel works). Transport errors and 530 = dead.
-fn head_probe(url: &str) -> bool {
-    match ureq::head(url).call() {
-        Ok(_) => true,
-        Err(ureq::Error::StatusCode(code)) => code != 530,
-        Err(_) => false,
+/// What a single HEAD probe of a recorded tunnel URL tells us.
+enum ProbeOutcome {
+    /// The edge routed the request to the origin — 2xx/3xx, or any origin error
+    /// status other than 530 (a 400/404 from the origin still proves routing).
+    /// The tunnel serves end to end.
+    Serving,
+    /// Cloudflare's 530 "tunnel is down" page: the edge has no origin tunnel
+    /// bound to this hostname. The binding is genuinely gone.
+    EdgeDown,
+    /// Transport/DNS failure. Inconclusive — the tunnel may be perfectly healthy
+    /// and only unreachable from *this* host (see `classify_recorded_tunnel`).
+    Unreachable,
+}
+
+/// Single HEAD probe against `url` using this host's resolver.
+fn head_probe(url: &str) -> ProbeOutcome {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(4)))
+        .build()
+        .new_agent();
+    match agent.head(url).call() {
+        Ok(_) => ProbeOutcome::Serving,
+        Err(ureq::Error::StatusCode(530)) => ProbeOutcome::EdgeDown,
+        Err(ureq::Error::StatusCode(_)) => ProbeOutcome::Serving,
+        Err(_) => ProbeOutcome::Unreachable,
     }
 }
 
-/// Probe with retries until `REUSE_PROBE_TIMEOUT` elapses.
-pub fn probe_tunnel_alive(url: &str) -> bool {
-    let deadline = Instant::now() + REUSE_PROBE_TIMEOUT;
-    loop {
-        if head_probe(url) {
-            return true;
+/// Resolve `host`'s first A record via Cloudflare's DNS-over-HTTPS JSON API,
+/// addressed by IP literal so it works even when this host's resolver is blind
+/// to the zone. `Some(ip)` means the hostname is published in public DNS — i.e.
+/// every *remote* party (Slack, Teams, the Bot Framework, ...) can resolve it,
+/// which is what actually matters for a tunnel fronting provider webhooks.
+fn resolve_via_public_doh(host: &str) -> Option<IpAddr> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .new_agent();
+    let query = format!("https://1.1.1.1/dns-query?name={host}&type=A");
+    let mut response = agent
+        .get(&query)
+        .header("accept", "application/dns-json")
+        .call()
+        .ok()?;
+    let body: serde_json::Value = response.body_mut().read_json().ok()?;
+    body.get("Answer")?
+        .as_array()?
+        .iter()
+        // type 1 = A record; CNAME chain entries (type 5) also appear here.
+        .filter(|answer| answer.get("type").and_then(serde_json::Value::as_u64) == Some(1))
+        .find_map(|answer| answer.get("data")?.as_str()?.parse().ok())
+}
+
+/// Whether process `pid` is currently alive. Uses a `kill -0` existence probe
+/// (delivers no signal) — consistent with `terminate_recorded_pid`, and avoids
+/// pulling in a `libc`/`nix` dependency just for this.
+pub fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
+    }
+}
+
+/// Whether the tunnel log shows cloudflared registered an edge connection —
+/// proof the tunnel came up at Cloudflare's edge even before DNS propagates.
+fn log_shows_registered_connection(log_path: &Path) -> bool {
+    std::fs::read_to_string(log_path)
+        .is_ok_and(|contents| contents.contains("Registered tunnel connection"))
+}
+
+/// Host component of `url`, for a DNS lookup.
+fn url_host(url: &str) -> Option<String> {
+    url::Url::parse(url).ok()?.host_str().map(str::to_string)
+}
+
+/// Verdict on whether a recorded tunnel should be reused or replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordedTunnelState {
+    /// Reachable now — directly, or published in public DNS. Reuse it.
+    Serving,
+    /// The cloudflared process is alive and registered with the edge, but the
+    /// hostname has not propagated into public DNS yet. Reuse and wait: a fresh
+    /// quick tunnel can take minutes to appear in DNS, and respawning would only
+    /// reset that clock and orphan the URL already handed to providers earlier
+    /// in this setup run.
+    WarmingUp,
+    /// No usable tunnel — the process is gone, the edge returned 530 (binding
+    /// lost), or it never registered. Replace it.
+    Down,
+}
+
+/// Decide whether the recorded tunnel (`pid`, `url`) is still usable.
+///
+/// The reuse decision deliberately does **not** hinge on a plain HTTP probe
+/// from this host. Freshly-minted `*.trycloudflare.com` hostnames land in the
+/// OS resolver's negative-DNS cache (30-min TTL) and lag public-DNS propagation
+/// by minutes, so a healthy tunnel probes as "dead" locally for a while.
+/// Tearing it down on that signal is exactly what makes setup mint a new URL on
+/// every wizard step and strand provider webhooks on a now-dead hostname. So we
+/// escalate through increasingly authoritative signals and only return `Down`
+/// on positive proof. Each branch logs what it saw, to keep this debuggable.
+pub fn classify_recorded_tunnel(
+    paths: &SharedTunnelPaths,
+    pid: Option<u32>,
+    url: &str,
+) -> RecordedTunnelState {
+    // 1. Direct probe. A routed response proves it serves; a 530 proves the
+    //    edge binding is gone. Anything else is inconclusive from here.
+    match head_probe(url) {
+        ProbeOutcome::Serving => {
+            eprintln!("Shared tunnel {url}: reachable directly — reusing (Serving)");
+            return RecordedTunnelState::Serving;
         }
-        if Instant::now() >= deadline {
-            return false;
+        ProbeOutcome::EdgeDown => {
+            eprintln!("Shared tunnel {url}: edge returned 530 (binding lost) — replacing (Down)");
+            return RecordedTunnelState::Down;
         }
-        std::thread::sleep(Duration::from_millis(300));
+        ProbeOutcome::Unreachable => {
+            eprintln!(
+                "Shared tunnel {url}: not reachable via the local resolver; checking public DNS"
+            );
+        }
+    }
+
+    // 2. The local resolver may just be blind. Ask public DNS directly: if the
+    //    hostname resolves there, remote providers can reach it even though we
+    //    cannot, so it is serving for the parties that matter.
+    if let Some(host) = url_host(url) {
+        if let Some(ip) = resolve_via_public_doh(&host) {
+            eprintln!(
+                "Shared tunnel {url}: unreachable locally but published in public DNS ({ip}) \
+                 — the OS resolver has a stale negative cache; remote providers resolve it \
+                 fine — reusing (Serving)"
+            );
+            return RecordedTunnelState::Serving;
+        }
+        eprintln!("Shared tunnel {url}: not resolvable via public DNS (1.1.1.1) yet");
+    }
+
+    // 3. Not reachable from anywhere yet. If cloudflared is still running and
+    //    registered an edge connection, it is simply mid-propagation. Reuse and
+    //    wait rather than churn the URL.
+    let running = pid.is_some_and(process_alive);
+    let registered = log_shows_registered_connection(&paths.log_path);
+    eprintln!(
+        "Shared tunnel {url}: local pid={pid:?} alive={running}, edge-registered={registered}"
+    );
+    if running && registered {
+        eprintln!(
+            "Shared tunnel {url}: cloudflared alive and registered with the edge — still \
+             propagating into public DNS; reusing rather than minting a new URL and orphaning \
+             provider webhooks (WarmingUp)"
+        );
+        RecordedTunnelState::WarmingUp
+    } else {
+        eprintln!("Shared tunnel {url}: no live/registered cloudflared — replacing (Down)");
+        RecordedTunnelState::Down
     }
 }
 
@@ -277,6 +420,49 @@ mod tests {
         );
         assert_eq!(local_port_from_base_url("http://127.0.0.1"), Some(80));
         assert_eq!(local_port_from_base_url("not a url"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_alive_true_for_self_false_for_reaped() {
+        assert!(process_alive(std::process::id()));
+        // A child we've spawned and reaped is no longer alive.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        assert!(!process_alive(pid));
+    }
+
+    #[test]
+    fn registration_detected_only_when_logged() {
+        let dir = tempdir().expect("tempdir");
+        let log = dir.path().join("cloudflared.log");
+        assert!(
+            !log_shows_registered_connection(&log),
+            "missing file → false"
+        );
+        std::fs::write(&log, "INF Starting metrics server\n").expect("write");
+        assert!(
+            !log_shows_registered_connection(&log),
+            "no registration line → false"
+        );
+        std::fs::write(
+            &log,
+            "INF Registered tunnel connection connIndex=0 protocol=quic\n",
+        )
+        .expect("write");
+        assert!(log_shows_registered_connection(&log));
+    }
+
+    #[test]
+    fn url_host_extracts_hostname() {
+        assert_eq!(
+            url_host("https://foo-bar.trycloudflare.com/x").as_deref(),
+            Some("foo-bar.trycloudflare.com")
+        );
+        assert_eq!(url_host("not a url"), None);
     }
 
     #[test]
