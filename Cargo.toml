@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "1.1.9"
+version = "1.1.10"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -32,7 +32,14 @@ flate2 = "1"
 # (deployer#322) that `manifest_to_answers` maps back for edit-mode pre-fill.
 greentic-deployer = { version = ">=1.1.0-dev.27640381592, <1.2.0-0", default-features = false }
 greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
-greentic-runner-host = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false }
+# Floor 1.1.6: every publish below it declares `async-nats = "0.46"` NON-optionally, and
+# every async-nats 0.46.x hard-pins `rustls-webpki = "0.102"`. Its newest release, 0.102.8,
+# carries GHSA-82j2-j2ch-gfr8 (high) and GHSA-pwjx-qhcg-rvj4, and no fixed 0.102.x exists --
+# async-nats only moved to the patched 0.103 line in 0.47. `default-features = false` turns
+# `agentic-worker` off but does NOT drop async-nats, so this crate was exposed regardless.
+# The `-dev` suffix is gone with it: this is a main-lane crate and must not resolve
+# develop-lane pre-releases.
+greentic-runner-host = { version = ">=1.1.6, <1.2.0-0", default-features = false }
 greentic-secrets-lib = { version = ">=1.1.0-dev.27563392344, <1.2.0-0", features = ["providers-dev"] }
 greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }
 hmac = "0.13"
