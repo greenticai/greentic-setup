@@ -11,7 +11,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::{Body, Bytes, to_bytes};
@@ -60,6 +60,13 @@ struct UiState {
     setup_session_id: String,
     setup_tunnel: Mutex<Option<SetupTunnel>>,
     setup_tunnel_start: AsyncMutex<()>,
+    /// Set when a setup tunnel was spawned but never became externally
+    /// reachable (e.g. cloudflared quick tunnels are unroutable on this
+    /// network's DNS path). Acts as a circuit breaker: while set and within
+    /// [`TUNNEL_FAILURE_COOLDOWN`], `ensure_setup_tunnel` returns the
+    /// recorded error immediately instead of spawning yet another tunnel
+    /// that would just fail the same reachability check again.
+    tunnel_failure_cooldown: Mutex<Option<Instant>>,
     setup_runtime: Mutex<Option<SetupRuntime>>,
     setup_runtime_start: AsyncMutex<()>,
     shutdown_tx: broadcast::Sender<()>,
@@ -423,6 +430,7 @@ pub async fn launch(
         setup_session_id,
         setup_tunnel: Mutex::new(None),
         setup_tunnel_start: AsyncMutex::new(()),
+        tunnel_failure_cooldown: Mutex::new(None),
         setup_runtime: Mutex::new(None),
         setup_runtime_start: AsyncMutex::new(()),
         shutdown_tx: shutdown_tx.clone(),
@@ -4869,12 +4877,89 @@ async fn setup_backend_public_tunnel_responds(base_url: &str) -> bool {
     else {
         return false;
     };
-    client
+    if client
         .get(base_url.trim_end_matches('/'))
         .send()
         .await
         .ok()
         .is_some_and(|response| response.status().as_u16() < 500)
+    {
+        return true;
+    }
+    // The plain probe shares the OS resolver with every other process on this
+    // machine — and freshly-minted quick-tunnel hostnames (*.trycloudflare.com)
+    // race DNS propagation: the first A-record query can land before the record
+    // exists, poisoning the OS resolver's negative cache for up to the zone's
+    // negative TTL (30 minutes for trycloudflare.com). On IPv4-only machines
+    // that leaves the host unresolvable locally even though the tunnel is up
+    // and every REMOTE party (Slack, Teams, ...) resolves it fine. Distinguish
+    // "tunnel dead" from "our resolver is blind" by re-resolving via public
+    // DNS-over-HTTPS (an IP-literal URL, so it needs no DNS at all) and
+    // retrying the probe with the answer pinned.
+    tunnel_responds_with_pinned_dns(base_url).await
+}
+
+/// Second-opinion tunnel probe that bypasses the OS resolver: resolve the
+/// host's A record via Cloudflare DoH (`https://1.1.1.1/...` — IP literal),
+/// then re-issue the probe with reqwest pinned to that address (correct SNI
+/// and cert validation still apply). Returns false when the host genuinely
+/// has no public A record or the pinned request fails.
+async fn tunnel_responds_with_pinned_dns(base_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        return false;
+    };
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let Some(ip) = resolve_host_via_public_doh(&host).await else {
+        return false;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .resolve(&host, std::net::SocketAddr::new(ip, port))
+        .build()
+    else {
+        return false;
+    };
+    let alive = client
+        .get(base_url.trim_end_matches('/'))
+        .send()
+        .await
+        .ok()
+        .is_some_and(|response| response.status().as_u16() < 500);
+    if alive {
+        eprintln!(
+            "Setup tunnel: {base_url} IS reachable via public DNS ({ip}) — the local \
+             system resolver has a stale negative cache for this hostname (it will \
+             self-heal when the negative TTL expires); treating the tunnel as healthy \
+             since remote services resolve it via their own DNS"
+        );
+    }
+    alive
+}
+
+/// Resolve `host`'s first IPv4 address via Cloudflare's DNS-over-HTTPS JSON
+/// API. The endpoint is addressed by IP literal so this works even when the
+/// local resolver cannot resolve anything under the host's zone.
+async fn resolve_host_via_public_doh(host: &str) -> Option<std::net::IpAddr> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("https://1.1.1.1/dns-query?name={host}&type=A"))
+        .header("accept", "application/dns-json")
+        .send()
+        .await
+        .ok()?;
+    let body: Value = response.json().await.ok()?;
+    body.get("Answer")?
+        .as_array()?
+        .iter()
+        // type 1 = A record; CNAME chain entries (type 5) also appear here.
+        .filter(|answer| answer.get("type").and_then(Value::as_u64) == Some(1))
+        .find_map(|answer| answer.get("data")?.as_str()?.parse().ok())
 }
 
 fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool {
@@ -6175,6 +6260,12 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     let env = req.env.unwrap_or_else(|| state.env.clone());
     let mut answers = req.answers;
     let tunnel_mode = setup_action_tunnel_mode(state, req.tunnel.as_deref())?;
+    eprintln!(
+        "[setup-action {}/{}] started (tenant={tenant} team={} env={env} tunnel_mode={tunnel_mode})",
+        req.provider_id,
+        req.action_id,
+        team.as_deref().unwrap_or("default"),
+    );
     ensure_setup_action_provider_answers(&mut answers, &req.provider_id);
     if let Some(mode) = req.tunnel.as_deref() {
         let tunnel = crate::platform_setup::TunnelAnswers {
@@ -6184,10 +6275,27 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     }
     if let Some(url) = injected_setup_public_base_url() {
         // Operator supplied a public URL; honor it instead of spinning our own tunnel.
+        eprintln!(
+            "[setup-action {}/{}] using operator-supplied public_base_url {url}",
+            req.provider_id, req.action_id
+        );
         inject_setup_public_base_url(&mut answers, &url);
     } else if should_start_setup_tunnel(&tunnel_mode, &answers) {
+        eprintln!(
+            "[setup-action {}/{}] acquiring {tunnel_mode} tunnel for public_base_url...",
+            req.provider_id, req.action_id
+        );
         let url = ensure_setup_tunnel(state, &tunnel_mode, &state.local_base_url).await?;
+        eprintln!(
+            "[setup-action {}/{}] tunnel ready, public_base_url={url}",
+            req.provider_id, req.action_id
+        );
         inject_setup_public_base_url(&mut answers, &url);
+    } else {
+        eprintln!(
+            "[setup-action {}/{}] no tunnel needed (mode={tunnel_mode} or public_base_url already set)",
+            req.provider_id, req.action_id
+        );
     }
     persist_ui_draft(&state.bundle_path, &tenant, team.as_deref(), &env, &answers).await?;
 
@@ -6249,6 +6357,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         .or_else(|| registration.get("mock_result"))
         .or_else(|| registration.get("outputs"))
     {
+        eprintln!(
+            "[setup-action {}/{}] using inline registration result (no component invocation)",
+            req.provider_id, req.action_id
+        );
         result.clone()
     } else {
         let component_ref = registration
@@ -6263,7 +6375,15 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("setup action registration missing op"))?;
-        invoke_setup_component_operation_blocking(
+        eprintln!(
+            "[setup-action {}/{}] invoking WASM registration op {component_ref}::{op} \
+             (pack: {}) — this is where the provider's own API gets called",
+            req.provider_id,
+            req.action_id,
+            provider.pack_path.display()
+        );
+        let started = Instant::now();
+        let output = invoke_setup_component_operation_blocking(
             state.bundle_path.clone(),
             provider.pack_path.clone(),
             component_ref.to_string(),
@@ -6271,9 +6391,29 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             request,
             setup_config,
         )
-        .await?
+        .await?;
+        eprintln!(
+            "[setup-action {}/{}] registration op returned in {:.1}s (ok={})",
+            req.provider_id,
+            req.action_id,
+            started.elapsed().as_secs_f32(),
+            output
+                .get("ok")
+                .and_then(Value::as_bool)
+                .map_or("unknown".to_string(), |ok| ok.to_string()),
+        );
+        output
     };
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        eprintln!(
+            "[setup-action {}/{}] FAILED: {}",
+            req.provider_id,
+            req.action_id,
+            output
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("setup action failed")
+        );
         return Ok(serde_json::json!({
             "ok": false,
             "provider_id": req.provider_id,
@@ -6294,7 +6434,16 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     if let Some((key, url)) =
         setup_action_final_url_value(&descriptor, action, &config, &final_url_context)?
     {
+        eprintln!(
+            "[setup-action {}/{}] resolved final install URL ({key}): {url}",
+            req.provider_id, req.action_id
+        );
         config.insert(key, Value::String(url));
+    } else {
+        eprintln!(
+            "[setup-action {}/{}] no final install URL resolved (browser resolves deep_link templates from returned values instead)",
+            req.provider_id, req.action_id
+        );
     }
     crate::qa::persist::persist_all_config_as_secrets(
         &state.bundle_path,
@@ -6306,6 +6455,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         Some(&provider.pack_path),
     )
     .await?;
+    eprintln!(
+        "[setup-action {}/{}] complete: outputs persisted as secrets, returning values to the UI",
+        req.provider_id, req.action_id
+    );
     let safe_values = public_setup_action_values(&config);
     Ok(serde_json::json!({
         "ok": true,
@@ -6558,6 +6711,14 @@ fn append_line(existing: &str, line: &str) -> String {
     }
 }
 
+/// How long `ensure_setup_tunnel` refuses to spawn another tunnel after one
+/// failed to become reachable. Without this, a network that can't route the
+/// tunnel provider's hostnames at all (e.g. cloudflared quick tunnels being
+/// unroutable on some networks' DNS path) causes every single call to spawn
+/// yet another doomed tunnel: the reuse-if-alive check always sees the prior
+/// one as dead (it never became reachable) and replaces it, forever.
+const TUNNEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(20);
+
 async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) -> Result<String> {
     if let Some(existing) = active_setup_tunnel_public_base_url(state, mode, local_base_url)? {
         if setup_backend_public_tunnel_responds(&existing).await {
@@ -6578,7 +6739,23 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
         setup_backend_clear_setup_tunnel(state);
     }
 
+    if let Some(remaining) = setup_backend_tunnel_cooldown_remaining(state)? {
+        eprintln!(
+            "Setup tunnel circuit breaker: refusing to spawn another {mode} tunnel, \
+             {}s left in cooldown after the last attempt never became reachable",
+            remaining.as_secs()
+        );
+        anyhow::bail!(
+            "{mode} setup tunnel is unavailable: the last attempt never became reachable \
+             (this usually means the tunnel provider's hostnames aren't routable from this \
+             network). Not retrying for another {}s to avoid spawning another doomed tunnel \
+             — switch tunnel.mode if this persists.",
+            remaining.as_secs()
+        );
+    }
+
     let local_base_url = local_base_url.trim_end_matches('/').to_string();
+    eprintln!("Setup tunnel: spawning {mode} tunnel for {local_base_url}");
     let mode_for_task = mode.to_string();
     let local_base_url_for_task = local_base_url.clone();
     let tunnel = tokio::task::spawn_blocking(move || {
@@ -6587,17 +6764,40 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     .await
     .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
     let public_base_url = tunnel.public_base_url.clone();
+    eprintln!("Setup tunnel: probing reachability of {public_base_url}");
     if wait_for_setup_public_tunnel(&public_base_url).await {
+        eprintln!("Setup tunnel: {public_base_url} is reachable, using it");
         persist_setup_tunnel_handoff(&state.bundle_path, &tunnel);
         let mut guard = state
             .setup_tunnel
             .lock()
             .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
         *guard = Some(tunnel);
+        if let Ok(mut cooldown) = state.tunnel_failure_cooldown.lock() {
+            *cooldown = None;
+        }
         return Ok(public_base_url);
     }
+    eprintln!(
+        "Setup tunnel: {public_base_url} never became reachable; entering {}s cooldown \
+         before another {mode} tunnel may be spawned",
+        TUNNEL_FAILURE_COOLDOWN.as_secs()
+    );
     drop(tunnel);
+    if let Ok(mut cooldown) = state.tunnel_failure_cooldown.lock() {
+        *cooldown = Some(Instant::now());
+    }
     anyhow::bail!("{mode} setup tunnel URL did not become reachable: {public_base_url}")
+}
+
+/// Remaining cooldown after a tunnel failed to become reachable, or `None`
+/// if there was no recent failure (or the cooldown has already elapsed).
+fn setup_backend_tunnel_cooldown_remaining(state: &UiState) -> Result<Option<Duration>> {
+    let guard = state
+        .tunnel_failure_cooldown
+        .lock()
+        .map_err(|_| anyhow!("tunnel failure cooldown lock poisoned"))?;
+    Ok(guard.and_then(|failed_at| TUNNEL_FAILURE_COOLDOWN.checked_sub(failed_at.elapsed())))
 }
 
 /// Persist a [`crate::platform_setup::TunnelHandoff`] for `tunnel`, best
@@ -7344,9 +7544,10 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderSetupEventRequest, UiState, build_router, persist_provider_setup_event,
-        persist_ui_draft, prefill_has_cloud_deployment_targets, read_provider_setup_events,
-        redact_provider_setup_event_detail,
+        ProviderSetupEventRequest, TUNNEL_FAILURE_COOLDOWN, UiState, build_router,
+        persist_provider_setup_event, persist_ui_draft, prefill_has_cloud_deployment_targets,
+        read_provider_setup_events, redact_provider_setup_event_detail,
+        setup_backend_tunnel_cooldown_remaining,
     };
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
@@ -7374,11 +7575,40 @@ mod tests {
             setup_session_id: "test-session".to_string(),
             setup_tunnel: Mutex::new(None),
             setup_tunnel_start: tokio::sync::Mutex::new(()),
+            tunnel_failure_cooldown: Mutex::new(None),
             setup_runtime: Mutex::new(None),
             setup_runtime_start: tokio::sync::Mutex::new(()),
             shutdown_tx,
             result: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn tunnel_cooldown_blocks_immediately_after_a_failure_then_clears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+
+        assert_eq!(
+            setup_backend_tunnel_cooldown_remaining(&state).unwrap(),
+            None,
+            "no failure recorded yet, so no cooldown"
+        );
+
+        *state.tunnel_failure_cooldown.lock().unwrap() = Some(std::time::Instant::now());
+        let remaining = setup_backend_tunnel_cooldown_remaining(&state)
+            .unwrap()
+            .expect("should be in cooldown right after a recorded failure");
+        assert!(remaining <= TUNNEL_FAILURE_COOLDOWN && remaining > std::time::Duration::ZERO);
+
+        // A failure recorded further in the past than the cooldown window
+        // has already elapsed, so it should read as no-longer-blocking.
+        let long_ago = std::time::Instant::now() - (TUNNEL_FAILURE_COOLDOWN * 2);
+        *state.tunnel_failure_cooldown.lock().unwrap() = Some(long_ago);
+        assert_eq!(
+            setup_backend_tunnel_cooldown_remaining(&state).unwrap(),
+            None,
+            "cooldown window has already elapsed"
+        );
     }
 
     fn test_jwt_with_exp(exp: u64) -> String {

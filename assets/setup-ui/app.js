@@ -1572,9 +1572,6 @@
       html += '<div class="setup-action">';
       html += '<div class="setup-action-heading">' + esc(action.label || "Create app") + '</div>';
       if (action.description) html += '<p class="setup-action-desc">' + esc(action.description) + '</p>';
-      if (action.kind === "oauth_install_button" || action.registration) {
-        html += '<div class="setup-action-warning">⚠️ Event Subscriptions are REQUIRED. After this step the app’s Event Subscriptions Request URL must be <strong>Verified &amp; Saved</strong> (pointing at your public tunnel), and <code>message.im</code> / <code>app_mention</code> subscribed — otherwise the bot receives nothing. If your tunnel URL changes, re-save it.</div>';
-      }
       if (completed) {
         html += '<div class="setup-action-status">App setup complete. Its Event Subscriptions &amp; Interactivity request URLs are now linked to this bundle’s message endpoint — send your bot a message to test. If the bundle’s public URL later changes, re-run this step to update them.</div>';
       } else if (running) {
@@ -1627,6 +1624,9 @@
 
   function runProviderSetupAction(provider, action) {
     var scope = cs();
+    var actionTag = "[setup-action " + provider.provider_id + "/" + action.id + "]";
+    console.info(actionTag + " clicked; opening placeholder popup and POSTing /api/setup-action (tunnel=" + (scope.tunnel || "default") + ")");
+    var startedAt = Date.now();
     var popup = openProviderInstallWindow();
     scope.providerSetupStatus[provider.provider_id] = { running: true };
     render();
@@ -1645,7 +1645,9 @@
     })
     .then(function (r) { return r.json(); })
     .then(function (result) {
+      var elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
       if (!result.ok) {
+        console.error(actionTag + " failed after " + elapsed + "s: " + (result.error || "Setup action failed"), result);
         closeProviderInstallWindow(popup);
         scope.providerSetupStatus[provider.provider_id] = {
           ok: false,
@@ -1654,19 +1656,23 @@
         render();
         return;
       }
+      console.info(actionTag + " succeeded in " + elapsed + "s; values: " + Object.keys(result.values || {}).join(", "));
       scope.providerSetupStatus[provider.provider_id] = result;
       if (result.values && typeof result.values === "object") {
         scope.answers[provider.provider_id] = Object.assign({}, scope.answers[provider.provider_id] || {}, result.values);
       }
       var installUrl = setupActionReturnedFinalUrl(provider, result);
       if (installUrl) {
+        console.info(actionTag + " navigating install popup to " + installUrl);
         navigateProviderInstallWindow(popup, installUrl);
       } else {
+        console.info(actionTag + " no install URL resolved; closing placeholder popup");
         closeProviderInstallWindow(popup);
       }
       render();
     })
     .catch(function (err) {
+      console.error(actionTag + " request error after " + ((Date.now() - startedAt) / 1000).toFixed(1) + "s: " + err.message);
       closeProviderInstallWindow(popup);
       scope.providerSetupStatus[provider.provider_id] = { ok: false, error: err.message };
       render();
