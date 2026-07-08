@@ -4877,12 +4877,89 @@ async fn setup_backend_public_tunnel_responds(base_url: &str) -> bool {
     else {
         return false;
     };
-    client
+    if client
         .get(base_url.trim_end_matches('/'))
         .send()
         .await
         .ok()
         .is_some_and(|response| response.status().as_u16() < 500)
+    {
+        return true;
+    }
+    // The plain probe shares the OS resolver with every other process on this
+    // machine — and freshly-minted quick-tunnel hostnames (*.trycloudflare.com)
+    // race DNS propagation: the first A-record query can land before the record
+    // exists, poisoning the OS resolver's negative cache for up to the zone's
+    // negative TTL (30 minutes for trycloudflare.com). On IPv4-only machines
+    // that leaves the host unresolvable locally even though the tunnel is up
+    // and every REMOTE party (Slack, Teams, ...) resolves it fine. Distinguish
+    // "tunnel dead" from "our resolver is blind" by re-resolving via public
+    // DNS-over-HTTPS (an IP-literal URL, so it needs no DNS at all) and
+    // retrying the probe with the answer pinned.
+    tunnel_responds_with_pinned_dns(base_url).await
+}
+
+/// Second-opinion tunnel probe that bypasses the OS resolver: resolve the
+/// host's A record via Cloudflare DoH (`https://1.1.1.1/...` — IP literal),
+/// then re-issue the probe with reqwest pinned to that address (correct SNI
+/// and cert validation still apply). Returns false when the host genuinely
+/// has no public A record or the pinned request fails.
+async fn tunnel_responds_with_pinned_dns(base_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        return false;
+    };
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let Some(ip) = resolve_host_via_public_doh(&host).await else {
+        return false;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .resolve(&host, std::net::SocketAddr::new(ip, port))
+        .build()
+    else {
+        return false;
+    };
+    let alive = client
+        .get(base_url.trim_end_matches('/'))
+        .send()
+        .await
+        .ok()
+        .is_some_and(|response| response.status().as_u16() < 500);
+    if alive {
+        eprintln!(
+            "Setup tunnel: {base_url} IS reachable via public DNS ({ip}) — the local \
+             system resolver has a stale negative cache for this hostname (it will \
+             self-heal when the negative TTL expires); treating the tunnel as healthy \
+             since remote services resolve it via their own DNS"
+        );
+    }
+    alive
+}
+
+/// Resolve `host`'s first IPv4 address via Cloudflare's DNS-over-HTTPS JSON
+/// API. The endpoint is addressed by IP literal so this works even when the
+/// local resolver cannot resolve anything under the host's zone.
+async fn resolve_host_via_public_doh(host: &str) -> Option<std::net::IpAddr> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("https://1.1.1.1/dns-query?name={host}&type=A"))
+        .header("accept", "application/dns-json")
+        .send()
+        .await
+        .ok()?;
+    let body: Value = response.json().await.ok()?;
+    body.get("Answer")?
+        .as_array()?
+        .iter()
+        // type 1 = A record; CNAME chain entries (type 5) also appear here.
+        .filter(|answer| answer.get("type").and_then(Value::as_u64) == Some(1))
+        .find_map(|answer| answer.get("data")?.as_str()?.parse().ok())
 }
 
 fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool {
