@@ -7489,6 +7489,23 @@ fn setup_action_final_url_value(
     context: &SetupActionFinalUrlContext<'_>,
 ) -> Result<Option<(String, String)>> {
     let key = setup_action_final_url_key(descriptor);
+    // For an open_url install action, prefer its url_template (e.g. Slack's
+    // api.slack.com/apps/{slack_app_id}/install-on-team? link) resolved from the
+    // returned values, over any app_redirect link the component put in config.
+    if action.get("kind").and_then(Value::as_str) == Some("open_url")
+        && let Some(template) = action
+            .get("url_template")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        && let Some(url) = resolve_url_template_from_config(template, config)
+    {
+        return Ok(Some((
+            key.clone()
+                .unwrap_or_else(|| "oauth_authorize_url".to_string()),
+            url,
+        )));
+    }
     if let Some(key) = key.as_deref()
         && let Some(url) = config
             .get(key)
@@ -7496,7 +7513,7 @@ fn setup_action_final_url_value(
             .map(str::trim)
             .filter(|value| !value.is_empty())
     {
-        return Ok(Some((key.to_string(), url.to_string())));
+        return Ok(Some((key.to_string(), rewrite_slack_app_redirect(url))));
     }
     let Some(url) = build_oauth_install_url(
         context.bundle_root,
@@ -7540,6 +7557,53 @@ fn setup_action_final_url_key(descriptor: &Value) -> Option<String> {
                 .find(|value| value.ends_with("_url"))
                 .map(ToString::to_string)
         })
+}
+
+/// Fill `{name}` placeholders in a `url_template` from returned config values
+/// (e.g. `{slack_app_id}` -> `A0…`). Returns `None` if any placeholder is
+/// missing/empty so the caller can fall back.
+fn resolve_url_template_from_config(
+    template: &str,
+    config: &JsonMap<String, Value>,
+) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let close = rest[open..].find('}')? + open;
+        out.push_str(&rest[..open]);
+        let name = rest[open + 1..close].trim();
+        let value = config
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        out.push_str(value);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Slack's `app_redirect` link (`https://[ws.]slack.com/app_redirect?app=<id>`)
+/// opens the workspace app page, not the install screen. Rewrite it to the
+/// `api.slack.com/apps/<id>/install-on-team?` link the setup flow expects.
+/// Any other URL is returned unchanged.
+fn rewrite_slack_app_redirect(url: &str) -> String {
+    const MARKER: &str = "/app_redirect?app=";
+    if let Some(idx) = url.find(MARKER) {
+        let host = &url[..idx];
+        if host.ends_with("slack.com") || host.ends_with(".slack.com") {
+            let app = url[idx + MARKER.len()..]
+                .split(['&', '#'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !app.is_empty() {
+                return format!("https://api.slack.com/apps/{app}/install-on-team?");
+            }
+        }
+    }
+    url.to_string()
 }
 
 fn build_oauth_install_url(
@@ -11133,8 +11197,8 @@ setup_actions:
     #[test]
     fn setup_ui_provider_setup_action_back_and_continue_do_not_trap_admin() {
         let app_js = include_str!("../../assets/setup-ui/app.js");
-        assert!(app_js.contains("var canContinue = completed || !!error;"));
-        assert!(app_js.contains("providerHasFormQuestions(p)"));
+        assert!(app_js.contains("var canContinue = completed || !!error || questions.length > 0;"));
+        assert!(app_js.contains("preActionQuestions(p)"));
         assert!(app_js.contains("state.phase = \"providers\";"));
     }
 
