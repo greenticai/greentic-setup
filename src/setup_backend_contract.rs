@@ -79,6 +79,25 @@ pub fn merge_browser_config_update(
         if server_owned.contains(key) {
             continue;
         }
+        // Ephemeral tunnel URLs are engine-assigned: the browser only ever
+        // *echoes* one from an earlier render, and the echo can be stale.
+        // Merging it reverts the engine's corrected ingress URL on every
+        // "Continue" click, which un-completes dependent steps and re-runs
+        // them forever. A user-supplied *stable* URL still merges normally.
+        if key == "public_base_url"
+            && value
+                .as_str()
+                .is_some_and(crate::setup_tunnel::is_ephemeral_tunnel_url)
+        {
+            if config.get(key) != Some(value) {
+                eprintln!(
+                    "[setup config] ignoring browser-echoed ephemeral public_base_url \
+                     {value} (stored: {stored}); ephemeral tunnel URLs are engine-owned",
+                    stored = config.get(key).and_then(Value::as_str).unwrap_or("<unset>")
+                );
+            }
+            continue;
+        }
         config.insert(key.clone(), value.clone());
     }
     Ok(())
@@ -2913,6 +2932,46 @@ mod tests {
         assert_eq!(config["public_base_url"], "https://example.test");
         assert!(config.get("oauth_device_code").is_none());
         assert!(config.get("graph_access_token").is_none());
+    }
+
+    #[test]
+    fn merge_browser_config_update_rejects_echoed_ephemeral_public_base_url() {
+        let contract = json!({ "server_owned_config_keys": [] });
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({"public_base_url": "https://current.trycloudflare.com"}),
+        );
+
+        // A browser echo of a (stale) ephemeral tunnel URL must not revert
+        // the engine-assigned value; sibling keys still merge.
+        merge_browser_config_update(
+            &mut stored,
+            &json!({
+                "public_base_url": "https://stale-snapshot.trycloudflare.com",
+                "bot_display_name": "Greentic Bot"
+            }),
+            &contract,
+            JsonMap::new(),
+        )
+        .unwrap();
+        let config = stored.get("config").and_then(Value::as_object).unwrap();
+        assert_eq!(
+            config["public_base_url"], "https://current.trycloudflare.com",
+            "engine-owned ephemeral URL survives a stale browser echo"
+        );
+        assert_eq!(config["bot_display_name"], "Greentic Bot");
+
+        // A user-supplied STABLE https URL is a deliberate override → merges.
+        merge_browser_config_update(
+            &mut stored,
+            &json!({"public_base_url": "https://bot.example.com"}),
+            &contract,
+            JsonMap::new(),
+        )
+        .unwrap();
+        let config = stored.get("config").and_then(Value::as_object).unwrap();
+        assert_eq!(config["public_base_url"], "https://bot.example.com");
     }
 
     #[test]
