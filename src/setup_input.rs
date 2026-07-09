@@ -58,7 +58,8 @@ pub fn load_setup_input(path: &Path) -> anyhow::Result<Value> {
 fn load_text_from_path_or_url(path: &Path) -> anyhow::Result<String> {
     let raw = path.to_string_lossy();
     if raw.starts_with("https://") || raw.starts_with("http://") {
-        let response = ureq::get(raw.as_ref())
+        let response = crate::http_client::api_agent()
+            .get(raw.as_ref())
             .call()
             .map_err(|err| anyhow!("failed to fetch {}: {err}", raw))?;
         return response

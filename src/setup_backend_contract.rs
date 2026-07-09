@@ -464,7 +464,8 @@ pub fn execute_oauth_device_code_start(
         ));
     }
     let device_url = format!("{}/oauth2/v2.0/devicecode", authority.trim_end_matches('/'));
-    let mut response = ureq::post(&device_url)
+    let mut response = crate::http_client::api_agent()
+        .post(&device_url)
         .send_form([
             ("client_id", client_id.as_str()),
             ("scope", scopes.as_str()),
@@ -612,10 +613,7 @@ pub fn execute_oauth_device_code_complete(
             serde_json::json!({ "ok": false, "error": "device_login_not_started" }),
         ));
     }
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = crate::http_client::api_agent_any_status();
     let mut response = agent
         .post(&token_url)
         .send_form([
@@ -1506,10 +1504,7 @@ fn expand_executor_links(
 }
 
 fn graph_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    crate::http_client::api_agent_any_status()
 }
 
 fn graph_json_request(
@@ -1695,10 +1690,7 @@ pub fn execute_provider_http_external(
         .filter(|value| !value.is_empty())
         .unwrap_or("POST")
         .to_ascii_uppercase();
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = crate::http_client::api_agent_any_status();
     let response = match method.as_str() {
         "POST" => agent.post(&target).send_json(&payload),
         "GET" => agent.get(&target).call(),

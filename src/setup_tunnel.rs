@@ -346,7 +346,8 @@ fn install_cloudflared_binary(target: &Path) -> Result<()> {
 }
 
 fn download_bytes(url: &str) -> Result<Vec<u8>> {
-    let mut response = ureq::get(url)
+    let mut response = crate::http_client::download_agent()
+        .get(url)
         .call()
         .map_err(|err| anyhow!("request {url}: {err}"))?;
     response
