@@ -123,7 +123,8 @@ pub fn setup_output_target(source: &Path) -> Result<Option<SetupOutputTarget>> {
 fn download_and_extract_remote_bundle(url: &str) -> Result<PathBuf> {
     use crate::gtbundle;
 
-    let response = ureq::get(url)
+    let response = crate::http_client::download_agent()
+        .get(url)
         .call()
         .map_err(|err| anyhow::anyhow!("failed to fetch {url}: {err}"))?;
     let bytes = response

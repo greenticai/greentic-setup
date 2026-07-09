@@ -249,7 +249,8 @@ pub fn exchange_oauth_code(
     client_id: &str,
     client_secret: &str,
 ) -> Result<Value> {
-    let mut response = ureq::post(&metadata.token_url)
+    let mut response = crate::http_client::api_agent()
+        .post(&metadata.token_url)
         .send_form([
             ("grant_type", "authorization_code"),
             ("code", code),

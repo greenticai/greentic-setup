@@ -39,6 +39,18 @@ impl SetupTunnel {
             None => true,
         }
     }
+
+    /// Handle for a tunnel owned elsewhere (the shared record, or tests):
+    /// no child process, never killed on drop.
+    pub(crate) fn detached(mode: &str, local_base_url: &str, public_base_url: &str) -> Self {
+        Self {
+            mode: mode.to_string(),
+            local_base_url: local_base_url.trim_end_matches('/').to_string(),
+            public_base_url: public_base_url.to_string(),
+            child: None,
+            kill_on_drop: false,
+        }
+    }
 }
 
 pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -> bool {
@@ -75,6 +87,13 @@ pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunne
     }
 }
 
+/// Build a [`SetupTunnel`] that reuses an already-running shared tunnel: there
+/// is no child to own and nothing to kill on drop — the tunnel deliberately
+/// outlives this setup process so the runtime it configures keeps the same URL.
+fn reuse_shared_tunnel(mode: &str, local_base_url: &str, public_base_url: String) -> SetupTunnel {
+    SetupTunnel::detached(mode, local_base_url, &public_base_url)
+}
+
 /// Acquire the machine-wide shared cloudflared tunnel for the port behind
 /// `local_base_url`: reuse the recorded one when it still serves, otherwise
 /// spawn a fresh cloudflared and publish it so greentic-start adopts the same
@@ -87,22 +106,27 @@ fn start_cloudflared_shared(local_base_url: &str) -> Result<SetupTunnel> {
     let _lock =
         crate::shared_tunnel::TunnelLock::acquire(&paths.lock_path, Duration::from_secs(45))?;
 
+    use crate::shared_tunnel::RecordedTunnelState;
     let (recorded_pid, recorded_url) = crate::shared_tunnel::read_record(&paths);
+    eprintln!(
+        "Setup tunnel: checking shared cloudflared record for port {port} \
+         (recorded pid={recorded_pid:?}, url={recorded_url:?})"
+    );
     if let Some(url) = recorded_url {
-        if crate::shared_tunnel::probe_tunnel_alive(&url) {
-            eprintln!("Reusing shared {mode} tunnel: {url}");
-            return Ok(SetupTunnel {
-                mode: mode.to_string(),
-                local_base_url: local_base_url.trim_end_matches('/').to_string(),
-                public_base_url: url,
-                child: None,
-                kill_on_drop: false,
-            });
-        }
-        // Recorded tunnel no longer serves. It is ours to replace: the pid
-        // came from the shared record, never from a process-name match.
-        if let Some(pid) = recorded_pid {
-            crate::shared_tunnel::terminate_recorded_pid(pid);
+        match crate::shared_tunnel::classify_recorded_tunnel(&paths, recorded_pid, &url) {
+            RecordedTunnelState::Serving | RecordedTunnelState::WarmingUp => {
+                eprintln!("Reusing shared {mode} tunnel: {url}");
+                return Ok(reuse_shared_tunnel(mode, local_base_url, url));
+            }
+            RecordedTunnelState::Down => {
+                // Recorded tunnel is genuinely gone (process dead, or the edge
+                // returned 530 for a lost binding). It is ours to replace: the
+                // pid came from the shared record, never a process-name match.
+                eprintln!("Shared {mode} tunnel {url} is down; replacing it");
+                if let Some(pid) = recorded_pid {
+                    crate::shared_tunnel::terminate_recorded_pid(pid);
+                }
+            }
         }
     }
     crate::shared_tunnel::clear_record(&paths);
@@ -322,7 +346,8 @@ fn install_cloudflared_binary(target: &Path) -> Result<()> {
 }
 
 fn download_bytes(url: &str) -> Result<Vec<u8>> {
-    let mut response = ureq::get(url)
+    let mut response = crate::http_client::download_agent()
+        .get(url)
         .call()
         .map_err(|err| anyhow!("request {url}: {err}"))?;
     response

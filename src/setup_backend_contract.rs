@@ -79,6 +79,25 @@ pub fn merge_browser_config_update(
         if server_owned.contains(key) {
             continue;
         }
+        // Ephemeral tunnel URLs are engine-assigned: the browser only ever
+        // *echoes* one from an earlier render, and the echo can be stale.
+        // Merging it reverts the engine's corrected ingress URL on every
+        // "Continue" click, which un-completes dependent steps and re-runs
+        // them forever. A user-supplied *stable* URL still merges normally.
+        if key == "public_base_url"
+            && value
+                .as_str()
+                .is_some_and(crate::setup_tunnel::is_ephemeral_tunnel_url)
+        {
+            if config.get(key) != Some(value) {
+                eprintln!(
+                    "[setup config] ignoring browser-echoed ephemeral public_base_url \
+                     {value} (stored: {stored}); ephemeral tunnel URLs are engine-owned",
+                    stored = config.get(key).and_then(Value::as_str).unwrap_or("<unset>")
+                );
+            }
+            continue;
+        }
         config.insert(key.clone(), value.clone());
     }
     Ok(())
@@ -445,7 +464,8 @@ pub fn execute_oauth_device_code_start(
         ));
     }
     let device_url = format!("{}/oauth2/v2.0/devicecode", authority.trim_end_matches('/'));
-    let mut response = ureq::post(&device_url)
+    let mut response = crate::http_client::api_agent()
+        .post(&device_url)
         .send_form([
             ("client_id", client_id.as_str()),
             ("scope", scopes.as_str()),
@@ -593,10 +613,7 @@ pub fn execute_oauth_device_code_complete(
             serde_json::json!({ "ok": false, "error": "device_login_not_started" }),
         ));
     }
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = crate::http_client::api_agent_any_status();
     let mut response = agent
         .post(&token_url)
         .send_form([
@@ -1487,10 +1504,7 @@ fn expand_executor_links(
 }
 
 fn graph_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    crate::http_client::api_agent_any_status()
 }
 
 fn graph_json_request(
@@ -1676,10 +1690,7 @@ pub fn execute_provider_http_external(
         .filter(|value| !value.is_empty())
         .unwrap_or("POST")
         .to_ascii_uppercase();
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = crate::http_client::api_agent_any_status();
     let response = match method.as_str() {
         "POST" => agent.post(&target).send_json(&payload),
         "GET" => agent.get(&target).call(),
@@ -2913,6 +2924,46 @@ mod tests {
         assert_eq!(config["public_base_url"], "https://example.test");
         assert!(config.get("oauth_device_code").is_none());
         assert!(config.get("graph_access_token").is_none());
+    }
+
+    #[test]
+    fn merge_browser_config_update_rejects_echoed_ephemeral_public_base_url() {
+        let contract = json!({ "server_owned_config_keys": [] });
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({"public_base_url": "https://current.trycloudflare.com"}),
+        );
+
+        // A browser echo of a (stale) ephemeral tunnel URL must not revert
+        // the engine-assigned value; sibling keys still merge.
+        merge_browser_config_update(
+            &mut stored,
+            &json!({
+                "public_base_url": "https://stale-snapshot.trycloudflare.com",
+                "bot_display_name": "Greentic Bot"
+            }),
+            &contract,
+            JsonMap::new(),
+        )
+        .unwrap();
+        let config = stored.get("config").and_then(Value::as_object).unwrap();
+        assert_eq!(
+            config["public_base_url"], "https://current.trycloudflare.com",
+            "engine-owned ephemeral URL survives a stale browser echo"
+        );
+        assert_eq!(config["bot_display_name"], "Greentic Bot");
+
+        // A user-supplied STABLE https URL is a deliberate override → merges.
+        merge_browser_config_update(
+            &mut stored,
+            &json!({"public_base_url": "https://bot.example.com"}),
+            &contract,
+            JsonMap::new(),
+        )
+        .unwrap();
+        let config = stored.get("config").and_then(Value::as_object).unwrap();
+        assert_eq!(config["public_base_url"], "https://bot.example.com");
     }
 
     #[test]
