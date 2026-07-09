@@ -4921,12 +4921,21 @@ fn setup_backend_runtime_context(
     let ingress_port = runtime_local_base_url
         .as_deref()
         .and_then(crate::shared_tunnel::local_port_from_base_url);
-    let active_tunnel_public_base_url = ingress_port
-        .and_then(|port| setup_backend_tunnel_public_base_url_for_port(state, port))
-        // Legacy fallback for sessions with no runtime yet: the slot, then the
-        // runtime-reported public base.
-        .or_else(|| setup_backend_active_tunnel_public_base_url(state))
-        .or(runtime_public_base_url);
+    let active_tunnel_public_base_url = match ingress_port {
+        // The ingress port is known: only a tunnel actually fronting that
+        // port may answer, falling back to the runtime's own reported public
+        // base. NEVER fall back to the port-blind in-session slot here — it
+        // may hold the Setup-UI tunnel, and letting it masquerade as the
+        // ingress tunnel un-completes every runtime-dependent step (observed:
+        // a setup restart with no live ingress tunnel re-ran the OAuth
+        // consents and the endpoint registration).
+        Some(port) => {
+            setup_backend_tunnel_public_base_url_for_port(state, port).or(runtime_public_base_url)
+        }
+        // No runtime yet: legacy behavior (in-session slot, then the
+        // runtime-reported public base).
+        None => setup_backend_active_tunnel_public_base_url(state).or(runtime_public_base_url),
+    };
     if !public_base_url.is_empty()
         && is_ephemeral_tunnel_public_base_url(&public_base_url)
         && active_tunnel_public_base_url.as_deref() != Some(public_base_url.as_str())
@@ -7724,8 +7733,8 @@ mod tests {
         persist_provider_setup_event, persist_setup_tunnel_handoff, persist_ui_draft,
         prefill_has_cloud_deployment_targets, read_provider_setup_events,
         redact_provider_setup_event_detail, setup_backend_record_step_attempt,
-        setup_backend_runtime_context_current, setup_backend_tunnel_cooldown_remaining,
-        setup_backend_tunnel_public_base_url_for_port_at,
+        setup_backend_runtime_context, setup_backend_runtime_context_current,
+        setup_backend_tunnel_cooldown_remaining, setup_backend_tunnel_public_base_url_for_port_at,
     };
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
@@ -7808,6 +7817,55 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn runtime_context_never_reports_the_setup_ui_slot_when_ingress_port_is_known() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        // Runtime endpoints on disk: ingress at a port that has no shared
+        // tunnel record anywhere (odd port keeps the test hermetic), public
+        // base = the registered ephemeral URL.
+        let runtime_dir = temp.path().join("state/runtime/demo.support");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            serde_json::to_string(&json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://ingress.trycloudflare.com",
+                "gateway_listen_addr": "127.0.0.1",
+                "gateway_port": 47391
+            }))
+            .unwrap(),
+        )
+        .expect("endpoints.json");
+        // The in-session slot holds the SETUP-UI tunnel (different port).
+        *state.setup_tunnel.lock().unwrap() = Some(crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:12345",
+            "https://ui-tunnel.trycloudflare.com",
+        ));
+        let mut config = JsonMap::new();
+        config.insert(
+            "public_base_url".to_string(),
+            json!("https://ingress.trycloudflare.com"),
+        );
+
+        let context = setup_backend_runtime_context(&state, "demo", &config);
+        // With the ingress port known, the slot must never answer: the
+        // runtime-reported public base wins, so the registered URL stays
+        // current and completed steps stay done across setup restarts.
+        assert_eq!(
+            context
+                .get("active_tunnel_public_base_url")
+                .and_then(Value::as_str),
+            Some("https://ingress.trycloudflare.com"),
+        );
+        assert!(setup_backend_runtime_context_current(
+            &json!({"runtime_context": {"public_base_url": "https://ingress.trycloudflare.com"}}),
+            &context
+        ));
     }
 
     #[test]
