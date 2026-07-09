@@ -3408,6 +3408,20 @@ async fn setup_backend_execute_provider_http(
             }),
         ));
     }
+    // Re-adopt AFTER the runtime/tunnel are ensured: the adopt above ran
+    // before `ensure_setup_runtime`, so on the very attempt that first boots
+    // the runtime, config still holds the pre-runtime (Setup-UI tunnel) URL
+    // and the provider would be registered against an endpoint that is about
+    // to be superseded — costing an extra run per state transition. Adopting
+    // again here makes the first post-boot attempt register the runtime's
+    // real ingress URL immediately.
+    let previous_public_base_url = setup_backend_config_str(config, "public_base_url");
+    if let Some(adopted) = setup_backend_adopt_runtime_public_base_url(state, tenant, config)? {
+        eprintln!(
+            "[setup provider-http] adopted runtime public_base_url {adopted} \
+             (was {previous_public_base_url:?}) before registering"
+        );
+    }
 
     let target = match setup_backend_provider_http_url(state, tenant, config, executor) {
         Ok(url) => url,
