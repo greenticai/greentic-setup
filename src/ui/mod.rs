@@ -439,7 +439,11 @@ pub async fn launch(
 
     let router = build_router(state.clone());
 
-    eprintln!("Setup UI started at: {url}");
+    eprintln!(
+        "Setup UI started at: {url} (greentic-setup {} build {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GREENTIC_SETUP_BUILD_SHA")
+    );
     if std::env::var("GREENTIC_SETUP_NO_OPEN").ok().as_deref() != Some("1") {
         let _ = open::that(&url);
     }
@@ -4558,24 +4562,25 @@ fn setup_backend_adopt_runtime_public_base_url(
     tenant: &str,
     config: &mut JsonMap<String, Value>,
 ) -> Result<Option<String>> {
-    let Some(runtime_public_base_url) = setup_backend_runtime_public_base_url(state, tenant) else {
+    // Resolve through the single ingress source of truth (live per-port
+    // tunnel record first, then the runtime-reported endpoints) so the URL
+    // adopted into config is the same one every currency check compares
+    // against.
+    let Some((ingress_public_base_url, _source)) =
+        setup_backend_resolve_ingress_public_base(state, tenant)
+    else {
         return Ok(None);
     };
-    if !setup_backend_public_base_url_is_external_https(&runtime_public_base_url)
-        && !is_ephemeral_tunnel_public_base_url(&runtime_public_base_url)
-    {
-        return Ok(None);
-    }
     let current = setup_backend_config_str(config, "public_base_url");
-    if current.trim_end_matches('/') == runtime_public_base_url {
+    if current.trim_end_matches('/') == ingress_public_base_url {
         return Ok(None);
     }
     if current.is_empty() || is_ephemeral_tunnel_public_base_url(&current) {
         config.insert(
             "public_base_url".to_string(),
-            Value::String(runtime_public_base_url.clone()),
+            Value::String(ingress_public_base_url.clone()),
         );
-        return Ok(Some(runtime_public_base_url));
+        return Ok(Some(ingress_public_base_url));
     }
     Ok(None)
 }
@@ -4901,6 +4906,37 @@ fn setup_backend_setup_runtime_info(state: &UiState) -> Option<SetupRuntimeInfo>
     runtime.info.lock().ok().map(|info| info.clone())
 }
 
+/// THE single source of truth for "what public URL fronts the runtime
+/// ingress right now": the live per-port shared tunnel record, else the
+/// runtime's own reported public base (`endpoints.json`), else nothing.
+///
+/// Every consumer (runtime_context, config adoption, registration bodies)
+/// must resolve through here — five places used to compose their own chains
+/// (contract config, in-session slot, per-port records, endpoints.json,
+/// browser echoes), and every wizard loop so far was two of them
+/// disagreeing. The port-blind in-session slot deliberately never answers:
+/// it may hold the Setup-UI tunnel, which must not masquerade as the
+/// ingress tunnel.
+fn setup_backend_resolve_ingress_public_base(
+    state: &UiState,
+    tenant: &str,
+) -> Option<(String, &'static str)> {
+    let ingress_port = setup_backend_runtime_local_base_url(state, tenant)
+        .as_deref()
+        .and_then(crate::shared_tunnel::local_port_from_base_url);
+    if let Some(port) = ingress_port
+        && let Some(url) = setup_backend_tunnel_public_base_url_for_port(state, port)
+    {
+        return Some((url, "ingress-port tunnel record"));
+    }
+    setup_backend_runtime_public_base_url(state, tenant)
+        .filter(|value| {
+            setup_backend_public_base_url_is_external_https(value)
+                || is_ephemeral_tunnel_public_base_url(value)
+        })
+        .map(|url| (url, "runtime endpoints"))
+}
+
 fn setup_backend_runtime_context(
     state: &UiState,
     tenant: &str,
@@ -4909,40 +4945,24 @@ fn setup_backend_runtime_context(
     let public_base_url = setup_backend_config_str(config, "public_base_url")
         .trim_end_matches('/')
         .to_string();
-    let runtime_public_base_url =
-        setup_backend_runtime_public_base_url(state, tenant).filter(|value| {
-            setup_backend_public_base_url_is_external_https(value)
-                || is_ephemeral_tunnel_public_base_url(value)
-        });
     let runtime_local_base_url = setup_backend_runtime_local_base_url(state, tenant);
-    // runtime_context describes the RUNTIME, so its active tunnel must be the
-    // one fronting the runtime-ingress port — never the Setup-UI tunnel that
-    // may currently occupy the port-blind in-session slot.
     let ingress_port = runtime_local_base_url
         .as_deref()
         .and_then(crate::shared_tunnel::local_port_from_base_url);
-    let active_tunnel_public_base_url = match ingress_port {
-        // The ingress port is known: only a tunnel actually fronting that
-        // port may answer, falling back to the runtime's own reported public
-        // base. NEVER fall back to the port-blind in-session slot here — it
-        // may hold the Setup-UI tunnel, and letting it masquerade as the
-        // ingress tunnel un-completes every runtime-dependent step (observed:
-        // a setup restart with no live ingress tunnel re-ran the OAuth
-        // consents and the endpoint registration).
-        Some(port) => {
-            setup_backend_tunnel_public_base_url_for_port(state, port).or(runtime_public_base_url)
-        }
-        // No runtime yet: legacy behavior (in-session slot, then the
-        // runtime-reported public base).
-        None => setup_backend_active_tunnel_public_base_url(state).or(runtime_public_base_url),
-    };
+    let resolved = setup_backend_resolve_ingress_public_base(state, tenant);
+    let active_tunnel_public_base_url = resolved.as_ref().map(|(url, _)| url.clone());
+    // Log only a LIVE conflict: a resolved ingress URL that differs from the
+    // one in config genuinely invalidates dependent steps. "Nothing resolved"
+    // (runtime and tunnel down, e.g. between setup sessions) is unknown, not
+    // stale — completed steps must survive it.
     if !public_base_url.is_empty()
         && is_ephemeral_tunnel_public_base_url(&public_base_url)
-        && active_tunnel_public_base_url.as_deref() != Some(public_base_url.as_str())
+        && let Some((active, source)) = resolved.as_ref()
+        && active != &public_base_url
     {
         eprintln!(
             "[setup runtime-context] ingress tunnel mismatch: config public_base_url={public_base_url} \
-             vs active tunnel={active_tunnel_public_base_url:?} (ingress_port={ingress_port:?}, \
+             vs active tunnel={active} (source: {source}, ingress_port={ingress_port:?}, \
              runtime_local_base_url={runtime_local_base_url:?}) — dependent steps will be treated as stale"
         );
     }
@@ -5109,13 +5129,18 @@ fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool
     let active_tunnel = current
         .get("active_tunnel_public_base_url")
         .and_then(Value::as_str);
-    // An ephemeral public base is current only while a live tunnel still serves
-    // that exact URL. A gone tunnel (active_tunnel absent) or a drifted one both
-    // disqualify it; a live tunnel reports the matching base via the runtime.
+    // An ephemeral public base is invalidated only by a LIVE conflicting
+    // tunnel — a resolved ingress URL that differs from the recorded one. An
+    // absent active tunnel (runtime and tunnel down, e.g. between setup
+    // sessions) is UNKNOWN, not stale: treating it as stale un-completed
+    // every runtime-dependent step on restart and re-ran OAuth consents and
+    // endpoint registrations. When the runtime comes back with a different
+    // URL, the conflict becomes live and dependent steps re-run exactly once.
     if current
         .get("public_base_url_is_ephemeral_tunnel")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        && active_tunnel.is_some()
         && active_tunnel != current_public_base_url
     {
         return false;
@@ -7869,6 +7894,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_context_unknown_ingress_is_not_stale() {
+        // Runtime and tunnel both down (e.g. between setup sessions): nothing
+        // resolves, so the context has no active tunnel...
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        *state.setup_tunnel.lock().unwrap() = Some(crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:12345",
+            "https://ui-tunnel.trycloudflare.com",
+        ));
+        let mut config = JsonMap::new();
+        config.insert(
+            "public_base_url".to_string(),
+            json!("https://ingress.trycloudflare.com"),
+        );
+        let context = setup_backend_runtime_context(&state, "demo", &config);
+        assert_eq!(
+            context
+                .get("active_tunnel_public_base_url")
+                .and_then(Value::as_str),
+            None,
+            "no runtime + no record + Setup-UI slot must resolve to nothing"
+        );
+        // ...and UNKNOWN must not invalidate previously completed steps: only
+        // a live conflicting URL may. (Treating unknown as stale re-ran OAuth
+        // consents and endpoint registrations on every setup restart.)
+        assert!(setup_backend_runtime_context_current(
+            &json!({"runtime_context": {"public_base_url": "https://ingress.trycloudflare.com"}}),
+            &context
+        ));
+    }
+
+    #[test]
     fn runtime_context_current_matches_ingress_tunnel_not_setup_ui_tunnel() {
         let ingress = "https://ingress.trycloudflare.com";
         let stored = serde_json::json!({
@@ -8808,6 +8866,23 @@ questions:
     fn setup_backend_hides_current_downstream_output_when_prior_step_pending() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
+        // A LIVE conflicting ingress (runtime endpoints report a different
+        // tunnel URL than the recorded context) is what makes the step stale
+        // under the unknown-is-not-stale semantics.
+        let runtime_dir = temp.path().join("state/runtime/demo.support");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            serde_json::to_string(&json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://rotated.trycloudflare.com",
+                "gateway_listen_addr": "127.0.0.1",
+                "gateway_port": 47392
+            }))
+            .unwrap(),
+        )
+        .expect("endpoints.json");
         let contract = super::ProviderBackendContract {
             provider_id: "messaging-example".to_string(),
             inline: json!({
@@ -9676,6 +9751,23 @@ questions:
     fn completed_provider_http_step_is_pending_when_runtime_context_is_stale() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
+        // A LIVE conflicting ingress (runtime endpoints report a different
+        // tunnel URL than the recorded context) is what makes the step stale
+        // under the unknown-is-not-stale semantics.
+        let runtime_dir = temp.path().join("state/runtime/demo.support");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            serde_json::to_string(&json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://rotated.trycloudflare.com",
+                "gateway_listen_addr": "127.0.0.1",
+                "gateway_port": 47392
+            }))
+            .unwrap(),
+        )
+        .expect("endpoints.json");
         let contract = super::ProviderBackendContract {
             provider_id: "messaging-teams".to_string(),
             inline: json!({
