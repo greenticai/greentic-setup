@@ -171,6 +171,11 @@ pub fn load_answers(
                 .context("parse platform_setup answers")?
                 .unwrap_or_default();
 
+            let providers: Vec<super::types::ProviderEntry> = map
+                .get("providers")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
             if let Some(Value::Object(setup_answers)) = map.get("setup_answers") {
                 Ok(LoadedAnswers {
                     tenant,
@@ -178,6 +183,7 @@ pub fn load_answers(
                     env,
                     platform_setup,
                     setup_answers: setup_answers.clone(),
+                    providers,
                 })
             } else if map.contains_key("bundle_source")
                 || map.contains_key("tenant")
@@ -191,6 +197,7 @@ pub fn load_answers(
                     env,
                     platform_setup,
                     setup_answers: JsonMap::new(),
+                    providers,
                 })
             } else {
                 Ok(LoadedAnswers {
@@ -199,6 +206,7 @@ pub fn load_answers(
                     env,
                     platform_setup,
                     setup_answers: map,
+                    providers,
                 })
             }
         }
@@ -301,46 +309,109 @@ pub fn prompt_secret_answers(bundle: &Path, answers_doc: &mut Value) -> anyhow::
 }
 
 /// Encrypt secret values in the answers document.
+///
+/// Walks both `setup_answers` (per-provider maps keyed by provider_id)
+/// and `providers[]` entries (declarative provider wiring). Secret
+/// fields are identified via the pack's `FormSpec` (`secret: true`).
 pub fn encrypt_secret_answers(
     bundle: &Path,
     answers_doc: &mut Value,
     key: Option<&str>,
     interactive: bool,
 ) -> anyhow::Result<()> {
-    let setup_answers = answers_doc
-        .get_mut("setup_answers")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("internal error: setup_answers not an object"))?;
     let discovered = if bundle.exists() {
         discovery::discover(bundle)?
     } else {
         return Ok(());
     };
 
-    let mut secret_paths = Vec::new();
-    for provider in discovered.setup_targets() {
-        let Some(form_spec) =
-            crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider.provider_id)
-        else {
-            continue;
-        };
-        let Some(provider_answers) = setup_answers
-            .get_mut(&provider.provider_id)
-            .and_then(Value::as_object_mut)
-        else {
-            continue;
-        };
-        for question in form_spec.questions {
-            if !question.secret {
-                continue;
-            }
-            let Some(value) = provider_answers.get(&question.id).cloned() else {
+    // Collect (location, value) pairs to encrypt. All reads happen first
+    // (immutable borrows), then all writes happen (mutable borrows).
+    // location: ("setup_answers", provider_id, field_id) or ("providers", idx as string, field_id)
+    let mut secret_paths: Vec<(String, String, String, Value)> = Vec::new();
+
+    // ── Walk setup_answers ───────────────────────────────────────────
+    if let Some(setup_answers) = answers_doc.get("setup_answers").and_then(Value::as_object) {
+        for provider in discovered.setup_targets() {
+            let Some(form_spec) = crate::setup_to_formspec::pack_to_form_spec(
+                &provider.pack_path,
+                &provider.provider_id,
+            ) else {
                 continue;
             };
-            if value.is_null() || value == Value::String(String::new()) {
+            let Some(provider_answers) = setup_answers
+                .get(&provider.provider_id)
+                .and_then(Value::as_object)
+            else {
                 continue;
+            };
+            for question in form_spec.questions {
+                if !question.secret {
+                    continue;
+                }
+                let Some(value) = provider_answers.get(&question.id).cloned() else {
+                    continue;
+                };
+                if value.is_null() || value == Value::String(String::new()) {
+                    continue;
+                }
+                secret_paths.push((
+                    "setup_answers".to_string(),
+                    provider.provider_id.clone(),
+                    question.id.clone(),
+                    value,
+                ));
             }
-            secret_paths.push((provider.provider_id.clone(), question.id.clone(), value));
+        }
+    }
+
+    // ── Walk providers[] entries ──────────────────────────────────────
+    if let Some(providers_arr) = answers_doc.get("providers").and_then(Value::as_array) {
+        for (idx, entry) in providers_arr.iter().enumerate() {
+            let Some(kind) = entry.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(entry_answers) = entry.get("answers").and_then(Value::as_object) else {
+                continue;
+            };
+
+            let pack_path = resolve_provider_pack_path(kind, &discovered);
+            let pack_path = match pack_path {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let provider_id = entry
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    crate::provider_registry::lookup(kind).map(|info| info.default_provider_id)
+                })
+                .unwrap_or(kind);
+
+            let Some(form_spec) =
+                crate::setup_to_formspec::pack_to_form_spec(&pack_path, provider_id)
+            else {
+                continue;
+            };
+
+            for question in form_spec.questions {
+                if !question.secret {
+                    continue;
+                }
+                let Some(value) = entry_answers.get(&question.id).cloned() else {
+                    continue;
+                };
+                if value.is_null() || value == Value::String(String::new()) {
+                    continue;
+                }
+                secret_paths.push((
+                    "providers".to_string(),
+                    idx.to_string(),
+                    question.id.clone(),
+                    value,
+                ));
+            }
         }
     }
 
@@ -358,17 +429,49 @@ pub fn encrypt_secret_answers(
         }
     };
 
-    for (provider_id, field_id, value) in secret_paths {
+    // ── Apply encryptions (mutable borrows) ──────────────────────────
+    for (section, id_or_idx, field_id, value) in secret_paths {
         let encrypted = answers_crypto::encrypt_value(&value, &resolved_key)?;
-        if let Some(provider_answers) = setup_answers
-            .get_mut(&provider_id)
-            .and_then(Value::as_object_mut)
-        {
-            provider_answers.insert(field_id, encrypted);
+        if section == "setup_answers" {
+            if let Some(provider_answers) = answers_doc
+                .get_mut("setup_answers")
+                .and_then(Value::as_object_mut)
+                .and_then(|sa| sa.get_mut(&id_or_idx))
+                .and_then(Value::as_object_mut)
+            {
+                provider_answers.insert(field_id, encrypted);
+            }
+        } else {
+            let idx: usize = id_or_idx.parse().unwrap_or(0);
+            if let Some(entry) = answers_doc
+                .get_mut("providers")
+                .and_then(Value::as_array_mut)
+                .and_then(|arr| arr.get_mut(idx))
+                && let Some(answers) = entry.get_mut("answers").and_then(Value::as_object_mut)
+            {
+                answers.insert(field_id, encrypted);
+            }
         }
     }
 
     Ok(())
+}
+
+/// Find the on-disk pack path for a provider kind by searching discovered
+/// packs. Maps `kind` -> `pack_name` via the provider registry, then matches
+/// against `provider_id` of discovered packs.
+fn resolve_provider_pack_path(
+    kind: &str,
+    discovered: &crate::discovery::DiscoveryResult,
+) -> Option<std::path::PathBuf> {
+    let info = crate::provider_registry::lookup(kind)?;
+    // Search discovered packs for one whose provider_id matches the
+    // registry's pack_name (e.g. "messaging-telegram") or default_provider_id.
+    discovered
+        .setup_targets()
+        .into_iter()
+        .find(|p| p.provider_id == info.pack_name || p.provider_id == info.default_provider_id)
+        .map(|p| p.pack_path.clone())
 }
 
 fn template_from_form_spec(form_spec: &qa_spec::FormSpec) -> JsonMap<String, Value> {
@@ -424,6 +527,250 @@ mod tests {
         )?;
         writer.finish()?;
         Ok(())
+    }
+
+    /// Path to the REAL messaging-telegram setup.yaml in the sibling repo.
+    /// Tests that anchor to the real artifact read the field name and
+    /// `secret: true` flag from this file rather than inventing a synthetic
+    /// FormSpec — a synthetic spec with a made-up field name would pass even
+    /// if the real field name never matches.
+    const REAL_TELEGRAM_SETUP_YAML: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../greentic-messaging-providers/packs/messaging-telegram/assets/setup.yaml"
+    );
+
+    /// Build a minimal .gtpack ZIP containing the REAL telegram setup.yaml.
+    fn write_telegram_pack_from_real_yaml(path: &Path) -> anyhow::Result<()> {
+        let yaml_contents = std::fs::read_to_string(REAL_TELEGRAM_SETUP_YAML)
+            .context("read real telegram setup.yaml — is greentic-messaging-providers checked out as a sibling?")?;
+        let file = std::fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options)?;
+        writer.write_all(
+            serde_json::json!({
+                "pack_id": "messaging-telegram",
+                "display_name": "Telegram",
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        writer.start_file("assets/setup.yaml", options)?;
+        writer.write_all(yaml_contents.as_bytes())?;
+        writer.finish()?;
+        Ok(())
+    }
+
+    /// Read the secret field name from the REAL telegram setup.yaml so the
+    /// test is anchored to the actual pack, not a hand-authored constant.
+    fn real_telegram_secret_field_name() -> String {
+        let yaml_contents =
+            std::fs::read_to_string(REAL_TELEGRAM_SETUP_YAML).expect("read real setup.yaml");
+        let spec: crate::setup_input::SetupSpec =
+            serde_yaml_bw::from_str(&yaml_contents).expect("parse real setup.yaml");
+        let secret_q = spec
+            .questions
+            .iter()
+            .find(|q| q.secret)
+            .expect("real telegram setup.yaml must declare at least one secret question");
+        secret_q.name.clone()
+    }
+
+    // ── BLOCKER 1 regression: providers[].answers secret encryption ──
+
+    #[test]
+    fn providers_secret_field_encrypted_on_disk() -> anyhow::Result<()> {
+        let secret_field = real_telegram_secret_field_name();
+        let plaintext_token = "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ";
+
+        let temp = tempfile::tempdir()?;
+        let bundle_root = temp.path().join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_root, Some("test-bundle"))?;
+        let pack_path = bundle_root.join("packs").join("messaging-telegram.gtpack");
+        write_telegram_pack_from_real_yaml(&pack_path)?;
+
+        // Build an answers doc with providers[] containing a secret value.
+        let mut answers_doc = serde_json::json!({
+            "greentic_setup_version": "1.0.0",
+            "bundle_source": bundle_root.display().to_string(),
+            "tenant": "demo",
+            "env": "local",
+            "setup_answers": {},
+            "providers": [{
+                "kind": "telegram",
+                "display_name": "Telegram",
+                "link_bundle": true,
+                "answers": {
+                    "public_base_url": "https://example.com",
+                    secret_field.clone(): plaintext_token,
+                }
+            }]
+        });
+
+        let encryption_key = "test-encryption-key-42";
+        encrypt_secret_answers(&bundle_root, &mut answers_doc, Some(encryption_key), false)?;
+
+        // The on-disk JSON must NOT contain the plaintext token.
+        let serialized = serde_json::to_string_pretty(&answers_doc)?;
+        assert!(
+            !serialized.contains(plaintext_token),
+            "plaintext token must not appear in encrypted answers doc"
+        );
+
+        // The secret field must be an encrypted envelope, not a string.
+        let encrypted_value = &answers_doc["providers"][0]["answers"][&secret_field];
+        assert!(
+            encrypted_value.is_object(),
+            "secret field must be an encrypted envelope object, got: {encrypted_value}"
+        );
+        assert_eq!(
+            encrypted_value
+                .get("__greentic_encrypted__")
+                .and_then(|v| v.as_str()),
+            Some("aes-256-gcm-siv-v1"),
+            "encrypted envelope must carry the encryption marker"
+        );
+
+        // Non-secret field must remain in plaintext.
+        assert_eq!(
+            answers_doc["providers"][0]["answers"]["public_base_url"],
+            serde_json::json!("https://example.com"),
+        );
+
+        // Round-trip: decrypt and verify the value comes back.
+        let decrypted = answers_crypto::decrypt_tree(&answers_doc, encryption_key)?;
+        let recovered = decrypted["providers"][0]["answers"][&secret_field]
+            .as_str()
+            .expect("decrypted value must be a string");
+        assert_eq!(
+            recovered, plaintext_token,
+            "decrypt must recover the original token"
+        );
+
+        Ok(())
+    }
+
+    // ── Backward compatibility: pre-existing answers without providers ──
+
+    #[test]
+    fn answers_without_providers_key_still_deserializes() -> anyhow::Result<()> {
+        // This mirrors the real answers.json shape from scripts/demo.sh —
+        // no `providers` key, which must default to an empty vec.
+        let temp = tempfile::tempdir()?;
+        let answers_path = temp.path().join("answers.json");
+        let doc = serde_json::json!({
+            "bundle_source": "./support-bot",
+            "env": "production",
+            "tenant": "acme-corp",
+            "team": "support",
+            "setup_answers": {
+                "messaging-webchat": {
+                    "public_base_url": "https://support.acme-corp.com",
+                    "jwt_signing_key": "super-secret-jwt-key-2024"
+                }
+            }
+        });
+        std::fs::write(&answers_path, serde_json::to_string_pretty(&doc)?)?;
+
+        let loaded = load_answers(&answers_path, None, false)?;
+        assert_eq!(loaded.tenant.as_deref(), Some("acme-corp"));
+        assert_eq!(loaded.team.as_deref(), Some("support"));
+        assert_eq!(loaded.env.as_deref(), Some("production"));
+        assert!(
+            loaded.providers.is_empty(),
+            "missing providers key must default to empty vec"
+        );
+        assert!(
+            loaded.setup_answers.contains_key("messaging-webchat"),
+            "setup_answers must be preserved"
+        );
+        Ok(())
+    }
+
+    // ── providers[] parsing ──
+
+    #[test]
+    fn load_answers_parses_providers_array() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let answers_path = temp.path().join("answers.json");
+        let doc = serde_json::json!({
+            "bundle_source": "./my-bundle",
+            "tenant": "demo",
+            "env": "local",
+            "setup_answers": {},
+            "providers": [{
+                "kind": "telegram",
+                "display_name": "Telegram",
+                "link_bundle": true,
+                "answers": {
+                    "public_base_url": "https://example.com",
+                    "telegram_bot_token": "fake-token"
+                }
+            }]
+        });
+        std::fs::write(&answers_path, serde_json::to_string_pretty(&doc)?)?;
+
+        let loaded = load_answers(&answers_path, None, false)?;
+        assert_eq!(loaded.providers.len(), 1);
+        assert_eq!(loaded.providers[0].kind, "telegram");
+        assert_eq!(
+            loaded.providers[0].display_name.as_deref(),
+            Some("Telegram")
+        );
+        assert!(loaded.providers[0].link_bundle);
+        assert_eq!(
+            loaded.providers[0]
+                .answers
+                .get("public_base_url")
+                .and_then(|v| v.as_str()),
+            Some("https://example.com"),
+        );
+        Ok(())
+    }
+
+    // ── Secret field detection anchored to real setup.yaml ──
+
+    #[test]
+    fn secret_detection_matches_real_telegram_field_name() {
+        let secret_field = real_telegram_secret_field_name();
+        // The real telegram setup.yaml declares `telegram_bot_token` as secret.
+        // If the real field name ever changes, this test breaks — which is the
+        // point: it forces updating the encryption walk and the provider wiring.
+        assert_eq!(
+            secret_field, "telegram_bot_token",
+            "real telegram setup.yaml secret field must be telegram_bot_token"
+        );
+    }
+
+    // ── Deterministic idempotency key ──
+
+    #[test]
+    fn deterministic_idempotency_key_is_stable() {
+        let key1 = crate::provider_commands::deterministic_idempotency_key(
+            "local", "telegram", "telegram",
+        );
+        let key2 = crate::provider_commands::deterministic_idempotency_key(
+            "local", "telegram", "telegram",
+        );
+        assert_eq!(key1, key2, "same inputs must produce the same key");
+        assert!(
+            key1.starts_with("setup-provider-"),
+            "key must carry the prefix, got: {key1}"
+        );
+    }
+
+    #[test]
+    fn deterministic_idempotency_key_differs_across_envs() {
+        let key_local = crate::provider_commands::deterministic_idempotency_key(
+            "local", "telegram", "telegram",
+        );
+        let key_prod =
+            crate::provider_commands::deterministic_idempotency_key("prod", "telegram", "telegram");
+        assert_ne!(
+            key_local, key_prod,
+            "different envs must produce different keys"
+        );
     }
 
     #[test]

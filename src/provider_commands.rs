@@ -238,6 +238,193 @@ fn auto_detect_bundle_id(store: &LocalFsStore, env_id_str: &str) -> Result<Strin
     }
 }
 
+/// Public wrapper around [`auto_detect_bundle_id`] for use from the binary
+/// crate's answers-driven auto-deploy path.
+pub fn auto_detect_bundle_id_pub(store: &LocalFsStore, env_id: &str) -> Result<String> {
+    auto_detect_bundle_id(store, env_id)
+}
+
+/// Public wrapper around [`resolve_pack`] for use from the binary crate's
+/// answers-driven auto-deploy path.
+pub fn resolve_pack_pub(
+    explicit_pack: Option<&Path>,
+    info: &crate::provider_registry::ProviderPackInfo,
+    store: &LocalFsStore,
+    env_id: &str,
+) -> Result<std::path::PathBuf> {
+    resolve_pack(explicit_pack, info, store, env_id)
+}
+
+// ---------------------------------------------------------------------------
+// Mutation core — reusable by `add()` and answers-driven auto-deploy
+// ---------------------------------------------------------------------------
+
+/// Payload for [`register_provider_core`].
+pub struct RegisterProviderPayload<'a> {
+    pub env_id: &'a str,
+    pub tenant: &'a str,
+    pub team: Option<&'a str>,
+    pub provider_type: &'a str,
+    pub provider_id: &'a str,
+    pub pack_name: &'a str,
+    pub display_name: String,
+    pub bundle_id: &'a str,
+    pub link_bundle: bool,
+    pub answers: &'a serde_json::Map<String, serde_json::Value>,
+    pub pack_path: &'a Path,
+}
+
+/// Register a messaging endpoint, write its secrets, and optionally link a
+/// bundle. This is the mutation core shared by `add()` (interactive) and
+/// answers-driven auto-deploy (non-interactive).
+///
+/// Ordering invariant: bundle_id is resolved BEFORE this function is called
+/// (the caller must verify it exists). Inside, the sequence is:
+/// 1. register endpoint (fail-fast on duplicate)
+/// 2. write secrets
+/// 3. link bundle
+///
+/// When `idempotency_key` is `Some`, the deployer's replay logic makes
+/// same-identity re-runs no-ops. When `None`, the deployer mints a fresh
+/// UUID (legacy interactive path).
+pub fn register_provider_core(
+    store: &LocalFsStore,
+    payload: &RegisterProviderPayload<'_>,
+    idempotency_key: Option<String>,
+) -> Result<String> {
+    // ── Build secret entries ─────────────────────────────────────────
+    let mut secret_keys = collect_secret_keys_from_pack(payload.pack_path);
+    for req in load_secret_requirements_from_pack(payload.pack_path).unwrap_or_default() {
+        secret_keys.insert(req.key.clone());
+        secret_keys.insert(crate::secret_name::canonical_secret_name(&req.key));
+    }
+
+    let mut secret_entries: Vec<(String, String, String, String)> = Vec::new();
+
+    for (key, value) in payload.answers {
+        let is_secret = secret_keys.contains(key)
+            || secret_keys.contains(&crate::secret_name::canonical_secret_name(key));
+        if !is_secret {
+            continue;
+        }
+        let secret_value = match value.as_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let rel_path = deployer_secret_path(payload.tenant, payload.team, payload.pack_name, key);
+        let uri = deployer_secret_uri(
+            payload.env_id,
+            payload.tenant,
+            payload.team,
+            payload.pack_name,
+            key,
+        );
+        secret_entries.push((key.clone(), secret_value, rel_path, uri));
+    }
+
+    let secret_refs: Vec<String> = secret_entries
+        .iter()
+        .map(|(_, _, _, uri)| uri.clone())
+        .collect();
+
+    // ── Register the messaging endpoint ──────────────────────────────
+    let add_result = messaging::add(
+        store,
+        &op_flags(),
+        Some(EndpointAddPayload {
+            environment_id: payload.env_id.to_string(),
+            provider_id: payload.provider_id.to_string(),
+            provider_type: payload.provider_type.to_string(),
+            display_name: payload.display_name.clone(),
+            secret_refs,
+            webhook_secret_ref: None,
+            idempotency_key,
+            updated_by: UPDATED_BY.to_string(),
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("add messaging endpoint: {e}"))?;
+
+    let endpoint_id = add_result
+        .result
+        .get("endpoint_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .context("add outcome missing endpoint_id")?;
+
+    eprintln!("Endpoint registered: {endpoint_id}");
+    print_outcome(&add_result).ok();
+
+    // ── Write secrets ────────────────────────────────────────────────
+    for (key, value, rel_path, uri) in &secret_entries {
+        let put_result = secrets::put(
+            store,
+            &op_flags(),
+            Some(SecretsPutPayload {
+                environment_id: payload.env_id.to_string(),
+                path: rel_path.clone(),
+                value: value.clone(),
+                idempotency_key: None,
+            }),
+        );
+        match put_result {
+            Ok(outcome) => {
+                eprintln!("  Secret written: {uri}");
+                let _ = outcome;
+            }
+            Err(e) => {
+                bail!(
+                    "failed to write secret `{key}` to env store: {e}\n\n\
+                     The endpoint `{endpoint_id}` was already registered. \
+                     To clean up, run:\n  \
+                     greentic-setup provider remove {endpoint_id} --env {payload_env}",
+                    payload_env = payload.env_id,
+                );
+            }
+        }
+    }
+
+    // ── Link bundle ──────────────────────────────────────────────────
+    if payload.link_bundle {
+        let link_result = messaging::link_bundle(
+            store,
+            &op_flags(),
+            Some(EndpointLinkBundlePayload {
+                environment_id: payload.env_id.to_string(),
+                endpoint_id: endpoint_id.clone(),
+                bundle_id: payload.bundle_id.to_string(),
+                idempotency_key: None,
+                updated_by: UPDATED_BY.to_string(),
+            }),
+        )
+        .map_err(|e| anyhow::anyhow!("link bundle `{}` to endpoint: {e}", payload.bundle_id))?;
+        print_outcome(&link_result).ok();
+    }
+
+    Ok(endpoint_id)
+}
+
+/// Derive a deterministic idempotency key from (env_id, provider_type,
+/// provider_id). Re-running the same answers.json against the same
+/// environment naturally replays as a no-op in the deployer's endpoint
+/// engine, which is idempotent on same-key same-identity replays.
+pub fn deterministic_idempotency_key(
+    env_id: &str,
+    provider_type: &str,
+    provider_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"greentic-setup:provider:");
+    hasher.update(env_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(provider_type.as_bytes());
+    hasher.update(b":");
+    hasher.update(provider_id.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("setup-provider-{hex}")
+}
+
 // ---------------------------------------------------------------------------
 // provider add
 // ---------------------------------------------------------------------------
@@ -340,129 +527,37 @@ pub fn add(
         return Ok(());
     }
 
-    // ── Build secret entries (without writing yet) ────────────────────
-    // Secrets use `info.pack_name` (e.g. `messaging-telegram`) as the
-    // provider segment — this matches what the runtime resolves via
-    // `scoped_secret_path_for_pack(ctx, pack_id, key)`.
-    let answers_map = answers.as_object().cloned().unwrap_or_default();
-    let mut secret_keys = collect_secret_keys_from_pack(&pack_path);
-    for req in load_secret_requirements_from_pack(&pack_path).unwrap_or_default() {
-        secret_keys.insert(req.key.clone());
-        secret_keys.insert(crate::secret_name::canonical_secret_name(&req.key));
-    }
-
-    let mut secret_entries: Vec<(String, String, String, String)> = Vec::new(); // (key, value, rel_path, uri)
-
-    for (key, value) in &answers_map {
-        let is_secret = secret_keys.contains(key)
-            || secret_keys.contains(&crate::secret_name::canonical_secret_name(key));
-
-        if !is_secret {
-            continue;
-        }
-
-        let secret_value = match value.as_str() {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => continue,
-        };
-
-        let rel_path = deployer_secret_path(tenant, team, info.pack_name, key);
-        let uri = deployer_secret_uri(env_id, tenant, team, info.pack_name, key);
-        secret_entries.push((key.clone(), secret_value, rel_path, uri));
-    }
-
-    let secret_refs: Vec<String> = secret_entries
-        .iter()
-        .map(|(_, _, _, uri)| uri.clone())
-        .collect();
-
     // ── Resolve the link target BEFORE any mutation ───────────────────
-    // Nothing below is transactional: if the bundle cannot be resolved after
-    // the endpoint and its secrets are written, the env is left with a live
-    // endpoint that is linked to nothing. Fail fast instead.
     let bundle_id = if let Some(id) = &args.bundle_id {
         id.clone()
     } else {
         auto_detect_bundle_id(&store, env_id)?
     };
 
-    // ── Register the messaging endpoint (before writing secrets) ──────
-    // Registering first ensures that a duplicate `provider add` bails
-    // before overwriting the existing endpoint's secret values.
     let display_name = args
         .display_name
         .clone()
         .unwrap_or_else(|| crate::setup_to_formspec::capitalize(info.kind));
 
-    let add_result = messaging::add(
+    let answers_map = answers.as_object().cloned().unwrap_or_default();
+
+    let endpoint_id = register_provider_core(
         &store,
-        &op_flags(),
-        Some(EndpointAddPayload {
-            environment_id: env_id.to_string(),
-            provider_id: provider_id.to_string(),
-            provider_type: info.provider_type.to_string(),
+        &RegisterProviderPayload {
+            env_id,
+            tenant,
+            team,
+            provider_type: info.provider_type,
+            provider_id,
+            pack_name: info.pack_name,
             display_name,
-            secret_refs,
-            webhook_secret_ref: None, // auto-minted for telegram-class
-            idempotency_key: None,    // auto-minted
-            updated_by: UPDATED_BY.to_string(),
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("add messaging endpoint: {e}"))?;
-
-    // Extract the endpoint_id from the add outcome.
-    let endpoint_id = add_result
-        .result
-        .get("endpoint_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .context("add outcome missing endpoint_id")?;
-
-    eprintln!("Endpoint registered: {endpoint_id}");
-    print_outcome(&add_result).ok();
-
-    // ── Write secrets to the env dev store ─────────────────────────────
-    for (key, value, rel_path, uri) in &secret_entries {
-        let put_result = secrets::put(
-            &store,
-            &op_flags(),
-            Some(SecretsPutPayload {
-                environment_id: env_id.to_string(),
-                path: rel_path.clone(),
-                value: value.clone(),
-                idempotency_key: None,
-            }),
-        );
-        match put_result {
-            Ok(outcome) => {
-                eprintln!("  Secret written: {uri}");
-                let _ = outcome;
-            }
-            Err(e) => {
-                bail!(
-                    "failed to write secret `{key}` to env store: {e}\n\n\
-                     The endpoint `{endpoint_id}` was already registered. \
-                     To clean up, run:\n  \
-                     greentic-setup provider remove {endpoint_id} --env {env_id}"
-                );
-            }
-        }
-    }
-
-    // ── Link to the bundle resolved up front ──────────────────────────
-    let link_result = messaging::link_bundle(
-        &store,
-        &op_flags(),
-        Some(EndpointLinkBundlePayload {
-            environment_id: env_id.to_string(),
-            endpoint_id: endpoint_id.clone(),
-            bundle_id: bundle_id.clone(),
-            idempotency_key: None,
-            updated_by: UPDATED_BY.to_string(),
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("link bundle `{bundle_id}` to endpoint: {e}"))?;
-    print_outcome(&link_result).ok();
+            bundle_id: &bundle_id,
+            link_bundle: true,
+            answers: &answers_map,
+            pack_path: &pack_path,
+        },
+        None, // auto-minted (interactive path)
+    )?;
 
     // ── Closing message ───────────────────────────────────────────────
     eprintln!();
@@ -486,6 +581,7 @@ pub fn add(
         );
     }
 
+    let _ = endpoint_id;
     Ok(())
 }
 
