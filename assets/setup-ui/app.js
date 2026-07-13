@@ -1804,6 +1804,11 @@
     context.setup_status = result.setup_status || (result.state && result.state.setup_status) || {};
     context.values = result.values || (result.state && result.state.values) || {};
     context.provider_id = provider.provider_id;
+    // An explicit install_url (e.g. Slack's dashboard install-on-team page) is
+    // this action's one-time install target; the final deep_link actions below
+    // keep pointing at the installed app (app_redirect -> DM with the bot).
+    var explicitInstall = deepValue(context, "install_url");
+    if (explicitInstall) return String(explicitInstall);
     for (var i = 0; i < actions.length; i++) {
       var item = resolveFinalSetupAction(provider, actions[i], context);
       if (item && item.url) return item.url;

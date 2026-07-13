@@ -155,6 +155,42 @@ pub fn persist_setup_actions(bundle_root: &Path, actions: &[SetupAction]) -> Res
                 action.created_at = Some(now_stamp());
             }
             if let Some(existing) = file.actions.iter_mut().find(|a| a.id == action.id) {
+                // Persisted action state must never get POORER. Multiple writers
+                // persist here (the UI action handler with a complete OAuth
+                // authorize URL, and the engine apply/finish flow which
+                // regenerates actions without a redirect_uri); writer order must
+                // not decide which survives.
+                //
+                // 1. A `complete` action stays complete — a captured credential
+                //    is never rolled back to pending by a later re-apply.
+                if existing.status == SetupActionStatus::Complete
+                    && action.status == SetupActionStatus::Pending
+                {
+                    continue;
+                }
+                // 2. An authorize URL carrying redirect_uri (and its matching
+                //    signed state) is never replaced by one without it — a
+                //    stripped URL sends the user through the provider's consent
+                //    flow with no way back to our callback.
+                let existing_has_redirect = existing
+                    .authorize_url
+                    .as_deref()
+                    .is_some_and(|url| url.contains("redirect_uri="));
+                let new_has_redirect = action
+                    .authorize_url
+                    .as_deref()
+                    .is_some_and(|url| url.contains("redirect_uri="));
+                // ...unless the preserved URL's signed state has expired — an
+                // expired state fails callback validation, so a fresh (if
+                // stripped) URL is strictly better than a dead complete one.
+                let existing_state_live = existing
+                    .state
+                    .as_deref()
+                    .is_some_and(|state| state_not_expired(state, current_epoch_secs()));
+                if existing_has_redirect && !new_has_redirect && existing_state_live {
+                    action.authorize_url = existing.authorize_url.clone();
+                    action.state = existing.state.clone();
+                }
                 let created_at = existing.created_at.clone().or(action.created_at.clone());
                 *existing = action;
                 existing.created_at = created_at;
@@ -172,6 +208,29 @@ pub fn persist_setup_actions(bundle_root: &Path, actions: &[SetupAction]) -> Res
         paths.push(path);
     }
     Ok(paths)
+}
+
+/// Whether a signed OAuth `state` token's embedded `expires_at` is still in the
+/// future. Signature is NOT checked here — this is only used to decide whether a
+/// persisted authorize URL is still clickable; the callback re-validates fully.
+fn state_not_expired(state: &str, now_epoch_secs: u64) -> bool {
+    let Some(payload_b64) = state.split('.').next() else {
+        return false;
+    };
+    let mut padded = payload_b64.to_string();
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()
+        .or_else(|| {
+            base64::engine::general_purpose::URL_SAFE
+                .decode(&padded)
+                .ok()
+        })
+        .and_then(|bytes| serde_json::from_slice::<OAuthStatePayload>(&bytes).ok())
+        .is_some_and(|payload| payload.expires_at > now_epoch_secs)
 }
 
 pub fn sign_pending_oauth_actions(bundle_root: &Path, actions: &mut [SetupAction]) -> Result<()> {
@@ -460,6 +519,146 @@ fn authorize_url_contains_state(value: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn oauth_action(id: &str, authorize_url: Option<&str>, state: Option<&str>) -> SetupAction {
+        SetupAction {
+            id: id.to_string(),
+            kind: SetupActionKind::OauthInstallButton,
+            label: "Install".to_string(),
+            provider_id: "messaging-example".to_string(),
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            authorize_url: authorize_url.map(ToString::to_string),
+            callback_path: None,
+            state: state.map(ToString::to_string),
+            status: SetupActionStatus::Pending,
+            created_at: None,
+            completed_at: None,
+            extra: JsonMap::new(),
+        }
+    }
+
+    fn live_state(bundle: &Path) -> String {
+        let key = load_or_create_signing_key(bundle).unwrap();
+        sign_oauth_state(
+            &OAuthStatePayload {
+                provider_id: "messaging-example".into(),
+                tenant: "demo".into(),
+                team: "default".into(),
+                action_id: "install".into(),
+                nonce: "n".into(),
+                expires_at: current_epoch_secs() + 600,
+            },
+            &key,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn persist_never_replaces_complete_authorize_url_with_stripped_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = live_state(temp.path());
+        let complete_url = format!(
+            "https://slack.com/oauth/v2/authorize?client_id=c&redirect_uri=https%3A%2F%2Fx%2Fcb&state={state}"
+        );
+        persist_setup_actions(
+            temp.path(),
+            &[oauth_action("install", Some(&complete_url), Some(&state))],
+        )
+        .unwrap();
+        // Engine re-apply persists a stripped regeneration (no redirect_uri).
+        persist_setup_actions(
+            temp.path(),
+            &[oauth_action(
+                "install",
+                Some("https://slack.com/oauth/v2/authorize?client_id=c&state=other"),
+                Some("other"),
+            )],
+        )
+        .unwrap();
+        let action = load_setup_action(
+            temp.path(),
+            "demo",
+            "default",
+            "messaging-example",
+            "install",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(action.authorize_url.as_deref(), Some(complete_url.as_str()));
+        assert_eq!(action.state.as_deref(), Some(state.as_str()));
+    }
+
+    #[test]
+    fn persist_replaces_expired_complete_url_with_fresh_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = load_or_create_signing_key(temp.path()).unwrap();
+        let expired = sign_oauth_state(
+            &OAuthStatePayload {
+                provider_id: "messaging-example".into(),
+                tenant: "demo".into(),
+                team: "default".into(),
+                action_id: "install".into(),
+                nonce: "n".into(),
+                expires_at: current_epoch_secs().saturating_sub(1),
+            },
+            &key,
+        )
+        .unwrap();
+        let stale_url =
+            format!("https://x/authorize?redirect_uri=https%3A%2F%2Fx%2Fcb&state={expired}");
+        persist_setup_actions(
+            temp.path(),
+            &[oauth_action("install", Some(&stale_url), Some(&expired))],
+        )
+        .unwrap();
+        persist_setup_actions(
+            temp.path(),
+            &[oauth_action(
+                "install",
+                Some("https://x/authorize?state=fresh"),
+                Some("fresh"),
+            )],
+        )
+        .unwrap();
+        let action = load_setup_action(
+            temp.path(),
+            "demo",
+            "default",
+            "messaging-example",
+            "install",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            action.authorize_url.as_deref(),
+            Some("https://x/authorize?state=fresh")
+        );
+    }
+
+    #[test]
+    fn persist_never_downgrades_complete_action_to_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut done = oauth_action("install", Some("https://x/a"), None);
+        done.status = SetupActionStatus::Complete;
+        persist_setup_actions(temp.path(), &[done]).unwrap();
+        persist_setup_actions(
+            temp.path(),
+            &[oauth_action("install", Some("https://x/b"), None)],
+        )
+        .unwrap();
+        let action = load_setup_action(
+            temp.path(),
+            "demo",
+            "default",
+            "messaging-example",
+            "install",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(action.status, SetupActionStatus::Complete);
+        assert_eq!(action.authorize_url.as_deref(), Some("https://x/a"));
+    }
 
     #[test]
     fn extract_setup_actions_fills_scope_defaults() {

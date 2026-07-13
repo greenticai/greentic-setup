@@ -4780,6 +4780,23 @@ fn setup_oauth_callback_base_url() -> Option<String> {
         .filter(|value| value.starts_with("https://"))
 }
 
+/// Single source of truth for the OAuth developer-install callback base.
+///
+/// The redirect URL must be byte-identical in three places or Slack rejects the
+/// exchange: the app manifest's `redirect_urls`, the authorize link's
+/// `redirect_uri`, and the `oauth.v2.access` exchange's `redirect_uri`. The URL
+/// the browser actually lands on is the *setup server's* public tunnel — not the
+/// runtime's `public_base_url` — so resolve it here and feed all three seams.
+///
+/// An explicit env override wins (named tunnels / prod); otherwise use the live
+/// setup tunnel fronting this UI.
+fn setup_oauth_callback_base(state: &UiState) -> Option<String> {
+    injected_setup_public_base_url()
+        .or_else(|| setup_backend_active_tunnel_public_base_url(state))
+        .map(|value| value.trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"))
+}
+
 fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String> {
     if let Some(value) = std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
         .ok()
@@ -6517,7 +6534,35 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     config.insert("env".to_string(), Value::String(env.clone()));
     setup_backend_apply_host_defaults(state, &tenant, &mut config);
 
-    let request = Value::Object(config.clone());
+    // Resolve ONE callback base for the whole OAuth developer-install flow. The
+    // same value must land in the app manifest's `redirect_urls` (below), in the
+    // authorize link's `redirect_uri` (via SetupActionFinalUrlContext), and in the
+    // exchange's `redirect_uri` (oauth_callback) — Slack rejects the exchange if
+    // they differ.
+    let setup_callback_base =
+        if action.get("kind").and_then(Value::as_str) == Some("oauth_install_button") {
+            setup_oauth_callback_base(state)
+        } else {
+            None
+        };
+
+    // Registration derives the manifest's `oauth_config.redirect_urls` from
+    // `public_base_url`. For an OAuth install that redirect must point at THIS
+    // setup server's callback (the live setup tunnel), not the runtime. Override
+    // it on the registration request ONLY — `config` is persisted back as provider
+    // answers and carries the runtime's public_base_url for webhook ingress, so it
+    // must stay untouched. (The manifest's event-subscription URL is re-pointed to
+    // the runtime by `setup_webhook` at `gtc start`.)
+    let request = {
+        let mut request_config = config.clone();
+        if let Some(base) = setup_callback_base.as_deref() {
+            request_config.insert(
+                "public_base_url".to_string(),
+                Value::String(base.to_string()),
+            );
+        }
+        Value::Object(request_config)
+    };
     let setup_config = SetupConfig {
         tenant: tenant.clone(),
         team: team.clone(),
@@ -6603,6 +6648,7 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         team: team.as_deref(),
         provider_id: &req.provider_id,
         action_id: &req.action_id,
+        setup_callback_base: setup_callback_base.as_deref(),
     };
     if let Some((key, url)) =
         setup_action_final_url_value(&descriptor, action, &config, &final_url_context)?
@@ -6785,6 +6831,9 @@ async fn get_oauth_callback(
             ),
         );
     }
+    // Exchange with the SAME callback base used for the manifest redirect_urls and
+    // the authorize link, or Slack rejects with `bad_redirect_uri`.
+    let setup_callback_base = setup_oauth_callback_base(state.as_ref());
     match crate::oauth_callback::complete_oauth_callback(
         &state.bundle_path,
         &state.env,
@@ -6793,6 +6842,7 @@ async fn get_oauth_callback(
             state: oauth_state,
         },
         "messaging.oauth.v1",
+        setup_callback_base.as_deref(),
     )
     .await
     {
@@ -6811,11 +6861,14 @@ async fn get_oauth_callback(
                 ),
             )
         }
-        Err(err) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            oauth_callback_page(false, "OAuth setup failed", &err.to_string()),
-        ),
+        Err(err) => {
+            eprintln!("[oauth-token] callback FAILED: {err:#}");
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                oauth_callback_page(false, "OAuth setup failed", &err.to_string()),
+            )
+        }
     }
 }
 
@@ -7480,6 +7533,10 @@ struct SetupActionFinalUrlContext<'a> {
     team: Option<&'a str>,
     provider_id: &'a str,
     action_id: &'a str,
+    /// Base URL of the setup server's own `/oauth/callback/<provider>` endpoint.
+    /// Must be the SAME value used for the app manifest's `redirect_urls` and for
+    /// the token-exchange `redirect_uri`, or Slack rejects the exchange.
+    setup_callback_base: Option<&'a str>,
 }
 
 fn setup_action_final_url_value(
@@ -7506,6 +7563,12 @@ fn setup_action_final_url_value(
             url,
         )));
     }
+    // The deep-link key (e.g. slack_app_url -> install-on-team) opens the
+    // provider dashboard install. It cannot deliver an OAuth code back to our
+    // callback, but it is the only install path that works in locked-down
+    // orgs (e.g. Enterprise Grid without org app approval), so it is preferred
+    // whenever registration returned it; the OAuth authorize URL below is the
+    // fallback for packs that don't supply a dashboard link.
     if let Some(key) = key.as_deref()
         && let Some(url) = config
             .get(key)
@@ -7513,24 +7576,40 @@ fn setup_action_final_url_value(
             .map(str::trim)
             .filter(|value| !value.is_empty())
     {
-        return Ok(Some((key.to_string(), rewrite_slack_app_redirect(url))));
+        let rewritten = rewrite_slack_app_redirect(url);
+        // When the rewrite produced a DIFFERENT url (app_redirect -> dashboard
+        // install page), return it under its own key so the registration's
+        // original value survives: `slack_app_url` (app_redirect) is the
+        // post-setup "open the bot in Slack" deep link and must not be
+        // clobbered by the one-time install-page URL.
+        let url_key = if rewritten != url {
+            "install_url".to_string()
+        } else {
+            key.to_string()
+        };
+        return Ok(Some((url_key, rewritten)));
     }
-    let Some(url) = build_oauth_install_url(
-        context.bundle_root,
-        action,
-        config,
-        context.tenant,
-        context.team,
-        context.provider_id,
-        context.action_id,
-    )?
-    else {
+    let Some(url) = build_oauth_install_url(action, config, context)? else {
         return Ok(None);
     };
-    Ok(Some((
-        key.unwrap_or_else(|| "oauth_authorize_url".to_string()),
-        url,
-    )))
+    // Store the authorize URL under the deep-link key only when registration did
+    // not already supply that key (legacy packs use it as the button slot). When
+    // registration returned it (e.g. Slack's slack_app_url -> install-on-team),
+    // keep that value for the post-setup "open the installed app" link and expose
+    // the authorize URL under oauth_authorize_url instead.
+    let url_key = match key {
+        Some(k)
+            if config
+                .get(&k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_none_or(str::is_empty) =>
+        {
+            k
+        }
+        _ => "oauth_authorize_url".to_string(),
+    };
+    Ok(Some((url_key, url)))
 }
 
 fn setup_action_final_url_key(descriptor: &Value) -> Option<String> {
@@ -7607,14 +7686,18 @@ fn rewrite_slack_app_redirect(url: &str) -> String {
 }
 
 fn build_oauth_install_url(
-    bundle_root: &Path,
     action: &Value,
     config: &JsonMap<String, Value>,
-    tenant: &str,
-    team: Option<&str>,
-    provider_id: &str,
-    action_id: &str,
+    context: &SetupActionFinalUrlContext<'_>,
 ) -> Result<Option<String>> {
+    let SetupActionFinalUrlContext {
+        bundle_root,
+        tenant,
+        team,
+        provider_id,
+        action_id,
+        setup_callback_base,
+    } = *context;
     let Some(authorize_url) = config
         .get("oauth_authorize_url")
         .and_then(Value::as_str)
@@ -7651,15 +7734,20 @@ fn build_oauth_install_url(
     if let Some(redirect_path) = action.get("redirect_path").and_then(Value::as_str) {
         // The OAuth callback (developer app-install) is served by THIS setup
         // server via `/oauth/callback/<provider>` + `complete_oauth_callback`,
-        // NOT the runtime. Prefer the setup server's own public URL; fall back to
-        // the messaging `public_base_url` (the runtime) only when unset.
-        let callback_base = setup_oauth_callback_base_url().or_else(|| {
-            config
-                .get("public_base_url")
-                .and_then(Value::as_str)
-                .map(|value| value.trim().trim_end_matches('/').to_string())
-                .filter(|value| !value.is_empty())
-        });
+        // NOT the runtime. Prefer the resolved setup-callback base (live setup
+        // tunnel or env override) — the same value stamped into the manifest's
+        // `redirect_urls` and used for the exchange — so all three agree. Fall
+        // back to the env, then to the messaging `public_base_url` (the runtime).
+        let callback_base = setup_callback_base
+            .map(|value| value.trim_end_matches('/').to_string())
+            .or_else(setup_oauth_callback_base_url)
+            .or_else(|| {
+                config
+                    .get("public_base_url")
+                    .and_then(Value::as_str)
+                    .map(|value| value.trim().trim_end_matches('/').to_string())
+                    .filter(|value| !value.is_empty())
+            });
         if let Some(callback_base) = callback_base {
             let redirect_uri = format!(
                 "{}{}",
