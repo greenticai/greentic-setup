@@ -490,6 +490,10 @@ pub struct ProviderAddArgs {
     /// Local .gtpack file override (skips OCI fetch)
     #[arg(long = "pack")]
     pub pack: Option<PathBuf>,
+    /// OCI tag override (e.g. a specific version like "0.5.6"). Only affects
+    /// the OCI reference; ignored when --pack is given.
+    #[arg(long = "pack-version")]
+    pub pack_version: Option<String>,
     /// Provider instance id (defaults to the kind name)
     #[arg(long = "provider-id")]
     pub provider_id: Option<String>,
