@@ -24,7 +24,7 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
 
-use greentic_setup::cli_args::{BundleCommand, Cli, Command};
+use greentic_setup::cli_args::{BundleCommand, Cli, Command, ProviderCommand};
 use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
     SetupOutputTarget, complete_loaded_answers_with_prompts, copy_dir_recursive,
@@ -132,6 +132,24 @@ fn main() -> Result<()> {
                 cli.dry_run,
                 cli.non_interactive,
             )
+        }
+        Some(Command::Provider(cmd)) => {
+            let env = greentic_setup::resolve_env(Some(&cli.env));
+            match cmd {
+                ProviderCommand::Add(args) => greentic_setup::provider_commands::add(
+                    &args,
+                    &env,
+                    &cli.tenant,
+                    cli.team.as_deref(),
+                    cli.dry_run,
+                    cli.non_interactive,
+                    cli.answers.as_deref(),
+                ),
+                ProviderCommand::List(_) => greentic_setup::provider_commands::list(&env),
+                ProviderCommand::Remove(args) => {
+                    greentic_setup::provider_commands::remove(&args.endpoint_id, &env)
+                }
+            }
         }
         Some(Command::Bundle(cmd)) => match *cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),

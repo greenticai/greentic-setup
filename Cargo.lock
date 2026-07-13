@@ -173,6 +173,9 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
 
 [[package]]
 name = "arc-swap"
@@ -1485,6 +1488,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2249,9 +2263,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aac2aedfc38d65f8e9744de6864ec73cb0c21240f0378be9e87ba6abe7157cb4"
+checksum = "c7d88ef49f94c14148af229c37e503e2a3d689bc45be63ed445443769b673eea"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2700,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -2829,18 +2843,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a47eb7b004ef9ad38b5d11acd9561c4b0cf28f9126c9cfe1d86fcf8ae66c6691"
 dependencies = [
  "chrono",
+ "flate2",
  "fs4",
  "greentic-distributor-client",
  "hex",
  "rcgen",
  "reqwest 0.13.4",
+ "self-replace",
  "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "x509-parser",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -5357,6 +5375,17 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "self-replace"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03ec815b5eab420ab893f63393878d89c90fdd94c0bcc44c07abb8ad95552fb7"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8039,6 +8068,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zip"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "crossbeam-utils",
+ "displaydoc",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "thiserror 2.0.18",
+ "zopfli",
 ]
 
 [[package]]
