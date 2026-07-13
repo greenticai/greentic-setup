@@ -48,7 +48,8 @@ pub fn emit_answers(
             "deployment_targets": plan.metadata.deployment_targets,
             "tunnel": tunnel_value
         },
-        "setup_answers": {}
+        "setup_answers": {},
+        "answers_schema": { "setup_answers": {} }
     });
 
     if !plan.metadata.static_routes.public_web_enabled
@@ -74,6 +75,10 @@ pub fn emit_answers(
     // Discover packs and populate question templates for all providers.
     // If a provider entry already exists but is empty, merge in the
     // questions from setup.yaml so the user sees what needs to be filled.
+    // `answers_schema` entries are accumulated separately (rather than
+    // written straight into `answers_doc`) because `setup_answers` already
+    // holds a mutable borrow of `answers_doc` for the duration of this loop.
+    let mut discovered_schemas: JsonMap<String, Value> = JsonMap::new();
     if bundle.exists() {
         let discovered = discovery::discover(bundle)?;
         for provider in discovered.setup_targets() {
@@ -83,10 +88,10 @@ pub fn emit_answers(
                 .and_then(|v| v.as_object())
                 .is_some_and(|m| m.is_empty());
             if !setup_answers.contains_key(&provider_id) || existing_is_empty {
-                let template = if let Some(form_spec) =
-                    crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider_id)
-                {
-                    template_from_form_spec(&form_spec)
+                let form_spec =
+                    crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider_id);
+                let template = if let Some(form_spec) = &form_spec {
+                    template_from_form_spec(form_spec)
                 } else if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
                     let mut entries = JsonMap::new();
                     for question in &spec.questions {
@@ -97,10 +102,22 @@ pub fn emit_answers(
                 } else {
                     JsonMap::new()
                 };
-                setup_answers.insert(provider_id, Value::Object(template));
+                setup_answers.insert(provider_id.clone(), Value::Object(template));
+
+                let schema = if let Some(form_spec) = &form_spec {
+                    schema_from_form_spec(form_spec)
+                } else {
+                    JsonMap::new()
+                };
+                discovered_schemas.insert(provider_id, Value::Object(schema));
             }
         }
     }
+
+    answers_doc["answers_schema"]["setup_answers"]
+        .as_object_mut()
+        .expect("answers_schema.setup_answers is an object")
+        .extend(discovered_schemas);
 
     // Prompt for secret values if interactive
     if interactive {
@@ -384,6 +401,23 @@ fn template_from_form_spec(form_spec: &qa_spec::FormSpec) -> JsonMap<String, Val
     entries
 }
 
+/// Build the per-question schema (required/secret/title) mirroring
+/// `template_from_form_spec`, so a shell-out consumer can classify each field.
+fn schema_from_form_spec(form_spec: &qa_spec::FormSpec) -> JsonMap<String, Value> {
+    let mut entries = JsonMap::new();
+    for question in &form_spec.questions {
+        entries.insert(
+            question.id.clone(),
+            serde_json::json!({
+                "required": question.required,
+                "secret": question.secret,
+                "title": question.title,
+            }),
+        );
+    }
+    entries
+}
+
 fn empty_value_for_question(kind: QuestionType) -> Value {
     match kind {
         QuestionType::Boolean => Value::String(String::new()),
@@ -464,6 +498,47 @@ mod tests {
             doc.pointer("/setup_answers/weather-app/weather_api_key"),
             Some(&Value::String(String::new()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn emit_answers_includes_answers_schema_with_required_and_secret_flags() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle_root = temp.path().join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_root, Some("weather-demo"))?;
+
+        let pack_path = bundle_root.join("packs").join("weather-app.gtpack");
+        write_app_pack(&pack_path, "weather-app", "WEATHER_API_KEY")?;
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".to_string(),
+            team: None,
+            env: "dev".to_string(),
+            offline: false,
+            verbose: false,
+        });
+        let request = SetupRequest {
+            bundle: bundle_root.clone(),
+            tenants: vec![TenantSelection {
+                tenant: "demo".to_string(),
+                team: None,
+                allow_paths: Vec::new(),
+            }],
+            update_ops: BTreeSet::new(),
+            static_routes: StaticRoutesPolicy::default(),
+            ..Default::default()
+        };
+        let plan = engine.plan(crate::SetupMode::Create, &request, true)?;
+
+        let answers_path = temp.path().join("answers.json");
+        emit_answers(engine.config(), &plan, &answers_path, None, false)?;
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&answers_path)?)?;
+        let field = &doc["answers_schema"]["setup_answers"]["weather-app"]["weather_api_key"];
+        assert_eq!(field["required"], serde_json::json!(true));
+        assert_eq!(field["secret"], serde_json::json!(true));
+        assert!(field["title"].is_string());
         Ok(())
     }
 }
