@@ -519,9 +519,15 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
                 Some(idem_key),
             ) {
                 Ok(_endpoint_id) => {
-                    eprintln!(
-                        "Provider `{provider_id}` wired to bundle `{bundle_id}` in env `{env}`."
-                    );
+                    if provider_entry.link_bundle {
+                        eprintln!(
+                            "Provider `{provider_id}` wired to bundle `{bundle_id}` in env `{env}`."
+                        );
+                    } else {
+                        eprintln!(
+                            "Provider `{provider_id}` registered in env `{env}` (not linked to bundle)."
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("Warning: failed to wire provider `{provider_id}`: {e:#}");

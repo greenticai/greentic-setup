@@ -13,6 +13,10 @@ use crate::plan::{
 };
 use crate::platform_setup::{PlatformSetupAnswers, StaticRoutesPolicy, TelemetryAnswers};
 
+fn default_true() -> bool {
+    true
+}
+
 /// A declarative provider entry in the answers document.
 ///
 /// Each entry maps to a `provider add` + `link-bundle` mutation during
@@ -25,7 +29,9 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub display_name: Option<String>,
     /// Whether to link the provider to the deployed bundle.
-    #[serde(default)]
+    /// Defaults to `true` — matching `provider add` interactive behaviour.
+    /// Set to `false` explicitly to register without linking.
+    #[serde(default = "default_true")]
     pub link_bundle: bool,
     /// Provider-specific setup answers (may contain secret values).
     #[serde(default)]

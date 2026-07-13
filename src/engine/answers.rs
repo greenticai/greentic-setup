@@ -173,7 +173,32 @@ pub fn load_answers(
 
             let providers: Vec<super::types::ProviderEntry> = map
                 .get("providers")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .cloned()
+                .map(|v| {
+                    serde_json::from_value::<Vec<super::types::ProviderEntry>>(v.clone())
+                        .with_context(|| {
+                            // Surface which entry is malformed by trying each element individually.
+                            if let Some(arr) = v.as_array() {
+                                for (i, entry) in arr.iter().enumerate() {
+                                    if let Err(e) =
+                                        serde_json::from_value::<super::types::ProviderEntry>(
+                                            entry.clone(),
+                                        )
+                                    {
+                                        let kind_hint = entry
+                                            .get("kind")
+                                            .and_then(|k| k.as_str())
+                                            .unwrap_or("<unknown>");
+                                        return format!(
+                                            "parse providers[{i}] (kind={kind_hint}): {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            "parse providers array".to_string()
+                        })
+                })
+                .transpose()?
                 .unwrap_or_default();
 
             if let Some(Value::Object(setup_answers)) = map.get("setup_answers") {
@@ -771,6 +796,93 @@ mod tests {
             key_local, key_prod,
             "different envs must produce different keys"
         );
+    }
+
+    // ── Finding 1: malformed providers[] must error, not silently drop ──
+
+    #[test]
+    fn malformed_provider_entry_returns_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers_path = temp.path().join("answers.json");
+        // "kid" is a typo for "kind" — the required field is missing.
+        let doc = serde_json::json!({
+            "bundle_source": "./my-bundle",
+            "tenant": "demo",
+            "env": "local",
+            "setup_answers": {},
+            "providers": [{
+                "kid": "telegram",
+                "answers": {
+                    "telegram_bot_token": "fake-token"
+                }
+            }]
+        });
+        std::fs::write(&answers_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let result = load_answers(&answers_path, None, false);
+        assert!(
+            result.is_err(),
+            "malformed providers[] entry must produce an error, not an empty vec"
+        );
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("providers[0]"),
+            "error must identify the offending entry index, got: {err_msg}"
+        );
+    }
+
+    // ── Finding 2: link_bundle defaults to true, explicit false honoured ──
+
+    #[test]
+    fn link_bundle_defaults_to_true_when_omitted() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let answers_path = temp.path().join("answers.json");
+        // No "link_bundle" key — must default to true.
+        let doc = serde_json::json!({
+            "bundle_source": "./my-bundle",
+            "tenant": "demo",
+            "env": "local",
+            "setup_answers": {},
+            "providers": [{
+                "kind": "telegram",
+                "answers": {}
+            }]
+        });
+        std::fs::write(&answers_path, serde_json::to_string_pretty(&doc)?)?;
+
+        let loaded = load_answers(&answers_path, None, false)?;
+        assert_eq!(loaded.providers.len(), 1);
+        assert!(
+            loaded.providers[0].link_bundle,
+            "link_bundle must default to true (matching interactive `provider add`)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn link_bundle_explicit_false_honoured() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let answers_path = temp.path().join("answers.json");
+        let doc = serde_json::json!({
+            "bundle_source": "./my-bundle",
+            "tenant": "demo",
+            "env": "local",
+            "setup_answers": {},
+            "providers": [{
+                "kind": "telegram",
+                "link_bundle": false,
+                "answers": {}
+            }]
+        });
+        std::fs::write(&answers_path, serde_json::to_string_pretty(&doc)?)?;
+
+        let loaded = load_answers(&answers_path, None, false)?;
+        assert_eq!(loaded.providers.len(), 1);
+        assert!(
+            !loaded.providers[0].link_bundle,
+            "explicit link_bundle: false must be honoured"
+        );
+        Ok(())
     }
 
     #[test]
