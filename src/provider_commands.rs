@@ -51,7 +51,7 @@ fn op_flags() -> OpFlags {
 /// 1. `--pack <path>` explicit override.
 /// 2. OCI fetch from GHCR.
 /// 3. Offline fallback: pack already inside the deployed bundle in this env.
-fn resolve_pack(
+pub fn resolve_pack(
     explicit_pack: Option<&Path>,
     info: &ProviderPackInfo,
     store: &LocalFsStore,
@@ -180,7 +180,7 @@ fn deployer_secret_path(tenant: &str, team: Option<&str>, provider: &str, key: &
 /// Reads `environment.json` directly from the store's on-disk layout rather
 /// than going through `EnvironmentReads` (which requires `EnvId`, a type
 /// from `greentic-deploy-spec` that is not in our dependency graph).
-fn auto_detect_bundle_id(store: &LocalFsStore, env_id_str: &str) -> Result<String> {
+pub fn auto_detect_bundle_id(store: &LocalFsStore, env_id_str: &str) -> Result<String> {
     let env_json_path = store.root().join(env_id_str).join("environment.json");
     if !env_json_path.is_file() {
         bail!(
@@ -236,23 +236,6 @@ fn auto_detect_bundle_id(store: &LocalFsStore, env_id_str: &str) -> Result<Strin
             )
         }
     }
-}
-
-/// Public wrapper around `auto_detect_bundle_id` for use from the binary
-/// crate's answers-driven auto-deploy path.
-pub fn auto_detect_bundle_id_pub(store: &LocalFsStore, env_id: &str) -> Result<String> {
-    auto_detect_bundle_id(store, env_id)
-}
-
-/// Public wrapper around `resolve_pack` for use from the binary crate's
-/// answers-driven auto-deploy path.
-pub fn resolve_pack_pub(
-    explicit_pack: Option<&Path>,
-    info: &crate::provider_registry::ProviderPackInfo,
-    store: &LocalFsStore,
-    env_id: &str,
-) -> Result<std::path::PathBuf> {
-    resolve_pack(explicit_pack, info, store, env_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -367,9 +350,8 @@ pub fn register_provider_core(
             }),
         );
         match put_result {
-            Ok(outcome) => {
+            Ok(_outcome) => {
                 eprintln!("  Secret written: {uri}");
-                let _ = outcome;
             }
             Err(e) => {
                 bail!(
@@ -541,7 +523,7 @@ pub fn add(
 
     let answers_map = answers.as_object().cloned().unwrap_or_default();
 
-    let endpoint_id = register_provider_core(
+    let _endpoint_id = register_provider_core(
         &store,
         &RegisterProviderPayload {
             env_id,
@@ -581,7 +563,6 @@ pub fn add(
         );
     }
 
-    let _ = endpoint_id;
     Ok(())
 }
 

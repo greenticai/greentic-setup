@@ -454,7 +454,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         let store_root = greentic_deployer::environment::LocalFsStore::default_root()
             .context("cannot locate the environment store")?;
         let store = greentic_deployer::environment::LocalFsStore::new(store_root);
-        let bundle_id = greentic_setup::provider_commands::auto_detect_bundle_id_pub(&store, &env)?;
+        let bundle_id = greentic_setup::provider_commands::auto_detect_bundle_id(&store, &env)?;
 
         for provider_entry in &declared_providers {
             let kind = provider_entry.kind.to_ascii_lowercase();
@@ -474,7 +474,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             // Resolve the pack: try the bundle's packs directory first,
             // then fall back to OCI / offline scan.
             let pack_path =
-                greentic_setup::provider_commands::resolve_pack_pub(None, info, &store, &env);
+                greentic_setup::provider_commands::resolve_pack(None, info, &store, &env);
             let pack_path = match pack_path {
                 Ok(p) => p,
                 Err(e) => {
