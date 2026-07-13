@@ -257,10 +257,11 @@ pub fn add(
     non_interactive: bool,
     answers_path: Option<&Path>,
 ) -> Result<()> {
-    let info = provider_registry::lookup(&args.kind).ok_or_else(|| {
+    let kind = args.kind.to_ascii_lowercase();
+    let info = provider_registry::lookup(&kind).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown provider kind `{}`. Known kinds: {}",
-            args.kind,
+            kind,
             provider_registry::known_kinds().join(", "),
         )
     })?;
@@ -342,9 +343,8 @@ pub fn add(
             "Dry run: would register provider `{provider_id}` (type: {}) in env `{env_id}`.",
             info.provider_type
         );
-        if let Ok(json) = serde_json::to_string_pretty(&answers) {
-            println!("{json}");
-        }
+        let json = serde_json::to_string_pretty(&answers).context("serialize dry-run answers")?;
+        println!("{json}");
         return Ok(());
     }
 
@@ -447,7 +447,12 @@ pub fn add(
                 let _ = outcome;
             }
             Err(e) => {
-                bail!("failed to write secret `{key}` to env store: {e}");
+                bail!(
+                    "failed to write secret `{key}` to env store: {e}\n\n\
+                     The endpoint `{endpoint_id}` was already registered. \
+                     To clean up, run:\n  \
+                     greentic-setup provider remove {endpoint_id} --env {env_id}"
+                );
             }
         }
     }
