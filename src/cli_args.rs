@@ -26,6 +26,13 @@ use clap::{Args, Parser, Subcommand};
     greentic-setup env-deploy ./my-bundle.gtbundle --env staging
     greentic-setup env-deploy --dry-run ./my-bundle.gtbundle
 
+  Add a messaging provider to an environment:
+    greentic-setup provider add telegram
+    greentic-setup provider add slack --env staging
+    greentic-setup provider add telegram --answers answers.json --non-interactive
+    greentic-setup provider list
+    greentic-setup provider remove <endpoint-id>
+
   Advanced (bundle subcommands):
     greentic-setup bundle init ./my-bundle
     greentic-setup bundle add pack.gtpack --bundle ./my-bundle
@@ -96,6 +103,9 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Deploy a bundle into an environment via the env-apply engine
     EnvDeploy(EnvDeployArgs),
+    /// Manage messaging providers in an environment
+    #[command(subcommand)]
+    Provider(ProviderCommand),
     /// Bundle lifecycle management (advanced)
     #[command(subcommand)]
     Bundle(Box<BundleCommand>),
@@ -455,4 +465,45 @@ pub struct BundleStatusArgs {
     /// Output format (text/json)
     #[arg(long = "format", default_value = "text")]
     pub format: String,
+}
+
+// --- Provider subcommands ---------------------------------------------------
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ProviderCommand {
+    /// Add a messaging provider to an environment
+    Add(ProviderAddArgs),
+    /// List messaging providers in an environment
+    List(ProviderListArgs),
+    /// Remove a messaging provider from an environment
+    Remove(ProviderRemoveArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProviderAddArgs {
+    /// Provider kind (telegram, slack, webex, teams)
+    #[arg(value_name = "KIND")]
+    pub kind: String,
+    /// Bundle id to link (auto-detected when the env has exactly one bundle)
+    #[arg(long = "bundle-id")]
+    pub bundle_id: Option<String>,
+    /// Local .gtpack file override (skips OCI fetch)
+    #[arg(long = "pack")]
+    pub pack: Option<PathBuf>,
+    /// Provider instance id (defaults to the kind name)
+    #[arg(long = "provider-id")]
+    pub provider_id: Option<String>,
+    /// Human-readable display name for the endpoint
+    #[arg(long = "display-name")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProviderListArgs {}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProviderRemoveArgs {
+    /// Endpoint id to remove (from `provider list`)
+    #[arg(value_name = "ENDPOINT_ID")]
+    pub endpoint_id: String,
 }
