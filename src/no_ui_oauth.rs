@@ -117,11 +117,13 @@ fn run_callback_server(listener: TcpListener, bundle_root: PathBuf, env: String)
 
         eprintln!("[no-ui-oauth] completing OAuth callback");
         let runtime = tokio::runtime::Runtime::new().context("create OAuth callback runtime")?;
+        let setup_callback_base = crate::oauth_callback::env_setup_callback_base();
         let result = runtime.block_on(crate::oauth_callback::complete_oauth_callback(
             &bundle_root,
             &env,
             &crate::oauth_callback::OAuthCallbackInput { code, state },
             "messaging.oauth.v1",
+            setup_callback_base.as_deref(),
         ));
 
         return match result {

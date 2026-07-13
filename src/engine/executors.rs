@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
 use serde_json::{Map as JsonMap, Value};
@@ -457,6 +457,14 @@ pub fn execute_apply_pack_setup(
             crate::setup_actions::persist_setup_actions(bundle_path, &setup_actions)?;
             pending_setup_actions.extend(setup_actions.clone());
         }
+        // Slack's `app_redirect` deep link (the final "Add to Slack" -> DM with
+        // the bot) cannot resolve the workspace without a `team` parameter in
+        // multi-workspace / Enterprise Grid browsers. When a bot token answer is
+        // available, resolve the workspace once via auth.test and pin it.
+        let slack_team = slack_team_id_from_answers(&effective_answers);
+        if let Some(team) = slack_team.as_deref() {
+            apply_slack_team_to_app_url(&mut effective_answers, team);
+        }
         let persisted_answers = crate::setup_actions::strip_setup_actions(&effective_answers);
 
         // Write answers to provider config directory
@@ -487,8 +495,11 @@ pub fn execute_apply_pack_setup(
         let resolved_secret_keys: Option<BTreeSet<String>> =
             pack_path.and_then(|pp| resolve_secret_answer_keys(pp, &provider_id));
         let secret_keys = secret_keys_or_fail_closed(resolved_secret_keys, answers, &provider_id)?;
-        let answers_for_disk = strip_secret_answer_keys(answers, &secret_keys);
-        let envelope_answers = redact_secret_answer_values_to_uri_refs(
+        let mut answers_for_disk = strip_secret_answer_keys(answers, &secret_keys);
+        if let Some(team) = slack_team.as_deref() {
+            apply_slack_team_to_app_url(&mut answers_for_disk, team);
+        }
+        let mut envelope_answers = redact_secret_answer_values_to_uri_refs(
             answers,
             &secret_keys,
             &env,
@@ -496,6 +507,9 @@ pub fn execute_apply_pack_setup(
             config.team.as_deref(),
             &provider_id,
         );
+        if let Some(team) = slack_team.as_deref() {
+            apply_slack_team_to_app_url(&mut envelope_answers, team);
+        }
 
         let config_path = config_dir.join("setup-answers.json");
         let content = serde_json::to_string_pretty(&answers_for_disk)
@@ -1017,13 +1031,33 @@ fn build_registration_request(
     let answers_obj = answers
         .as_object()
         .ok_or_else(|| anyhow!("provider setup answers must be an object"))?;
-    let effective_public_base_url = public_base_url.or_else(|| {
-        answers_obj
-            .get("public_base_url")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    });
+    // For an OAuth developer-install action, the app manifest's `redirect_urls`
+    // (written by this registration op) MUST equal the authorize `redirect_uri`
+    // that `build_oauth_install_url` will later put in the install link — which is
+    // the setup server's own callback base (`GREENTIC_SETUP_PUBLIC_BASE_URL`), not
+    // the runtime's `public_base_url`. Prefer that base here so Slack sees a
+    // redirect_uri it recognizes; otherwise the exchange fails with
+    // `bad_redirect_uri` and no bot token is captured.
+    let setup_callback_base =
+        if action.kind == crate::setup_actions::SetupActionKind::OauthInstallButton {
+            std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
+                .ok()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| value.starts_with("https://"))
+        } else {
+            None
+        };
+    let effective_public_base_url =
+        setup_callback_base
+            .as_deref()
+            .or(public_base_url)
+            .or_else(|| {
+                answers_obj
+                    .get("public_base_url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            });
     let effective_team = config.team.as_deref().unwrap_or("default");
     let mut input = JsonMap::new();
     input.insert("answers".into(), answers.clone());
@@ -1162,6 +1196,65 @@ fn invoke_registration_operation(
     invoke_wasm_registration_component(bundle_path, pack_path, component_ref, op, request, config)
 }
 
+/// Resolve the Slack workspace (team) id for the bot token in `answers` via
+/// `auth.test`, so `slack_app_url` can be pinned to the right workspace.
+/// Returns `None` (best-effort) when there's no token, no `slack_app_url` to
+/// enrich, the URL is already pinned, or the call fails.
+fn slack_team_id_from_answers(answers: &Value) -> Option<String> {
+    let obj = answers.as_object()?;
+    let app_url = obj.get("slack_app_url").and_then(Value::as_str)?;
+    if !app_url.contains("app_redirect") || app_url.contains("team=") {
+        return None;
+    }
+    let token = obj
+        .get("slack_bot_token")
+        .or_else(|| obj.get("bot_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| t.starts_with("xoxb"))?;
+    let mut response = crate::http_client::api_agent_any_status()
+        .post("https://slack.com/api/auth.test")
+        .header("Authorization", &format!("Bearer {token}"))
+        .send_empty()
+        .ok()?;
+    let body: Value = response.body_mut().read_json().ok()?;
+    if body.get("ok").and_then(Value::as_bool) != Some(true) {
+        eprintln!(
+            "[oauth-token] auth.test failed: {:?} — Add to Slack link stays unpinned",
+            body.get("error").and_then(Value::as_str)
+        );
+        return None;
+    }
+    let team = body
+        .get("team_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?
+        .to_string();
+    eprintln!("[oauth-token] auth.test ok: team_id={team} — pinning Add to Slack link");
+    Some(team)
+}
+
+/// Pin `slack_app_url` (an `app_redirect` link) to `team` and record
+/// `slack_team_id`, so the final "Add to Slack" opens the bot's DM in the right
+/// workspace instead of a workspace picker / app-not-found page.
+fn apply_slack_team_to_app_url(answers: &mut Value, team: &str) {
+    let Some(obj) = answers.as_object_mut() else {
+        return;
+    };
+    if let Some(url) = obj
+        .get("slack_app_url")
+        .and_then(Value::as_str)
+        .filter(|url| url.contains("app_redirect") && !url.contains("team="))
+    {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let pinned = format!("{url}{separator}team={team}");
+        obj.insert("slack_app_url".to_string(), Value::String(pinned));
+    }
+    obj.entry("slack_team_id".to_string())
+        .or_insert_with(|| Value::String(team.to_string()));
+}
+
 pub fn invoke_setup_component_operation(
     bundle_path: &Path,
     pack_path: &Path,
@@ -1177,23 +1270,101 @@ pub fn invoke_setup_component_operation(
     invoke_registration_operation(bundle_path, pack_path, &registration, request, config)
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct SetupRegistrationSecrets {
+    /// Secrets written by the op during this invocation (e.g. freshly minted
+    /// credentials). Takes precedence over the persisted store.
     values: Mutex<BTreeMap<String, Vec<u8>>>,
+    /// Read-through to the bundle's persisted dev store so the op can recover
+    /// previously-stored secrets on re-runs (e.g. the Slack signing secret,
+    /// which Slack only returns when it *creates* an app — not on reuse).
+    dev_store: Option<Arc<greentic_secrets_lib::DevStore>>,
+}
+
+impl SetupRegistrationSecrets {
+    fn with_dev_store(dev_store: Option<Arc<greentic_secrets_lib::DevStore>>) -> Self {
+        Self {
+            values: Mutex::new(BTreeMap::new()),
+            dev_store,
+        }
+    }
+}
+
+/// Candidate secret URIs to try when reading a previously-stored secret.
+///
+/// A secret URI is `secrets://<env>/<tenant>/<team>/<provider>/<key>`, and two
+/// segments are normalized inconsistently across persist/read sites:
+/// - **env** is branched between the current default [`crate::DEFAULT_ENV_ID`]
+///   (`local`) and the legacy [`crate::LEGACY_ENV_ID`] (`dev`); a value stored
+///   under one may be read under the other.
+/// - **provider** is branched between the hyphenated pack id (`messaging-slack`)
+///   and the underscore-normalized form the store uses (`messaging_slack`).
+///
+/// Emit the path as-is plus the env × provider variants so reuse can recover a
+/// value regardless of which normalization was used when it was written.
+fn secret_uri_candidates(path: &str) -> Vec<String> {
+    let mut out = vec![path.to_string()];
+    let Some(rest) = path.strip_prefix("secrets://") else {
+        return out;
+    };
+    let segs: Vec<&str> = rest.splitn(5, '/').collect();
+    if segs.len() != 5 {
+        return out;
+    }
+    let (env, tenant, team, provider, key) = (segs[0], segs[1], segs[2], segs[3], segs[4]);
+
+    let env_variants: Vec<&str> = if env == crate::DEFAULT_ENV_ID {
+        vec![crate::DEFAULT_ENV_ID, crate::LEGACY_ENV_ID]
+    } else if env == crate::LEGACY_ENV_ID {
+        vec![crate::LEGACY_ENV_ID, crate::DEFAULT_ENV_ID]
+    } else {
+        vec![env]
+    };
+    let mut provider_variants = vec![provider.to_string()];
+    for alt in [provider.replace('-', "_"), provider.replace('_', "-")] {
+        if alt != provider && !provider_variants.contains(&alt) {
+            provider_variants.push(alt);
+        }
+    }
+
+    for env in &env_variants {
+        for provider in &provider_variants {
+            let candidate = format!("secrets://{env}/{tenant}/{team}/{provider}/{key}");
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
 }
 
 #[async_trait::async_trait]
 impl greentic_secrets_lib::SecretsManager for SetupRegistrationSecrets {
     async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
-        let values = self.values.lock().map_err(|_| {
-            greentic_secrets_lib::SecretError::Backend(
-                "setup component secrets lock poisoned".into(),
-            )
-        })?;
-        values
-            .get(path)
-            .cloned()
-            .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+        {
+            let values = self.values.lock().map_err(|_| {
+                greentic_secrets_lib::SecretError::Backend(
+                    "setup component secrets lock poisoned".into(),
+                )
+            })?;
+            if let Some(value) = values.get(path) {
+                return Ok(value.clone());
+            }
+        }
+        if let Some(store) = &self.dev_store {
+            use greentic_secrets_lib::SecretsStore;
+            for candidate in secret_uri_candidates(path) {
+                match store.get(&candidate).await {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(err) => {
+                        tracing::debug!(candidate, error = %err, "setup secrets read miss");
+                    }
+                }
+            }
+        }
+        Err(greentic_secrets_lib::SecretError::NotFound(
+            path.to_string(),
+        ))
     }
 
     async fn write(&self, path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
@@ -1268,8 +1439,23 @@ timers: []
 
     let session_store = new_session_store();
     let state_store = new_state_store();
+    // greentic-runner-host's provider-core-only enforcement defaults to ON and
+    // denies every component secrets_store::get/put BEFORE consulting the secrets
+    // manager. greentic-start disables it at startup; mirror that here or
+    // registration ops can never read stored secrets (e.g. Slack's signing secret
+    // or configuration tokens on app reuse) and fail with misleading
+    // "<secret> is required" errors.
+    unsafe { std::env::set_var("GREENTIC_PROVIDER_CORE_ONLY", "0") };
+
+    // Back the setup-component secrets with the bundle's persisted dev store so
+    // registration ops can recover previously-stored secrets on re-runs (e.g. the
+    // Slack signing secret on app reuse). Best-effort: an unreadable store just
+    // means the op sees only what it writes this invocation (prior behavior).
+    let dev_store = crate::secrets::open_dev_store(bundle_path)
+        .ok()
+        .map(Arc::new);
     let secrets: greentic_runner_host::secrets::DynSecretsManager =
-        Arc::new(SetupRegistrationSecrets::default());
+        Arc::new(SetupRegistrationSecrets::with_dev_store(dev_store));
     let pack = greentic_runner_host::runtime::block_on(PackRuntime::load(
         pack_path,
         Arc::clone(&host_config),
@@ -1825,6 +2011,59 @@ mod tests {
     use super::*;
     use crate::platform_setup::StaticRoutesPolicy;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn secret_uri_candidates_cover_env_and_provider_branches() {
+        // Stored under the current default env + underscore provider; a read that
+        // resolves to the legacy env + hyphenated provider must still find it.
+        let cands =
+            secret_uri_candidates("secrets://dev/demo/_/messaging-slack/slack_signing_secret");
+        assert!(
+            cands
+                .contains(&"secrets://dev/demo/_/messaging-slack/slack_signing_secret".to_string())
+        );
+        assert!(
+            cands.contains(
+                &"secrets://local/demo/_/messaging_slack/slack_signing_secret".to_string()
+            )
+        );
+        assert!(
+            cands.contains(
+                &"secrets://local/demo/_/messaging-slack/slack_signing_secret".to_string()
+            )
+        );
+        assert!(
+            cands
+                .contains(&"secrets://dev/demo/_/messaging_slack/slack_signing_secret".to_string())
+        );
+        // First candidate is always the path as-is.
+        assert_eq!(
+            cands[0],
+            "secrets://dev/demo/_/messaging-slack/slack_signing_secret"
+        );
+    }
+
+    #[test]
+    fn secret_uri_candidates_do_not_alias_custom_env() {
+        let cands = secret_uri_candidates("secrets://prod/acme/team/messaging_slack/bot_token");
+        // Provider still branches, but a non-default/non-legacy env is never
+        // remapped to dev/local.
+        assert!(cands.contains(&"secrets://prod/acme/team/messaging_slack/bot_token".to_string()));
+        assert!(cands.contains(&"secrets://prod/acme/team/messaging-slack/bot_token".to_string()));
+        assert!(
+            !cands
+                .iter()
+                .any(|c| c.contains("/dev/") || c.contains("/local/"))
+        );
+    }
+
+    #[test]
+    fn secret_uri_candidates_passthrough_non_secret_paths() {
+        assert_eq!(
+            secret_uri_candidates("SLACK_BOT_TOKEN"),
+            vec!["SLACK_BOT_TOKEN".to_string()]
+        );
+    }
 
     fn empty_metadata(pack_refs: Vec<String>) -> SetupPlanMetadata {
         SetupPlanMetadata {
