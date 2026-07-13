@@ -474,7 +474,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             // Resolve the pack: try the bundle's packs directory first,
             // then fall back to OCI / offline scan.
             let pack_path =
-                greentic_setup::provider_commands::resolve_pack(None, info, &store, &env);
+                greentic_setup::provider_commands::resolve_pack(None, info, &store, &env, None);
             let pack_path = match pack_path {
                 Ok(p) => p,
                 Err(e) => {

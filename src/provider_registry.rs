@@ -25,8 +25,10 @@ pub struct ProviderPackInfo {
 /// OCI registry base for provider packs.
 pub const OCI_REGISTRY_BASE: &str = "ghcr.io/greenticai/packs/messaging";
 
-/// Current pack version published to GHCR.
-pub const PACK_VERSION: &str = "0.5.1";
+/// Default OCI tag for provider packs. Uses the mutable `:stable` tag that the
+/// publish workflow pushes on every release, so it cannot go stale the way a
+/// hand-maintained version constant would.
+pub const PACK_TAG: &str = "stable";
 
 /// All known provider kinds.
 const REGISTRY: &[ProviderPackInfo] = &[
@@ -67,12 +69,15 @@ pub fn known_kinds() -> Vec<&'static str> {
 }
 
 /// Build the full OCI reference for a provider pack.
-pub fn oci_reference(info: &ProviderPackInfo) -> String {
+///
+/// When `tag_override` is `Some`, uses that tag verbatim (the `--pack-version`
+/// escape hatch). Otherwise falls back to [`PACK_TAG`] (`"stable"`).
+pub fn oci_reference(info: &ProviderPackInfo, tag_override: Option<&str>) -> String {
+    let tag = tag_override.unwrap_or(PACK_TAG);
     format!(
-        "oci://{}/{pack}:{version}",
+        "oci://{}/{pack}:{tag}",
         OCI_REGISTRY_BASE,
         pack = info.pack_name,
-        version = PACK_VERSION,
     )
 }
 
@@ -96,13 +101,38 @@ mod tests {
     }
 
     #[test]
-    fn oci_reference_format() {
+    fn oci_reference_uses_stable_tag_by_default() {
         let info = lookup("telegram").unwrap();
-        let reference = oci_reference(info);
-        assert!(
-            reference.starts_with("oci://ghcr.io/greenticai/packs/messaging/messaging-telegram:")
+        let reference = oci_reference(info, None);
+        assert_eq!(
+            reference,
+            "oci://ghcr.io/greenticai/packs/messaging/messaging-telegram:stable"
         );
-        assert!(reference.ends_with(PACK_VERSION));
+    }
+
+    /// Guard against somebody silently re-pinning a semver version into the
+    /// default OCI reference. The default tag must NOT match `X.Y.Z`.
+    #[test]
+    fn oci_reference_default_contains_no_hardcoded_semver() {
+        let re = regex::Regex::new(r"[0-9]+\.[0-9]+\.[0-9]+").unwrap();
+        for kind in &["telegram", "slack", "webex", "teams"] {
+            let info = lookup(kind).unwrap();
+            let reference = oci_reference(info, None);
+            assert!(
+                !re.is_match(&reference),
+                "default OCI reference for `{kind}` contains a hardcoded semver: {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_reference_with_version_override() {
+        let info = lookup("slack").unwrap();
+        let reference = oci_reference(info, Some("0.5.6"));
+        assert_eq!(
+            reference,
+            "oci://ghcr.io/greenticai/packs/messaging/messaging-slack:0.5.6"
+        );
     }
 
     #[test]

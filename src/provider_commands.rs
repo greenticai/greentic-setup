@@ -51,31 +51,62 @@ fn op_flags() -> OpFlags {
 /// 1. `--pack <path>` explicit override.
 /// 2. OCI fetch from GHCR.
 /// 3. Offline fallback: pack already inside the deployed bundle in this env.
+///
+/// `pack_version` overrides the OCI tag (the `--pack-version` escape hatch).
+/// It is ignored when `explicit_pack` is `Some` (the `--pack` flag wins).
 pub fn resolve_pack(
     explicit_pack: Option<&Path>,
     info: &ProviderPackInfo,
     store: &LocalFsStore,
     env_id: &str,
+    pack_version: Option<&str>,
 ) -> Result<PathBuf> {
     // 1. Explicit override.
     if let Some(pack) = explicit_pack {
         if !pack.exists() {
             bail!("pack path does not exist: {}", pack.display());
         }
+        eprintln!("Resolved pack: {} (local override)", pack.display());
         return Ok(pack.to_path_buf());
     }
 
     // 2. OCI fetch.
-    let oci_ref = provider_registry::oci_reference(info);
+    let oci_ref = provider_registry::oci_reference(info, pack_version);
     match BundleSource::parse(&oci_ref) {
         Ok(source) => match source.resolve() {
-            Ok(path) => return Ok(path),
+            Ok(path) => {
+                eprintln!("Resolved pack: {oci_ref} -> {}", path.display());
+                return Ok(path);
+            }
             Err(err) => {
-                tracing::debug!("OCI fetch failed for {oci_ref}: {err:#}");
+                // When the user explicitly requested a version, do not
+                // silently fall back to an arbitrary old pack — the offline
+                // fallback has no version awareness and would return
+                // whichever pack happened to be deployed previously.
+                if pack_version.is_some() {
+                    bail!(
+                        "OCI fetch failed for {oci_ref}: {err:#}\n\
+                         The --pack-version override requires a successful \
+                         OCI fetch. Supply --pack <path> to use a local file."
+                    );
+                }
+                eprintln!(
+                    "Warning: OCI fetch failed for {oci_ref}: {err:#}\n\
+                     Falling back to bundle-embedded pack."
+                );
             }
         },
         Err(err) => {
-            tracing::debug!("OCI parse failed for {oci_ref}: {err:#}");
+            if pack_version.is_some() {
+                bail!(
+                    "OCI reference could not be parsed ({oci_ref}): {err:#}\n\
+                     The --pack-version override requires a valid OCI reference."
+                );
+            }
+            eprintln!(
+                "Warning: OCI reference could not be parsed ({oci_ref}): {err:#}\n\
+                 Falling back to bundle-embedded pack."
+            );
         }
     }
 
@@ -84,6 +115,10 @@ pub fn resolve_pack(
     if env_dir.is_dir()
         && let Some(path) = find_pack_in_revisions(&env_dir, info.pack_name)
     {
+        eprintln!(
+            "Resolved pack: {} (offline fallback from deployed revision)",
+            path.display()
+        );
         return Ok(path);
     }
 
@@ -453,7 +488,13 @@ pub fn add(
     }
 
     // ── Resolve the provider pack ─────────────────────────────────────
-    let pack_path = resolve_pack(args.pack.as_deref(), info, &store, env_id)?;
+    let pack_path = resolve_pack(
+        args.pack.as_deref(),
+        info,
+        &store,
+        env_id,
+        args.pack_version.as_deref(),
+    )?;
     eprintln!("Using provider pack: {}", pack_path.display());
 
     // ── Resolve provider id (used by the device-code check and all
@@ -849,5 +890,145 @@ mod tests {
         assert!(msg.contains("--bundle-id"), "got: {msg}");
         assert!(msg.contains("bundle-a"), "got: {msg}");
         assert!(msg.contains("bundle-b"), "got: {msg}");
+    }
+
+    // -- resolve_pack precedence tests (no network) --------------------------
+
+    #[test]
+    fn resolve_pack_explicit_path_wins() {
+        // Precedence rule: --pack (explicit path) wins over OCI and fallback.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let info = provider_registry::lookup("telegram").unwrap();
+
+        // Create a fake pack file.
+        let pack_file = root.path().join("my.gtpack");
+        std::fs::write(&pack_file, b"fake").unwrap();
+
+        let result = resolve_pack(Some(&pack_file), info, &store, "local", None);
+        assert_eq!(result.unwrap(), pack_file);
+    }
+
+    #[test]
+    fn resolve_pack_explicit_path_missing_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let info = provider_registry::lookup("telegram").unwrap();
+
+        let missing = root.path().join("nonexistent.gtpack");
+        let result = resolve_pack(Some(&missing), info, &store, "local", None);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("does not exist"), "got: {msg}");
+    }
+
+    #[test]
+    fn find_pack_in_revisions_finds_pack() {
+        // Test the offline fallback scan directly (no network dependency).
+        let root = tempfile::tempdir().unwrap();
+        let env_dir = root.path().join("local");
+
+        // Set up the revision directory structure the fallback expects.
+        let pack_dir = env_dir
+            .join("revisions")
+            .join("rev-001")
+            .join("bundle")
+            .join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_file = pack_dir.join("messaging-telegram.gtpack");
+        std::fs::write(&pack_file, b"fake-pack").unwrap();
+
+        let found = find_pack_in_revisions(&env_dir, "messaging-telegram");
+        assert_eq!(found.unwrap(), pack_file);
+    }
+
+    #[test]
+    fn find_pack_in_revisions_returns_none_when_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let env_dir = root.path().join("local");
+        std::fs::create_dir_all(env_dir.join("revisions")).unwrap();
+
+        let found = find_pack_in_revisions(&env_dir, "messaging-telegram");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn resolve_pack_no_source_available_errors() {
+        // Use a tag that will never exist on the registry so OCI always fails,
+        // regardless of whether GHCR is reachable.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let info = provider_registry::lookup("telegram").unwrap();
+
+        let result = resolve_pack(
+            None,
+            info,
+            &store,
+            "local",
+            Some("nonexistent-tag-for-testing"),
+        );
+        assert!(result.is_err(), "expected error, got: {result:?}");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("OCI"),
+            "error should mention OCI attempt: {msg}"
+        );
+        assert!(
+            msg.contains("--pack"),
+            "error should suggest --pack escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_pack_version_override_rejects_offline_fallback() {
+        // When the user explicitly passes --pack-version, OCI failure must NOT
+        // silently fall back to an arbitrary old pack from a deployed revision.
+        // The function must error so the user knows the requested version could
+        // not be fetched.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let info = provider_registry::lookup("telegram").unwrap();
+
+        // Plant a pack in a deployed revision so the offline fallback *would*
+        // find it.
+        let pack_dir = root
+            .path()
+            .join("local")
+            .join("revisions")
+            .join("rev-old")
+            .join("bundle")
+            .join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join(format!("{}.gtpack", info.pack_name)),
+            b"old-pack",
+        )
+        .unwrap();
+
+        let result = resolve_pack(
+            None,
+            info,
+            &store,
+            "local",
+            Some("nonexistent-tag-for-testing"),
+        );
+        assert!(
+            result.is_err(),
+            "should error when --pack-version is set and OCI fails, \
+             not silently use an offline fallback; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_pack_version_override_reflected_in_oci_ref() {
+        // Verify the version override flows into the OCI reference. We cannot
+        // observe the OCI reference directly from resolve_pack (it's internal),
+        // so we test via the registry helper.
+        let info = provider_registry::lookup("telegram").unwrap();
+        let ref_default = provider_registry::oci_reference(info, None);
+        let ref_pinned = provider_registry::oci_reference(info, Some("0.5.17"));
+
+        assert!(ref_default.ends_with(":stable"));
+        assert!(ref_pinned.ends_with(":0.5.17"));
     }
 }
