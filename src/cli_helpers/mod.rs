@@ -217,6 +217,7 @@ pub fn run_interactive_wizard(
                 telemetry: None,
             },
             setup_answers: all_answers,
+            providers: Vec::new(),
         });
     }
 
@@ -298,6 +299,7 @@ pub fn run_interactive_wizard(
             telemetry: None,
         },
         setup_answers: all_answers,
+        providers: Vec::new(),
     })
 }
 

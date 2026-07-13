@@ -13,6 +13,35 @@ use crate::plan::{
 };
 use crate::platform_setup::{PlatformSetupAnswers, StaticRoutesPolicy, TelemetryAnswers};
 
+fn default_true() -> bool {
+    true
+}
+
+/// A declarative provider entry in the answers document.
+///
+/// Each entry maps to a `provider add` + `link-bundle` mutation during
+/// post-setup auto-deploy.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEntry {
+    /// Provider kind (e.g. `telegram`, `slack`, `webex`).
+    pub kind: String,
+    /// Human-readable display name for the messaging endpoint.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether to link the provider to the deployed bundle.
+    /// Defaults to `true` — matching `provider add` interactive behaviour.
+    /// Set to `false` explicitly to register without linking.
+    #[serde(default = "default_true")]
+    pub link_bundle: bool,
+    /// Provider-specific setup answers (may contain secret values).
+    #[serde(default)]
+    pub answers: JsonMap<String, Value>,
+    /// Override the default provider instance id.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+}
+
 /// Loaded answers from a JSON/YAML file.
 #[derive(Clone, Debug, Default)]
 pub struct LoadedAnswers {
@@ -21,6 +50,8 @@ pub struct LoadedAnswers {
     pub env: Option<String>,
     pub platform_setup: PlatformSetupAnswers,
     pub setup_answers: JsonMap<String, Value>,
+    /// Declarative provider wiring — processed after bundle deploy.
+    pub providers: Vec<ProviderEntry>,
 }
 
 /// The request object that drives plan building.

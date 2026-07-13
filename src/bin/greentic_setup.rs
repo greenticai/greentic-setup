@@ -315,6 +315,9 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             .context("Missing required answers in --non-interactive mode")?;
     }
 
+    // Preserve providers[] before fields are moved into the request.
+    let declared_providers = std::mem::take(&mut loaded_answers.providers);
+
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
         bundle_name: greentic_setup::bundle::read_bundle_name(&bundle_dir)
@@ -427,6 +430,108 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
                 gtbundle::create_gtbundle(&bundle_dir, &output_bundle)
                     .context("failed to write configured .gtbundle archive")?;
                 println!("Configured bundle written to: {}", output_bundle.display());
+            }
+        }
+    }
+
+    // ── Auto-deploy + provider wiring ──────────────────────────────────
+    // When the answers doc declares providers[], deploy the bundle into
+    // the target environment and wire each provider through the mutation
+    // core. This makes `greentic-setup --answers a.json ./my-bundle` a
+    // single command that leaves the environment fully operational.
+    if !declared_providers.is_empty() {
+        eprintln!();
+        eprintln!("Deploying bundle to environment `{env}`...");
+        greentic_setup::env_deploy::deploy_bundle_to_env(
+            &bundle_dir,
+            &env,
+            false,
+            true, // non-interactive
+        )
+        .context("auto-deploy bundle to environment")?;
+
+        // Build store + resolve bundle_id for provider wiring.
+        let store_root = greentic_deployer::environment::LocalFsStore::default_root()
+            .context("cannot locate the environment store")?;
+        let store = greentic_deployer::environment::LocalFsStore::new(store_root);
+        let bundle_id = greentic_setup::provider_commands::auto_detect_bundle_id(&store, &env)?;
+
+        for provider_entry in &declared_providers {
+            let kind = provider_entry.kind.to_ascii_lowercase();
+            let info = match greentic_setup::provider_registry::lookup(&kind) {
+                Some(info) => info,
+                None => {
+                    eprintln!("Warning: unknown provider kind `{kind}` in providers[]; skipping.");
+                    continue;
+                }
+            };
+
+            let provider_id = provider_entry
+                .provider_id
+                .as_deref()
+                .unwrap_or(info.default_provider_id);
+
+            // Resolve the pack: try the bundle's packs directory first,
+            // then fall back to OCI / offline scan.
+            let pack_path =
+                greentic_setup::provider_commands::resolve_pack(None, info, &store, &env);
+            let pack_path = match pack_path {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not resolve pack for provider `{kind}`: {e:#}; skipping."
+                    );
+                    continue;
+                }
+            };
+
+            let display_name = provider_entry
+                .display_name
+                .clone()
+                .unwrap_or_else(|| greentic_setup::setup_to_formspec::capitalize(info.kind));
+
+            let idem_key = greentic_setup::provider_commands::deterministic_idempotency_key(
+                &env,
+                info.provider_type,
+                provider_id,
+            );
+
+            eprintln!();
+            eprintln!(
+                "Wiring provider `{provider_id}` (type: {})...",
+                info.provider_type
+            );
+            match greentic_setup::provider_commands::register_provider_core(
+                &store,
+                &greentic_setup::provider_commands::RegisterProviderPayload {
+                    env_id: &env,
+                    tenant: &tenant,
+                    team: team.as_deref(),
+                    provider_type: info.provider_type,
+                    provider_id,
+                    pack_name: info.pack_name,
+                    display_name,
+                    bundle_id: &bundle_id,
+                    link_bundle: provider_entry.link_bundle,
+                    answers: &provider_entry.answers,
+                    pack_path: &pack_path,
+                },
+                Some(idem_key),
+            ) {
+                Ok(_endpoint_id) => {
+                    if provider_entry.link_bundle {
+                        eprintln!(
+                            "Provider `{provider_id}` wired to bundle `{bundle_id}` in env `{env}`."
+                        );
+                    } else {
+                        eprintln!(
+                            "Provider `{provider_id}` registered in env `{env}` (not linked to bundle)."
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to wire provider `{provider_id}`: {e:#}");
+                }
             }
         }
     }
