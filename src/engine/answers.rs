@@ -564,10 +564,92 @@ mod tests {
         "/../greentic-messaging-providers/packs/messaging-telegram/assets/setup.yaml"
     );
 
-    /// Build a minimal .gtpack ZIP containing the REAL telegram setup.yaml.
+    /// Verbatim copy of that file.
+    ///
+    /// Vendored rather than read from the sibling repo: greentic-setup's CI does
+    /// not check `greentic-messaging-providers` out, so reading it there panics
+    /// and takes the secret-encryption regression test down with it. The point of
+    /// anchoring to the real pack is that a synthetic FormSpec with an invented
+    /// field name would pass even if the real name never matched — vendoring keeps
+    /// that property while letting the tests run anywhere.
+    /// `vendored_telegram_yaml_still_matches_real_pack` guards this copy against drift.
+    const TELEGRAM_SETUP_YAML_FIXTURE: &str = r#"
+provider_id: telegram
+version: 1
+title: Telegram provider setup
+setup_actions:
+  - id: add-to-telegram
+    label: Add to Telegram
+    kind: deep_link
+    url_template: "https://t.me/{bot_username}"
+    style: primary
+    opens_new_window: true
+    copyable: true
+    requires:
+      - bot_username
+questions:
+  - name: public_base_url
+    title: Public base URL
+    kind: string
+    required: true
+    help: "Public-facing URL for webhook callbacks. Use the runtime or tunnel URL shown by the setup host."
+    group: Connection
+    validate:
+      regex: "^https://"
+  - name: bot_username
+    title: Bot username
+    kind: string
+    required: true
+    help: "Telegram bot username from @BotFather, without the leading @. This is used for the final Add to Telegram link."
+    group: Connection
+  - name: default_chat_id
+    title: Default chat ID
+    kind: string
+    required: false
+    placeholder: "-1001234567890"
+    group: Defaults
+  - name: api_base_url
+    title: API base URL
+    kind: string
+    required: true
+    default: "https://api.telegram.org"
+    help: "Telegram Bot API base URL (default: https://api.telegram.org)"
+    placeholder: "https://api.telegram.org"
+    group: Connection
+    validate:
+      regex: "^https?://"
+  - name: telegram_bot_token
+    title: Telegram bot token
+    kind: string
+    required: true
+    secret: true
+    help: "Token from @BotFather"
+    group: Authentication
+    docs_url: "https://core.telegram.org/bots#how-do-i-create-a-bot"
+    create_url: "https://t.me/BotFather"
+"#;
+
+    /// Drift guard. Where the sibling repo IS checked out (local dev, the
+    /// monorepo), the vendored copy above must still match the real pack.
+    /// Skipping is correct here — it checks the fixture, not the encryption
+    /// logic, which is covered unconditionally either way.
+    #[test]
+    fn vendored_telegram_yaml_still_matches_real_pack() {
+        let Ok(real) = std::fs::read_to_string(REAL_TELEGRAM_SETUP_YAML) else {
+            eprintln!("skipping drift check: greentic-messaging-providers not checked out");
+            return;
+        };
+        assert_eq!(
+            real.trim(),
+            TELEGRAM_SETUP_YAML_FIXTURE.trim(),
+            "the vendored TELEGRAM_SETUP_YAML_FIXTURE has drifted from the real \
+             messaging-telegram setup.yaml — update it"
+        );
+    }
+
+    /// Build a minimal .gtpack ZIP containing the real telegram setup.yaml.
     fn write_telegram_pack_from_real_yaml(path: &Path) -> anyhow::Result<()> {
-        let yaml_contents = std::fs::read_to_string(REAL_TELEGRAM_SETUP_YAML)
-            .context("read real telegram setup.yaml — is greentic-messaging-providers checked out as a sibling?")?;
+        let yaml_contents = TELEGRAM_SETUP_YAML_FIXTURE;
         let file = std::fs::File::create(path)?;
         let mut writer = ZipWriter::new(file);
         let options: FileOptions<'_, ()> =
@@ -590,10 +672,9 @@ mod tests {
     /// Read the secret field name from the REAL telegram setup.yaml so the
     /// test is anchored to the actual pack, not a hand-authored constant.
     fn real_telegram_secret_field_name() -> String {
-        let yaml_contents =
-            std::fs::read_to_string(REAL_TELEGRAM_SETUP_YAML).expect("read real setup.yaml");
         let spec: crate::setup_input::SetupSpec =
-            serde_yaml_bw::from_str(&yaml_contents).expect("parse real setup.yaml");
+            serde_yaml_bw::from_str(TELEGRAM_SETUP_YAML_FIXTURE)
+                .expect("parse telegram setup.yaml");
         let secret_q = spec
             .questions
             .iter()
