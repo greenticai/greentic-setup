@@ -124,6 +124,15 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Doctor(args)) => cli_commands::doctor(args, i18n),
+        Some(Command::EnvDeploy(args)) => {
+            let env = greentic_setup::resolve_env(Some(&cli.env));
+            greentic_setup::env_deploy::deploy_bundle_to_env(
+                &args.bundle,
+                &env,
+                cli.dry_run,
+                cli.non_interactive,
+            )
+        }
         Some(Command::Bundle(cmd)) => match *cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
             BundleCommand::Add(args) => cli_commands::add(args, i18n),

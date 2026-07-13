@@ -18,6 +18,7 @@ pub mod deployment_targets;
 pub mod discovery;
 pub mod doctor;
 pub mod engine;
+pub mod env_deploy;
 pub mod env_mode;
 pub mod env_wizard;
 pub mod flow;

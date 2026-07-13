@@ -1049,6 +1049,9 @@ mod tests {
                     "secret://local/realbot/telegram/webhook".to_string(),
                 ],
             }],
+            cluster: None,
+            updates: None,
+            vault_bootstrap: None,
         }
     }
 
@@ -1159,6 +1162,9 @@ mod tests {
             bundles: Vec::new(),
             extensions: Vec::new(),
             messaging_endpoints: Vec::new(),
+            cluster: None,
+            updates: None,
+            vault_bootstrap: None,
         };
         let back = round_trip(&original);
         assert_eq!(
