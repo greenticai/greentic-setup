@@ -26,6 +26,16 @@ use std::time::{Duration, Instant};
 /// be reclaimed. Spawn + URL discovery hold the lock for well under a minute.
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(120);
 
+/// How long after spawn a quick tunnel may stay absent from public DNS before
+/// it counts as dead rather than propagating. Fresh `*.trycloudflare.com`
+/// hostnames appear in public DNS within a couple of minutes; when a quick
+/// tunnel dies, Cloudflare removes the hostname from DNS entirely — so a
+/// hostname still unresolvable this long after the record was written is a
+/// dead tunnel, not a slow one. (This also explains why the HTTP 530
+/// "binding lost" proof never arrives for dead tunnels: with no DNS record
+/// there is nothing to return the 530.)
+const DNS_WARMUP_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
 /// On-disk paths of the shared cloudflared record for one local port.
 #[derive(Clone, Debug)]
 pub struct SharedTunnelPaths {
@@ -115,9 +125,39 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `pid` currently belongs to a cloudflared process. Guards against
+/// PID reuse: a recorded pid recycled by the OS onto an unrelated process
+/// must neither count as tunnel liveness nor be terminated.
+fn process_is_cloudflared(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("cloudflared"))
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .to_ascii_lowercase()
+                    .contains("cloudflared")
+            })
+    }
+}
+
 /// Terminate the recorded process. Only ever called with a PID read from the
-/// shared record — ownership is proven by the record, never by process name.
+/// shared record — ownership is proven by the record, never by process name —
+/// and even then only when the pid still runs cloudflared, so a recycled pid
+/// cannot get an unrelated process killed.
 pub fn terminate_recorded_pid(pid: u32) {
+    if !process_is_cloudflared(pid) {
+        eprintln!("Shared tunnel: recorded pid {pid} is not a cloudflared process — not killing");
+        return;
+    }
     #[cfg(unix)]
     {
         let _ = std::process::Command::new("kill")
@@ -164,29 +204,70 @@ fn head_probe(url: &str) -> ProbeOutcome {
     }
 }
 
-/// Resolve `host`'s first A record via Cloudflare's DNS-over-HTTPS JSON API,
-/// addressed by IP literal so it works even when this host's resolver is blind
-/// to the zone. `Some(ip)` means the hostname is published in public DNS — i.e.
-/// every *remote* party (Slack, Teams, the Bot Framework, ...) can resolve it,
-/// which is what actually matters for a tunnel fronting provider webhooks.
-fn resolve_via_public_doh(host: &str) -> Option<IpAddr> {
+/// What public DNS says about a tunnel hostname.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicDnsVerdict {
+    /// Published — remote parties (Slack, Teams, the Bot Framework, ...) can
+    /// resolve it, which is what actually matters for a tunnel fronting
+    /// provider webhooks.
+    Published(IpAddr),
+    /// At least one public resolver answered and the name has no A record.
+    /// For a quick tunnel this is evidence of death: Cloudflare removes the
+    /// hostname from DNS when the tunnel goes away.
+    Absent,
+    /// No public resolver could be reached — says nothing about the tunnel
+    /// (e.g. a network that blocks DoH endpoints). Must not count as proof.
+    Unknown,
+}
+
+/// Query one DoH JSON endpoint for `host`'s A record.
+/// `Some(Some(ip))` — published; `Some(None)` — the resolver answered and the
+/// name is absent; `None` — the resolver itself was unreachable.
+fn query_doh_a_record(endpoint: &str, host: &str) -> Option<Option<IpAddr>> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(3)))
         .build()
         .new_agent();
-    let query = format!("https://1.1.1.1/dns-query?name={host}&type=A");
+    let query = format!("{endpoint}?name={host}&type=A");
     let mut response = agent
         .get(&query)
         .header("accept", "application/dns-json")
         .call()
         .ok()?;
     let body: serde_json::Value = response.body_mut().read_json().ok()?;
-    body.get("Answer")?
-        .as_array()?
-        .iter()
+    // A parsed DNS answer (any Status, e.g. NXDOMAIN) is an authoritative
+    // reply; require the Status field so an unrelated JSON body (captive
+    // portal, block page) does not count as one.
+    body.get("Status")?.as_u64()?;
+    let ip = body
+        .get("Answer")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
         // type 1 = A record; CNAME chain entries (type 5) also appear here.
         .filter(|answer| answer.get("type").and_then(serde_json::Value::as_u64) == Some(1))
-        .find_map(|answer| answer.get("data")?.as_str()?.parse().ok())
+        .find_map(|answer| answer.get("data")?.as_str()?.parse().ok());
+    Some(ip)
+}
+
+/// Resolve `host` via public DNS-over-HTTPS resolvers, addressed by IP
+/// literal so it works even when this host's resolver is blind to the zone.
+/// Two independent resolvers, so one blocked or flaky endpoint cannot turn
+/// into a false "absent" verdict that gets a healthy tunnel killed.
+fn resolve_via_public_dns(host: &str) -> PublicDnsVerdict {
+    let mut any_answered = false;
+    for endpoint in ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"] {
+        match query_doh_a_record(endpoint, host) {
+            Some(Some(ip)) => return PublicDnsVerdict::Published(ip),
+            Some(None) => any_answered = true,
+            None => {}
+        }
+    }
+    if any_answered {
+        PublicDnsVerdict::Absent
+    } else {
+        PublicDnsVerdict::Unknown
+    }
 }
 
 /// Whether process `pid` is currently alive. Uses a `kill -0` existence probe
@@ -209,11 +290,34 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// Whether the tunnel log shows cloudflared registered an edge connection —
-/// proof the tunnel came up at Cloudflare's edge even before DNS propagates.
+/// Whether the tunnel log shows cloudflared *currently* holds an edge
+/// connection — proof the tunnel came up at Cloudflare's edge even before DNS
+/// propagates. Registration must postdate the last unregistration: a
+/// "Registered tunnel connection" line stays in the log forever, so its mere
+/// presence says nothing about a tunnel that has since lost the edge.
+/// (Case matters: "Unregistered tunnel connection" does not contain the
+/// capital-R needle, so the two searches cannot cross-match.)
 fn log_shows_registered_connection(log_path: &Path) -> bool {
-    std::fs::read_to_string(log_path)
-        .is_ok_and(|contents| contents.contains("Registered tunnel connection"))
+    std::fs::read_to_string(log_path).is_ok_and(|contents| {
+        match (
+            contents.rfind("Registered tunnel connection"),
+            contents.rfind("Unregistered tunnel connection"),
+        ) {
+            (Some(registered), Some(unregistered)) => registered > unregistered,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    })
+}
+
+/// Age of the shared record, from the url file's mtime — written once at
+/// spawn (reuse never rewrites it), so this is time since the tunnel was
+/// minted. `None` when the age cannot be established.
+fn record_age(paths: &SharedTunnelPaths) -> Option<Duration> {
+    std::fs::metadata(&paths.url_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
 }
 
 /// Host component of `url`, for a DNS lookup.
@@ -230,10 +334,12 @@ pub enum RecordedTunnelState {
     /// hostname has not propagated into public DNS yet. Reuse and wait: a fresh
     /// quick tunnel can take minutes to appear in DNS, and respawning would only
     /// reset that clock and orphan the URL already handed to providers earlier
-    /// in this setup run.
+    /// in this setup run. Only a *recent* record qualifies — past
+    /// [`DNS_WARMUP_DEADLINE`] an unresolvable hostname is dead, not warming.
     WarmingUp,
     /// No usable tunnel — the process is gone, the edge returned 530 (binding
-    /// lost), or it never registered. Replace it.
+    /// lost), it never registered (or lost its last edge connection), or its
+    /// hostname stayed out of public DNS past the warm-up deadline. Replace it.
     Down,
 }
 
@@ -246,7 +352,11 @@ pub enum RecordedTunnelState {
 /// Tearing it down on that signal is exactly what makes setup mint a new URL on
 /// every wizard step and strand provider webhooks on a now-dead hostname. So we
 /// escalate through increasingly authoritative signals and only return `Down`
-/// on positive proof. Each branch logs what it saw, to keep this debuggable.
+/// on positive proof: a 530, a dead (or recycled) pid, a lost edge
+/// registration, or absence from public DNS past [`DNS_WARMUP_DEADLINE`] —
+/// the last one matters because a dead quick tunnel's hostname leaves DNS
+/// entirely, so the 530 proof can never arrive for it. Each branch logs what
+/// it saw, to keep this debuggable.
 pub fn classify_recorded_tunnel(
     paths: &SharedTunnelPaths,
     pid: Option<u32>,
@@ -273,8 +383,12 @@ pub fn classify_recorded_tunnel(
     // 2. The local resolver may just be blind. Ask public DNS directly: if the
     //    hostname resolves there, remote providers can reach it even though we
     //    cannot, so it is serving for the parties that matter.
-    if let Some(host) = url_host(url) {
-        if let Some(ip) = resolve_via_public_doh(&host) {
+    let dns = match url_host(url) {
+        Some(host) => resolve_via_public_dns(&host),
+        None => PublicDnsVerdict::Unknown,
+    };
+    match dns {
+        PublicDnsVerdict::Published(ip) => {
             eprintln!(
                 "Shared tunnel {url}: unreachable locally but published in public DNS ({ip}) \
                  — the OS resolver has a stale negative cache; remote providers resolve it \
@@ -282,27 +396,70 @@ pub fn classify_recorded_tunnel(
             );
             return RecordedTunnelState::Serving;
         }
-        eprintln!("Shared tunnel {url}: not resolvable via public DNS (1.1.1.1) yet");
+        PublicDnsVerdict::Absent => {
+            eprintln!("Shared tunnel {url}: not published in public DNS (1.1.1.1/8.8.8.8)");
+        }
+        PublicDnsVerdict::Unknown => {
+            eprintln!(
+                "Shared tunnel {url}: no public DNS resolver reachable — cannot tell whether \
+                 the hostname is published"
+            );
+        }
     }
 
-    // 3. Not reachable from anywhere yet. If cloudflared is still running and
-    //    registered an edge connection, it is simply mid-propagation. Reuse and
-    //    wait rather than churn the URL.
-    let running = pid.is_some_and(process_alive);
+    // 3. Not reachable from anywhere yet. Decide from local evidence whether
+    //    this is a fresh tunnel mid-propagation (reuse and wait) or a dead one
+    //    (its hostname will never come back — let it go).
+    let running = pid.is_some_and(|pid| process_alive(pid) && process_is_cloudflared(pid));
     let registered = log_shows_registered_connection(&paths.log_path);
+    let age = record_age(paths);
     eprintln!(
-        "Shared tunnel {url}: local pid={pid:?} alive={running}, edge-registered={registered}"
+        "Shared tunnel {url}: local pid={pid:?} alive-cloudflared={running}, \
+         edge-registered={registered}, record-age={age:?}, dns={dns:?}"
     );
-    if running && registered {
+    classify_local_evidence(
+        url,
+        running,
+        registered,
+        age,
+        dns == PublicDnsVerdict::Absent,
+    )
+}
+
+/// Step-3 verdict from local evidence alone, once probes and public DNS have
+/// both come back empty. Separate from [`classify_recorded_tunnel`] so the
+/// decision table is unit-testable without network access. `dns_absent` is
+/// true only when a public resolver positively answered that the hostname has
+/// no record — an unreachable resolver is not evidence.
+fn classify_local_evidence(
+    url: &str,
+    running: bool,
+    registered: bool,
+    age: Option<Duration>,
+    dns_absent: bool,
+) -> RecordedTunnelState {
+    if !(running && registered) {
+        eprintln!("Shared tunnel {url}: no live/registered cloudflared — replacing (Down)");
+        return RecordedTunnelState::Down;
+    }
+    // Unknown age gives no proof of death — keep the reuse bias.
+    let past_deadline = age.is_some_and(|age| age > DNS_WARMUP_DEADLINE);
+    if past_deadline && dns_absent {
+        eprintln!(
+            "Shared tunnel {url}: cloudflared is alive but the hostname is confirmed absent \
+             from public DNS {}s after spawn — a healthy quick tunnel propagates within \
+             minutes, and dead ones drop out of DNS entirely; letting this one go — \
+             replacing (Down)",
+            age.map(|age| age.as_secs()).unwrap_or_default()
+        );
+        RecordedTunnelState::Down
+    } else {
         eprintln!(
             "Shared tunnel {url}: cloudflared alive and registered with the edge — still \
              propagating into public DNS; reusing rather than minting a new URL and orphaning \
              provider webhooks (WarmingUp)"
         );
         RecordedTunnelState::WarmingUp
-    } else {
-        eprintln!("Shared tunnel {url}: no live/registered cloudflared — replacing (Down)");
-        RecordedTunnelState::Down
     }
 }
 
@@ -454,6 +611,110 @@ mod tests {
         )
         .expect("write");
         assert!(log_shows_registered_connection(&log));
+    }
+
+    #[test]
+    fn registration_must_postdate_last_unregistration() {
+        let dir = tempdir().expect("tempdir");
+        let log = dir.path().join("cloudflared.log");
+        std::fs::write(
+            &log,
+            "INF Registered tunnel connection connIndex=0\n\
+             INF Unregistered tunnel connection connIndex=0\n",
+        )
+        .expect("write");
+        assert!(
+            !log_shows_registered_connection(&log),
+            "edge connection lost after registering → false"
+        );
+        std::fs::write(
+            &log,
+            "INF Registered tunnel connection connIndex=0\n\
+             INF Unregistered tunnel connection connIndex=0\n\
+             INF Registered tunnel connection connIndex=1\n",
+        )
+        .expect("write");
+        assert!(
+            log_shows_registered_connection(&log),
+            "re-registered after a drop → true"
+        );
+        std::fs::write(&log, "INF Unregistered tunnel connection connIndex=0\n").expect("write");
+        assert!(
+            !log_shows_registered_connection(&log),
+            "unregistration alone must not match the registered needle"
+        );
+    }
+
+    #[test]
+    fn local_evidence_reuses_fresh_and_lets_go_of_expired() {
+        let url = "https://demo.trycloudflare.com";
+        let expired = Some(DNS_WARMUP_DEADLINE + Duration::from_secs(1));
+        // Fresh tunnel, alive and registered: reuse while DNS propagates.
+        assert_eq!(
+            classify_local_evidence(url, true, true, Some(Duration::from_secs(30)), true),
+            RecordedTunnelState::WarmingUp
+        );
+        // Unknown age is no proof of death: keep the reuse bias.
+        assert_eq!(
+            classify_local_evidence(url, true, true, None, true),
+            RecordedTunnelState::WarmingUp
+        );
+        // Past the warm-up deadline with the hostname confirmed absent from
+        // public DNS: the tunnel is dead — let it go.
+        assert_eq!(
+            classify_local_evidence(url, true, true, expired, true),
+            RecordedTunnelState::Down
+        );
+        // Past the deadline but no resolver answered: absence was never
+        // confirmed, so there is no proof of death — keep reusing.
+        assert_eq!(
+            classify_local_evidence(url, true, true, expired, false),
+            RecordedTunnelState::WarmingUp
+        );
+        // Dead process or lost edge registration: down regardless of age.
+        assert_eq!(
+            classify_local_evidence(url, false, true, Some(Duration::from_secs(30)), false),
+            RecordedTunnelState::Down
+        );
+        assert_eq!(
+            classify_local_evidence(url, true, false, Some(Duration::from_secs(30)), false),
+            RecordedTunnelState::Down
+        );
+    }
+
+    #[test]
+    fn record_age_reads_url_file_mtime() {
+        let dir = tempdir().expect("tempdir");
+        let paths = shared_tunnel_paths_at(dir.path(), 8080);
+        assert_eq!(record_age(&paths), None, "no record → no age");
+
+        write_record(&paths, 4242, "https://demo.trycloudflare.com").expect("write record");
+        let age = record_age(&paths).expect("age");
+        assert!(age < Duration::from_secs(60), "fresh record: {age:?}");
+
+        let spawned =
+            std::time::SystemTime::now() - (DNS_WARMUP_DEADLINE + Duration::from_secs(60));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths.url_path)
+            .expect("open url file");
+        file.set_modified(spawned).expect("age url file");
+        drop(file);
+        let age = record_age(&paths).expect("age");
+        assert!(age > DNS_WARMUP_DEADLINE, "aged record: {age:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_pid_identity_guards_against_reuse() {
+        // This test process is not cloudflared, so its pid must fail the
+        // identity check even though it is alive.
+        assert!(process_alive(std::process::id()));
+        assert!(!process_is_cloudflared(std::process::id()));
+        // terminate_recorded_pid must refuse to kill it (we're still here to
+        // assert afterwards precisely because it refused).
+        terminate_recorded_pid(std::process::id());
+        assert!(process_alive(std::process::id()));
     }
 
     #[test]
