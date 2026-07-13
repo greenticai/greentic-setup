@@ -831,6 +831,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn misspelled_optional_provider_field_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers_path = temp.path().join("answers.json");
+        // "anwers" is a typo for "answers". Without `deny_unknown_fields` this
+        // parses cleanly, `answers` defaults to `{}`, and the provider is wired
+        // with no bot token — registering fine and then failing to authenticate
+        // at runtime with nothing in the logs to explain why.
+        let doc = serde_json::json!({
+            "bundle_source": "./my-bundle",
+            "tenant": "demo",
+            "env": "local",
+            "setup_answers": {},
+            "providers": [{
+                "kind": "telegram",
+                "anwers": {
+                    "telegram_bot_token": "fake-token"
+                }
+            }]
+        });
+        std::fs::write(&answers_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let result = load_answers(&answers_path, None, false);
+        assert!(
+            result.is_err(),
+            "an unknown field in a providers[] entry must be rejected, not silently dropped"
+        );
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("anwers"),
+            "error must name the unknown field, got: {err_msg}"
+        );
+    }
+
     // ── Finding 2: link_bundle defaults to true, explicit false honoured ──
 
     #[test]

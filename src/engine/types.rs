@@ -22,6 +22,7 @@ fn default_true() -> bool {
 /// Each entry maps to a `provider add` + `link-bundle` mutation during
 /// post-setup auto-deploy.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderEntry {
     /// Provider kind (e.g. `telegram`, `slack`, `webex`).
     pub kind: String,
