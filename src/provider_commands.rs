@@ -153,23 +153,18 @@ fn deployer_secret_uri(
     provider: &str,
     key: &str,
 ) -> String {
-    let team_segment = match team {
-        Some(t) if !t.is_empty() && t != "default" => t.to_string(),
-        _ => "_".to_string(),
-    };
-    let normalized_provider = normalize_provider_segment(provider);
-    let normalized_key = crate::secret_name::canonical_secret_name(key);
-    format!("secret://{env}/{tenant}/{team_segment}/{normalized_provider}/{normalized_key}")
+    let rel_path = deployer_secret_path(tenant, team, provider, key);
+    format!("secret://{env}/{rel_path}")
 }
 
 /// Build the relative path portion (everything after `secret://<env>/`) for
 /// the deployer's `SecretsPutPayload.path`. Provider segment uses
 /// [`normalize_provider_segment`]; key segment uses `canonical_secret_name`.
+/// Team segment uses [`greentic_secrets_lib::normalize_team`] (canonical
+/// source of truth for the empty / `"default"` → `_` rule).
 fn deployer_secret_path(tenant: &str, team: Option<&str>, provider: &str, key: &str) -> String {
-    let team_segment = match team {
-        Some(t) if !t.is_empty() && t != "default" => t.to_string(),
-        _ => "_".to_string(),
-    };
+    let team_segment = greentic_secrets_lib::normalize_team(team)
+        .unwrap_or_else(|| greentic_secrets_lib::TEAM_PLACEHOLDER.to_string());
     let normalized_provider = normalize_provider_segment(provider);
     let normalized_key = crate::secret_name::canonical_secret_name(key);
     format!("{tenant}/{team_segment}/{normalized_provider}/{normalized_key}")
@@ -292,12 +287,15 @@ pub fn add(
     let pack_path = resolve_pack(args.pack.as_deref(), info, &store, env_id)?;
     eprintln!("Using provider pack: {}", pack_path.display());
 
+    // ── Resolve provider id (used by the device-code check and all
+    //    downstream steps) ────────────────────────────────────────────
+    let provider_id = args
+        .provider_id
+        .as_deref()
+        .unwrap_or(info.default_provider_id);
+
     // ── Check for teams device-code flow (before collecting answers) ──
     if has_oauth_device_code_action(&pack_path) {
-        let provider_id = args
-            .provider_id
-            .as_deref()
-            .unwrap_or(info.default_provider_id);
         bail!(
             "provider `teams` requires an OAuth device-code flow that is currently only \
              available through the full bundle-setup engine.\n\n\
@@ -314,12 +312,6 @@ pub fn add(
             pid = provider_id,
         );
     }
-
-    // ── Collect setup answers ─────────────────────────────────────────
-    let provider_id = args
-        .provider_id
-        .as_deref()
-        .unwrap_or(info.default_provider_id);
 
     let setup_input = if let Some(path) = answers_path {
         let raw = setup_input::load_setup_input(path)
@@ -352,18 +344,18 @@ pub fn add(
     // Secrets use `info.pack_name` (e.g. `messaging-telegram`) as the
     // provider segment — this matches what the runtime resolves via
     // `scoped_secret_path_for_pack(ctx, pack_id, key)`.
-    let secret_reqs = load_secret_requirements_from_pack(&pack_path).unwrap_or_default();
     let answers_map = answers.as_object().cloned().unwrap_or_default();
-    let secret_keys = collect_secret_keys_from_pack(&pack_path);
+    let mut secret_keys = collect_secret_keys_from_pack(&pack_path);
+    for req in load_secret_requirements_from_pack(&pack_path).unwrap_or_default() {
+        secret_keys.insert(req.key.clone());
+        secret_keys.insert(crate::secret_name::canonical_secret_name(&req.key));
+    }
 
     let mut secret_entries: Vec<(String, String, String, String)> = Vec::new(); // (key, value, rel_path, uri)
 
     for (key, value) in &answers_map {
         let is_secret = secret_keys.contains(key)
-            || secret_reqs.iter().any(|r| {
-                crate::secret_name::canonical_secret_name(&r.key)
-                    == crate::secret_name::canonical_secret_name(key)
-            });
+            || secret_keys.contains(&crate::secret_name::canonical_secret_name(key));
 
         if !is_secret {
             continue;
@@ -400,7 +392,7 @@ pub fn add(
     let display_name = args
         .display_name
         .clone()
-        .unwrap_or_else(|| capitalize_kind(info.kind));
+        .unwrap_or_else(|| crate::setup_to_formspec::capitalize(info.kind));
 
     let add_result = messaging::add(
         &store,
@@ -605,14 +597,6 @@ fn has_resolvable_public_url(store: &LocalFsStore, env_id: &str) -> bool {
         .is_some_and(|url| !url.is_empty())
 }
 
-fn capitalize_kind(kind: &str) -> String {
-    let mut chars = kind.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,12 +772,5 @@ mod tests {
         assert!(msg.contains("--bundle-id"), "got: {msg}");
         assert!(msg.contains("bundle-a"), "got: {msg}");
         assert!(msg.contains("bundle-b"), "got: {msg}");
-    }
-
-    #[test]
-    fn capitalize_kind_works() {
-        assert_eq!(capitalize_kind("telegram"), "Telegram");
-        assert_eq!(capitalize_kind("slack"), "Slack");
-        assert_eq!(capitalize_kind(""), "");
     }
 }
