@@ -79,6 +79,17 @@ pub fn resolve_pack(
                 return Ok(path);
             }
             Err(err) => {
+                // When the user explicitly requested a version, do not
+                // silently fall back to an arbitrary old pack — the offline
+                // fallback has no version awareness and would return
+                // whichever pack happened to be deployed previously.
+                if pack_version.is_some() {
+                    bail!(
+                        "OCI fetch failed for {oci_ref}: {err:#}\n\
+                         The --pack-version override requires a successful \
+                         OCI fetch. Supply --pack <path> to use a local file."
+                    );
+                }
                 eprintln!(
                     "Warning: OCI fetch failed for {oci_ref}: {err:#}\n\
                      Falling back to bundle-embedded pack."
@@ -86,6 +97,12 @@ pub fn resolve_pack(
             }
         },
         Err(err) => {
+            if pack_version.is_some() {
+                bail!(
+                    "OCI reference could not be parsed ({oci_ref}): {err:#}\n\
+                     The --pack-version override requires a valid OCI reference."
+                );
+            }
             eprintln!(
                 "Warning: OCI reference could not be parsed ({oci_ref}): {err:#}\n\
                  Falling back to bundle-embedded pack."
@@ -959,6 +976,46 @@ mod tests {
         assert!(
             msg.contains("--pack"),
             "error should suggest --pack escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_pack_version_override_rejects_offline_fallback() {
+        // When the user explicitly passes --pack-version, OCI failure must NOT
+        // silently fall back to an arbitrary old pack from a deployed revision.
+        // The function must error so the user knows the requested version could
+        // not be fetched.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let info = provider_registry::lookup("telegram").unwrap();
+
+        // Plant a pack in a deployed revision so the offline fallback *would*
+        // find it.
+        let pack_dir = root
+            .path()
+            .join("local")
+            .join("revisions")
+            .join("rev-old")
+            .join("bundle")
+            .join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join(format!("{}.gtpack", info.pack_name)),
+            b"old-pack",
+        )
+        .unwrap();
+
+        let result = resolve_pack(
+            None,
+            info,
+            &store,
+            "local",
+            Some("nonexistent-tag-for-testing"),
+        );
+        assert!(
+            result.is_err(),
+            "should error when --pack-version is set and OCI fails, \
+             not silently use an offline fallback; got: {result:?}"
         );
     }
 
