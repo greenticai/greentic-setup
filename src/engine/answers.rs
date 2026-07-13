@@ -90,6 +90,7 @@ pub fn emit_answers(
             if !setup_answers.contains_key(&provider_id) || existing_is_empty {
                 let form_spec =
                     crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider_id);
+                let mut fallback_spec: Option<setup_input::SetupSpec> = None;
                 let template = if let Some(form_spec) = &form_spec {
                     template_from_form_spec(form_spec)
                 } else if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
@@ -98,6 +99,7 @@ pub fn emit_answers(
                         let default_value = infer_default_value(question);
                         entries.insert(question.name.clone(), default_value);
                     }
+                    fallback_spec = Some(spec);
                     entries
                 } else {
                     JsonMap::new()
@@ -106,6 +108,8 @@ pub fn emit_answers(
 
                 let schema = if let Some(form_spec) = &form_spec {
                     schema_from_form_spec(form_spec)
+                } else if let Some(spec) = &fallback_spec {
+                    schema_from_setup_spec(spec)
                 } else {
                     JsonMap::new()
                 };
@@ -418,6 +422,28 @@ fn schema_from_form_spec(form_spec: &qa_spec::FormSpec) -> JsonMap<String, Value
     entries
 }
 
+/// Build a best-effort per-question schema for providers without a
+/// FormSpec (the `setup.yaml`-only fallback), mirroring the `entries`
+/// built for those providers in `emit_answers`.
+///
+/// No FormSpec is available here, so secret classification can't be
+/// derived (setup.yaml's own `secret` flag is not wired into the
+/// prompt/encrypt paths for this fallback); `secret` is always `false`.
+fn schema_from_setup_spec(spec: &setup_input::SetupSpec) -> JsonMap<String, Value> {
+    let mut entries = JsonMap::new();
+    for question in &spec.questions {
+        entries.insert(
+            question.name.clone(),
+            serde_json::json!({
+                "required": question.required,
+                "secret": false,
+                "title": question.name.clone(),
+            }),
+        );
+    }
+    entries
+}
+
 fn empty_value_for_question(kind: QuestionType) -> Value {
     match kind {
         QuestionType::Boolean => Value::String(String::new()),
@@ -539,6 +565,65 @@ mod tests {
         assert_eq!(field["required"], serde_json::json!(true));
         assert_eq!(field["secret"], serde_json::json!(true));
         assert!(field["title"].is_string());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_from_setup_spec_defaults_secret_false_and_uses_required_flag() {
+        let spec = setup_input::SetupSpec {
+            title: None,
+            description: None,
+            questions: vec![
+                setup_input::SetupQuestion {
+                    name: "api_key".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                setup_input::SetupQuestion {
+                    name: "region".to_string(),
+                    required: false,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let schema = schema_from_setup_spec(&spec);
+
+        assert_eq!(
+            schema["api_key"],
+            serde_json::json!({ "required": true, "secret": false, "title": "api_key" })
+        );
+        assert_eq!(
+            schema["region"],
+            serde_json::json!({ "required": false, "secret": false, "title": "region" })
+        );
+    }
+
+    /// Regression guard: `load_answers` must keep ignoring unknown
+    /// top-level fields such as `answers_schema` (an emit → fill →
+    /// `--answers` round trip must stay safe after Task A1 added it).
+    #[test]
+    fn load_answers_tolerates_answers_schema_field() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("answers.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "greentic_setup_version": "1.0.0",
+                "tenant": "acme", "team": null, "env": "dev",
+                "platform_setup": { "static_routes": {}, "deployment_targets": [], "tunnel": { "mode": null } },
+                "setup_answers": { "weather-app": { "weather_api_key": "k" } },
+                "answers_schema": { "setup_answers": { "weather-app": { "weather_api_key": { "required": true, "secret": true, "title": "Weather API key" } } } }
+            })
+            .to_string(),
+        )?;
+
+        let loaded = load_answers(&path, None, false)?;
+        assert_eq!(loaded.tenant.as_deref(), Some("acme"));
+        assert_eq!(
+            loaded.setup_answers["weather-app"]["weather_api_key"],
+            serde_json::json!("k")
+        );
         Ok(())
     }
 }
