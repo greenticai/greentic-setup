@@ -238,13 +238,13 @@ fn auto_detect_bundle_id(store: &LocalFsStore, env_id_str: &str) -> Result<Strin
     }
 }
 
-/// Public wrapper around [`auto_detect_bundle_id`] for use from the binary
+/// Public wrapper around `auto_detect_bundle_id` for use from the binary
 /// crate's answers-driven auto-deploy path.
 pub fn auto_detect_bundle_id_pub(store: &LocalFsStore, env_id: &str) -> Result<String> {
     auto_detect_bundle_id(store, env_id)
 }
 
-/// Public wrapper around [`resolve_pack`] for use from the binary crate's
+/// Public wrapper around `resolve_pack` for use from the binary crate's
 /// answers-driven auto-deploy path.
 pub fn resolve_pack_pub(
     explicit_pack: Option<&Path>,
