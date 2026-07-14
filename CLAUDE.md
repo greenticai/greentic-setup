@@ -10,7 +10,7 @@ conventions see [docs/coding-agents.md](docs/coding-agents.md).
 
 ## Crate Info
 
-Single crate (no workspace). Version `1.1.0-dev.0`, edition 2024,
+Single crate (no workspace). Version `1.2.0-dev.0`, edition 2024,
 `rust-version = "1.95"`. Toolchain pinned to 1.95.0 via `rust-toolchain.toml`.
 
 Binary: `src/bin/greentic_setup.rs`.
@@ -100,8 +100,11 @@ Integration tests in `tests/`:
 - `perf_scaling.rs` — setup scaling characteristics
 - `perf_timeout.rs` — timeout behavior under load
 
-Helper scripts in `scripts/`: `demo.sh` (end-to-end demo run), `test_provider.sh`
-(provider setup smoke test). `tools/i18n.sh` regenerates i18n catalogs.
+Helper scripts in `scripts/`: `demo.sh` (end-to-end demo run),
+`install-hooks.sh` (git hook setup), `make_test_bundle.sh` (test-bundle
+builder), `test_default_welcome.sh` (default-welcome smoke test), and
+`test_provider.sh` (provider setup smoke test). `tools/i18n.sh` regenerates
+i18n catalogs.
 
 ## i18n
 
@@ -110,7 +113,7 @@ CLI strings go through `cli_i18n.rs`; regenerate catalogs with `tools/i18n.sh`.
 
 ## CI Gate Detail
 
-`ci/local_check.sh` runs 6 steps beyond the basics listed above:
+`ci/local_check.sh` runs these 6 steps:
 1. `cargo fmt --all -- --check`
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 3. `cargo test --all-features`
