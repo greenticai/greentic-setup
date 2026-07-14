@@ -979,6 +979,7 @@ pub fn manifest_to_answers(manifest: &EnvManifest) -> Result<AnswerSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_registry;
     use greentic_deployer::cli::bundles::{RouteBindingPayload, TenantSelectorPayload};
     use greentic_deployer::cli::env_manifest::{
         ENV_MANIFEST_SCHEMA_V1, ManifestBundle, ManifestEndpoint, ManifestEnvironment,
@@ -1037,7 +1038,10 @@ mod tests {
             extensions: Vec::new(),
             messaging_endpoints: vec![ManifestEndpoint {
                 name: "demo-telegram".to_string(),
-                provider_type: "messaging.telegram.bot".to_string(),
+                provider_type: provider_registry::lookup("telegram")
+                    .expect("telegram must be in provider_registry")
+                    .provider_type
+                    .to_string(),
                 links: vec!["realbot".to_string(), "auditbot".to_string()],
                 welcome_flow: Some(ManifestWelcomeFlow {
                     bundle_id: "realbot".to_string(),
@@ -1510,6 +1514,9 @@ mod tests {
         // basic form spec and converts + shape-validates through the deployer —
         // proving the hidden columns are never required.
         let basic = spec_for_mode(&manifest_form_spec(), false);
+        let telegram_type = provider_registry::lookup("telegram")
+            .expect("telegram must be in provider_registry")
+            .provider_type;
         let raw = json!({
             "environment_id": "local",
             "trust_root_bootstrap": true,
@@ -1523,7 +1530,7 @@ mod tests {
             }],
             "messaging_endpoints": [{
                 "name": "legal",
-                "provider_type": "messaging.telegram.bot",
+                "provider_type": telegram_type,
                 "links": "legal"
             }]
         });
