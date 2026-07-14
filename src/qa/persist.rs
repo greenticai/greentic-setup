@@ -81,8 +81,9 @@ pub async fn persist_qa_secrets(
         }
     }
 
+    let entries = retain_changed_entries(store, entries).await;
     if entries.is_empty() {
-        return Ok(vec![]);
+        return Ok(saved_keys);
     }
 
     let report = apply_seed(store, &SeedDoc { entries }, ApplyOptions::default()).await;
@@ -95,6 +96,32 @@ pub async fn persist_qa_secrets(
     }
 
     Ok(saved_keys)
+}
+
+/// Drop entries whose stored value already equals the value about to be
+/// written.
+///
+/// Every retained entry appends a new secret VERSION and rewrites the whole
+/// dev-store file. The setup UI persists config drafts continuously, so
+/// re-seeding unchanged values ballooned the store (hundreds of versions per
+/// key within minutes) until every store operation took seconds and the
+/// wizard starved behind its own autosaves. Unchanged values are already
+/// served by the store — skipping them changes nothing for readers.
+async fn retain_changed_entries(store: &DevStore, entries: Vec<SeedEntry>) -> Vec<SeedEntry> {
+    let mut changed = Vec::new();
+    for entry in entries {
+        let unchanged = match &entry.value {
+            SeedValue::Text { text } => store
+                .get(&entry.uri)
+                .await
+                .is_ok_and(|existing| existing == text.as_bytes()),
+            _ => false,
+        };
+        if !unchanged {
+            changed.push(entry);
+        }
+    }
+    changed
 }
 
 /// Remove secret fields from a config object.
@@ -195,9 +222,11 @@ pub async fn persist_all_config_as_secrets(
         );
     }
 
+    let entries = retain_changed_entries(&store, entries).await;
     if entries.is_empty() {
-        // No answer/alias entries, but generated secrets may already have been
-        // introduced above — report those rather than dropping them.
+        // Nothing actually changed (or no answer/alias entries at all) — skip
+        // the whole-file rewrite. Generated secrets may already have been
+        // introduced above; report those rather than dropping them.
         return Ok(saved_keys);
     }
 
@@ -744,6 +773,79 @@ mod tests {
             String::from_utf8(store.get(&alias_uri).await.expect("alias")).expect("alias utf8");
         assert_eq!(base_value, "xyz");
         assert_eq!(alias_value, "xyz");
+    }
+
+    #[tokio::test]
+    async fn persist_skips_store_rewrite_when_values_unchanged() {
+        // The setup UI persists config drafts continuously. Re-seeding
+        // unchanged values must be a no-op: every real write appends a new
+        // version of every key and rewrites the whole store file, which
+        // ballooned the store within minutes until the wizard starved behind
+        // its own autosaves.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle_root = temp.path();
+        let config = json!({
+            "bot_token": "xyz",
+            "enabled": "true"
+        });
+        persist_all_config_as_secrets(
+            bundle_root,
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-webex",
+            &config,
+            None,
+        )
+        .await
+        .expect("first persist");
+
+        let store_path = crate::secrets::ensure_path(bundle_root).expect("store path");
+        let before = std::fs::read(&store_path).expect("read store");
+
+        persist_all_config_as_secrets(
+            bundle_root,
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-webex",
+            &config,
+            None,
+        )
+        .await
+        .expect("second persist");
+        let after = std::fs::read(&store_path).expect("read store");
+        assert_eq!(
+            before, after,
+            "re-persisting unchanged values must not rewrite the store"
+        );
+
+        // A genuinely changed value must still be written.
+        let changed = json!({
+            "bot_token": "rotated",
+            "enabled": "true"
+        });
+        persist_all_config_as_secrets(
+            bundle_root,
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-webex",
+            &changed,
+            None,
+        )
+        .await
+        .expect("third persist");
+        let store = open_dev_store(bundle_root).expect("open store");
+        let uri = crate::canonical_secret_uri(
+            "dev",
+            "tenant-a",
+            Some("core"),
+            "messaging-webex",
+            "bot_token",
+        );
+        let value = String::from_utf8(store.get(&uri).await.expect("get")).expect("utf8");
+        assert_eq!(value, "rotated");
     }
 
     #[test]

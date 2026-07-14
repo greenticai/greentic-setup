@@ -1617,7 +1617,13 @@ fn response_needs_oauth(response: &Value) -> bool {
         || text.contains("token is expired");
     let says_invalid = text.contains("invalid token")
         || text.contains("access token is invalid")
-        || text.contains("invalid access token");
+        || text.contains("invalid access token")
+        // Microsoft Graph 401s carry CamelCase codes and JWT-shape complaints
+        // (e.g. a redaction placeholder sent as the bearer token) with none of
+        // the spaced phrases above.
+        || text.contains("invalidauthenticationtoken")
+        || text.contains("jwt is not well formed")
+        || text.contains("compact serialization format");
     says_unauthorized && (says_expired || says_invalid)
 }
 
@@ -2636,13 +2642,16 @@ fn hydrate_redacted_backend_config(
     let tenant = tenant.to_string();
     let team = team.to_string();
     let provider_id = provider_id.to_string();
+    let lookup_provider_id = provider_id.clone();
+    let lookup_keys = keys.clone();
     let hydrated = block_on_backend_secret_task(async move {
         use greentic_secrets_lib::SecretsStore;
 
         let store = crate::secrets::open_dev_store(&bundle_root)?;
         let mut values = JsonMap::new();
-        for key in keys {
-            let uri = crate::canonical_secret_uri(&env, &tenant, Some(&team), &provider_id, &key);
+        for key in lookup_keys {
+            let uri =
+                crate::canonical_secret_uri(&env, &tenant, Some(&team), &lookup_provider_id, &key);
             if let Ok(bytes) = store.get(&uri).await
                 && let Ok(text) = String::from_utf8(bytes)
                 && !text.is_empty()
@@ -2652,8 +2661,27 @@ fn hydrate_redacted_backend_config(
         }
         Ok::<_, anyhow::Error>(values)
     })?;
-    for (key, value) in hydrated {
-        config.insert(key, value);
+    for key in keys {
+        match hydrated.get(&key) {
+            Some(value) => {
+                config.insert(key, value.clone());
+            }
+            None => {
+                // The store no longer holds this secret, so the redacted
+                // placeholder cannot be restored. Drop the key entirely:
+                // executors treat a missing credential as "complete OAuth /
+                // re-enter it, then retry", whereas leaving the placeholder in
+                // place sends the literal string "[redacted:dev-secret]" to
+                // the provider as a credential (observed as a Graph 401
+                // "JWT is not well formed" dead end).
+                eprintln!(
+                    "[setup backend-state] stored secret for {provider_id}/{key} is missing \
+                     from the dev store; clearing the redacted placeholder so setup re-prompts \
+                     for it instead of using the placeholder as a credential"
+                );
+                config.remove(&key);
+            }
+        }
     }
     Ok(())
 }
@@ -3271,6 +3299,34 @@ mod tests {
     }
 
     #[test]
+    fn oauth_required_result_treats_graph_invalid_authentication_token_as_reauth() {
+        // Verbatim shape of a Microsoft Graph 401 when the bearer token is not
+        // a JWT (e.g. a redaction placeholder): CamelCase code, no spaced
+        // "invalid token"/"expired" phrase anywhere in the body.
+        let action = json!({"id": "bot_app_identity"});
+        let result = oauth_required_result(
+            &action,
+            "graph_access_token",
+            "authenticated request failed",
+            &json!({
+                "ok": false,
+                "status": 401,
+                "body": {
+                    "error": {
+                        "code": "InvalidAuthenticationToken",
+                        "message": "IDX14100: JWT is not well formed, there are no dots (.).\nThe token needs to be in JWS or JWE Compact Serialization Format. (JWS): 'EncodedHeader.EncodedPayload.EncodedSignature'."
+                    }
+                }
+            }),
+        )
+        .expect("Graph InvalidAuthenticationToken must route to re-auth, not a dead end");
+
+        assert_eq!(result["result"]["error"], "oauth_required");
+        assert_eq!(result["result"]["token_store_key"], "graph_access_token");
+        assert_eq!(blocked_from_result(&result).unwrap()["retryable"], true);
+    }
+
+    #[test]
     fn runtime_observation_waits_until_state_store_key_exists() -> anyhow::Result<()> {
         let action = json!({
             "id": "observe",
@@ -3808,6 +3864,44 @@ mod tests {
             "https://login.example/token"
         );
         assert_eq!(loaded["last_oauth"]["response"]["user_code"], "SECRET-CODE");
+    }
+
+    #[test]
+    fn backend_state_drops_redacted_keys_missing_from_store_on_load() {
+        // A secret can vanish from the dev store after the state file was
+        // written (e.g. a concurrent whole-file rewrite losing the update).
+        // The load must then DROP the redacted key — an executor treats a
+        // missing credential as "complete OAuth, then retry" — rather than
+        // leave the "[redacted:dev-secret]" placeholder to be sent to a
+        // provider as a live credential.
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "env": "dev",
+                "graph_access_token": "real-token",
+                "oauth_token_url": "https://login.example/token"
+            }),
+        );
+        save_backend_state(temp.path(), "demo", "default", "messaging-teams", &stored)
+            .expect("save state");
+
+        // Simulate the lost update: wipe the dev store the save persisted to.
+        let store_path = crate::secrets::ensure_path(temp.path()).expect("store path");
+        std::fs::write(&store_path, "").expect("wipe dev store");
+
+        let loaded = load_backend_state(temp.path(), "dev", "demo", "default", "messaging-teams")
+            .expect("load state");
+        assert!(
+            loaded["config"].get("graph_access_token").is_none(),
+            "unhydratable redacted key must be dropped, got {:?}",
+            loaded["config"].get("graph_access_token")
+        );
+        assert_eq!(
+            loaded["config"]["oauth_token_url"],
+            "https://login.example/token"
+        );
     }
 
     #[test]
