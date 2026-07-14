@@ -79,11 +79,16 @@ fn read_bundle_id_from_dir(dir: &Path) -> Result<String> {
 /// Resolves the input to an absolute `.gtbundle` archive, reads the
 /// declared `bundle_id` from the archive metadata, synthesizes an
 /// env-manifest document, and runs it through the env-apply engine.
+///
+/// When `customer_id` is `Some`, it is included in the synthesized
+/// env-manifest so the deployer's `resolve_customer_id` finds it
+/// (required for non-local environments).
 pub fn deploy_bundle_to_env(
     bundle: &Path,
     env_id: &str,
     dry_run: bool,
     non_interactive: bool,
+    customer_id: Option<&str>,
 ) -> Result<()> {
     // ── Step 1: resolve to an absolute .gtbundle archive file ────────────
     let _temp_dir; // keep alive until after apply returns
@@ -133,15 +138,7 @@ pub fn deploy_bundle_to_env(
     };
 
     // ── Step 3: synthesize the env-manifest document ────────────────────
-    let manifest = json!({
-        "schema": ENV_MANIFEST_SCHEMA_V1,
-        "environment": { "id": env_id },
-        "trust_root": "bootstrap",
-        "bundles": [{
-            "bundle_id": bundle_id,
-            "bundle_path": archive_path.to_string_lossy(),
-        }]
-    });
+    let manifest = build_env_manifest(env_id, &bundle_id, &archive_path, customer_id);
 
     // ── Step 4: write to a temp file and call env-apply ─────────────────
     let manifest_file = tempfile::NamedTempFile::new().context("create temporary manifest file")?;
@@ -165,6 +162,35 @@ pub fn deploy_bundle_to_env(
     )?;
     print_outcome(&outcome)?;
     Ok(())
+}
+
+/// Build the synthesized single-bundle env-manifest document.
+///
+/// Split out so tests exercise the real construction instead of re-deriving it:
+/// `customer_id` is required by the deployer's `resolve_customer_id` for every
+/// non-`local` env, so dropping it here silently breaks named environments.
+fn build_env_manifest(
+    env_id: &str,
+    bundle_id: &str,
+    archive_path: &Path,
+    customer_id: Option<&str>,
+) -> serde_json::Value {
+    let mut bundle_entry = json!({
+        "bundle_id": bundle_id,
+        "bundle_path": archive_path.to_string_lossy(),
+    });
+    if let Some(cid) = customer_id {
+        bundle_entry
+            .as_object_mut()
+            .expect("bundle_entry is a json object")
+            .insert("customer_id".to_string(), json!(cid));
+    }
+    json!({
+        "schema": ENV_MANIFEST_SCHEMA_V1,
+        "environment": { "id": env_id },
+        "trust_root": "bootstrap",
+        "bundles": [bundle_entry]
+    })
 }
 
 #[cfg(test)]
@@ -253,6 +279,47 @@ mod tests {
         );
     }
 
+    // ── customer_id in synthesized manifest ───────────────────────────
+
+    #[test]
+    fn synthesized_manifest_includes_customer_id_when_provided() {
+        // Exercises the REAL construction (`build_env_manifest`). An earlier
+        // version of this test re-derived the manifest inline and so passed even
+        // with the customer_id insertion deleted from production — a tautology.
+        // The deployer's resolve_customer_id REQUIRES this field for every
+        // non-local env; without it, `provider add` hard-fails after the
+        // endpoint, secrets, and bundle link have already been committed.
+        let manifest = build_env_manifest(
+            "staging",
+            "my-bundle",
+            Path::new("/tmp/my-bundle.gtbundle"),
+            Some("acme-billing"),
+        );
+        let parsed: EnvManifest =
+            serde_json::from_value(manifest).expect("manifest must deserialize");
+        assert_eq!(
+            parsed.bundles[0].customer_id.as_deref(),
+            Some("acme-billing"),
+            "customer_id must be present in the synthesized manifest"
+        );
+    }
+
+    #[test]
+    fn synthesized_manifest_omits_customer_id_when_none() {
+        let manifest = build_env_manifest(
+            "local",
+            "my-bundle",
+            Path::new("/tmp/my-bundle.gtbundle"),
+            None,
+        );
+        let parsed: EnvManifest =
+            serde_json::from_value(manifest).expect("manifest must deserialize");
+        assert!(
+            parsed.bundles[0].customer_id.is_none(),
+            "customer_id must be absent when not provided (local env defaults it)"
+        );
+    }
+
     // ── bundle_id from bundle-manifest.json, not filename ───────────────
 
     #[test]
@@ -311,7 +378,7 @@ mod tests {
         let not_a_bundle = temp.path().join("random.txt");
         fs::write(&not_a_bundle, "hello").unwrap();
 
-        let err = deploy_bundle_to_env(&not_a_bundle, "local", true, true).unwrap_err();
+        let err = deploy_bundle_to_env(&not_a_bundle, "local", true, true, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not a .gtbundle"),
@@ -321,9 +388,14 @@ mod tests {
 
     #[test]
     fn nonexistent_path_is_a_clear_error() {
-        let err =
-            deploy_bundle_to_env(Path::new("/nonexistent/path.gtbundle"), "local", true, true)
-                .unwrap_err();
+        let err = deploy_bundle_to_env(
+            Path::new("/nonexistent/path.gtbundle"),
+            "local",
+            true,
+            true,
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("does not exist"),

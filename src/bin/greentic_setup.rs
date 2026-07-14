@@ -131,6 +131,7 @@ fn main() -> Result<()> {
                 &env,
                 cli.dry_run,
                 cli.non_interactive,
+                None,
             )
         }
         Some(Command::Provider(cmd)) => {
@@ -447,6 +448,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             &env,
             false,
             true, // non-interactive
+            None,
         )
         .context("auto-deploy bundle to environment")?;
 
@@ -518,7 +520,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
                 },
                 Some(idem_key),
             ) {
-                Ok(_endpoint_id) => {
+                Ok(_result) => {
                     if provider_entry.link_bundle {
                         eprintln!(
                             "Provider `{provider_id}` wired to bundle `{bundle_id}` in env `{env}`."

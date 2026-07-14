@@ -32,6 +32,21 @@ use crate::setup_input::{self, SetupInputAnswers};
 /// The `updated_by` identity stamped on every mutation this module performs.
 const UPDATED_BY: &str = "greentic-setup";
 
+/// Outcome of the provider-pack deployment step in [`register_provider_core`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackDeployOutcome {
+    /// A new revision was staged with the provider pack injected into the bundle.
+    Deployed,
+    /// The provider pack was already present in the deployed bundle.
+    AlreadyPresent,
+}
+
+/// Result of [`register_provider_core`].
+pub struct ProviderRegistrationResult {
+    pub endpoint_id: String,
+    pub pack_deploy: PackDeployOutcome,
+}
+
 /// No-op flags for direct deployer library calls (no `--schema`, no
 /// `--answers` file — we supply payloads programmatically).
 fn op_flags() -> OpFlags {
@@ -292,8 +307,9 @@ pub struct RegisterProviderPayload<'a> {
     pub pack_path: &'a Path,
 }
 
-/// Register a messaging endpoint, write its secrets, and optionally link a
-/// bundle. This is the mutation core shared by `add()` (interactive) and
+/// Register a messaging endpoint, write its secrets, optionally link a
+/// bundle, and deploy the provider pack into the environment's bundle.
+/// This is the mutation core shared by `add()` (interactive) and
 /// answers-driven auto-deploy (non-interactive).
 ///
 /// Ordering invariant: bundle_id is resolved BEFORE this function is called
@@ -301,6 +317,8 @@ pub struct RegisterProviderPayload<'a> {
 /// 1. register endpoint (fail-fast on duplicate)
 /// 2. write secrets
 /// 3. link bundle
+/// 4. deploy provider pack (when `link_bundle` is true and the pack is not
+///    already in the deployed bundle)
 ///
 /// When `idempotency_key` is `Some`, the deployer's replay logic makes
 /// same-identity re-runs no-ops. When `None`, the deployer mints a fresh
@@ -309,7 +327,28 @@ pub fn register_provider_core(
     store: &LocalFsStore,
     payload: &RegisterProviderPayload<'_>,
     idempotency_key: Option<String>,
-) -> Result<String> {
+) -> Result<ProviderRegistrationResult> {
+    register_provider_core_impl(
+        store,
+        payload,
+        idempotency_key,
+        |bundle_copy, env_id, customer_id| {
+            crate::env_deploy::deploy_bundle_to_env(bundle_copy, env_id, false, true, customer_id)
+        },
+    )
+}
+
+/// Testable inner implementation of [`register_provider_core`].
+///
+/// Accepts a `deploy_fn` closure so tests can substitute a lightweight stub for
+/// the real [`crate::env_deploy::deploy_bundle_to_env`] call and assert that the
+/// pack-deploy step is actually reached from this function.
+fn register_provider_core_impl(
+    store: &LocalFsStore,
+    payload: &RegisterProviderPayload<'_>,
+    idempotency_key: Option<String>,
+    deploy_fn: impl FnOnce(&Path, &str, Option<&str>) -> Result<()>,
+) -> Result<ProviderRegistrationResult> {
     // ── Build secret entries ─────────────────────────────────────────
     let mut secret_keys = collect_secret_keys_from_pack(payload.pack_path);
     for req in load_secret_requirements_from_pack(payload.pack_path).unwrap_or_default() {
@@ -417,7 +456,24 @@ pub fn register_provider_core(
         print_outcome(&link_result).ok();
     }
 
-    Ok(endpoint_id)
+    // ── Deploy provider pack into the environment's bundle ──────────
+    let pack_deploy = if payload.link_bundle {
+        inject_provider_pack_impl(
+            store,
+            payload.env_id,
+            payload.bundle_id,
+            payload.pack_path,
+            payload.pack_name,
+            deploy_fn,
+        )?
+    } else {
+        PackDeployOutcome::AlreadyPresent
+    };
+
+    Ok(ProviderRegistrationResult {
+        endpoint_id,
+        pack_deploy,
+    })
 }
 
 /// Derive a deterministic idempotency key from (env_id, provider_type,
@@ -564,7 +620,7 @@ pub fn add(
 
     let answers_map = answers.as_object().cloned().unwrap_or_default();
 
-    let _endpoint_id = register_provider_core(
+    let result = register_provider_core(
         &store,
         &RegisterProviderPayload {
             env_id,
@@ -579,7 +635,11 @@ pub fn add(
             answers: &answers_map,
             pack_path: &pack_path,
         },
-        None, // auto-minted (interactive path)
+        Some(deterministic_idempotency_key(
+            env_id,
+            info.provider_type,
+            provider_id,
+        )),
     )?;
 
     // ── Closing message ───────────────────────────────────────────────
@@ -589,7 +649,20 @@ pub fn add(
          and linked to bundle `{bundle_id}`.",
         ptype = info.provider_type,
     );
-    eprintln!("A running runtime (`gtc start`) will pick up the new endpoint on its next reload.");
+    match result.pack_deploy {
+        PackDeployOutcome::Deployed => {
+            eprintln!(
+                "Provider pack deployed and new revision staged. \
+                 Restart the runtime (`gtc start`) to activate."
+            );
+        }
+        PackDeployOutcome::AlreadyPresent => {
+            eprintln!(
+                "The provider pack is already in the deployed bundle. \
+                 A running runtime will pick up the endpoint on its next reload."
+            );
+        }
+    }
 
     // Warn about webhook registration if no public base URL is resolvable.
     if !has_resolvable_public_url(&store, env_id) {
@@ -713,6 +786,243 @@ fn has_resolvable_public_url(store: &LocalFsStore, env_id: &str) -> bool {
         .and_then(|hc| hc.get("public_base_url"))
         .and_then(|v| v.as_str())
         .is_some_and(|url| !url.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Provider-pack-into-bundle injection
+// ---------------------------------------------------------------------------
+
+/// Resolved deployment context from `environment.json`.
+#[derive(Debug)]
+struct DeploymentContext {
+    /// Directory containing the serving revision's bundle tree.
+    bundle_dir: PathBuf,
+    /// Billing principal from the `BundleDeployment`.
+    customer_id: Option<String>,
+}
+
+/// The subset of the deployer's `environment.json` that provider-add needs.
+///
+/// Deserialized into named fields rather than poked at with `serde_json::Value`
+/// `.get()` chains: if the deployer renames `bundles` or `bundle_id`, this fails
+/// loudly at parse time instead of silently yielding `None` and reporting a
+/// misleading "no deployment for bundle" further down.
+///
+/// This mirrors the deployer's `Environment` / `BundleDeployment`. Using those
+/// types directly would be better still, but constructing one in a test requires
+/// a trusted operator key that the deployer refuses to auto-generate, which would
+/// make every test here non-hermetic. Unknown fields are ignored on purpose —
+/// `environment.json` carries far more than this.
+#[derive(serde::Deserialize)]
+struct EnvJson {
+    bundles: Vec<EnvJsonBundle>,
+}
+
+#[derive(serde::Deserialize)]
+struct EnvJsonBundle {
+    bundle_id: String,
+    /// `#[serde(default)]` mirrors the deployer's own default on this field.
+    #[serde(default)]
+    current_revisions: Vec<String>,
+    #[serde(default)]
+    customer_id: Option<String>,
+}
+
+/// Resolve the deployment context for `bundle_id` from the store.
+///
+/// Reads `environment.json`, finds the `BundleDeployment` whose `bundle_id`
+/// matches, validates it has exactly one serving revision, and returns the
+/// revision's bundle directory and the deployment's `customer_id`.
+fn resolve_deployment_context(env_dir: &Path, bundle_id: &str) -> Result<DeploymentContext> {
+    let env_json_path = env_dir.join("environment.json");
+    let raw = std::fs::read_to_string(&env_json_path)
+        .with_context(|| format!("read {}", env_json_path.display()))?;
+    let doc: EnvJson =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", env_json_path.display()))?;
+
+    let deployment = doc
+        .bundles
+        .iter()
+        .find(|b| b.bundle_id == bundle_id)
+        .with_context(|| {
+            format!(
+                "no deployment for bundle `{bundle_id}` in environment at {}",
+                env_dir.display(),
+            )
+        })?;
+
+    let current_revisions = &deployment.current_revisions;
+
+    match current_revisions.len() {
+        0 => bail!(
+            "deployment for bundle `{bundle_id}` has no serving revisions.\n\
+             Deploy the bundle first: gtc start <bundle>"
+        ),
+        1 => {}
+        n => bail!(
+            "deployment for bundle `{bundle_id}` has {n} serving revisions \
+             (active traffic split).\n\
+             `provider add` cannot safely rebuild a bundle mid-split because \
+             silently picking one revision would shift traffic.\n\
+             Resolve the traffic split first, then retry."
+        ),
+    }
+
+    let revision_id = &current_revisions[0];
+    let bundle_dir = env_dir.join("revisions").join(revision_id).join("bundle");
+
+    if !bundle_dir.is_dir() {
+        bail!(
+            "revision `{revision_id}` for bundle `{bundle_id}` has no bundle \
+             directory at {}",
+            bundle_dir.display(),
+        );
+    }
+
+    Ok(DeploymentContext {
+        bundle_dir,
+        customer_id: deployment.customer_id.clone(),
+    })
+}
+
+/// Result of checking whether a pack file already exists in a bundle.
+enum PackPresence {
+    /// No pack file at this location.
+    Absent,
+    /// File exists and has the same sha256 digest as the source.
+    MatchingDigest,
+    /// File exists but has a different sha256 digest.
+    DigestMismatch,
+}
+
+/// Compute the sha256 hex digest of a file.
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).with_context(|| format!("read file {}", path.display()))?;
+    let hash = Sha256::digest(bytes);
+    Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Check whether a pack is already present in a bundle directory, comparing
+/// content digests rather than just filenames. Uses the same placement logic
+/// as [`crate::engine::get_pack_target_dir`].
+fn check_pack_in_bundle_dir(
+    bundle_dir: &Path,
+    pack_id: &str,
+    source_pack_path: &Path,
+) -> Result<PackPresence> {
+    let target_dir = crate::engine::get_pack_target_dir(bundle_dir, pack_id);
+    let embedded_path = target_dir.join(format!("{pack_id}.gtpack"));
+    if !embedded_path.is_file() {
+        return Ok(PackPresence::Absent);
+    }
+    let source_digest = sha256_file(source_pack_path)?;
+    let embedded_digest = sha256_file(&embedded_path)?;
+    if source_digest == embedded_digest {
+        Ok(PackPresence::MatchingDigest)
+    } else {
+        Ok(PackPresence::DigestMismatch)
+    }
+}
+
+/// Prepare a modified bundle directory with the provider pack injected.
+///
+/// Returns `Ok(Some((bundle_dir, tempdir_handle)))` when the pack was
+/// injected into a copy of the deployed bundle. Returns `Ok(None)` when the
+/// pack was already present with the same content digest (idempotent
+/// re-run). The `tempdir_handle` must be kept alive until the caller is
+/// done with the returned path.
+///
+/// When the pack file exists but has a different digest (e.g. a newer
+/// version resolved via `--pack-version` or a rotated `:stable` tag), the
+/// embedded copy is replaced and the bundle is rebuilt.
+fn prepare_bundle_with_provider_pack(
+    source_bundle_dir: &Path,
+    pack_path: &Path,
+    pack_name: &str,
+) -> Result<Option<(PathBuf, tempfile::TempDir)>> {
+    match check_pack_in_bundle_dir(source_bundle_dir, pack_name, pack_path)? {
+        PackPresence::MatchingDigest => return Ok(None),
+        PackPresence::Absent | PackPresence::DigestMismatch => {}
+    }
+
+    let temp_dir =
+        tempfile::tempdir().context("create temporary directory for bundle modification")?;
+    let bundle_copy = temp_dir.path().join("bundle");
+    crate::cli_helpers::copy_dir_recursive(
+        &source_bundle_dir.to_path_buf(),
+        &bundle_copy,
+        false, // `only_used_providers` — keep the deployed tree intact
+    )
+    .context("copy deployed bundle for modification")?;
+
+    // When the pack exists with a different digest, remove the stale copy
+    // before injecting. `execute_add_packs_to_bundle` overwrites anyway,
+    // but removing first keeps the lock file consistent.
+    let target_dir = crate::engine::get_pack_target_dir(&bundle_copy, pack_name);
+    let stale = target_dir.join(format!("{pack_name}.gtpack"));
+    if stale.is_file() {
+        std::fs::remove_file(&stale)
+            .with_context(|| format!("remove stale pack {}", stale.display()))?;
+    }
+
+    let digest = format!("sha256:{}", sha256_file(pack_path)?);
+
+    crate::engine::execute_add_packs_to_bundle(
+        &bundle_copy,
+        &[crate::plan::ResolvedPackInfo {
+            source_ref: pack_path.display().to_string(),
+            mapped_ref: pack_path.display().to_string(),
+            resolved_digest: digest,
+            pack_id: pack_name.to_string(),
+            entry_flows: Vec::new(),
+            cached_path: pack_path.to_path_buf(),
+            output_path: pack_path.to_path_buf(),
+        }],
+    )
+    .context("inject provider pack into bundle")?;
+
+    Ok(Some((bundle_copy, temp_dir)))
+}
+
+/// Inject the provider pack into the environment's deployed bundle and
+/// redeploy via the env-apply engine, creating a new revision.
+///
+/// Returns [`PackDeployOutcome::AlreadyPresent`] when the pack is already in
+/// the serving revision's bundle tree with the same content digest.
+///
+/// Resolves the target deployment from the store via `bundle_id` (not
+/// mtime), extracts `customer_id` and the single serving revision, and
+/// errors clearly on traffic splits.
+///
+/// Accepts a `deploy_fn` closure so tests can substitute a lightweight
+/// stub for the real [`crate::env_deploy::deploy_bundle_to_env`] call.
+fn inject_provider_pack_impl(
+    store: &LocalFsStore,
+    env_id: &str,
+    bundle_id: &str,
+    pack_path: &Path,
+    pack_name: &str,
+    deploy_fn: impl FnOnce(&Path, &str, Option<&str>) -> Result<()>,
+) -> Result<PackDeployOutcome> {
+    let env_dir = store.root().join(env_id);
+    let ctx = resolve_deployment_context(&env_dir, bundle_id)?;
+
+    match prepare_bundle_with_provider_pack(&ctx.bundle_dir, pack_path, pack_name)? {
+        None => {
+            eprintln!(
+                "Provider pack `{pack_name}` is already present in the deployed bundle; \
+                 skipping bundle rebuild."
+            );
+            Ok(PackDeployOutcome::AlreadyPresent)
+        }
+        Some((bundle_copy, _temp_dir)) => {
+            eprintln!("Deploying bundle with provider pack `{pack_name}`...");
+            deploy_fn(&bundle_copy, env_id, ctx.customer_id.as_deref())
+                .context("redeploy bundle with injected provider pack")?;
+            Ok(PackDeployOutcome::Deployed)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1030,5 +1340,799 @@ mod tests {
 
         assert!(ref_default.ends_with(":stable"));
         assert!(ref_pinned.ends_with(":0.5.17"));
+    }
+
+    // -- provider pack injection helpers ----------------------------------------
+
+    /// Write a minimal .gtpack ZIP archive with a `pack.manifest.json`.
+    fn write_test_pack(path: &Path, pack_id: &str) {
+        use std::io::Write;
+        use zip::write::{FileOptions, ZipWriter};
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("pack.manifest.json", options).unwrap();
+        writer
+            .write_all(
+                serde_json::json!({
+                    "pack_id": pack_id,
+                    "display_name": pack_id,
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    // -- resolve_deployment_context tests ----------------------------------------
+
+    /// Write an `environment.json` fixture into `env_dir`.
+    fn write_env_json(env_dir: &Path, bundles_json: serde_json::Value) {
+        std::fs::create_dir_all(env_dir).unwrap();
+        let env_json = serde_json::json!({
+            "schema": "greentic.environment.v1",
+            "environment_id": env_dir.file_name().unwrap().to_str().unwrap(),
+            "bundles": bundles_json,
+        });
+        std::fs::write(
+            env_dir.join("environment.json"),
+            serde_json::to_string_pretty(&env_json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_deployment_context_finds_single_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let env_dir = root.path().join("local");
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "my-bundle",
+                "customer_id": "acme-corp",
+                "current_revisions": ["rev-001"],
+            }]),
+        );
+
+        let ctx = resolve_deployment_context(&env_dir, "my-bundle").unwrap();
+        assert_eq!(ctx.bundle_dir, bundle_dir);
+        assert_eq!(ctx.customer_id.as_deref(), Some("acme-corp"));
+    }
+
+    #[test]
+    fn resolve_deployment_context_errors_on_traffic_split() {
+        let root = tempfile::tempdir().unwrap();
+        let env_dir = root.path().join("local");
+        for rev in &["rev-a", "rev-b"] {
+            std::fs::create_dir_all(env_dir.join("revisions").join(rev).join("bundle")).unwrap();
+        }
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "split-bundle",
+                "current_revisions": ["rev-a", "rev-b"],
+            }]),
+        );
+
+        let err = resolve_deployment_context(&env_dir, "split-bundle").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("traffic split"),
+            "expected traffic-split error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_deployment_context_errors_on_no_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        let env_dir = root.path().join("local");
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "empty-bundle",
+                "current_revisions": [],
+            }]),
+        );
+
+        let err = resolve_deployment_context(&env_dir, "empty-bundle").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no serving revisions"),
+            "expected no-revisions error, got: {msg}"
+        );
+    }
+
+    // -- check_pack_in_bundle_dir tests -------------------------------------------
+
+    #[test]
+    fn check_pack_absent_when_not_present() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle_dir = root.path().join("bundle");
+        std::fs::create_dir_all(bundle_dir.join("packs")).unwrap();
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let result =
+            check_pack_in_bundle_dir(&bundle_dir, "messaging-telegram", &pack_path).unwrap();
+        assert!(matches!(result, PackPresence::Absent));
+    }
+
+    #[test]
+    fn check_pack_matching_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle_dir = root.path().join("bundle");
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+        // Copy the exact same file into the bundle.
+        std::fs::copy(&pack_path, provider_dir.join("messaging-telegram.gtpack")).unwrap();
+
+        let result =
+            check_pack_in_bundle_dir(&bundle_dir, "messaging-telegram", &pack_path).unwrap();
+        assert!(matches!(result, PackPresence::MatchingDigest));
+    }
+
+    #[test]
+    fn check_pack_digest_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle_dir = root.path().join("bundle");
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+
+        // Write two packs with different content.
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+        // Write a different file in the bundle location.
+        std::fs::write(
+            provider_dir.join("messaging-telegram.gtpack"),
+            b"old-version-different-content",
+        )
+        .unwrap();
+
+        let result =
+            check_pack_in_bundle_dir(&bundle_dir, "messaging-telegram", &pack_path).unwrap();
+        assert!(matches!(result, PackPresence::DigestMismatch));
+    }
+
+    // -- prepare_bundle_with_provider_pack tests ----------------------------------
+
+    #[test]
+    fn prepare_bundle_injects_provider_pack() {
+        // This test FAILS without the fix: without execute_add_packs_to_bundle,
+        // the provider pack would not be present in the output bundle and the
+        // assertions would fail.
+        let root = tempfile::tempdir().unwrap();
+
+        // Set up a fake environment with a deployed revision.
+        let env_dir = root.path().join("local");
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+
+        // Create a provider pack to inject.
+        let pack_dir = root.path().join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_path = pack_dir.join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        // Act: inject the pack (first arg is bundle dir, not env dir).
+        let result =
+            prepare_bundle_with_provider_pack(&bundle_dir, &pack_path, "messaging-telegram")
+                .unwrap();
+
+        // Assert: pack was injected (not already present).
+        assert!(
+            result.is_some(),
+            "pack should be injected (was not already present)"
+        );
+        let (output_bundle, _tempdir) = result.unwrap();
+
+        // Assert: provider pack file exists in the correct location.
+        let target_pack = output_bundle
+            .join("providers")
+            .join("messaging")
+            .join("messaging-telegram.gtpack");
+        assert!(
+            target_pack.is_file(),
+            "provider pack must be present at {}",
+            target_pack.display(),
+        );
+
+        // Assert: bundle.yaml has the extension_providers reference.
+        let bundle_yaml =
+            std::fs::read_to_string(output_bundle.join(crate::bundle::BUNDLE_WORKSPACE_MARKER))
+                .unwrap();
+        assert!(
+            bundle_yaml.contains("providers/messaging/messaging-telegram.gtpack"),
+            "bundle.yaml must contain the provider pack reference.\nGot:\n{bundle_yaml}",
+        );
+
+        // Assert: bundle.lock.json has the entry with a digest.
+        let lock_raw =
+            std::fs::read_to_string(output_bundle.join(crate::bundle::BUNDLE_LOCK_FILE)).unwrap();
+        let lock: serde_json::Value = serde_json::from_str(&lock_raw).unwrap();
+        let ext_providers = lock
+            .get("extension_providers")
+            .and_then(|v| v.as_array())
+            .expect("extension_providers array in lock");
+        let has_telegram = ext_providers.iter().any(|entry| {
+            entry
+                .get("reference")
+                .and_then(|v| v.as_str())
+                .is_some_and(|r| r == "providers/messaging/messaging-telegram.gtpack")
+        });
+        assert!(
+            has_telegram,
+            "bundle.lock.json must contain the provider pack reference.\nGot:\n{lock_raw}",
+        );
+    }
+
+    #[test]
+    fn prepare_bundle_skips_when_pack_already_present() {
+        let root = tempfile::tempdir().unwrap();
+
+        // Set up a revision with the provider pack already in the bundle.
+        let env_dir = root.path().join("local");
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        write_test_pack(
+            &provider_dir.join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+        );
+
+        // Act: try to inject the same pack (same content).
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let result =
+            prepare_bundle_with_provider_pack(&bundle_dir, &pack_path, "messaging-telegram")
+                .unwrap();
+
+        // Assert: injection was skipped (pack already present with matching digest).
+        assert!(
+            result.is_none(),
+            "should skip injection when pack is already in the bundle with same digest",
+        );
+    }
+
+    #[test]
+    fn prepare_bundle_replaces_when_digest_mismatch() {
+        // When a pack exists but has different content (e.g. new version),
+        // prepare_bundle must inject anyway (not skip).
+        let root = tempfile::tempdir().unwrap();
+
+        let bundle_dir = root.path().join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+
+        // Plant a stale pack in the bundle.
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        std::fs::write(
+            provider_dir.join("messaging-telegram.gtpack"),
+            b"old-stale-content",
+        )
+        .unwrap();
+
+        // Create a new pack with different content.
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let result =
+            prepare_bundle_with_provider_pack(&bundle_dir, &pack_path, "messaging-telegram")
+                .unwrap();
+
+        assert!(
+            result.is_some(),
+            "must inject when digest differs (not skip)"
+        );
+    }
+
+    #[test]
+    fn prepare_bundle_is_idempotent_on_rerun() {
+        // Running inject twice should produce the same bundle.yaml content.
+        let root = tempfile::tempdir().unwrap();
+        let bundle_dir = root.path().join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        // First injection.
+        let result1 =
+            prepare_bundle_with_provider_pack(&bundle_dir, &pack_path, "messaging-telegram")
+                .unwrap();
+        assert!(result1.is_some(), "first injection should proceed");
+        let (bundle1, _td1) = result1.unwrap();
+        let yaml1 =
+            std::fs::read_to_string(bundle1.join(crate::bundle::BUNDLE_WORKSPACE_MARKER)).unwrap();
+
+        // Simulate a second run: the pack is now in the source bundle
+        // (because the first run deployed it). Copy it into the bundle dir to
+        // simulate what stage_local_bundle would do.
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        std::fs::copy(
+            bundle1
+                .join("providers")
+                .join("messaging")
+                .join("messaging-telegram.gtpack"),
+            provider_dir.join("messaging-telegram.gtpack"),
+        )
+        .unwrap();
+
+        // Second injection should detect the pack (same digest) and skip.
+        let result2 =
+            prepare_bundle_with_provider_pack(&bundle_dir, &pack_path, "messaging-telegram")
+                .unwrap();
+        assert!(
+            result2.is_none(),
+            "second injection should be skipped (pack already present with same digest)"
+        );
+
+        // Verify the first bundle.yaml is well-formed (only one reference).
+        let count = yaml1
+            .matches("providers/messaging/messaging-telegram.gtpack")
+            .count();
+        assert_eq!(
+            count, 1,
+            "bundle.yaml should contain exactly one reference to the pack, found {count}"
+        );
+    }
+
+    // -- inject_provider_pack_impl (orchestrator-level) tests -------------------
+
+    #[test]
+    fn inject_provider_pack_calls_deploy_when_pack_absent() {
+        // This test exercises the thin orchestrator that `register_provider_core`
+        // delegates to. It FAILS if the deploy function is never called (i.e.
+        // the integration is removed or short-circuited).
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+
+        // Set up env with a deployed revision (no provider pack yet).
+        let env_dir = root.path().join("local");
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+
+        // Write environment.json with the bundle deployment pointing at rev-001.
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "test-bundle",
+                "current_revisions": ["rev-001"],
+            }]),
+        );
+
+        // Create a provider pack to inject.
+        let pack_dir = root.path().join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_path = pack_dir.join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        // Track whether the deploy function is called.
+        let deploy_called = std::cell::Cell::new(false);
+
+        let result = inject_provider_pack_impl(
+            &store,
+            "local",
+            "test-bundle",
+            &pack_path,
+            "messaging-telegram",
+            |bundle_copy, env_id, _customer_id| {
+                deploy_called.set(true);
+                // The bundle copy must contain the injected provider pack.
+                let target = bundle_copy
+                    .join("providers")
+                    .join("messaging")
+                    .join("messaging-telegram.gtpack");
+                assert!(
+                    target.is_file(),
+                    "deploy_fn must receive a bundle containing the injected pack at {}",
+                    target.display(),
+                );
+                assert_eq!(env_id, "local");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            deploy_called.get(),
+            "deploy function must be called when the provider pack is absent from the bundle"
+        );
+        assert_eq!(
+            result,
+            PackDeployOutcome::Deployed,
+            "outcome must be Deployed when pack was absent and deploy succeeded"
+        );
+    }
+
+    #[test]
+    fn inject_provider_pack_skips_deploy_when_pack_present() {
+        // Counter-test: when the pack is already in the revision with the same
+        // digest, the deploy function must NOT be called.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+
+        // Set up env with a revision that already has the provider pack.
+        let env_dir = root.path().join("local");
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        write_test_pack(
+            &provider_dir.join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+        );
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "test-bundle",
+                "current_revisions": ["rev-001"],
+            }]),
+        );
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let result = inject_provider_pack_impl(
+            &store,
+            "local",
+            "test-bundle",
+            &pack_path,
+            "messaging-telegram",
+            |_, _, _| {
+                panic!("deploy function must NOT be called when the pack is already present");
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            PackDeployOutcome::AlreadyPresent,
+            "outcome must be AlreadyPresent when pack is already in the bundle"
+        );
+    }
+
+    // -- F1: injection targets bundle_id, not mtime --------------------------------
+
+    #[test]
+    fn inject_targets_bundle_id_not_mtime() {
+        // THREE bundles, with the target (bundle-a) deliberately in the MIDDLE
+        // of the `bundles` array and owning the mtime-OLDEST revision. Every
+        // positional shortcut therefore lands on a decoy:
+        //   * "newest by mtime"  -> bundle-b
+        //   * "first in array"   -> bundle-z
+        //   * "last in array"    -> bundle-b
+        // Both decoys already carry the pack, so any of those choices reports
+        // "already present" and skips the deploy, failing the assertions below.
+        // Only an actual bundle_id match reaches bundle-a, where the pack is
+        // absent and a deploy is required.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let env_dir = root.path().join("local");
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        // Decoy + target + decoy. Decoys get the pack planted; the target does not.
+        let plant_pack_in = |rev: &str, bundle_id: &str, with_pack: bool| {
+            let dir = env_dir.join("revisions").join(rev).join("bundle");
+            crate::bundle::create_demo_bundle_structure(&dir, Some(bundle_id)).unwrap();
+            if with_pack {
+                let pd = dir.join("providers").join("messaging");
+                std::fs::create_dir_all(&pd).unwrap();
+                std::fs::copy(&pack_path, pd.join("messaging-telegram.gtpack")).unwrap();
+            }
+        };
+        plant_pack_in("rev-z", "bundle-z", true); // first in array
+        plant_pack_in("rev-a", "bundle-a", false); // the target
+        plant_pack_in("rev-b", "bundle-b", true); // last in array, newest mtime
+
+        // Explicit mtimes: rev-b is newest, so the old mtime heuristic picks it.
+        use std::fs::FileTimes;
+        use std::time::{Duration, SystemTime};
+        let stamp = |rev: &str, secs: u64| {
+            std::fs::File::open(env_dir.join("revisions").join(rev))
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+                )
+                .unwrap();
+        };
+        stamp("rev-a", 1_000_000); // oldest
+        stamp("rev-z", 1_500_000);
+        stamp("rev-b", 2_000_000_000); // newest
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([
+                { "bundle_id": "bundle-z", "current_revisions": ["rev-z"] },
+                { "bundle_id": "bundle-a", "current_revisions": ["rev-a"] },
+                { "bundle_id": "bundle-b", "current_revisions": ["rev-b"] },
+            ]),
+        );
+
+        let deploy_called = std::cell::Cell::new(false);
+        let result = inject_provider_pack_impl(
+            &store,
+            "local",
+            "bundle-a", // target the MIDDLE bundle
+            &pack_path,
+            "messaging-telegram",
+            |bundle_copy, _env_id, _customer_id| {
+                deploy_called.set(true);
+                // Prove we rebuilt bundle-a's tree, not a decoy's: a deploy
+                // firing is not enough, it must be the RIGHT bundle.
+                let marker =
+                    std::fs::read_to_string(bundle_copy.join(crate::bundle::LEGACY_BUNDLE_MARKER))
+                        .expect("bundle copy must carry the bundle marker");
+                assert!(
+                    marker.contains("bundle-a"),
+                    "deploy must receive bundle-a's tree, got marker: {marker}"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        // Must deploy (pack absent from bundle-a), not skip (pack present in
+        // bundle-b which would be chosen by mtime).
+        assert!(
+            deploy_called.get(),
+            "deploy must target bundle-a (absent), not bundle-b (present but wrong bundle_id)"
+        );
+        assert_eq!(result, PackDeployOutcome::Deployed);
+    }
+
+    // -- F2: customer_id carried into manifest ------------------------------------
+
+    #[test]
+    fn inject_passes_customer_id_to_deploy_fn() {
+        // The deploy_fn must receive the customer_id from the deployment so the
+        // synthesized manifest includes it (required for non-local envs).
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let env_dir = root.path().join("staging");
+
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("my-bundle")).unwrap();
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "my-bundle",
+                "customer_id": "billing-corp-42",
+                "current_revisions": ["rev-001"],
+            }]),
+        );
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let observed_customer_id = std::cell::RefCell::new(None::<Option<String>>);
+        let _result = inject_provider_pack_impl(
+            &store,
+            "staging",
+            "my-bundle",
+            &pack_path,
+            "messaging-telegram",
+            |_bundle_copy, _env_id, customer_id| {
+                *observed_customer_id.borrow_mut() = Some(customer_id.map(String::from));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let cid = observed_customer_id.borrow();
+        assert_eq!(
+            cid.as_ref().unwrap().as_deref(),
+            Some("billing-corp-42"),
+            "deploy_fn must receive customer_id from the deployment"
+        );
+    }
+
+    // -- F2: traffic-split error --------------------------------------------------
+
+    #[test]
+    fn inject_errors_on_traffic_split() {
+        // When a deployment has multiple serving revisions (active traffic split),
+        // inject must refuse rather than silently picking one.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let env_dir = root.path().join("local");
+
+        for rev in &["rev-a", "rev-b"] {
+            let bd = env_dir.join("revisions").join(rev).join("bundle");
+            crate::bundle::create_demo_bundle_structure(&bd, Some("split-bundle")).unwrap();
+        }
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "split-bundle",
+                "current_revisions": ["rev-a", "rev-b"],
+            }]),
+        );
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let err = inject_provider_pack_impl(
+            &store,
+            "local",
+            "split-bundle",
+            &pack_path,
+            "messaging-telegram",
+            |_, _, _| panic!("deploy must not be called during a traffic split"),
+        )
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("traffic split"),
+            "expected traffic-split error, got: {msg}"
+        );
+    }
+
+    // -- F4: digest mismatch triggers redeploy ------------------------------------
+
+    #[test]
+    fn inject_redeploys_on_digest_mismatch() {
+        // When the embedded pack has different content (e.g. new version),
+        // inject must replace it and redeploy, not skip.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let env_dir = root.path().join("local");
+
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+
+        // Plant a stale pack with different content.
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        std::fs::write(
+            provider_dir.join("messaging-telegram.gtpack"),
+            b"stale-old-pack-bytes",
+        )
+        .unwrap();
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "test-bundle",
+                "current_revisions": ["rev-001"],
+            }]),
+        );
+
+        // New pack with different content.
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let deploy_called = std::cell::Cell::new(false);
+        let result = inject_provider_pack_impl(
+            &store,
+            "local",
+            "test-bundle",
+            &pack_path,
+            "messaging-telegram",
+            |_bundle_copy, _env_id, _customer_id| {
+                deploy_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            deploy_called.get(),
+            "deploy must be called when digest differs (not skipped)"
+        );
+        assert_eq!(result, PackDeployOutcome::Deployed);
+    }
+
+    #[test]
+    fn inject_skips_on_matching_digest() {
+        // When the embedded pack has the SAME content, inject must skip.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let env_dir = root.path().join("local");
+
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        // Copy the exact same pack into the bundle.
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        std::fs::copy(&pack_path, provider_dir.join("messaging-telegram.gtpack")).unwrap();
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([{
+                "bundle_id": "test-bundle",
+                "current_revisions": ["rev-001"],
+            }]),
+        );
+
+        let result = inject_provider_pack_impl(
+            &store,
+            "local",
+            "test-bundle",
+            &pack_path,
+            "messaging-telegram",
+            |_, _, _| panic!("deploy must NOT be called when digest matches"),
+        )
+        .unwrap();
+
+        assert_eq!(result, PackDeployOutcome::AlreadyPresent);
+    }
+
+    // -- register_provider_core (integration call-site) tests -------------------
+    //
+    // The `link_bundle = true` path cannot be exercised hermetically: it calls
+    // `messaging::link_bundle`, which requires a bundle actually deployed in the
+    // env, which in turn requires a trusted operator key at
+    // `~/.greentic/operator/key.pem`. The deployer deliberately refuses to
+    // auto-generate that key (see its own test at `cli/bundles.rs`), and faking
+    // it would mean writing to the user's real HOME.
+    //
+    // That path is instead guarded at COMPILE time: `register_provider_core_impl`
+    // takes the deploy step as a `deploy_fn` parameter, so short-circuiting the
+    // pack-deploy call leaves `deploy_fn` unused and
+    // `clippy --all-targets --all-features -- -D warnings` (run by
+    // `ci/local_check.sh` and PR CI) fails the build. Verified by mutation:
+    // removing the call site yields `error: unused variable: deploy_fn` plus four
+    // now-dead helper functions. The deploy behaviour itself is covered by the
+    // `inject_provider_pack_impl` tests above.
+
+    #[test]
+    fn register_provider_core_skips_deploy_when_not_linking_bundle() {
+        // With link_bundle = false there is no env bundle to inject into, so the
+        // deploy must not fire and the outcome must be AlreadyPresent.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+
+        // Endpoint registration needs a registered `local` env, not just a
+        // directory on disk. Use production's own bootstrap.
+        ensure_local_environment(&store, None).expect("bootstrap local env");
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+        let answers = serde_json::Map::new();
+
+        let result = register_provider_core_impl(
+            &store,
+            &RegisterProviderPayload {
+                env_id: "local",
+                tenant: "acme",
+                team: None,
+                provider_type: "messaging.telegram.bot",
+                provider_id: "telegram",
+                pack_name: "messaging-telegram",
+                display_name: "Telegram".to_string(),
+                bundle_id: "test-bundle",
+                link_bundle: false,
+                answers: &answers,
+                pack_path: &pack_path,
+            },
+            None,
+            |_, _, _| panic!("deploy must NOT be called when link_bundle is false"),
+        )
+        .expect("register_provider_core_impl must succeed");
+
+        assert_eq!(result.pack_deploy, PackDeployOutcome::AlreadyPresent);
     }
 }
