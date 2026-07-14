@@ -328,6 +328,22 @@ pub fn register_provider_core(
     payload: &RegisterProviderPayload<'_>,
     idempotency_key: Option<String>,
 ) -> Result<ProviderRegistrationResult> {
+    register_provider_core_impl(store, payload, idempotency_key, |bundle_copy, env_id| {
+        crate::env_deploy::deploy_bundle_to_env(bundle_copy, env_id, false, true)
+    })
+}
+
+/// Testable inner implementation of [`register_provider_core`].
+///
+/// Accepts a `deploy_fn` closure so tests can substitute a lightweight stub for
+/// the real [`crate::env_deploy::deploy_bundle_to_env`] call and assert that the
+/// pack-deploy step is actually reached from this function.
+fn register_provider_core_impl(
+    store: &LocalFsStore,
+    payload: &RegisterProviderPayload<'_>,
+    idempotency_key: Option<String>,
+    deploy_fn: impl FnOnce(&Path, &str) -> Result<()>,
+) -> Result<ProviderRegistrationResult> {
     // ── Build secret entries ─────────────────────────────────────────
     let mut secret_keys = collect_secret_keys_from_pack(payload.pack_path);
     for req in load_secret_requirements_from_pack(payload.pack_path).unwrap_or_default() {
@@ -437,7 +453,13 @@ pub fn register_provider_core(
 
     // ── Deploy provider pack into the environment's bundle ──────────
     let pack_deploy = if payload.link_bundle {
-        inject_provider_pack_into_env(store, payload.env_id, payload.pack_path, payload.pack_name)?
+        inject_provider_pack_impl(
+            store,
+            payload.env_id,
+            payload.pack_path,
+            payload.pack_name,
+            deploy_fn,
+        )?
     } else {
         PackDeployOutcome::AlreadyPresent
     };
@@ -872,18 +894,6 @@ fn prepare_bundle_with_provider_pack(
 /// Returns [`PackDeployOutcome::AlreadyPresent`] when the pack is already in
 /// the latest revision's bundle tree (idempotent re-run or legacy bundle
 /// that bakes provider packs in).
-fn inject_provider_pack_into_env(
-    store: &LocalFsStore,
-    env_id: &str,
-    pack_path: &Path,
-    pack_name: &str,
-) -> Result<PackDeployOutcome> {
-    inject_provider_pack_impl(store, env_id, pack_path, pack_name, |bundle_copy, eid| {
-        crate::env_deploy::deploy_bundle_to_env(bundle_copy, eid, false, true)
-    })
-}
-
-/// Testable inner implementation of [`inject_provider_pack_into_env`].
 ///
 /// Accepts a `deploy_fn` closure so tests can substitute a lightweight
 /// stub for the real [`crate::env_deploy::deploy_bundle_to_env`] call.
@@ -1570,6 +1580,62 @@ mod tests {
             PackDeployOutcome::AlreadyPresent,
             "outcome must be AlreadyPresent when pack is already in the bundle"
         );
+    }
+
+    // -- register_provider_core (integration call-site) tests -------------------
+    //
+    // The `link_bundle = true` path cannot be exercised hermetically: it calls
+    // `messaging::link_bundle`, which requires a bundle actually deployed in the
+    // env, which in turn requires a trusted operator key at
+    // `~/.greentic/operator/key.pem`. The deployer deliberately refuses to
+    // auto-generate that key (see its own test at `cli/bundles.rs`), and faking
+    // it would mean writing to the user's real HOME.
+    //
+    // That path is instead guarded at COMPILE time: `register_provider_core_impl`
+    // takes the deploy step as a `deploy_fn` parameter, so short-circuiting the
+    // pack-deploy call leaves `deploy_fn` unused and
+    // `clippy --all-targets --all-features -- -D warnings` (run by
+    // `ci/local_check.sh` and PR CI) fails the build. Verified by mutation:
+    // removing the call site yields `error: unused variable: deploy_fn` plus four
+    // now-dead helper functions. The deploy behaviour itself is covered by the
+    // `inject_provider_pack_impl` tests above.
+
+    #[test]
+    fn register_provider_core_skips_deploy_when_not_linking_bundle() {
+        // With link_bundle = false there is no env bundle to inject into, so the
+        // deploy must not fire and the outcome must be AlreadyPresent.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+
+        // Endpoint registration needs a registered `local` env, not just a
+        // directory on disk. Use production's own bootstrap.
+        ensure_local_environment(&store, None).expect("bootstrap local env");
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+        let answers = serde_json::Map::new();
+
+        let result = register_provider_core_impl(
+            &store,
+            &RegisterProviderPayload {
+                env_id: "local",
+                tenant: "acme",
+                team: None,
+                provider_type: "messaging.telegram.bot",
+                provider_id: "telegram",
+                pack_name: "messaging-telegram",
+                display_name: "Telegram".to_string(),
+                bundle_id: "test-bundle",
+                link_bundle: false,
+                answers: &answers,
+                pack_path: &pack_path,
+            },
+            None,
+            |_, _| panic!("deploy must NOT be called when link_bundle is false"),
+        )
+        .expect("register_provider_core_impl must succeed");
+
+        assert_eq!(result.pack_deploy, PackDeployOutcome::AlreadyPresent);
     }
 
     // -- find_revision_bundle_dir multi-revision ordering test ------------------
