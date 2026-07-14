@@ -801,6 +801,33 @@ struct DeploymentContext {
     customer_id: Option<String>,
 }
 
+/// The subset of the deployer's `environment.json` that provider-add needs.
+///
+/// Deserialized into named fields rather than poked at with `serde_json::Value`
+/// `.get()` chains: if the deployer renames `bundles` or `bundle_id`, this fails
+/// loudly at parse time instead of silently yielding `None` and reporting a
+/// misleading "no deployment for bundle" further down.
+///
+/// This mirrors the deployer's `Environment` / `BundleDeployment`. Using those
+/// types directly would be better still, but constructing one in a test requires
+/// a trusted operator key that the deployer refuses to auto-generate, which would
+/// make every test here non-hermetic. Unknown fields are ignored on purpose —
+/// `environment.json` carries far more than this.
+#[derive(serde::Deserialize)]
+struct EnvJson {
+    bundles: Vec<EnvJsonBundle>,
+}
+
+#[derive(serde::Deserialize)]
+struct EnvJsonBundle {
+    bundle_id: String,
+    /// `#[serde(default)]` mirrors the deployer's own default on this field.
+    #[serde(default)]
+    current_revisions: Vec<String>,
+    #[serde(default)]
+    customer_id: Option<String>,
+}
+
 /// Resolve the deployment context for `bundle_id` from the store.
 ///
 /// Reads `environment.json`, finds the `BundleDeployment` whose `bundle_id`
@@ -810,21 +837,13 @@ fn resolve_deployment_context(env_dir: &Path, bundle_id: &str) -> Result<Deploym
     let env_json_path = env_dir.join("environment.json");
     let raw = std::fs::read_to_string(&env_json_path)
         .with_context(|| format!("read {}", env_json_path.display()))?;
-    let doc: serde_json::Value =
+    let doc: EnvJson =
         serde_json::from_str(&raw).with_context(|| format!("parse {}", env_json_path.display()))?;
 
-    let bundles = doc
-        .get("bundles")
-        .and_then(|v| v.as_array())
-        .context("environment.json missing bundles array")?;
-
-    let deployment = bundles
+    let deployment = doc
+        .bundles
         .iter()
-        .find(|b| {
-            b.get("bundle_id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| id == bundle_id)
-        })
+        .find(|b| b.bundle_id == bundle_id)
         .with_context(|| {
             format!(
                 "no deployment for bundle `{bundle_id}` in environment at {}",
@@ -832,15 +851,7 @@ fn resolve_deployment_context(env_dir: &Path, bundle_id: &str) -> Result<Deploym
             )
         })?;
 
-    let current_revisions: Vec<String> = deployment
-        .get("current_revisions")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let current_revisions = &deployment.current_revisions;
 
     match current_revisions.len() {
         0 => bail!(
@@ -868,14 +879,9 @@ fn resolve_deployment_context(env_dir: &Path, bundle_id: &str) -> Result<Deploym
         );
     }
 
-    let customer_id = deployment
-        .get("customer_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
     Ok(DeploymentContext {
         bundle_dir,
-        customer_id,
+        customer_id: deployment.customer_id.clone(),
     })
 }
 
@@ -919,26 +925,6 @@ fn check_pack_in_bundle_dir(
     }
 }
 
-/// Recursively copy a directory tree.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst).with_context(|| format!("create directory {}", dst.display()))?;
-    for entry in
-        std::fs::read_dir(src).with_context(|| format!("read directory {}", src.display()))?
-    {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path).with_context(|| {
-                format!("copy {} -> {}", src_path.display(), dst_path.display())
-            })?;
-        }
-    }
-    Ok(())
-}
-
 /// Prepare a modified bundle directory with the provider pack injected.
 ///
 /// Returns `Ok(Some((bundle_dir, tempdir_handle)))` when the pack was
@@ -963,8 +949,12 @@ fn prepare_bundle_with_provider_pack(
     let temp_dir =
         tempfile::tempdir().context("create temporary directory for bundle modification")?;
     let bundle_copy = temp_dir.path().join("bundle");
-    copy_dir_recursive(source_bundle_dir, &bundle_copy)
-        .context("copy deployed bundle for modification")?;
+    crate::cli_helpers::copy_dir_recursive(
+        &source_bundle_dir.to_path_buf(),
+        &bundle_copy,
+        false, // `only_used_providers` — keep the deployed tree intact
+    )
+    .context("copy deployed bundle for modification")?;
 
     // When the pack exists with a different digest, remove the stale copy
     // before injecting. `execute_add_packs_to_bundle` overwrites anyway,
@@ -976,14 +966,7 @@ fn prepare_bundle_with_provider_pack(
             .with_context(|| format!("remove stale pack {}", stale.display()))?;
     }
 
-    let digest = {
-        use sha2::{Digest, Sha256};
-        let bytes = std::fs::read(pack_path)
-            .with_context(|| format!("read provider pack {}", pack_path.display()))?;
-        let hash = Sha256::digest(bytes);
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        format!("sha256:{hex}")
-    };
+    let digest = format!("sha256:{}", sha256_file(pack_path)?);
 
     crate::engine::execute_add_packs_to_bundle(
         &bundle_copy,
