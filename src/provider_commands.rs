@@ -878,6 +878,22 @@ fn inject_provider_pack_into_env(
     pack_path: &Path,
     pack_name: &str,
 ) -> Result<PackDeployOutcome> {
+    inject_provider_pack_impl(store, env_id, pack_path, pack_name, |bundle_copy, eid| {
+        crate::env_deploy::deploy_bundle_to_env(bundle_copy, eid, false, true)
+    })
+}
+
+/// Testable inner implementation of [`inject_provider_pack_into_env`].
+///
+/// Accepts a `deploy_fn` closure so tests can substitute a lightweight
+/// stub for the real [`crate::env_deploy::deploy_bundle_to_env`] call.
+fn inject_provider_pack_impl(
+    store: &LocalFsStore,
+    env_id: &str,
+    pack_path: &Path,
+    pack_name: &str,
+    deploy_fn: impl FnOnce(&Path, &str) -> Result<()>,
+) -> Result<PackDeployOutcome> {
     let env_dir = store.root().join(env_id);
 
     match prepare_bundle_with_provider_pack(&env_dir, pack_path, pack_name)? {
@@ -890,7 +906,7 @@ fn inject_provider_pack_into_env(
         }
         Some((bundle_copy, _temp_dir)) => {
             eprintln!("Deploying bundle with provider pack `{pack_name}`...");
-            crate::env_deploy::deploy_bundle_to_env(&bundle_copy, env_id, false, true)
+            deploy_fn(&bundle_copy, env_id)
                 .context("redeploy bundle with injected provider pack")?;
             Ok(PackDeployOutcome::Deployed)
         }
@@ -1461,6 +1477,140 @@ mod tests {
         assert_eq!(
             count, 1,
             "bundle.yaml should contain exactly one reference to the pack, found {count}"
+        );
+    }
+
+    // -- inject_provider_pack_impl (orchestrator-level) tests -------------------
+
+    #[test]
+    fn inject_provider_pack_calls_deploy_when_pack_absent() {
+        // This test exercises the thin orchestrator that `register_provider_core`
+        // delegates to (lines 439-443). It FAILS if the deploy function is never
+        // called (i.e. the integration is removed or short-circuited).
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+
+        // Set up env with a deployed revision (no provider pack yet).
+        let env_dir = root.path().join("local");
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+
+        // Create a provider pack to inject.
+        let pack_dir = root.path().join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_path = pack_dir.join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        // Track whether the deploy function is called.
+        let deploy_called = std::cell::Cell::new(false);
+
+        let result = inject_provider_pack_impl(
+            &store,
+            "local",
+            &pack_path,
+            "messaging-telegram",
+            |bundle_copy, env_id| {
+                deploy_called.set(true);
+                // The bundle copy must contain the injected provider pack.
+                let target = bundle_copy
+                    .join("providers")
+                    .join("messaging")
+                    .join("messaging-telegram.gtpack");
+                assert!(
+                    target.is_file(),
+                    "deploy_fn must receive a bundle containing the injected pack at {}",
+                    target.display(),
+                );
+                assert_eq!(env_id, "local");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            deploy_called.get(),
+            "deploy function must be called when the provider pack is absent from the bundle"
+        );
+        assert_eq!(
+            result,
+            PackDeployOutcome::Deployed,
+            "outcome must be Deployed when pack was absent and deploy succeeded"
+        );
+    }
+
+    #[test]
+    fn inject_provider_pack_skips_deploy_when_pack_present() {
+        // Counter-test: when the pack is already in the revision, the deploy
+        // function must NOT be called and the outcome must be AlreadyPresent.
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+
+        // Set up env with a revision that already has the provider pack.
+        let env_dir = root.path().join("local");
+        let bundle_dir = env_dir.join("revisions").join("rev-001").join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_dir, Some("test-bundle")).unwrap();
+        let provider_dir = bundle_dir.join("providers").join("messaging");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        write_test_pack(
+            &provider_dir.join("messaging-telegram.gtpack"),
+            "messaging-telegram",
+        );
+
+        let pack_path = root.path().join("messaging-telegram.gtpack");
+        write_test_pack(&pack_path, "messaging-telegram");
+
+        let result =
+            inject_provider_pack_impl(&store, "local", &pack_path, "messaging-telegram", |_, _| {
+                panic!("deploy function must NOT be called when the pack is already present");
+            })
+            .unwrap();
+
+        assert_eq!(
+            result,
+            PackDeployOutcome::AlreadyPresent,
+            "outcome must be AlreadyPresent when pack is already in the bundle"
+        );
+    }
+
+    // -- find_revision_bundle_dir multi-revision ordering test ------------------
+
+    #[test]
+    fn find_revision_bundle_dir_returns_newest_of_multiple_revisions() {
+        // This test FAILS if the mtime sort in find_revision_bundle_dir is
+        // removed or reversed (oldest-first instead of newest-first).
+        let root = tempfile::tempdir().unwrap();
+        let env_dir = root.path().join("local");
+
+        // Create two revision directories with bundle sub-dirs.
+        let rev_old = env_dir.join("revisions").join("rev-old");
+        let rev_new = env_dir.join("revisions").join("rev-new");
+        std::fs::create_dir_all(rev_old.join("bundle")).unwrap();
+        std::fs::create_dir_all(rev_new.join("bundle")).unwrap();
+
+        // Set explicit, widely separated mtimes so the test is deterministic
+        // regardless of filesystem creation order or timestamp resolution.
+        use std::fs::FileTimes;
+        use std::time::{Duration, SystemTime};
+
+        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let future = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+
+        std::fs::File::open(&rev_old)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(past))
+            .unwrap();
+        std::fs::File::open(&rev_new)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(future))
+            .unwrap();
+
+        let found = find_revision_bundle_dir(&env_dir);
+        assert!(found.is_some(), "should find a bundle dir");
+        assert_eq!(
+            found.unwrap(),
+            rev_new.join("bundle"),
+            "find_revision_bundle_dir must return the NEWEST revision's bundle dir, \
+             not the oldest"
         );
     }
 }
