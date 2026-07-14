@@ -2135,4 +2135,263 @@ mod tests {
 
         assert_eq!(result.pack_deploy, PackDeployOutcome::AlreadyPresent);
     }
+    // -- pack-driven helpers --------------------------------------------------
+
+    /// Build a minimal `.gtpack` (zip) containing `assets/setup.yaml`.
+    fn create_test_pack(yaml: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write as _;
+        use zip::write::{FileOptions, ZipWriter};
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pack_path = temp_dir.path().join("messaging-test.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("assets/setup.yaml", options).unwrap();
+        writer.write_all(yaml.as_bytes()).unwrap();
+        writer.finish().unwrap();
+        (temp_dir, pack_path)
+    }
+
+    #[test]
+    fn has_oauth_device_code_action_detects_device_code_kind() {
+        let yaml = "provider_id: teams\n\
+                    questions: []\n\
+                    setup_actions:\n  \
+                      - id: device_login\n    \
+                        kind: oauth_device_code\n";
+        let (_dir, pack) = create_test_pack(yaml);
+        assert!(has_oauth_device_code_action(&pack));
+    }
+
+    #[test]
+    fn has_oauth_device_code_action_false_for_other_actions() {
+        let yaml = "provider_id: slack\n\
+                    questions: []\n\
+                    setup_actions:\n  \
+                      - id: add_to_slack\n    \
+                        kind: oauth_install_button\n";
+        let (_dir, pack) = create_test_pack(yaml);
+        assert!(!has_oauth_device_code_action(&pack));
+    }
+
+    #[test]
+    fn has_oauth_device_code_action_false_for_non_pack_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_pack = dir.path().join("garbage.gtpack");
+        std::fs::write(&not_a_pack, b"not a zip archive").unwrap();
+        assert!(!has_oauth_device_code_action(&not_a_pack));
+    }
+
+    #[test]
+    fn collect_secret_keys_from_pack_collects_only_secret_questions() {
+        let yaml = "provider_id: telegram\n\
+                    questions:\n  \
+                      - name: bot-token\n    \
+                        secret: true\n  \
+                      - name: public_base_url\n";
+        let (_dir, pack) = create_test_pack(yaml);
+        let keys = collect_secret_keys_from_pack(&pack);
+        assert!(keys.contains("bot-token"), "got: {keys:?}");
+        // The canonical form (hyphens -> underscores) is inserted alongside.
+        assert!(keys.contains("bot_token"), "got: {keys:?}");
+        assert!(!keys.contains("public_base_url"), "got: {keys:?}");
+    }
+
+    #[test]
+    fn collect_secret_keys_from_pack_empty_for_non_pack_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_pack = dir.path().join("garbage.gtpack");
+        std::fs::write(&not_a_pack, b"not a zip archive").unwrap();
+        assert!(collect_secret_keys_from_pack(&not_a_pack).is_empty());
+    }
+
+    // -- deterministic_idempotency_key ----------------------------------------
+
+    #[test]
+    fn deterministic_idempotency_key_is_stable_and_input_sensitive() {
+        let a = deterministic_idempotency_key("local", "telegram", "tg-main");
+        let b = deterministic_idempotency_key("local", "telegram", "tg-main");
+        assert_eq!(a, b);
+        assert!(a.starts_with("setup-provider-"), "got: {a}");
+        // 16 digest bytes -> 32 hex chars.
+        assert_eq!(a.len(), "setup-provider-".len() + 32);
+        assert_ne!(
+            a,
+            deterministic_idempotency_key("local", "telegram", "tg-2")
+        );
+        assert_ne!(
+            a,
+            deterministic_idempotency_key("prod", "telegram", "tg-main")
+        );
+        assert_ne!(
+            a,
+            deterministic_idempotency_key("local", "slack", "tg-main")
+        );
+    }
+
+    // -- has_resolvable_public_url ---------------------------------------------
+
+    fn write_host_env_json(root: &Path, env_id: &str, doc: &serde_json::Value) {
+        let env_dir = root.join(env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(
+            env_dir.join("environment.json"),
+            serde_json::to_string_pretty(doc).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn has_resolvable_public_url_reads_host_config() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        write_host_env_json(
+            root.path(),
+            "local",
+            &serde_json::json!({
+                "host_config": {"public_base_url": "https://example.com"}
+            }),
+        );
+        assert!(has_resolvable_public_url(&store, "local"));
+    }
+
+    #[test]
+    fn has_resolvable_public_url_false_without_config() {
+        // The PUBLIC_BASE_URL env var short-circuits everything; skip when the
+        // outer environment (a developer shell) has it set — mirrors the exact
+        // non-empty filter the production code applies.
+        if std::env::var("PUBLIC_BASE_URL").is_ok_and(|v| !v.is_empty()) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        // No environment.json at all.
+        assert!(!has_resolvable_public_url(&store, "local"));
+        // environment.json without host_config.
+        write_host_env_json(root.path(), "local", &serde_json::json!({"bundles": []}));
+        assert!(!has_resolvable_public_url(&store, "local"));
+        // host_config present but the URL is empty.
+        write_host_env_json(
+            root.path(),
+            "local",
+            &serde_json::json!({"host_config": {"public_base_url": ""}}),
+        );
+        assert!(!has_resolvable_public_url(&store, "local"));
+    }
+
+    // -- register_provider_core ------------------------------------------------
+
+    #[test]
+    fn register_provider_core_registers_endpoint_and_writes_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        ensure_local_environment(&store, None).expect("bootstrap local env");
+
+        let yaml = "provider_id: telegram\n\
+                    questions:\n  \
+                      - name: bot_token\n    \
+                        secret: true\n  \
+                      - name: webhook_secret\n    \
+                        secret: true\n  \
+                      - name: numeric_secret\n    \
+                        secret: true\n  \
+                      - name: public_base_url\n";
+        let (_pack_dir, pack_path) = create_test_pack(yaml);
+
+        let mut answers = serde_json::Map::new();
+        answers.insert("bot_token".into(), serde_json::json!("123456:test-token"));
+        // Empty and non-string secret values must be skipped, not written.
+        answers.insert("webhook_secret".into(), serde_json::json!(""));
+        answers.insert("numeric_secret".into(), serde_json::json!(42));
+        // Non-secret answers never become secret entries.
+        answers.insert(
+            "public_base_url".into(),
+            serde_json::json!("https://example.com"),
+        );
+
+        let payload = RegisterProviderPayload {
+            env_id: "local",
+            tenant: "demo",
+            team: None,
+            provider_type: "telegram",
+            provider_id: "tg-main",
+            pack_name: "messaging-telegram",
+            display_name: "Telegram".to_string(),
+            bundle_id: "unused",
+            link_bundle: false,
+            answers: &answers,
+            pack_path: &pack_path,
+        };
+        let key = deterministic_idempotency_key("local", "telegram", "tg-main");
+        let endpoint_id = register_provider_core(&store, &payload, Some(key.clone()))
+            .expect("register")
+            .endpoint_id;
+        assert!(!endpoint_id.is_empty());
+
+        // Same-key same-identity re-run replays as a no-op on the same endpoint.
+        let replay_id = register_provider_core(&store, &payload, Some(key))
+            .expect("replay")
+            .endpoint_id;
+        assert_eq!(replay_id, endpoint_id);
+
+        // The endpoint is visible through the deployer's list verb and carries
+        // exactly one secret ref — the non-empty string secret.
+        let outcome = messaging::list(&store, &op_flags(), "local").expect("list");
+        let endpoints = outcome
+            .result
+            .get("endpoints")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(endpoints.len(), 1, "got: {endpoints:?}");
+        let ep = &endpoints[0];
+        assert_eq!(
+            ep.get("endpoint_id").and_then(|v| v.as_str()),
+            Some(endpoint_id.as_str())
+        );
+        assert_eq!(
+            ep.get("provider_type").and_then(|v| v.as_str()),
+            Some("telegram")
+        );
+        let refs: Vec<&str> = ep
+            .get("secret_refs")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            refs,
+            vec!["secret://local/demo/_/messaging-telegram/bot_token"]
+        );
+    }
+
+    #[test]
+    fn register_provider_core_link_bundle_reports_missing_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        ensure_local_environment(&store, None).expect("bootstrap local env");
+
+        let (_pack_dir, pack_path) = create_test_pack("provider_id: telegram\nquestions: []\n");
+        let answers = serde_json::Map::new();
+
+        let payload = RegisterProviderPayload {
+            env_id: "local",
+            tenant: "demo",
+            team: None,
+            provider_type: "telegram",
+            provider_id: "tg-main",
+            pack_name: "messaging-telegram",
+            display_name: "Telegram".to_string(),
+            bundle_id: "no-such-bundle",
+            link_bundle: true,
+            answers: &answers,
+            pack_path: &pack_path,
+        };
+        let Err(err) = register_provider_core(&store, &payload, None) else {
+            panic!("linking a bundle that is not deployed must fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("link bundle"), "got: {msg}");
+        assert!(msg.contains("no-such-bundle"), "got: {msg}");
+    }
 }
