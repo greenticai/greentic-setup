@@ -35,25 +35,25 @@ const REGISTRY: &[ProviderPackInfo] = &[
     ProviderPackInfo {
         kind: "telegram",
         pack_name: "messaging-telegram",
-        provider_type: "telegram",
+        provider_type: "messaging.telegram.bot",
         default_provider_id: "telegram",
     },
     ProviderPackInfo {
         kind: "slack",
         pack_name: "messaging-slack",
-        provider_type: "slack",
+        provider_type: "messaging.slack.api",
         default_provider_id: "slack",
     },
     ProviderPackInfo {
         kind: "webex",
         pack_name: "messaging-webex",
-        provider_type: "webex",
+        provider_type: "messaging.webex.bot",
         default_provider_id: "webex",
     },
     ProviderPackInfo {
         kind: "teams",
         pack_name: "messaging-teams-graph",
-        provider_type: "teams",
+        provider_type: "messaging.teams.graph",
         default_provider_id: "teams",
     },
 ];
@@ -143,5 +143,57 @@ mod tests {
         assert!(kinds.contains(&"slack"));
         assert!(kinds.contains(&"webex"));
         assert!(kinds.contains(&"teams"));
+    }
+
+    /// Pin every `provider_type` to the canonical dotted form declared by the
+    /// messaging-provider packs (`messaging.<transport>.<variant>`).
+    ///
+    /// These values MUST stay in sync with:
+    /// - each pack's `greentic.provider-extension.v1 → provider_type` field
+    ///   (source of truth in greentic-messaging-providers),
+    /// - the `PROVIDER_TYPE` constants in the pack component sources,
+    /// - the env_wizard test fixtures in `env_wizard.rs` (which hardcode the
+    ///   same strings for round-trip validation).
+    ///
+    /// A mismatch between this registry and the pack manifests causes the
+    /// runner-host `ProviderRegistry::resolve` to return `Unsupported` (exact
+    /// string equality), breaking provider identification end-to-end.
+    #[test]
+    fn provider_types_use_canonical_dotted_form() {
+        // Canonical mapping: kind → pack-declared provider_type.
+        let expected: &[(&str, &str)] = &[
+            ("telegram", "messaging.telegram.bot"),
+            ("slack", "messaging.slack.api"),
+            ("webex", "messaging.webex.bot"),
+            ("teams", "messaging.teams.graph"),
+        ];
+
+        for &(kind, expected_type) in expected {
+            let info =
+                lookup(kind).unwrap_or_else(|| panic!("kind `{kind}` missing from REGISTRY"));
+            assert_eq!(
+                info.provider_type, expected_type,
+                "provider_type for kind `{kind}` must be the dotted form \
+                 declared by the pack manifest (`{expected_type}`), \
+                 not the short form (`{kind}`)"
+            );
+            // Structural invariant: every provider_type starts with "messaging."
+            assert!(
+                info.provider_type.starts_with("messaging."),
+                "provider_type `{}` for kind `{kind}` does not start with \
+                 `messaging.` — all messaging-provider packs use the \
+                 `messaging.<transport>.<variant>` convention",
+                info.provider_type
+            );
+        }
+
+        // Guard: if a new kind is added to REGISTRY without adding it to this
+        // test, the count mismatch will catch it.
+        assert_eq!(
+            known_kinds().len(),
+            expected.len(),
+            "a provider was added to REGISTRY without updating this test — \
+             add the canonical dotted provider_type here"
+        );
     }
 }
