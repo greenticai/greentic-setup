@@ -1825,69 +1825,80 @@ mod tests {
 
     #[test]
     fn inject_targets_bundle_id_not_mtime() {
-        // Two bundles in the env. The mtime-newest revision belongs to
-        // bundle-b, but we target bundle-a. The injection must use bundle-a's
-        // revision (rev-a), NOT the mtime-newest one (rev-b).
+        // THREE bundles, with the target (bundle-a) deliberately in the MIDDLE
+        // of the `bundles` array and owning the mtime-OLDEST revision. Every
+        // positional shortcut therefore lands on a decoy:
+        //   * "newest by mtime"  -> bundle-b
+        //   * "first in array"   -> bundle-z
+        //   * "last in array"    -> bundle-b
+        // Both decoys already carry the pack, so any of those choices reports
+        // "already present" and skips the deploy, failing the assertions below.
+        // Only an actual bundle_id match reaches bundle-a, where the pack is
+        // absent and a deploy is required.
         let root = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(root.path());
         let env_dir = root.path().join("local");
 
-        // rev-a: older mtime, belongs to bundle-a.
-        let bundle_a_dir = env_dir.join("revisions").join("rev-a").join("bundle");
-        crate::bundle::create_demo_bundle_structure(&bundle_a_dir, Some("bundle-a")).unwrap();
-
-        // rev-b: newer mtime, belongs to bundle-b. Plant the pack here so
-        // an mtime-based lookup would find it and short-circuit.
-        let bundle_b_dir = env_dir.join("revisions").join("rev-b").join("bundle");
-        crate::bundle::create_demo_bundle_structure(&bundle_b_dir, Some("bundle-b")).unwrap();
-        let b_provider_dir = bundle_b_dir.join("providers").join("messaging");
-        std::fs::create_dir_all(&b_provider_dir).unwrap();
-
-        // Set explicit mtimes: rev-b is newer.
-        use std::fs::FileTimes;
-        use std::time::{Duration, SystemTime};
-        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let future = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        std::fs::File::open(env_dir.join("revisions").join("rev-a"))
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(past))
-            .unwrap();
-        std::fs::File::open(env_dir.join("revisions").join("rev-b"))
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(future))
-            .unwrap();
-
-        // environment.json: two deployments, each with one revision.
-        write_env_json(
-            &env_dir,
-            serde_json::json!([
-                {
-                    "bundle_id": "bundle-a",
-                    "current_revisions": ["rev-a"],
-                },
-                {
-                    "bundle_id": "bundle-b",
-                    "current_revisions": ["rev-b"],
-                },
-            ]),
-        );
-
         let pack_path = root.path().join("messaging-telegram.gtpack");
         write_test_pack(&pack_path, "messaging-telegram");
 
-        // Also plant the same pack in rev-b so an mtime-based lookup would
-        // conclude "already present" and skip.
-        std::fs::copy(&pack_path, b_provider_dir.join("messaging-telegram.gtpack")).unwrap();
+        // Decoy + target + decoy. Decoys get the pack planted; the target does not.
+        let plant_pack_in = |rev: &str, bundle_id: &str, with_pack: bool| {
+            let dir = env_dir.join("revisions").join(rev).join("bundle");
+            crate::bundle::create_demo_bundle_structure(&dir, Some(bundle_id)).unwrap();
+            if with_pack {
+                let pd = dir.join("providers").join("messaging");
+                std::fs::create_dir_all(&pd).unwrap();
+                std::fs::copy(&pack_path, pd.join("messaging-telegram.gtpack")).unwrap();
+            }
+        };
+        plant_pack_in("rev-z", "bundle-z", true); // first in array
+        plant_pack_in("rev-a", "bundle-a", false); // the target
+        plant_pack_in("rev-b", "bundle-b", true); // last in array, newest mtime
+
+        // Explicit mtimes: rev-b is newest, so the old mtime heuristic picks it.
+        use std::fs::FileTimes;
+        use std::time::{Duration, SystemTime};
+        let stamp = |rev: &str, secs: u64| {
+            std::fs::File::open(env_dir.join("revisions").join(rev))
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+                )
+                .unwrap();
+        };
+        stamp("rev-a", 1_000_000); // oldest
+        stamp("rev-z", 1_500_000);
+        stamp("rev-b", 2_000_000_000); // newest
+
+        write_env_json(
+            &env_dir,
+            serde_json::json!([
+                { "bundle_id": "bundle-z", "current_revisions": ["rev-z"] },
+                { "bundle_id": "bundle-a", "current_revisions": ["rev-a"] },
+                { "bundle_id": "bundle-b", "current_revisions": ["rev-b"] },
+            ]),
+        );
 
         let deploy_called = std::cell::Cell::new(false);
         let result = inject_provider_pack_impl(
             &store,
             "local",
-            "bundle-a", // target bundle-a, NOT bundle-b
+            "bundle-a", // target the MIDDLE bundle
             &pack_path,
             "messaging-telegram",
-            |_bundle_copy, _env_id, _customer_id| {
+            |bundle_copy, _env_id, _customer_id| {
                 deploy_called.set(true);
+                // Prove we rebuilt bundle-a's tree, not a decoy's: a deploy
+                // firing is not enough, it must be the RIGHT bundle.
+                let marker =
+                    std::fs::read_to_string(bundle_copy.join(crate::bundle::LEGACY_BUNDLE_MARKER))
+                        .expect("bundle copy must carry the bundle marker");
+                assert!(
+                    marker.contains("bundle-a"),
+                    "deploy must receive bundle-a's tree, got marker: {marker}"
+                );
                 Ok(())
             },
         )
