@@ -2405,10 +2405,12 @@ fn execute_oauth_device_code_start(
         );
     }
 
-    let mut response = match ureq::post(&device_code_url).send_form([
-        ("client_id", client_id.as_str()),
-        ("scope", scopes.as_str()),
-    ]) {
+    let mut response = match crate::http_client::api_agent()
+        .post(&device_code_url)
+        .send_form([
+            ("client_id", client_id.as_str()),
+            ("scope", scopes.as_str()),
+        ]) {
         Ok(response) => response,
         Err(err) => {
             return pause_oauth_device_error(
@@ -2576,10 +2578,7 @@ fn execute_oauth_device_code_poll(
             serde_json::json!({"expired": true}),
         );
     }
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = crate::http_client::api_agent_any_status();
     let mut response = match agent.post(&session.token_url).send_form([
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ("client_id", session.client_id.as_str()),
@@ -3064,10 +3063,7 @@ fn exchange_setup_machine_oauth_authorization_code(
     if let Some(client_secret) = client_secret {
         form.push(("client_secret".to_string(), client_secret));
     }
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = crate::http_client::api_agent_any_status();
     let mut response = agent
         .post(&token_url)
         .send_form(form)
@@ -4035,7 +4031,7 @@ fn execute_http_step(
         .and_then(Value::as_u64)
         .unwrap_or(200) as u16;
     let response = match method.as_str() {
-        "GET" => ureq::get(&target).call(),
+        "GET" => crate::http_client::api_agent().get(&target).call(),
         "POST" => {
             let payload = step
                 .extra
@@ -4043,7 +4039,9 @@ fn execute_http_step(
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
             let payload = expand_machine_value_templates(payload, state);
-            ureq::post(&target).send_json(payload)
+            crate::http_client::api_agent()
+                .post(&target)
+                .send_json(payload)
         }
         _ => {
             state.status = SetupMachineStatus::Paused;

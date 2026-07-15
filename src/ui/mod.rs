@@ -11,7 +11,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::{Body, Bytes, to_bytes};
@@ -60,6 +60,13 @@ struct UiState {
     setup_session_id: String,
     setup_tunnel: Mutex<Option<SetupTunnel>>,
     setup_tunnel_start: AsyncMutex<()>,
+    /// Set when a setup tunnel was spawned but never became externally
+    /// reachable (e.g. cloudflared quick tunnels are unroutable on this
+    /// network's DNS path). Acts as a circuit breaker: while set and within
+    /// [`TUNNEL_FAILURE_COOLDOWN`], `ensure_setup_tunnel` returns the
+    /// recorded error immediately instead of spawning yet another tunnel
+    /// that would just fail the same reachability check again.
+    tunnel_failure_cooldown: Mutex<Option<Instant>>,
     setup_runtime: Mutex<Option<SetupRuntime>>,
     setup_runtime_start: AsyncMutex<()>,
     shutdown_tx: broadcast::Sender<()>,
@@ -397,7 +404,15 @@ pub async fn launch(
 ) -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    // Bind an ephemeral port by default. When GREENTIC_SETUP_BIND_PORT is set,
+    // bind that stable port instead so the setup server is reachable at a fixed
+    // address — required to tunnel the OAuth developer-install callback (paired
+    // with GREENTIC_SETUP_PUBLIC_BASE_URL). Falls back to ephemeral on bad input.
+    let bind_port = std::env::var("GREENTIC_SETUP_BIND_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", bind_port)).await?;
     let port = listener.local_addr()?.port();
     let url = format!("http://127.0.0.1:{port}");
     let setup_session_id = format!("setup-{port}-{}", unix_timestamp_millis());
@@ -415,6 +430,7 @@ pub async fn launch(
         setup_session_id,
         setup_tunnel: Mutex::new(None),
         setup_tunnel_start: AsyncMutex::new(()),
+        tunnel_failure_cooldown: Mutex::new(None),
         setup_runtime: Mutex::new(None),
         setup_runtime_start: AsyncMutex::new(()),
         shutdown_tx: shutdown_tx.clone(),
@@ -423,7 +439,11 @@ pub async fn launch(
 
     let router = build_router(state.clone());
 
-    eprintln!("Setup UI started at: {url}");
+    eprintln!(
+        "Setup UI started at: {url} (greentic-setup {} build {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GREENTIC_SETUP_BUILD_SHA")
+    );
     if std::env::var("GREENTIC_SETUP_NO_OPEN").ok().as_deref() != Some("1") {
         let _ = open::that(&url);
     }
@@ -2681,6 +2701,7 @@ async fn setup_backend_contract_next(
             "result": { "ok": true }
         })
     } else {
+        setup_backend_record_step_attempt(&mut stored, &next_step);
         setup_backend_execute_action(state, contract, tenant, &mut stored, &next_step).await?
     };
     crate::setup_backend_contract::record_action_result(
@@ -2710,6 +2731,59 @@ async fn setup_backend_contract_next(
     ))
 }
 
+/// Track and log repeated executions of the same setup step. Returns the
+/// attempt number (1-based; resets when `config.public_base_url` changes,
+/// since a URL change makes a re-run legitimate). A step re-running with an
+/// unchanged public_base_url is making no progress — from attempt 3 on this
+/// logs loudly: that pattern is the signature of a staleness/currency check
+/// comparing the wrong tunnel, not of a genuine retry.
+fn setup_backend_record_step_attempt(stored: &mut JsonMap<String, Value>, step: &str) -> u64 {
+    let public_base_url = stored
+        .get("config")
+        .and_then(|config| config.get("public_base_url"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    let attempts = stored
+        .entry("step_attempts".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
+    let Some(map) = attempts.as_object_mut() else {
+        return 1;
+    };
+    let previous = map.get(step);
+    let same_url = previous
+        .and_then(|entry| entry.get("public_base_url"))
+        .and_then(Value::as_str)
+        == Some(public_base_url.as_str());
+    let count = if same_url {
+        previous
+            .and_then(|entry| entry.get("count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+    map.insert(
+        step.to_string(),
+        serde_json::json!({"count": count, "public_base_url": public_base_url}),
+    );
+    if count >= 3 {
+        eprintln!(
+            "[setup] step {step} is re-running for the {count}th time with an unchanged \
+             public_base_url ({public_base_url}) — it keeps being treated as not-done. This \
+             usually means a staleness/currency check is comparing the wrong tunnel (see \
+             any [setup runtime-context] mismatch lines above)"
+        );
+    } else {
+        eprintln!(
+            "[setup] executing step {step} (attempt {count}, public_base_url={public_base_url})"
+        );
+    }
+    count
+}
+
 async fn setup_backend_contract_action(
     state: &UiState,
     contract: &ProviderBackendContract,
@@ -2732,6 +2806,7 @@ async fn setup_backend_contract_action(
         .cloned()
         .unwrap_or(Value::Null);
     let result = if action.is_some() {
+        setup_backend_record_step_attempt(&mut stored, step);
         setup_backend_execute_action(state, contract, tenant, &mut stored, step).await?
     } else {
         setup_backend_action_error(
@@ -3336,6 +3411,20 @@ async fn setup_backend_execute_provider_http(
                 "detail": detail,
             }),
         ));
+    }
+    // Re-adopt AFTER the runtime/tunnel are ensured: the adopt above ran
+    // before `ensure_setup_runtime`, so on the very attempt that first boots
+    // the runtime, config still holds the pre-runtime (Setup-UI tunnel) URL
+    // and the provider would be registered against an endpoint that is about
+    // to be superseded — costing an extra run per state transition. Adopting
+    // again here makes the first post-boot attempt register the runtime's
+    // real ingress URL immediately.
+    let previous_public_base_url = setup_backend_config_str(config, "public_base_url");
+    if let Some(adopted) = setup_backend_adopt_runtime_public_base_url(state, tenant, config)? {
+        eprintln!(
+            "[setup provider-http] adopted runtime public_base_url {adopted} \
+             (was {previous_public_base_url:?}) before registering"
+        );
     }
 
     let target = match setup_backend_provider_http_url(state, tenant, config, executor) {
@@ -4473,24 +4562,25 @@ fn setup_backend_adopt_runtime_public_base_url(
     tenant: &str,
     config: &mut JsonMap<String, Value>,
 ) -> Result<Option<String>> {
-    let Some(runtime_public_base_url) = setup_backend_runtime_public_base_url(state, tenant) else {
+    // Resolve through the single ingress source of truth (live per-port
+    // tunnel record first, then the runtime-reported endpoints) so the URL
+    // adopted into config is the same one every currency check compares
+    // against.
+    let Some((ingress_public_base_url, _source)) =
+        setup_backend_resolve_ingress_public_base(state, tenant)
+    else {
         return Ok(None);
     };
-    if !setup_backend_public_base_url_is_external_https(&runtime_public_base_url)
-        && !is_ephemeral_tunnel_public_base_url(&runtime_public_base_url)
-    {
-        return Ok(None);
-    }
     let current = setup_backend_config_str(config, "public_base_url");
-    if current.trim_end_matches('/') == runtime_public_base_url {
+    if current.trim_end_matches('/') == ingress_public_base_url {
         return Ok(None);
     }
     if current.is_empty() || is_ephemeral_tunnel_public_base_url(&current) {
         config.insert(
             "public_base_url".to_string(),
-            Value::String(runtime_public_base_url.clone()),
+            Value::String(ingress_public_base_url.clone()),
         );
-        return Ok(Some(runtime_public_base_url));
+        return Ok(Some(ingress_public_base_url));
     }
     Ok(None)
 }
@@ -4669,7 +4759,41 @@ fn injected_setup_public_base_url() -> Option<String> {
     std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
         .ok()
         .or_else(|| std::env::var("GREENTIC_PUBLIC_BASE_URL").ok())
+        // `PUBLIC_BASE_URL` is the runtime (`greentic-start`) override; accept it
+        // here too so a single export drives both setup actions and start,
+        // instead of a provider action erroring on a URL the operator already set.
+        .or_else(|| std::env::var("PUBLIC_BASE_URL").ok())
         .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"))
+}
+
+/// The setup server's own public HTTPS base URL for OAuth *callbacks* (the
+/// developer app-install flow handled here by `/oauth/callback/<provider>`),
+/// distinct from the messaging `public_base_url` that targets the runtime for
+/// webhook ingress. Set `GREENTIC_SETUP_PUBLIC_BASE_URL` to the setup server's
+/// public tunnel. `None` (unset/non-https) → callers fall back to the messaging
+/// `public_base_url`.
+fn setup_oauth_callback_base_url() -> Option<String> {
+    std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"))
+}
+
+/// Single source of truth for the OAuth developer-install callback base.
+///
+/// The redirect URL must be byte-identical in three places or Slack rejects the
+/// exchange: the app manifest's `redirect_urls`, the authorize link's
+/// `redirect_uri`, and the `oauth.v2.access` exchange's `redirect_uri`. The URL
+/// the browser actually lands on is the *setup server's* public tunnel — not the
+/// runtime's `public_base_url` — so resolve it here and feed all three seams.
+///
+/// An explicit env override wins (named tunnels / prod); otherwise use the live
+/// setup tunnel fronting this UI.
+fn setup_oauth_callback_base(state: &UiState) -> Option<String> {
+    injected_setup_public_base_url()
+        .or_else(|| setup_backend_active_tunnel_public_base_url(state))
+        .map(|value| value.trim_end_matches('/').to_string())
         .filter(|value| value.starts_with("https://"))
 }
 
@@ -4677,6 +4801,9 @@ fn setup_backend_public_base_url(state: &UiState, tenant: &str) -> Option<String
     if let Some(value) = std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
         .ok()
         .or_else(|| std::env::var("GREENTIC_PUBLIC_BASE_URL").ok())
+        // Also honor the runtime override so one `PUBLIC_BASE_URL` export covers
+        // both setup and start (see injected_setup_public_base_url).
+        .or_else(|| std::env::var("PUBLIC_BASE_URL").ok())
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
     {
@@ -4709,6 +4836,47 @@ fn setup_backend_active_tunnel_public_base_url(state: &UiState) -> Option<String
         return None;
     }
     Some(tunnel.public_base_url.trim_end_matches('/').to_string()).filter(|value| !value.is_empty())
+}
+
+/// Public URL of the tunnel fronting `port`: the in-session slot when it
+/// fronts that exact port, else the machine-wide shared tunnel record.
+///
+/// The in-session slot (`state.setup_tunnel`) is last-writer-wins across
+/// flows that tunnel *different* ports (runtime ingress vs the Setup UI), so
+/// reading it port-blind reports whichever tunnel was acquired most recently
+/// — comparing that against a runtime-ingress URL is what made the Teams
+/// reconcile step permanently "stale". Keying by port restores one identity
+/// per tunnel. Record read only — no probing here (this runs on every status
+/// render); liveness is enforced by the acquire paths, and a dead-but-still-
+/// recorded tunnel self-heals on the next acquire (record changes → one
+/// legitimate re-register).
+fn setup_backend_tunnel_public_base_url_for_port(state: &UiState, port: u16) -> Option<String> {
+    setup_backend_tunnel_public_base_url_for_port_at(state, port, None)
+}
+
+/// Testable seam for [`setup_backend_tunnel_public_base_url_for_port`]:
+/// `record_root` overrides the shared tunnel state root (tests use a temp dir
+/// instead of mutating `GREENTIC_TUNNEL_STATE_DIR`, which races across
+/// parallel tests).
+fn setup_backend_tunnel_public_base_url_for_port_at(
+    state: &UiState,
+    port: u16,
+    record_root: Option<&Path>,
+) -> Option<String> {
+    if let Ok(mut guard) = state.setup_tunnel.lock()
+        && let Some(tunnel) = guard.as_mut()
+        && crate::shared_tunnel::local_port_from_base_url(&tunnel.local_base_url) == Some(port)
+        && tunnel.is_running()
+    {
+        return Some(tunnel.public_base_url.trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+    }
+    let paths = match record_root {
+        Some(root) => crate::shared_tunnel::shared_tunnel_paths_at(root, port),
+        None => crate::shared_tunnel::shared_tunnel_paths(port),
+    };
+    let (_pid, url) = crate::shared_tunnel::read_record(&paths);
+    url
 }
 
 fn setup_backend_runtime_public_base_url(state: &UiState, tenant: &str) -> Option<String> {
@@ -4755,6 +4923,37 @@ fn setup_backend_setup_runtime_info(state: &UiState) -> Option<SetupRuntimeInfo>
     runtime.info.lock().ok().map(|info| info.clone())
 }
 
+/// THE single source of truth for "what public URL fronts the runtime
+/// ingress right now": the live per-port shared tunnel record, else the
+/// runtime's own reported public base (`endpoints.json`), else nothing.
+///
+/// Every consumer (runtime_context, config adoption, registration bodies)
+/// must resolve through here — five places used to compose their own chains
+/// (contract config, in-session slot, per-port records, endpoints.json,
+/// browser echoes), and every wizard loop so far was two of them
+/// disagreeing. The port-blind in-session slot deliberately never answers:
+/// it may hold the Setup-UI tunnel, which must not masquerade as the
+/// ingress tunnel.
+fn setup_backend_resolve_ingress_public_base(
+    state: &UiState,
+    tenant: &str,
+) -> Option<(String, &'static str)> {
+    let ingress_port = setup_backend_runtime_local_base_url(state, tenant)
+        .as_deref()
+        .and_then(crate::shared_tunnel::local_port_from_base_url);
+    if let Some(port) = ingress_port
+        && let Some(url) = setup_backend_tunnel_public_base_url_for_port(state, port)
+    {
+        return Some((url, "ingress-port tunnel record"));
+    }
+    setup_backend_runtime_public_base_url(state, tenant)
+        .filter(|value| {
+            setup_backend_public_base_url_is_external_https(value)
+                || is_ephemeral_tunnel_public_base_url(value)
+        })
+        .map(|url| (url, "runtime endpoints"))
+}
+
 fn setup_backend_runtime_context(
     state: &UiState,
     tenant: &str,
@@ -4763,14 +4962,27 @@ fn setup_backend_runtime_context(
     let public_base_url = setup_backend_config_str(config, "public_base_url")
         .trim_end_matches('/')
         .to_string();
-    let runtime_public_base_url =
-        setup_backend_runtime_public_base_url(state, tenant).filter(|value| {
-            setup_backend_public_base_url_is_external_https(value)
-                || is_ephemeral_tunnel_public_base_url(value)
-        });
-    let active_tunnel_public_base_url =
-        setup_backend_active_tunnel_public_base_url(state).or(runtime_public_base_url);
     let runtime_local_base_url = setup_backend_runtime_local_base_url(state, tenant);
+    let ingress_port = runtime_local_base_url
+        .as_deref()
+        .and_then(crate::shared_tunnel::local_port_from_base_url);
+    let resolved = setup_backend_resolve_ingress_public_base(state, tenant);
+    let active_tunnel_public_base_url = resolved.as_ref().map(|(url, _)| url.clone());
+    // Log only a LIVE conflict: a resolved ingress URL that differs from the
+    // one in config genuinely invalidates dependent steps. "Nothing resolved"
+    // (runtime and tunnel down, e.g. between setup sessions) is unknown, not
+    // stale — completed steps must survive it.
+    if !public_base_url.is_empty()
+        && is_ephemeral_tunnel_public_base_url(&public_base_url)
+        && let Some((active, source)) = resolved.as_ref()
+        && active != &public_base_url
+    {
+        eprintln!(
+            "[setup runtime-context] ingress tunnel mismatch: config public_base_url={public_base_url} \
+             vs active tunnel={active} (source: {source}, ingress_port={ingress_port:?}, \
+             runtime_local_base_url={runtime_local_base_url:?}) — dependent steps will be treated as stale"
+        );
+    }
     serde_json::json!({
         "public_base_url": if public_base_url.is_empty() { Value::Null } else { Value::String(public_base_url.clone()) },
         "public_base_url_is_ephemeral_tunnel": !public_base_url.is_empty() && is_ephemeral_tunnel_public_base_url(&public_base_url),
@@ -4841,12 +5053,89 @@ async fn setup_backend_public_tunnel_responds(base_url: &str) -> bool {
     else {
         return false;
     };
-    client
+    if client
         .get(base_url.trim_end_matches('/'))
         .send()
         .await
         .ok()
         .is_some_and(|response| response.status().as_u16() < 500)
+    {
+        return true;
+    }
+    // The plain probe shares the OS resolver with every other process on this
+    // machine — and freshly-minted quick-tunnel hostnames (*.trycloudflare.com)
+    // race DNS propagation: the first A-record query can land before the record
+    // exists, poisoning the OS resolver's negative cache for up to the zone's
+    // negative TTL (30 minutes for trycloudflare.com). On IPv4-only machines
+    // that leaves the host unresolvable locally even though the tunnel is up
+    // and every REMOTE party (Slack, Teams, ...) resolves it fine. Distinguish
+    // "tunnel dead" from "our resolver is blind" by re-resolving via public
+    // DNS-over-HTTPS (an IP-literal URL, so it needs no DNS at all) and
+    // retrying the probe with the answer pinned.
+    tunnel_responds_with_pinned_dns(base_url).await
+}
+
+/// Second-opinion tunnel probe that bypasses the OS resolver: resolve the
+/// host's A record via Cloudflare DoH (`https://1.1.1.1/...` — IP literal),
+/// then re-issue the probe with reqwest pinned to that address (correct SNI
+/// and cert validation still apply). Returns false when the host genuinely
+/// has no public A record or the pinned request fails.
+async fn tunnel_responds_with_pinned_dns(base_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        return false;
+    };
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let Some(ip) = resolve_host_via_public_doh(&host).await else {
+        return false;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .resolve(&host, std::net::SocketAddr::new(ip, port))
+        .build()
+    else {
+        return false;
+    };
+    let alive = client
+        .get(base_url.trim_end_matches('/'))
+        .send()
+        .await
+        .ok()
+        .is_some_and(|response| response.status().as_u16() < 500);
+    if alive {
+        eprintln!(
+            "Setup tunnel: {base_url} IS reachable via public DNS ({ip}) — the local \
+             system resolver has a stale negative cache for this hostname (it will \
+             self-heal when the negative TTL expires); treating the tunnel as healthy \
+             since remote services resolve it via their own DNS"
+        );
+    }
+    alive
+}
+
+/// Resolve `host`'s first IPv4 address via Cloudflare's DNS-over-HTTPS JSON
+/// API. The endpoint is addressed by IP literal so this works even when the
+/// local resolver cannot resolve anything under the host's zone.
+async fn resolve_host_via_public_doh(host: &str) -> Option<std::net::IpAddr> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("https://1.1.1.1/dns-query?name={host}&type=A"))
+        .header("accept", "application/dns-json")
+        .send()
+        .await
+        .ok()?;
+    let body: Value = response.json().await.ok()?;
+    body.get("Answer")?
+        .as_array()?
+        .iter()
+        // type 1 = A record; CNAME chain entries (type 5) also appear here.
+        .filter(|answer| answer.get("type").and_then(Value::as_u64) == Some(1))
+        .find_map(|answer| answer.get("data")?.as_str()?.parse().ok())
 }
 
 fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool {
@@ -4857,13 +5146,18 @@ fn setup_backend_runtime_context_current(value: &Value, current: &Value) -> bool
     let active_tunnel = current
         .get("active_tunnel_public_base_url")
         .and_then(Value::as_str);
-    // An ephemeral public base is current only while a live tunnel still serves
-    // that exact URL. A gone tunnel (active_tunnel absent) or a drifted one both
-    // disqualify it; a live tunnel reports the matching base via the runtime.
+    // An ephemeral public base is invalidated only by a LIVE conflicting
+    // tunnel — a resolved ingress URL that differs from the recorded one. An
+    // absent active tunnel (runtime and tunnel down, e.g. between setup
+    // sessions) is UNKNOWN, not stale: treating it as stale un-completed
+    // every runtime-dependent step on restart and re-ran OAuth consents and
+    // endpoint registrations. When the runtime comes back with a different
+    // URL, the conflict becomes live and dependent steps re-run exactly once.
     if current
         .get("public_base_url_is_ephemeral_tunnel")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        && active_tunnel.is_some()
         && active_tunnel != current_public_base_url
     {
         return false;
@@ -5153,6 +5447,15 @@ fn setup_backend_filter_stale_action_values(
 
 fn setup_backend_mark_action_value_stale(value: &mut Value, step_id: &str) {
     if let Some(object) = value.as_object_mut() {
+        // Log only the fresh→stale transition, not the idempotent re-mark on
+        // every render, so a stuck step shows one line per invalidation.
+        if object.get("stale").and_then(Value::as_bool) != Some(true) {
+            eprintln!(
+                "[setup] marking stored result for step {step_id} as stale (step is not \
+                 done under the current runtime context); its completion will not count \
+                 until the step re-runs"
+            );
+        }
         object.insert("ok".to_string(), Value::Bool(false));
         object.insert("stale".to_string(), Value::Bool(true));
         object.insert("stale_step".to_string(), Value::String(step_id.to_string()));
@@ -6147,6 +6450,12 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     let env = req.env.unwrap_or_else(|| state.env.clone());
     let mut answers = req.answers;
     let tunnel_mode = setup_action_tunnel_mode(state, req.tunnel.as_deref())?;
+    eprintln!(
+        "[setup-action {}/{}] started (tenant={tenant} team={} env={env} tunnel_mode={tunnel_mode})",
+        req.provider_id,
+        req.action_id,
+        team.as_deref().unwrap_or("default"),
+    );
     ensure_setup_action_provider_answers(&mut answers, &req.provider_id);
     if let Some(mode) = req.tunnel.as_deref() {
         let tunnel = crate::platform_setup::TunnelAnswers {
@@ -6156,10 +6465,27 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     }
     if let Some(url) = injected_setup_public_base_url() {
         // Operator supplied a public URL; honor it instead of spinning our own tunnel.
+        eprintln!(
+            "[setup-action {}/{}] using operator-supplied public_base_url {url}",
+            req.provider_id, req.action_id
+        );
         inject_setup_public_base_url(&mut answers, &url);
     } else if should_start_setup_tunnel(&tunnel_mode, &answers) {
+        eprintln!(
+            "[setup-action {}/{}] acquiring {tunnel_mode} tunnel for public_base_url...",
+            req.provider_id, req.action_id
+        );
         let url = ensure_setup_tunnel(state, &tunnel_mode, &state.local_base_url).await?;
+        eprintln!(
+            "[setup-action {}/{}] tunnel ready, public_base_url={url}",
+            req.provider_id, req.action_id
+        );
         inject_setup_public_base_url(&mut answers, &url);
+    } else {
+        eprintln!(
+            "[setup-action {}/{}] no tunnel needed (mode={tunnel_mode} or public_base_url already set)",
+            req.provider_id, req.action_id
+        );
     }
     persist_ui_draft(&state.bundle_path, &tenant, team.as_deref(), &env, &answers).await?;
 
@@ -6178,7 +6504,17 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
                 .find(|action| action.get("id").and_then(Value::as_str) == Some(&req.action_id))
         })
         .ok_or_else(|| anyhow!("setup action not found: {}", req.action_id))?;
-    if action.get("kind").and_then(Value::as_str) != Some("oauth_install_button") {
+    // `oauth_install_button` additionally builds an authorize_url (client_id,
+    // scopes, redirect_uri) after registration; `open_url` is a plain link
+    // whose target is resolved entirely from registration output via the
+    // generic `install-to-workspace`-style deep_link action in the pack's
+    // `greentic.setup.actions.v1` extension (see setup_final_actions.rs) —
+    // it just needs registration to run, nothing more, and
+    // `setup_action_final_url_value` already no-ops gracefully for it.
+    if !matches!(
+        action.get("kind").and_then(Value::as_str),
+        Some("oauth_install_button" | "open_url")
+    ) {
         anyhow::bail!("setup action kind is not executable in this phase");
     }
     let registration = action
@@ -6198,7 +6534,35 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     config.insert("env".to_string(), Value::String(env.clone()));
     setup_backend_apply_host_defaults(state, &tenant, &mut config);
 
-    let request = Value::Object(config.clone());
+    // Resolve ONE callback base for the whole OAuth developer-install flow. The
+    // same value must land in the app manifest's `redirect_urls` (below), in the
+    // authorize link's `redirect_uri` (via SetupActionFinalUrlContext), and in the
+    // exchange's `redirect_uri` (oauth_callback) — Slack rejects the exchange if
+    // they differ.
+    let setup_callback_base =
+        if action.get("kind").and_then(Value::as_str) == Some("oauth_install_button") {
+            setup_oauth_callback_base(state)
+        } else {
+            None
+        };
+
+    // Registration derives the manifest's `oauth_config.redirect_urls` from
+    // `public_base_url`. For an OAuth install that redirect must point at THIS
+    // setup server's callback (the live setup tunnel), not the runtime. Override
+    // it on the registration request ONLY — `config` is persisted back as provider
+    // answers and carries the runtime's public_base_url for webhook ingress, so it
+    // must stay untouched. (The manifest's event-subscription URL is re-pointed to
+    // the runtime by `setup_webhook` at `gtc start`.)
+    let request = {
+        let mut request_config = config.clone();
+        if let Some(base) = setup_callback_base.as_deref() {
+            request_config.insert(
+                "public_base_url".to_string(),
+                Value::String(base.to_string()),
+            );
+        }
+        Value::Object(request_config)
+    };
     let setup_config = SetupConfig {
         tenant: tenant.clone(),
         team: team.clone(),
@@ -6211,6 +6575,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         .or_else(|| registration.get("mock_result"))
         .or_else(|| registration.get("outputs"))
     {
+        eprintln!(
+            "[setup-action {}/{}] using inline registration result (no component invocation)",
+            req.provider_id, req.action_id
+        );
         result.clone()
     } else {
         let component_ref = registration
@@ -6225,7 +6593,15 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("setup action registration missing op"))?;
-        invoke_setup_component_operation_blocking(
+        eprintln!(
+            "[setup-action {}/{}] invoking WASM registration op {component_ref}::{op} \
+             (pack: {}) — this is where the provider's own API gets called",
+            req.provider_id,
+            req.action_id,
+            provider.pack_path.display()
+        );
+        let started = Instant::now();
+        let output = invoke_setup_component_operation_blocking(
             state.bundle_path.clone(),
             provider.pack_path.clone(),
             component_ref.to_string(),
@@ -6233,9 +6609,29 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             request,
             setup_config,
         )
-        .await?
+        .await?;
+        eprintln!(
+            "[setup-action {}/{}] registration op returned in {:.1}s (ok={})",
+            req.provider_id,
+            req.action_id,
+            started.elapsed().as_secs_f32(),
+            output
+                .get("ok")
+                .and_then(Value::as_bool)
+                .map_or("unknown".to_string(), |ok| ok.to_string()),
+        );
+        output
     };
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        eprintln!(
+            "[setup-action {}/{}] FAILED: {}",
+            req.provider_id,
+            req.action_id,
+            output
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("setup action failed")
+        );
         return Ok(serde_json::json!({
             "ok": false,
             "provider_id": req.provider_id,
@@ -6252,11 +6648,21 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         team: team.as_deref(),
         provider_id: &req.provider_id,
         action_id: &req.action_id,
+        setup_callback_base: setup_callback_base.as_deref(),
     };
     if let Some((key, url)) =
         setup_action_final_url_value(&descriptor, action, &config, &final_url_context)?
     {
+        eprintln!(
+            "[setup-action {}/{}] resolved final install URL ({key}): {url}",
+            req.provider_id, req.action_id
+        );
         config.insert(key, Value::String(url));
+    } else {
+        eprintln!(
+            "[setup-action {}/{}] no final install URL resolved (browser resolves deep_link templates from returned values instead)",
+            req.provider_id, req.action_id
+        );
     }
     crate::qa::persist::persist_all_config_as_secrets(
         &state.bundle_path,
@@ -6268,6 +6674,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         Some(&provider.pack_path),
     )
     .await?;
+    eprintln!(
+        "[setup-action {}/{}] complete: outputs persisted as secrets, returning values to the UI",
+        req.provider_id, req.action_id
+    );
     let safe_values = public_setup_action_values(&config);
     Ok(serde_json::json!({
         "ok": true,
@@ -6421,6 +6831,9 @@ async fn get_oauth_callback(
             ),
         );
     }
+    // Exchange with the SAME callback base used for the manifest redirect_urls and
+    // the authorize link, or Slack rejects with `bad_redirect_uri`.
+    let setup_callback_base = setup_oauth_callback_base(state.as_ref());
     match crate::oauth_callback::complete_oauth_callback(
         &state.bundle_path,
         &state.env,
@@ -6429,6 +6842,7 @@ async fn get_oauth_callback(
             state: oauth_state,
         },
         "messaging.oauth.v1",
+        setup_callback_base.as_deref(),
     )
     .await
     {
@@ -6447,11 +6861,14 @@ async fn get_oauth_callback(
                 ),
             )
         }
-        Err(err) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            oauth_callback_page(false, "OAuth setup failed", &err.to_string()),
-        ),
+        Err(err) => {
+            eprintln!("[oauth-token] callback FAILED: {err:#}");
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                oauth_callback_page(false, "OAuth setup failed", &err.to_string()),
+            )
+        }
     }
 }
 
@@ -6520,6 +6937,14 @@ fn append_line(existing: &str, line: &str) -> String {
     }
 }
 
+/// How long `ensure_setup_tunnel` refuses to spawn another tunnel after one
+/// failed to become reachable. Without this, a network that can't route the
+/// tunnel provider's hostnames at all (e.g. cloudflared quick tunnels being
+/// unroutable on some networks' DNS path) causes every single call to spawn
+/// yet another doomed tunnel: the reuse-if-alive check always sees the prior
+/// one as dead (it never became reachable) and replaces it, forever.
+const TUNNEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(20);
+
 async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) -> Result<String> {
     if let Some(existing) = active_setup_tunnel_public_base_url(state, mode, local_base_url)? {
         if setup_backend_public_tunnel_responds(&existing).await {
@@ -6540,7 +6965,23 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
         setup_backend_clear_setup_tunnel(state);
     }
 
+    if let Some(remaining) = setup_backend_tunnel_cooldown_remaining(state)? {
+        eprintln!(
+            "Setup tunnel circuit breaker: refusing to spawn another {mode} tunnel, \
+             {}s left in cooldown after the last attempt never became reachable",
+            remaining.as_secs()
+        );
+        anyhow::bail!(
+            "{mode} setup tunnel is unavailable: the last attempt never became reachable \
+             (this usually means the tunnel provider's hostnames aren't routable from this \
+             network). Not retrying for another {}s to avoid spawning another doomed tunnel \
+             — switch tunnel.mode if this persists.",
+            remaining.as_secs()
+        );
+    }
+
     let local_base_url = local_base_url.trim_end_matches('/').to_string();
+    eprintln!("Setup tunnel: spawning {mode} tunnel for {local_base_url}");
     let mode_for_task = mode.to_string();
     let local_base_url_for_task = local_base_url.clone();
     let tunnel = tokio::task::spawn_blocking(move || {
@@ -6549,16 +6990,97 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     .await
     .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
     let public_base_url = tunnel.public_base_url.clone();
+    eprintln!("Setup tunnel: probing reachability of {public_base_url}");
     if wait_for_setup_public_tunnel(&public_base_url).await {
+        eprintln!("Setup tunnel: {public_base_url} is reachable, using it");
+        persist_setup_tunnel_handoff(&state.bundle_path, &state.local_base_url, &tunnel);
         let mut guard = state
             .setup_tunnel
             .lock()
             .map_err(|_| anyhow!("setup tunnel lock poisoned"))?;
+        // The slot is last-writer-wins across flows that tunnel different
+        // ports (runtime ingress vs Setup UI) — make each takeover visible.
+        match guard.as_ref() {
+            Some(previous) if previous.local_base_url != tunnel.local_base_url => eprintln!(
+                "[setup tunnel-slot] now fronts {} → {} (was {} → {}); port-keyed lookups \
+                 still resolve the previous tunnel via the shared record",
+                tunnel.local_base_url,
+                tunnel.public_base_url,
+                previous.local_base_url,
+                previous.public_base_url
+            ),
+            _ => eprintln!(
+                "[setup tunnel-slot] now fronts {} → {}",
+                tunnel.local_base_url, tunnel.public_base_url
+            ),
+        }
         *guard = Some(tunnel);
+        if let Ok(mut cooldown) = state.tunnel_failure_cooldown.lock() {
+            *cooldown = None;
+        }
         return Ok(public_base_url);
     }
+    eprintln!(
+        "Setup tunnel: {public_base_url} never became reachable; entering {}s cooldown \
+         before another {mode} tunnel may be spawned",
+        TUNNEL_FAILURE_COOLDOWN.as_secs()
+    );
     drop(tunnel);
+    if let Ok(mut cooldown) = state.tunnel_failure_cooldown.lock() {
+        *cooldown = Some(Instant::now());
+    }
     anyhow::bail!("{mode} setup tunnel URL did not become reachable: {public_base_url}")
+}
+
+/// Remaining cooldown after a tunnel failed to become reachable, or `None`
+/// if there was no recent failure (or the cooldown has already elapsed).
+fn setup_backend_tunnel_cooldown_remaining(state: &UiState) -> Result<Option<Duration>> {
+    let guard = state
+        .tunnel_failure_cooldown
+        .lock()
+        .map_err(|_| anyhow!("tunnel failure cooldown lock poisoned"))?;
+    Ok(guard.and_then(|failed_at| TUNNEL_FAILURE_COOLDOWN.checked_sub(failed_at.elapsed())))
+}
+
+/// Persist a [`crate::platform_setup::TunnelHandoff`] for `tunnel`, best
+/// effort — a write failure here should never fail setup itself, it only
+/// means `greentic-start` falls back to its own port selection. See
+/// `cli_helpers::persist_tunnel_handoff` for the CLI-side counterpart.
+fn persist_setup_tunnel_handoff(
+    bundle_path: &Path,
+    setup_ui_local_base_url: &str,
+    tunnel: &crate::setup_tunnel::SetupTunnel,
+) {
+    let Some(local_port) = crate::shared_tunnel::local_port_from_base_url(&tunnel.local_base_url)
+    else {
+        return;
+    };
+    // greentic-start binds its gateway to the handoff's local_port (so a
+    // pre-created tunnel keeps fronting the runtime). The Setup-UI port is
+    // occupied by this very process — handing it off would make the next
+    // `greentic-start` try to bind a taken port and point the gateway at the
+    // wrong tunnel. Only runtime-facing tunnels may be handed off.
+    if crate::shared_tunnel::local_port_from_base_url(setup_ui_local_base_url) == Some(local_port) {
+        eprintln!(
+            "[setup tunnel-handoff] skipping handoff for {url}: port {local_port} is the \
+             Setup-UI port, not a runtime ingress port",
+            url = tunnel.public_base_url
+        );
+        return;
+    }
+    eprintln!(
+        "[setup tunnel-handoff] persisting handoff: port {local_port} → {url}",
+        url = tunnel.public_base_url
+    );
+    let handoff = crate::platform_setup::TunnelHandoff {
+        service: tunnel.mode.clone(),
+        local_port,
+        public_base_url: tunnel.public_base_url.clone(),
+    };
+    if let Err(err) = crate::platform_setup::persist_tunnel_handoff_artifact(bundle_path, &handoff)
+    {
+        tracing::warn!("failed to persist setup tunnel handoff: {err:#}");
+    }
 }
 
 fn active_setup_tunnel_public_base_url(
@@ -7011,6 +7533,10 @@ struct SetupActionFinalUrlContext<'a> {
     team: Option<&'a str>,
     provider_id: &'a str,
     action_id: &'a str,
+    /// Base URL of the setup server's own `/oauth/callback/<provider>` endpoint.
+    /// Must be the SAME value used for the app manifest's `redirect_urls` and for
+    /// the token-exchange `redirect_uri`, or Slack rejects the exchange.
+    setup_callback_base: Option<&'a str>,
 }
 
 fn setup_action_final_url_value(
@@ -7020,6 +7546,29 @@ fn setup_action_final_url_value(
     context: &SetupActionFinalUrlContext<'_>,
 ) -> Result<Option<(String, String)>> {
     let key = setup_action_final_url_key(descriptor);
+    // For an open_url install action, prefer its url_template (e.g. Slack's
+    // api.slack.com/apps/{slack_app_id}/install-on-team? link) resolved from the
+    // returned values, over any app_redirect link the component put in config.
+    if action.get("kind").and_then(Value::as_str) == Some("open_url")
+        && let Some(template) = action
+            .get("url_template")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        && let Some(url) = resolve_url_template_from_config(template, config)
+    {
+        return Ok(Some((
+            key.clone()
+                .unwrap_or_else(|| "oauth_authorize_url".to_string()),
+            url,
+        )));
+    }
+    // The deep-link key (e.g. slack_app_url -> install-on-team) opens the
+    // provider dashboard install. It cannot deliver an OAuth code back to our
+    // callback, but it is the only install path that works in locked-down
+    // orgs (e.g. Enterprise Grid without org app approval), so it is preferred
+    // whenever registration returned it; the OAuth authorize URL below is the
+    // fallback for packs that don't supply a dashboard link.
     if let Some(key) = key.as_deref()
         && let Some(url) = config
             .get(key)
@@ -7027,24 +7576,40 @@ fn setup_action_final_url_value(
             .map(str::trim)
             .filter(|value| !value.is_empty())
     {
-        return Ok(Some((key.to_string(), url.to_string())));
+        let rewritten = rewrite_slack_app_redirect(url);
+        // When the rewrite produced a DIFFERENT url (app_redirect -> dashboard
+        // install page), return it under its own key so the registration's
+        // original value survives: `slack_app_url` (app_redirect) is the
+        // post-setup "open the bot in Slack" deep link and must not be
+        // clobbered by the one-time install-page URL.
+        let url_key = if rewritten != url {
+            "install_url".to_string()
+        } else {
+            key.to_string()
+        };
+        return Ok(Some((url_key, rewritten)));
     }
-    let Some(url) = build_oauth_install_url(
-        context.bundle_root,
-        action,
-        config,
-        context.tenant,
-        context.team,
-        context.provider_id,
-        context.action_id,
-    )?
-    else {
+    let Some(url) = build_oauth_install_url(action, config, context)? else {
         return Ok(None);
     };
-    Ok(Some((
-        key.unwrap_or_else(|| "oauth_authorize_url".to_string()),
-        url,
-    )))
+    // Store the authorize URL under the deep-link key only when registration did
+    // not already supply that key (legacy packs use it as the button slot). When
+    // registration returned it (e.g. Slack's slack_app_url -> install-on-team),
+    // keep that value for the post-setup "open the installed app" link and expose
+    // the authorize URL under oauth_authorize_url instead.
+    let url_key = match key {
+        Some(k)
+            if config
+                .get(&k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_none_or(str::is_empty) =>
+        {
+            k
+        }
+        _ => "oauth_authorize_url".to_string(),
+    };
+    Ok(Some((url_key, url)))
 }
 
 fn setup_action_final_url_key(descriptor: &Value) -> Option<String> {
@@ -7073,15 +7638,66 @@ fn setup_action_final_url_key(descriptor: &Value) -> Option<String> {
         })
 }
 
+/// Fill `{name}` placeholders in a `url_template` from returned config values
+/// (e.g. `{slack_app_id}` -> `A0…`). Returns `None` if any placeholder is
+/// missing/empty so the caller can fall back.
+fn resolve_url_template_from_config(
+    template: &str,
+    config: &JsonMap<String, Value>,
+) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let close = rest[open..].find('}')? + open;
+        out.push_str(&rest[..open]);
+        let name = rest[open + 1..close].trim();
+        let value = config
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        out.push_str(value);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Slack's `app_redirect` link (`https://[ws.]slack.com/app_redirect?app=<id>`)
+/// opens the workspace app page, not the install screen. Rewrite it to the
+/// `api.slack.com/apps/<id>/install-on-team?` link the setup flow expects.
+/// Any other URL is returned unchanged.
+fn rewrite_slack_app_redirect(url: &str) -> String {
+    const MARKER: &str = "/app_redirect?app=";
+    if let Some(idx) = url.find(MARKER) {
+        let host = &url[..idx];
+        if host.ends_with("slack.com") || host.ends_with(".slack.com") {
+            let app = url[idx + MARKER.len()..]
+                .split(['&', '#'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !app.is_empty() {
+                return format!("https://api.slack.com/apps/{app}/install-on-team?");
+            }
+        }
+    }
+    url.to_string()
+}
+
 fn build_oauth_install_url(
-    bundle_root: &Path,
     action: &Value,
     config: &JsonMap<String, Value>,
-    tenant: &str,
-    team: Option<&str>,
-    provider_id: &str,
-    action_id: &str,
+    context: &SetupActionFinalUrlContext<'_>,
 ) -> Result<Option<String>> {
+    let SetupActionFinalUrlContext {
+        bundle_root,
+        tenant,
+        team,
+        provider_id,
+        action_id,
+        setup_callback_base,
+    } = *context;
     let Some(authorize_url) = config
         .get("oauth_authorize_url")
         .and_then(Value::as_str)
@@ -7115,20 +7731,35 @@ fn build_oauth_install_url(
             }
         }
     }
-    if let Some(redirect_path) = action.get("redirect_path").and_then(Value::as_str)
-        && let Some(public_base_url) = config.get("public_base_url").and_then(Value::as_str)
-        && !public_base_url.trim().is_empty()
-    {
-        let redirect_uri = format!(
-            "{}{}",
-            public_base_url.trim().trim_end_matches('/'),
-            if redirect_path.starts_with('/') {
-                redirect_path.to_string()
-            } else {
-                format!("/{redirect_path}")
-            }
-        );
-        set_url_query_key(&mut parsed, "redirect_uri", &redirect_uri);
+    if let Some(redirect_path) = action.get("redirect_path").and_then(Value::as_str) {
+        // The OAuth callback (developer app-install) is served by THIS setup
+        // server via `/oauth/callback/<provider>` + `complete_oauth_callback`,
+        // NOT the runtime. Prefer the resolved setup-callback base (live setup
+        // tunnel or env override) — the same value stamped into the manifest's
+        // `redirect_urls` and used for the exchange — so all three agree. Fall
+        // back to the env, then to the messaging `public_base_url` (the runtime).
+        let callback_base = setup_callback_base
+            .map(|value| value.trim_end_matches('/').to_string())
+            .or_else(setup_oauth_callback_base_url)
+            .or_else(|| {
+                config
+                    .get("public_base_url")
+                    .and_then(Value::as_str)
+                    .map(|value| value.trim().trim_end_matches('/').to_string())
+                    .filter(|value| !value.is_empty())
+            });
+        if let Some(callback_base) = callback_base {
+            let redirect_uri = format!(
+                "{}{}",
+                callback_base,
+                if redirect_path.starts_with('/') {
+                    redirect_path.to_string()
+                } else {
+                    format!("/{redirect_path}")
+                }
+            );
+            set_url_query_key(&mut parsed, "redirect_uri", &redirect_uri);
+        }
     }
     let mut persisted_action = action.clone();
     let Some(object) = persisted_action.as_object_mut() else {
@@ -7275,9 +7906,12 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderSetupEventRequest, UiState, build_router, persist_provider_setup_event,
-        persist_ui_draft, prefill_has_cloud_deployment_targets, read_provider_setup_events,
-        redact_provider_setup_event_detail,
+        ProviderSetupEventRequest, TUNNEL_FAILURE_COOLDOWN, UiState, build_router,
+        persist_provider_setup_event, persist_setup_tunnel_handoff, persist_ui_draft,
+        prefill_has_cloud_deployment_targets, read_provider_setup_events,
+        redact_provider_setup_event_detail, setup_backend_record_step_attempt,
+        setup_backend_runtime_context, setup_backend_runtime_context_current,
+        setup_backend_tunnel_cooldown_remaining, setup_backend_tunnel_public_base_url_for_port_at,
     };
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
@@ -7305,11 +7939,262 @@ mod tests {
             setup_session_id: "test-session".to_string(),
             setup_tunnel: Mutex::new(None),
             setup_tunnel_start: tokio::sync::Mutex::new(()),
+            tunnel_failure_cooldown: Mutex::new(None),
             setup_runtime: Mutex::new(None),
             setup_runtime_start: tokio::sync::Mutex::new(()),
             shutdown_tx,
             result: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn port_keyed_tunnel_resolution_prefers_slot_then_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record_root = tempfile::tempdir().expect("record root");
+        let state = test_ui_state(temp.path());
+
+        // Plant a Setup-UI-port tunnel in the in-session slot (port 12345
+        // matches test_ui_state's local_base_url).
+        *state.setup_tunnel.lock().unwrap() = Some(crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:12345",
+            "https://ui-tunnel.trycloudflare.com",
+        ));
+        // Publish a runtime-ingress record for port 8080 at the temp root.
+        let paths = crate::shared_tunnel::shared_tunnel_paths_at(record_root.path(), 8080);
+        crate::shared_tunnel::write_record(&paths, 4242, "https://ingress.trycloudflare.com")
+            .expect("write record");
+
+        // Slot port match → slot URL, even though a record root is supplied.
+        assert_eq!(
+            setup_backend_tunnel_public_base_url_for_port_at(
+                &state,
+                12345,
+                Some(record_root.path())
+            )
+            .as_deref(),
+            Some("https://ui-tunnel.trycloudflare.com"),
+        );
+        // Different port → the slot must NOT answer; the shared record does.
+        assert_eq!(
+            setup_backend_tunnel_public_base_url_for_port_at(
+                &state,
+                8080,
+                Some(record_root.path())
+            )
+            .as_deref(),
+            Some("https://ingress.trycloudflare.com"),
+        );
+        // No slot match, no record → None.
+        assert_eq!(
+            setup_backend_tunnel_public_base_url_for_port_at(
+                &state,
+                9999,
+                Some(record_root.path())
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn runtime_context_never_reports_the_setup_ui_slot_when_ingress_port_is_known() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        // Runtime endpoints on disk: ingress at a port that has no shared
+        // tunnel record anywhere (odd port keeps the test hermetic), public
+        // base = the registered ephemeral URL.
+        let runtime_dir = temp.path().join("state/runtime/demo.support");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            serde_json::to_string(&json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://ingress.trycloudflare.com",
+                "gateway_listen_addr": "127.0.0.1",
+                "gateway_port": 47391
+            }))
+            .unwrap(),
+        )
+        .expect("endpoints.json");
+        // The in-session slot holds the SETUP-UI tunnel (different port).
+        *state.setup_tunnel.lock().unwrap() = Some(crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:12345",
+            "https://ui-tunnel.trycloudflare.com",
+        ));
+        let mut config = JsonMap::new();
+        config.insert(
+            "public_base_url".to_string(),
+            json!("https://ingress.trycloudflare.com"),
+        );
+
+        let context = setup_backend_runtime_context(&state, "demo", &config);
+        // With the ingress port known, the slot must never answer: the
+        // runtime-reported public base wins, so the registered URL stays
+        // current and completed steps stay done across setup restarts.
+        assert_eq!(
+            context
+                .get("active_tunnel_public_base_url")
+                .and_then(Value::as_str),
+            Some("https://ingress.trycloudflare.com"),
+        );
+        assert!(setup_backend_runtime_context_current(
+            &json!({"runtime_context": {"public_base_url": "https://ingress.trycloudflare.com"}}),
+            &context
+        ));
+    }
+
+    #[test]
+    fn runtime_context_unknown_ingress_is_not_stale() {
+        // Runtime and tunnel both down (e.g. between setup sessions): nothing
+        // resolves, so the context has no active tunnel...
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        *state.setup_tunnel.lock().unwrap() = Some(crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:12345",
+            "https://ui-tunnel.trycloudflare.com",
+        ));
+        let mut config = JsonMap::new();
+        config.insert(
+            "public_base_url".to_string(),
+            json!("https://ingress.trycloudflare.com"),
+        );
+        let context = setup_backend_runtime_context(&state, "demo", &config);
+        assert_eq!(
+            context
+                .get("active_tunnel_public_base_url")
+                .and_then(Value::as_str),
+            None,
+            "no runtime + no record + Setup-UI slot must resolve to nothing"
+        );
+        // ...and UNKNOWN must not invalidate previously completed steps: only
+        // a live conflicting URL may. (Treating unknown as stale re-ran OAuth
+        // consents and endpoint registrations on every setup restart.)
+        assert!(setup_backend_runtime_context_current(
+            &json!({"runtime_context": {"public_base_url": "https://ingress.trycloudflare.com"}}),
+            &context
+        ));
+    }
+
+    #[test]
+    fn runtime_context_current_matches_ingress_tunnel_not_setup_ui_tunnel() {
+        let ingress = "https://ingress.trycloudflare.com";
+        let stored = serde_json::json!({
+            "runtime_context": { "public_base_url": ingress }
+        });
+        // Post-fix shape: the active tunnel resolved for the INGRESS port
+        // matches the registered public_base_url → the step stays done.
+        let current_ok = serde_json::json!({
+            "public_base_url": ingress,
+            "public_base_url_is_ephemeral_tunnel": true,
+            "active_tunnel_public_base_url": ingress,
+        });
+        assert!(setup_backend_runtime_context_current(&stored, &current_ok));
+        // The pre-fix failure: the port-blind slot reported the Setup-UI
+        // tunnel instead → permanently stale. The gate itself must still
+        // reject a genuine mismatch (that is what triggers a re-register).
+        let current_mismatch = serde_json::json!({
+            "public_base_url": ingress,
+            "public_base_url_is_ephemeral_tunnel": true,
+            "active_tunnel_public_base_url": "https://ui-tunnel.trycloudflare.com",
+        });
+        assert!(!setup_backend_runtime_context_current(
+            &stored,
+            &current_mismatch
+        ));
+    }
+
+    #[test]
+    fn tunnel_handoff_never_persists_the_setup_ui_port() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        let setup_ui = "http://127.0.0.1:12345";
+        let handoff_path = bundle
+            .path()
+            .join("state/config/platform/tunnel-handoff.json");
+
+        // Setup-UI-port tunnel: skipped — greentic-start would try to bind
+        // its gateway to a port this process already occupies.
+        let ui_tunnel = crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            setup_ui,
+            "https://ui-tunnel.trycloudflare.com",
+        );
+        persist_setup_tunnel_handoff(bundle.path(), setup_ui, &ui_tunnel);
+        assert!(
+            !handoff_path.exists(),
+            "Setup-UI-port tunnel must not be handed off"
+        );
+
+        // Runtime-ingress tunnel: persisted with its own port.
+        let ingress_tunnel = crate::setup_tunnel::SetupTunnel::detached(
+            "cloudflared",
+            "http://127.0.0.1:8080",
+            "https://ingress.trycloudflare.com",
+        );
+        persist_setup_tunnel_handoff(bundle.path(), setup_ui, &ingress_tunnel);
+        let handoff: Value =
+            serde_json::from_str(&std::fs::read_to_string(&handoff_path).expect("handoff written"))
+                .expect("valid json");
+        assert_eq!(
+            handoff.get("local_port").and_then(Value::as_u64),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn step_attempt_counter_increments_and_resets_on_url_change() {
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            serde_json::json!({"public_base_url": "https://a.trycloudflare.com"}),
+        );
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 1);
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 2);
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 3);
+        // Independent step tracks separately.
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "publish"), 1);
+        // A changed public_base_url makes a re-run legitimate → reset.
+        stored.insert(
+            "config".to_string(),
+            serde_json::json!({"public_base_url": "https://b.trycloudflare.com"}),
+        );
+        assert_eq!(setup_backend_record_step_attempt(&mut stored, "reg"), 1);
+        // Counter round-trips through the stored map.
+        assert_eq!(
+            stored["step_attempts"]["reg"]["count"].as_u64(),
+            Some(1),
+            "persisted counter reflects the reset"
+        );
+    }
+
+    #[test]
+    fn tunnel_cooldown_blocks_immediately_after_a_failure_then_clears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+
+        assert_eq!(
+            setup_backend_tunnel_cooldown_remaining(&state).unwrap(),
+            None,
+            "no failure recorded yet, so no cooldown"
+        );
+
+        *state.tunnel_failure_cooldown.lock().unwrap() = Some(std::time::Instant::now());
+        let remaining = setup_backend_tunnel_cooldown_remaining(&state)
+            .unwrap()
+            .expect("should be in cooldown right after a recorded failure");
+        assert!(remaining <= TUNNEL_FAILURE_COOLDOWN && remaining > std::time::Duration::ZERO);
+
+        // A failure recorded further in the past than the cooldown window
+        // has already elapsed, so it should read as no-longer-blocking.
+        let long_ago = std::time::Instant::now() - (TUNNEL_FAILURE_COOLDOWN * 2);
+        *state.tunnel_failure_cooldown.lock().unwrap() = Some(long_ago);
+        assert_eq!(
+            setup_backend_tunnel_cooldown_remaining(&state).unwrap(),
+            None,
+            "cooldown window has already elapsed"
+        );
     }
 
     fn test_jwt_with_exp(exp: u64) -> String {
@@ -8133,6 +9018,23 @@ questions:
     fn setup_backend_hides_current_downstream_output_when_prior_step_pending() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
+        // A LIVE conflicting ingress (runtime endpoints report a different
+        // tunnel URL than the recorded context) is what makes the step stale
+        // under the unknown-is-not-stale semantics.
+        let runtime_dir = temp.path().join("state/runtime/demo.support");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            serde_json::to_string(&json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://rotated.trycloudflare.com",
+                "gateway_listen_addr": "127.0.0.1",
+                "gateway_port": 47392
+            }))
+            .unwrap(),
+        )
+        .expect("endpoints.json");
         let contract = super::ProviderBackendContract {
             provider_id: "messaging-example".to_string(),
             inline: json!({
@@ -9001,6 +9903,23 @@ questions:
     fn completed_provider_http_step_is_pending_when_runtime_context_is_stale() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
+        // A LIVE conflicting ingress (runtime endpoints report a different
+        // tunnel URL than the recorded context) is what makes the step stale
+        // under the unknown-is-not-stale semantics.
+        let runtime_dir = temp.path().join("state/runtime/demo.support");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            serde_json::to_string(&json!({
+                "tenant": "demo",
+                "team": "support",
+                "public_base_url": "https://rotated.trycloudflare.com",
+                "gateway_listen_addr": "127.0.0.1",
+                "gateway_port": 47392
+            }))
+            .unwrap(),
+        )
+        .expect("endpoints.json");
         let contract = super::ProviderBackendContract {
             provider_id: "messaging-teams".to_string(),
             inline: json!({
@@ -10116,6 +11035,100 @@ questions:
         assert_eq!(action.authorize_url.as_deref(), Some(add_url));
     }
 
+    fn write_pack_with_open_url_setup_action(
+        path: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("pack.manifest.json", SimpleFileOptions::default())?;
+        zip.write_all(
+            json!({
+                "pack_id": provider_id,
+                "display_name": "Open URL Action Provider"
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())?;
+        zip.write_all(
+            br#"
+provider_id: generic
+version: 1
+title: Generic provider setup
+setup_actions:
+  - id: create_app
+    label: Create Provider App
+    kind: open_url
+    provider_id: provider-alias
+    url_template: "https://provider.example/apps/{resolved_app_id}/install-on-team?"
+    registration:
+      component_ref: provider-setup
+      op: setup_app_registration
+      app_id_output: resolved_app_id
+      mock_result:
+        ok: true
+        resolved_app_id: app-from-registration
+"#,
+        )?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_action_endpoint_runs_registration_for_open_url_action() {
+        // Slack's "Setup Slack App" action has no client_id to drive an
+        // oauth_install_button (Slack's apps.manifest.update never returns
+        // one on reuse), so it uses a plain open_url action instead. The
+        // registration must still run — the setup-action endpoint used to
+        // hard-reject any kind other than oauth_install_button.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_open_url_setup_action(
+            &providers.join("messaging-open-url-action.gtpack"),
+            "messaging-open-url-action",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup-action")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider_id": "messaging-open-url-action",
+                            "action_id": "create_app",
+                            "tenant": "demo",
+                            "team": "support",
+                            "env": "dev",
+                            "tunnel": "off",
+                            "answers": {
+                                "messaging-open-url-action": {
+                                    "public_base_url": "https://runtime.example.test"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("setup action response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(body["ok"] == true, "{body}");
+        assert_eq!(
+            body["values"]["resolved_app_id"],
+            Value::String("app-from-registration".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn draft_endpoint_persists_selected_tunnel_without_answers() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -10246,6 +11259,22 @@ questions:
     }
 
     #[test]
+    fn setup_ui_provider_setup_phase_accepts_open_url_registration_actions() {
+        // A provider whose "run registration" setup action is a plain
+        // `open_url` link (e.g. Slack's install-on-team button, which has no
+        // client_id to drive an oauth_install_button) must still surface as a
+        // runnable step — not be silently filtered out, which would skip the
+        // whole provider-setup-action phase and never invoke registration.
+        let app_js = include_str!("../../assets/setup-ui/app.js");
+        assert!(
+            app_js.contains(
+                r#"return action && (action.kind === "oauth_install_button" || action.kind === "open_url") && action.registration;"#
+            ),
+            "providerSetupPhaseActions must accept open_url registration actions alongside oauth_install_button"
+        );
+    }
+
+    #[test]
     fn setup_ui_opens_returned_install_url_after_provider_setup_action() {
         let app_js = include_str!("../../assets/setup-ui/app.js");
         assert!(app_js.contains("var popup = openProviderInstallWindow();"));
@@ -10256,8 +11285,8 @@ questions:
     #[test]
     fn setup_ui_provider_setup_action_back_and_continue_do_not_trap_admin() {
         let app_js = include_str!("../../assets/setup-ui/app.js");
-        assert!(app_js.contains("var canContinue = completed || !!error;"));
-        assert!(app_js.contains("providerHasFormQuestions(p)"));
+        assert!(app_js.contains("var canContinue = completed || !!error || questions.length > 0;"));
+        assert!(app_js.contains("preActionQuestions(p)"));
         assert!(app_js.contains("state.phase = \"providers\";"));
     }
 

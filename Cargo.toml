@@ -59,13 +59,13 @@ ureq = { version = "3", features = ["json"] }
 tracing = "0.1"
 url = "2"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+tempfile = "3"
 
 [[bin]]
 name = "greentic-setup"
 path = "src/bin/greentic_setup.rs"
 
 [dev-dependencies]
-tempfile = "3"
 criterion = "0.8"
 tower = "0.5"
 

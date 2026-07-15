@@ -117,11 +117,31 @@ pub async fn complete_setup_action_oauth_callback_with_token_response(
     .map(Some)
 }
 
+/// The setup server's public base URL as declared by the operator's environment.
+///
+/// Used where no live setup-tunnel handle is available (e.g. the headless
+/// `no_ui_oauth` callback listener). The UI path resolves the active tunnel first
+/// and only falls back to this.
+pub fn env_setup_callback_base() -> Option<String> {
+    std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
+        .ok()
+        .or_else(|| std::env::var("GREENTIC_PUBLIC_BASE_URL").ok())
+        .or_else(|| std::env::var("PUBLIC_BASE_URL").ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"))
+}
+
+/// `setup_callback_base`: the setup server's public base URL (live setup tunnel or
+/// env override). The exchange's `redirect_uri` MUST equal the one the authorize
+/// link used and the one registered in the app manifest, or the provider rejects
+/// the exchange (Slack: `bad_redirect_uri`). `None` falls back to the legacy
+/// `resolve_public_base_url` behaviour.
 pub async fn complete_oauth_callback(
     bundle_root: &Path,
     env: &str,
     input: &OAuthCallbackInput,
     extension_key: &str,
+    setup_callback_base: Option<&str>,
 ) -> Result<OAuthCallbackReport> {
     if input.code.trim().is_empty() {
         bail!("OAuth callback missing code");
@@ -135,6 +155,14 @@ pub async fn complete_oauth_callback(
         None,
         crate::setup_actions::current_epoch_secs(),
     )?;
+    eprintln!(
+        "[oauth-token] callback received: provider={} tenant={}/{} action={} code_len={}",
+        state.provider_id,
+        state.tenant,
+        state.team,
+        state.action_id,
+        input.code.trim().len()
+    );
     let machine_result = crate::setup_machine::complete_setup_machine_oauth_authorization_code(
         bundle_root,
         env,
@@ -150,6 +178,7 @@ pub async fn complete_oauth_callback(
             &state,
             input.code.trim(),
             extension_key,
+            setup_callback_base,
         )
         .await?
         {
@@ -165,6 +194,7 @@ pub async fn complete_setup_action_oauth_callback(
     state: &OAuthStatePayload,
     code: &str,
     extension_key: &str,
+    setup_callback_base: Option<&str>,
 ) -> Result<Option<OAuthCallbackReport>> {
     let Some(action) = crate::setup_actions::load_setup_action(
         bundle_root,
@@ -181,6 +211,12 @@ pub async fn complete_setup_action_oauth_callback(
     }
 
     let metadata = load_provider_oauth_metadata(bundle_root, &state.provider_id, extension_key)?;
+    eprintln!(
+        "[oauth-token] {extension_key} metadata: token_url={} secret_keys={:?} response_secret_map_keys={:?}",
+        metadata.token_url,
+        metadata.secret_keys,
+        metadata.response_secret_map.keys().collect::<Vec<_>>()
+    );
     let client_id = load_setup_action_secret(
         bundle_root,
         env,
@@ -197,23 +233,34 @@ pub async fn complete_setup_action_oauth_callback(
     )
     .await?
     .ok_or_else(|| anyhow::anyhow!("setup action OAuth callback missing client secret"))?;
-    let public_base_url =
-        match resolve_public_base_url(bundle_root, &state.tenant, Some(&state.team), &state.provider_id)
-        {
-            Ok(value) => value,
-            Err(_) => load_setup_action_secret(
-                bundle_root,
-                env,
-                state,
-                &["public_base_url".to_string()],
-            )
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "This provider requires a public_base_url to generate OAuth callback and webhook URLs."
+    // The callback is served by the setup server, so the exchange's redirect_uri must
+    // be built from the setup server's base — the same one the authorize link used and
+    // the app manifest registered. Only fall back to the provider's (runtime)
+    // public_base_url when no setup base was resolved.
+    let public_base_url = match setup_callback_base
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(base) => base.to_string(),
+        None => {
+            match resolve_public_base_url(bundle_root, &state.tenant, Some(&state.team), &state.provider_id)
+            {
+                Ok(value) => value,
+                Err(_) => load_setup_action_secret(
+                    bundle_root,
+                    env,
+                    state,
+                    &["public_base_url".to_string()],
                 )
-            })?,
-        };
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "This provider requires a public_base_url to generate OAuth callback and webhook URLs."
+                    )
+                })?,
+            }
+        }
+    };
     let redirect_path = setup_action_string(&action, "redirect_path")
         .or_else(|| action.callback_path.clone())
         .or_else(|| metadata.redirect_path.clone())
@@ -223,6 +270,12 @@ pub async fn complete_setup_action_oauth_callback(
         public_base_url.trim().trim_end_matches('/'),
         ensure_leading_slash(&redirect_path)
     );
+    eprintln!(
+        "[oauth-token] exchanging code at {} (redirect_uri={redirect_uri}, client_id={}, client_secret_present={})",
+        metadata.token_url,
+        client_id.trim(),
+        !client_secret.trim().is_empty()
+    );
     let token_response = exchange_oauth_code(
         &metadata,
         code.trim(),
@@ -230,6 +283,15 @@ pub async fn complete_setup_action_oauth_callback(
         client_id.trim(),
         client_secret.trim(),
     )?;
+    let tr_ok = token_response.get("ok").and_then(Value::as_bool);
+    let tr_err = token_response.get("error").and_then(Value::as_str);
+    let token_prefix = token_response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(|t| t.chars().take(5).collect::<String>());
+    eprintln!(
+        "[oauth-token] exchange response: ok={tr_ok:?} error={tr_err:?} access_token_prefix={token_prefix:?}"
+    );
     persist_setup_action_oauth_token_response(
         bundle_root,
         env,
@@ -249,7 +311,8 @@ pub fn exchange_oauth_code(
     client_id: &str,
     client_secret: &str,
 ) -> Result<Value> {
-    let mut response = ureq::post(&metadata.token_url)
+    let mut response = crate::http_client::api_agent()
+        .post(&metadata.token_url)
         .send_form([
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -312,6 +375,10 @@ async fn persist_setup_action_oauth_token_response(
     token_response: &Value,
 ) -> Result<OAuthCallbackReport> {
     let mapped = crate::setup_actions::map_oauth_token_response(metadata, token_response)?;
+    eprintln!(
+        "[oauth-token] mapped token response -> secret key(s): {:?}",
+        mapped.keys().collect::<Vec<_>>()
+    );
     let config = mapped
         .into_iter()
         .map(|(key, value)| (key, Value::String(value)))
@@ -326,6 +393,10 @@ async fn persist_setup_action_oauth_token_response(
         None,
     )
     .await?;
+    eprintln!(
+        "[oauth-token] persisted {:?} for {} ({}/{}); action {} -> complete",
+        persisted_keys, state.provider_id, state.tenant, state.team, action.id
+    );
     crate::setup_actions::mark_setup_action_complete(
         bundle_root,
         &state.tenant,
@@ -960,6 +1031,7 @@ mod tests {
                 state,
             },
             "messaging.oauth.v1",
+            None,
         )
         .await?;
         server_handle.join().unwrap()?;

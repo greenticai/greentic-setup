@@ -24,7 +24,7 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
 
-use greentic_setup::cli_args::{BundleCommand, Cli, Command};
+use greentic_setup::cli_args::{BundleCommand, Cli, Command, ProviderCommand};
 use greentic_setup::cli_commands;
 use greentic_setup::cli_helpers::{
     SetupOutputTarget, complete_loaded_answers_with_prompts, copy_dir_recursive,
@@ -124,6 +124,34 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Doctor(args)) => cli_commands::doctor(args, i18n),
+        Some(Command::EnvDeploy(args)) => {
+            let env = greentic_setup::resolve_env(Some(&cli.env));
+            greentic_setup::env_deploy::deploy_bundle_to_env(
+                &args.bundle,
+                &env,
+                cli.dry_run,
+                cli.non_interactive,
+                None,
+            )
+        }
+        Some(Command::Provider(cmd)) => {
+            let env = greentic_setup::resolve_env(Some(&cli.env));
+            match cmd {
+                ProviderCommand::Add(args) => greentic_setup::provider_commands::add(
+                    &args,
+                    &env,
+                    &cli.tenant,
+                    cli.team.as_deref(),
+                    cli.dry_run,
+                    cli.non_interactive,
+                    cli.answers.as_deref(),
+                ),
+                ProviderCommand::List(_) => greentic_setup::provider_commands::list(&env),
+                ProviderCommand::Remove(args) => {
+                    greentic_setup::provider_commands::remove(&args.endpoint_id, &env)
+                }
+            }
+        }
         Some(Command::Bundle(cmd)) => match *cmd {
             BundleCommand::Init(args) => cli_commands::init(args, i18n),
             BundleCommand::Add(args) => cli_commands::add(args, i18n),
@@ -272,7 +300,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             .as_ref()
             .map(|server| server.local_base_url.as_str())
             .unwrap_or("http://127.0.0.1:1");
-        let tunnel = maybe_start_cli_setup_tunnel(&mut loaded_answers, local_base_url)
+        let tunnel = maybe_start_cli_setup_tunnel(&bundle_dir, &mut loaded_answers, local_base_url)
             .context("failed to start setup tunnel")?;
         if let Some(tunnel) = tunnel.as_ref() {
             println!("Setup tunnel public_base_url: {}", tunnel.public_base_url);
@@ -287,6 +315,9 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
         ensure_required_setup_answers_present(&bundle_dir, &loaded_answers)
             .context("Missing required answers in --non-interactive mode")?;
     }
+
+    // Preserve providers[] before fields are moved into the request.
+    let declared_providers = std::mem::take(&mut loaded_answers.providers);
 
     let request = SetupRequest {
         bundle: bundle_dir.clone(),
@@ -400,6 +431,109 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
                 gtbundle::create_gtbundle(&bundle_dir, &output_bundle)
                     .context("failed to write configured .gtbundle archive")?;
                 println!("Configured bundle written to: {}", output_bundle.display());
+            }
+        }
+    }
+
+    // ── Auto-deploy + provider wiring ──────────────────────────────────
+    // When the answers doc declares providers[], deploy the bundle into
+    // the target environment and wire each provider through the mutation
+    // core. This makes `greentic-setup --answers a.json ./my-bundle` a
+    // single command that leaves the environment fully operational.
+    if !declared_providers.is_empty() {
+        eprintln!();
+        eprintln!("Deploying bundle to environment `{env}`...");
+        greentic_setup::env_deploy::deploy_bundle_to_env(
+            &bundle_dir,
+            &env,
+            false,
+            true, // non-interactive
+            None,
+        )
+        .context("auto-deploy bundle to environment")?;
+
+        // Build store + resolve bundle_id for provider wiring.
+        let store_root = greentic_deployer::environment::LocalFsStore::default_root()
+            .context("cannot locate the environment store")?;
+        let store = greentic_deployer::environment::LocalFsStore::new(store_root);
+        let bundle_id = greentic_setup::provider_commands::auto_detect_bundle_id(&store, &env)?;
+
+        for provider_entry in &declared_providers {
+            let kind = provider_entry.kind.to_ascii_lowercase();
+            let info = match greentic_setup::provider_registry::lookup(&kind) {
+                Some(info) => info,
+                None => {
+                    eprintln!("Warning: unknown provider kind `{kind}` in providers[]; skipping.");
+                    continue;
+                }
+            };
+
+            let provider_id = provider_entry
+                .provider_id
+                .as_deref()
+                .unwrap_or(info.default_provider_id);
+
+            // Resolve the pack: try the bundle's packs directory first,
+            // then fall back to OCI / offline scan.
+            let pack_path =
+                greentic_setup::provider_commands::resolve_pack(None, info, &store, &env, None);
+            let pack_path = match pack_path {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not resolve pack for provider `{kind}`: {e:#}; skipping."
+                    );
+                    continue;
+                }
+            };
+
+            let display_name = provider_entry
+                .display_name
+                .clone()
+                .unwrap_or_else(|| greentic_setup::setup_to_formspec::capitalize(info.kind));
+
+            let idem_key = greentic_setup::provider_commands::deterministic_idempotency_key(
+                &env,
+                info.provider_type,
+                provider_id,
+            );
+
+            eprintln!();
+            eprintln!(
+                "Wiring provider `{provider_id}` (type: {})...",
+                info.provider_type
+            );
+            match greentic_setup::provider_commands::register_provider_core(
+                &store,
+                &greentic_setup::provider_commands::RegisterProviderPayload {
+                    env_id: &env,
+                    tenant: &tenant,
+                    team: team.as_deref(),
+                    provider_type: info.provider_type,
+                    provider_id,
+                    pack_name: info.pack_name,
+                    display_name,
+                    bundle_id: &bundle_id,
+                    link_bundle: provider_entry.link_bundle,
+                    answers: &provider_entry.answers,
+                    pack_path: &pack_path,
+                },
+                Some(idem_key),
+            ) {
+                Ok(_result) => {
+                    if provider_entry.link_bundle {
+                        eprintln!(
+                            "Provider `{provider_id}` wired to bundle `{bundle_id}` in env `{env}`."
+                        );
+                    } else {
+                        eprintln!(
+                            "Provider `{provider_id}` registered in env `{env}` (not linked to bundle)."
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to wire provider `{provider_id}`: {e:#}");
+                }
             }
         }
     }

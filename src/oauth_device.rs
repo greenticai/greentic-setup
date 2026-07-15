@@ -240,7 +240,8 @@ pub fn start_oauth_device_code(
     let setup_answers = load_provider_setup_answers(bundle_root, &input.provider_id)?;
     let client_id = lookup_client_id(&metadata, &setup_answers)?;
     let request_form = device_code_request_form(&metadata, &client_id);
-    let mut response = ureq::post(&metadata.device_code_url)
+    let mut response = crate::http_client::api_agent()
+        .post(&metadata.device_code_url)
         .send_form(request_form)
         .context("OAuth device-code request failed")?;
     let response = response
@@ -318,10 +319,7 @@ pub async fn poll_oauth_device_code(
     }
     let metadata = load_provider_device_metadata(bundle_root, &session.provider_id, extension_key)?;
     let request_form = token_poll_request_form(&session.client_id, &session.device_code);
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = crate::http_client::api_agent_any_status();
     let mut response = agent
         .post(&metadata.token_url)
         .send_form(request_form)
@@ -731,7 +729,8 @@ pub fn execute_post_login_discovery(
     let mut context = BTreeMap::new();
     for step in &metadata.post_login_discovery {
         let url = resolve_discovery_url(step, &context)?;
-        let mut response = ureq::get(&url)
+        let mut response = crate::http_client::api_agent()
+            .get(&url)
             .header("Authorization", &format!("Bearer {access_token}"))
             .config()
             .http_status_as_error(false)

@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::platform_setup::types::{StaticRoutesPolicy, TelemetryAnswers, TunnelAnswers};
+use crate::platform_setup::types::{
+    StaticRoutesPolicy, TelemetryAnswers, TunnelAnswers, TunnelHandoff,
+};
 
 /// Get the path to the static routes artifact file.
 pub fn static_routes_artifact_path(bundle_root: &Path) -> PathBuf {
@@ -143,6 +145,53 @@ pub fn persist_tunnel_artifact(bundle_root: &Path, answers: &TunnelAnswers) -> R
         std::fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(answers).context("serialize tunnel answers")?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Get the path to the setup tunnel handoff artifact file.
+///
+/// Lives alongside `static-routes.json` in `state/config/platform/` — the
+/// same bundle-scoped directory `greentic-start` already reads config from
+/// (see `configured_public_base_url_from_static_routes` there). This is a
+/// cross-repo protocol file, like the machine-wide shared tunnel record
+/// (`shared_tunnel.rs`): it hands off the *local port* setup's speculative
+/// tunnel targets, so `greentic-start` can bind its gateway to that same
+/// port on first boot and adopt the already-running tunnel via the shared
+/// record, instead of picking its own default/fallback port and minting a
+/// second, disconnected tunnel.
+pub fn tunnel_handoff_artifact_path(bundle_root: &Path) -> PathBuf {
+    bundle_root
+        .join("state")
+        .join("config")
+        .join("platform")
+        .join("tunnel-handoff.json")
+}
+
+/// Load the setup tunnel handoff from the bundle artifact file.
+pub fn load_tunnel_handoff_artifact(bundle_root: &Path) -> Result<Option<TunnelHandoff>> {
+    let path = tunnel_handoff_artifact_path(bundle_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let handoff: TunnelHandoff = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(handoff))
+}
+
+/// Persist the setup tunnel handoff to the bundle artifact file.
+pub fn persist_tunnel_handoff_artifact(
+    bundle_root: &Path,
+    handoff: &TunnelHandoff,
+) -> Result<PathBuf> {
+    let path = tunnel_handoff_artifact_path(bundle_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string_pretty(handoff).context("serialize tunnel handoff")?;
     std::fs::write(&path, payload)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)

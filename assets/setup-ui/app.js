@@ -90,6 +90,9 @@
 
   function makeScope(tenant, env, team) {
     var answers = {};
+    // Packs with no questions need no user input — mark them done up front so
+    // they don't sit as "Pending" forever and don't block the "all done" gate.
+    var providersDone = {};
     state.providers.forEach(function (p) {
       answers[p.provider_id] = {};
       var form = state.providerForms[p.provider_id];
@@ -97,6 +100,9 @@
         form.questions.forEach(function (q) {
           if (q.saved_value) answers[p.provider_id][q.id] = q.saved_value;
         });
+        if ((form.questions || []).length === 0 && !p.setup_web_component) {
+          providersDone[p.provider_id] = true;
+        }
       }
     });
     return {
@@ -106,7 +112,7 @@
       tunnel: state.defaultTunnel || (state.cloudDeploy ? "off" : "cloudflared"),
       answers: answers,
       sharedAnswers: {},
-      providersDone: {},
+      providersDone: providersDone,
       providerSetupStatus: {},
       publicBaseUrlStatus: {},
       sharedAnswersDone: false,
@@ -713,9 +719,13 @@
 
     state.providers.forEach(function (p, idx) {
       var enabled = providerEnabled(scope, p.provider_id);
-      var done = scope.providersDone[p.provider_id];
       var form = state.providerForms[p.provider_id];
       var qCount = form ? form.questions.length : 0;
+      // Hide packs with nothing to configure — no questions and no web setup
+      // component. They are auto-done (see makeScope); a "0 questions" card
+      // stuck on Pending only confuses.
+      if (qCount === 0 && !p.setup_web_component) return;
+      var done = scope.providersDone[p.provider_id];
       var setupKind = p.setup_web_component ? "web setup" : qCount + ' ' + esc(t("ui.questions"));
       var displayName = formatProviderName(p);
       html +=
@@ -1441,13 +1451,25 @@
         return;
       }
     }
+    // For providers with an install action, only the action's input fields
+    // (config tokens) show on this step; the action + its result field (the
+    // bot token) show on the next step (provider-setup-action).
+    var pageQuestions = form.questions;
+    if (providerSetupPhaseActions(p).length > 0) {
+      pageQuestions = preActionQuestions(p);
+      if (pageQuestions.length === 0) {
+        state.phase = "provider-setup-action";
+        render();
+        return;
+      }
+    }
     var backFn = function () {
       if (state.currentProvider > 0) { state.currentProvider--; state.phase = "provider-form"; }
       else if (state.sharedQuestions.length > 0) { state.phase = "shared"; }
       else { state.phase = "providers"; }
       render();
     };
-    renderForm(form.questions, form.title || formatProviderName(p), t("ui.provider.configure", [formatProviderName(p)]), null, function () {
+    renderForm(pageQuestions, form.title || formatProviderName(p), t("ui.provider.configure", [formatProviderName(p)]), null, function () {
       if (providerSetupPhaseActions(p).length > 0) {
         persistDraftNow().finally(function () {
           state.phase = "provider-setup-action";
@@ -1520,8 +1542,34 @@
     var descriptor = provider && provider.setup_actions;
     var actions = descriptor && Array.isArray(descriptor.actions) ? descriptor.actions : [];
     return actions.filter(function (action) {
-      return action && action.kind === "oauth_install_button" && action.registration;
+      return action && (action.kind === "oauth_install_button" || action.kind === "open_url") && action.registration;
     });
+  }
+
+  // Question ids the action consumes as registration inputs (its "*_field"
+  // values, e.g. the config tokens). Those show on the pre-action step (page 1);
+  // any remaining question (e.g. the bot token) shows with the action (page 2).
+  function actionInputFieldNames(provider) {
+    var names = {};
+    providerSetupPhaseActions(provider).forEach(function (action) {
+      var reg = (action && action.registration) || {};
+      Object.keys(reg).forEach(function (k) {
+        if (/_field$/.test(k) && typeof reg[k] === "string") names[reg[k]] = true;
+      });
+    });
+    return names;
+  }
+  function preActionQuestions(provider) {
+    var form = state.providerForms[provider.provider_id];
+    if (!form || !Array.isArray(form.questions)) return [];
+    var inputNames = actionInputFieldNames(provider);
+    return form.questions.filter(function (q) { return inputNames[q.id]; });
+  }
+  function actionStepQuestions(provider) {
+    var form = state.providerForms[provider.provider_id];
+    if (!form || !Array.isArray(form.questions)) return [];
+    var inputNames = actionInputFieldNames(provider);
+    return form.questions.filter(function (q) { return !inputNames[q.id]; });
   }
 
   function completeProviderAndAdvance(providerId) {
@@ -1542,7 +1590,10 @@
     var completed = status && status.ok === true;
     var running = status && status.running;
     var error = status && status.error;
-    var canContinue = completed || !!error;
+    var questions = actionStepQuestions(p);
+    // Continue is allowed once the app action completes/errors, or — when this
+    // step also carries a field (the bot token) — as soon as it is filled.
+    var canContinue = completed || !!error || questions.length > 0;
     var name = formatProviderName(p);
     var html =
       '<div class="fade-in">' +
@@ -1572,6 +1623,24 @@
       if (error) html += '<div class="setup-action-error">' + esc(error) + '</div>';
       html += '</div>';
     });
+    // Render this step's leftover field (the bot token) below the action button.
+    if (questions.length) {
+      html += '<div id="form-area" class="form-fields">';
+      var currentGroup = null;
+      questions.forEach(function (q) {
+        if (q.group && q.group !== currentGroup) {
+          if (currentGroup !== null) html += '</div>';
+          currentGroup = q.group;
+          html += '<div class="form-group"><h4 class="form-group-title">' + esc(q.group) + '</h4>';
+        } else if (!q.group && currentGroup !== null) {
+          html += '</div>';
+          currentGroup = null;
+        }
+        html += renderQuestion(q);
+      });
+      if (currentGroup !== null) html += '</div>';
+      html += '</div>';
+    }
     html +=
           '</div>' +
           '<div class="card-footer card-footer-split">' +
@@ -1581,8 +1650,27 @@
         '</div>' +
       '</div>';
     app.innerHTML = html;
+    if (questions.length) {
+      restoreFormValues(questions);
+      setupTableQuestions(questions);
+      setupVisibility(questions);
+      var formArea = document.getElementById("form-area");
+      if (formArea) {
+        var delegateHandler = function (e) {
+          var tt = e.target;
+          if (!tt) return;
+          var tag = (tt.tagName || "").toLowerCase();
+          if (tag !== "input" && tag !== "select" && tag !== "textarea") return;
+          collectFormValues(questions);
+          scheduleDraftSave();
+        };
+        formArea.addEventListener("input", delegateHandler);
+        formArea.addEventListener("change", delegateHandler);
+      }
+    }
     var backFn = function () {
-      if (providerHasFormQuestions(p)) {
+      // Back returns to this provider's config step (page 1) when it has one.
+      if (preActionQuestions(p).length > 0) {
         state.phase = "provider-form";
       } else if (state.currentProvider > 0) {
         state.currentProvider--;
@@ -1597,7 +1685,12 @@
     document.getElementById("btn-back").addEventListener("click", backFn);
     document.getElementById("btn-prev").addEventListener("click", backFn);
     document.getElementById("btn-submit").addEventListener("click", function () {
-      completeProviderAndAdvance(p.provider_id);
+      // Require the field only when the install action hasn't been run.
+      if (questions.length && !completed && !error) {
+        if (!validateForm(questions)) return;
+      }
+      if (questions.length) collectFormValues(questions);
+      persistDraftNow().finally(function () { completeProviderAndAdvance(p.provider_id); });
     });
     Array.prototype.forEach.call(document.querySelectorAll(".btn-run-provider-setup-action"), function (btn) {
       btn.addEventListener("click", function () {
@@ -1614,6 +1707,9 @@
 
   function runProviderSetupAction(provider, action) {
     var scope = cs();
+    var actionTag = "[setup-action " + provider.provider_id + "/" + action.id + "]";
+    console.info(actionTag + " clicked; opening placeholder popup and POSTing /api/setup-action (tunnel=" + (scope.tunnel || "default") + ")");
+    var startedAt = Date.now();
     var popup = openProviderInstallWindow();
     scope.providerSetupStatus[provider.provider_id] = { running: true };
     render();
@@ -1632,7 +1728,9 @@
     })
     .then(function (r) { return r.json(); })
     .then(function (result) {
+      var elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
       if (!result.ok) {
+        console.error(actionTag + " failed after " + elapsed + "s: " + (result.error || "Setup action failed"), result);
         closeProviderInstallWindow(popup);
         scope.providerSetupStatus[provider.provider_id] = {
           ok: false,
@@ -1641,19 +1739,23 @@
         render();
         return;
       }
+      console.info(actionTag + " succeeded in " + elapsed + "s; values: " + Object.keys(result.values || {}).join(", "));
       scope.providerSetupStatus[provider.provider_id] = result;
       if (result.values && typeof result.values === "object") {
         scope.answers[provider.provider_id] = Object.assign({}, scope.answers[provider.provider_id] || {}, result.values);
       }
       var installUrl = setupActionReturnedFinalUrl(provider, result);
       if (installUrl) {
+        console.info(actionTag + " navigating install popup to " + installUrl);
         navigateProviderInstallWindow(popup, installUrl);
       } else {
+        console.info(actionTag + " no install URL resolved; closing placeholder popup");
         closeProviderInstallWindow(popup);
       }
       render();
     })
     .catch(function (err) {
+      console.error(actionTag + " request error after " + ((Date.now() - startedAt) / 1000).toFixed(1) + "s: " + err.message);
       closeProviderInstallWindow(popup);
       scope.providerSetupStatus[provider.provider_id] = { ok: false, error: err.message };
       render();
@@ -1702,13 +1804,40 @@
     context.setup_status = result.setup_status || (result.state && result.state.setup_status) || {};
     context.values = result.values || (result.state && result.state.values) || {};
     context.provider_id = provider.provider_id;
+    // An explicit install_url (e.g. Slack's dashboard install-on-team page) is
+    // this action's one-time install target; the final deep_link actions below
+    // keep pointing at the installed app (app_redirect -> DM with the bot).
+    var explicitInstall = deepValue(context, "install_url");
+    if (explicitInstall) return String(explicitInstall);
     for (var i = 0; i < actions.length; i++) {
       var item = resolveFinalSetupAction(provider, actions[i], context);
       if (item && item.url) return item.url;
     }
+    // For an install action (kind: open_url), prefer its url_template — e.g.
+    // Slack's api.slack.com/apps/{slack_app_id}/install-on-team link resolved
+    // with the returned app id — over any oauth redirect the component returned
+    // (which points at the workspace app_redirect page).
+    for (var k = 0; k < actions.length; k++) {
+      var url = resolveOpenUrlActionTemplate(actions[k], context);
+      if (url) return url;
+    }
     var directUrl = deepValue(context, "oauth_authorize_url") || deepValue(context, "authorize_url");
     if (directUrl) return String(directUrl);
     return "";
+  }
+
+  function resolveOpenUrlActionTemplate(action, context) {
+    if (!action || action.kind !== "open_url") return "";
+    var template = String(action.url_template || "").trim();
+    if (!template) return "";
+    var missing = false;
+    var url = template.replace(/\{([A-Za-z0-9_.-]+)\}/g, function (_, name) {
+      var value = deepValue(context, name);
+      if (value === undefined || value === null || value === "") { missing = true; return ""; }
+      return encodeURIComponent(String(value));
+    });
+    if (missing || !isSafeFinalSetupActionUrl(url)) return "";
+    return url;
   }
 
   function renderProviderWebComponent(p) {
@@ -2375,6 +2504,12 @@
         html += '<div class="setup-action">';
         html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.authorize_url) + '">' + esc(action.label || "Open") + '</a>';
         html += '</div>';
+          return;
+        }
+        if (action.kind === "open_url" && action.url) {
+          html += '<div class="setup-action">';
+          html += '<a class="btn btn-primary setup-action-btn" target="_blank" rel="noopener noreferrer" href="' + esc(action.url) + '">' + esc(action.label || "Open") + '</a>';
+          html += '</div>';
           return;
         }
         if (action.kind === "oauth_device_code") {

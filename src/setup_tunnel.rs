@@ -39,6 +39,18 @@ impl SetupTunnel {
             None => true,
         }
     }
+
+    /// Handle for a tunnel owned elsewhere (the shared record, or tests):
+    /// no child process, never killed on drop.
+    pub(crate) fn detached(mode: &str, local_base_url: &str, public_base_url: &str) -> Self {
+        Self {
+            mode: mode.to_string(),
+            local_base_url: local_base_url.trim_end_matches('/').to_string(),
+            public_base_url: public_base_url.to_string(),
+            child: None,
+            kill_on_drop: false,
+        }
+    }
 }
 
 pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -> bool {
@@ -75,6 +87,13 @@ pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunne
     }
 }
 
+/// Build a [`SetupTunnel`] that reuses an already-running shared tunnel: there
+/// is no child to own and nothing to kill on drop — the tunnel deliberately
+/// outlives this setup process so the runtime it configures keeps the same URL.
+fn reuse_shared_tunnel(mode: &str, local_base_url: &str, public_base_url: String) -> SetupTunnel {
+    SetupTunnel::detached(mode, local_base_url, &public_base_url)
+}
+
 /// Acquire the machine-wide shared cloudflared tunnel for the port behind
 /// `local_base_url`: reuse the recorded one when it still serves, otherwise
 /// spawn a fresh cloudflared and publish it so greentic-start adopts the same
@@ -87,22 +106,27 @@ fn start_cloudflared_shared(local_base_url: &str) -> Result<SetupTunnel> {
     let _lock =
         crate::shared_tunnel::TunnelLock::acquire(&paths.lock_path, Duration::from_secs(45))?;
 
+    use crate::shared_tunnel::RecordedTunnelState;
     let (recorded_pid, recorded_url) = crate::shared_tunnel::read_record(&paths);
+    eprintln!(
+        "Setup tunnel: checking shared cloudflared record for port {port} \
+         (recorded pid={recorded_pid:?}, url={recorded_url:?})"
+    );
     if let Some(url) = recorded_url {
-        if crate::shared_tunnel::probe_tunnel_alive(&url) {
-            eprintln!("Reusing shared {mode} tunnel: {url}");
-            return Ok(SetupTunnel {
-                mode: mode.to_string(),
-                local_base_url: local_base_url.trim_end_matches('/').to_string(),
-                public_base_url: url,
-                child: None,
-                kill_on_drop: false,
-            });
-        }
-        // Recorded tunnel no longer serves. It is ours to replace: the pid
-        // came from the shared record, never from a process-name match.
-        if let Some(pid) = recorded_pid {
-            crate::shared_tunnel::terminate_recorded_pid(pid);
+        match crate::shared_tunnel::classify_recorded_tunnel(&paths, recorded_pid, &url) {
+            RecordedTunnelState::Serving | RecordedTunnelState::WarmingUp => {
+                eprintln!("Reusing shared {mode} tunnel: {url}");
+                return Ok(reuse_shared_tunnel(mode, local_base_url, url));
+            }
+            RecordedTunnelState::Down => {
+                // Recorded tunnel is genuinely gone (process dead, or the edge
+                // returned 530 for a lost binding). It is ours to replace: the
+                // pid came from the shared record, never a process-name match.
+                eprintln!("Shared {mode} tunnel {url} is down; replacing it");
+                if let Some(pid) = recorded_pid {
+                    crate::shared_tunnel::terminate_recorded_pid(pid);
+                }
+            }
         }
     }
     crate::shared_tunnel::clear_record(&paths);
@@ -322,7 +346,8 @@ fn install_cloudflared_binary(target: &Path) -> Result<()> {
 }
 
 fn download_bytes(url: &str) -> Result<Vec<u8>> {
-    let mut response = ureq::get(url)
+    let mut response = crate::http_client::download_agent()
+        .get(url)
         .call()
         .map_err(|err| anyhow!("request {url}: {err}"))?;
     response
@@ -435,12 +460,27 @@ fn extract_https_urls(line: &str) -> Vec<String> {
 }
 
 pub fn inject_setup_public_base_url(answers: &mut JsonMap<String, Value>, public_base_url: &str) {
+    // The OAuth *callback* (developer app-install) is served by the setup server,
+    // not the runtime, so provider ops that register OAuth redirect URLs need the
+    // setup server's public URL — separate from the messaging `public_base_url`.
+    // Injected only when `GREENTIC_SETUP_PUBLIC_BASE_URL` is set; otherwise ops
+    // fall back to `public_base_url` for back-compat.
+    let oauth_callback_base_url = std::env::var("GREENTIC_SETUP_PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("https://"));
     for provider_answers in answers.values_mut() {
         let Some(obj) = provider_answers.as_object_mut() else {
             continue;
         };
         if !crate::provider_state::provider_enabled_from_map(obj) {
             continue;
+        }
+        if let Some(ref callback_base) = oauth_callback_base_url {
+            obj.insert(
+                "oauth_callback_base_url".to_string(),
+                Value::String(callback_base.clone()),
+            );
         }
         if obj
             .get("public_base_url")
@@ -472,12 +512,13 @@ pub fn is_ephemeral_tunnel_url(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::{Map as JsonMap, Value, json};
 
-    use super::{
-        extract_tunnel_https_url, inject_setup_public_base_url, is_ephemeral_tunnel_url,
-        should_start_setup_tunnel,
-    };
+    use super::*;
+
+    // ---- should_start_setup_tunnel ----
 
     #[test]
     fn setup_tunnel_helpers_detect_public_url_need() {
@@ -548,6 +589,283 @@ mod tests {
     }
 
     #[test]
+    fn should_start_tunnel_ngrok_mode() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-slack": {}
+        }))
+        .expect("answers");
+        assert!(should_start_setup_tunnel("ngrok", &answers));
+    }
+
+    #[test]
+    fn should_start_tunnel_non_object_value_ignored() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-slack": "not-an-object"
+        }))
+        .expect("answers");
+        assert!(!should_start_setup_tunnel("cloudflared", &answers));
+    }
+
+    #[test]
+    fn should_start_tunnel_whitespace_only_url_needs_tunnel() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-slack": {
+                "public_base_url": "   "
+            }
+        }))
+        .expect("answers");
+        assert!(should_start_setup_tunnel("cloudflared", &answers));
+    }
+
+    #[test]
+    fn should_start_tunnel_http_url_needs_tunnel() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-slack": {
+                "public_base_url": "http://127.0.0.1:8080"
+            }
+        }))
+        .expect("answers");
+        assert!(should_start_setup_tunnel("cloudflared", &answers));
+    }
+
+    #[test]
+    fn should_start_tunnel_stale_ngrok_url_needs_tunnel() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-telegram": {
+                "public_base_url": "https://stale.ngrok-free.app"
+            }
+        }))
+        .expect("answers");
+        assert!(should_start_setup_tunnel("ngrok", &answers));
+    }
+
+    #[test]
+    fn should_start_tunnel_mixed_providers_one_needs_tunnel() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-teams": {
+                "public_base_url": "https://stable.example.com"
+            },
+            "messaging-slack": {
+                "public_base_url": "http://localhost:3000"
+            }
+        }))
+        .expect("answers");
+        // One provider has http, so tunnel is needed.
+        assert!(should_start_setup_tunnel("cloudflared", &answers));
+    }
+
+    #[test]
+    fn should_start_tunnel_all_have_stable_https() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-teams": {
+                "public_base_url": "https://stable.example.com"
+            },
+            "messaging-slack": {
+                "public_base_url": "https://prod.example.com"
+            }
+        }))
+        .expect("answers");
+        assert!(!should_start_setup_tunnel("cloudflared", &answers));
+    }
+
+    #[test]
+    fn should_start_tunnel_empty_answers_map() {
+        let answers = JsonMap::new();
+        // No providers at all: no one needs a tunnel.
+        assert!(!should_start_setup_tunnel("cloudflared", &answers));
+    }
+
+    // ---- extract_https_urls ----
+
+    #[test]
+    fn extract_https_urls_empty_line() {
+        assert!(extract_https_urls("").is_empty());
+    }
+
+    #[test]
+    fn extract_https_urls_no_urls() {
+        assert!(extract_https_urls("just some text without urls").is_empty());
+    }
+
+    #[test]
+    fn extract_https_urls_single_url() {
+        let urls = extract_https_urls("visit https://example.com now");
+        assert_eq!(urls, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn extract_https_urls_trailing_slash_stripped() {
+        let urls = extract_https_urls("https://example.com/");
+        assert_eq!(urls, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn extract_https_urls_multiple_urls() {
+        let urls =
+            extract_https_urls("first https://one.example.com then https://two.example.com end");
+        assert_eq!(
+            urls,
+            vec!["https://one.example.com", "https://two.example.com"]
+        );
+    }
+
+    #[test]
+    fn extract_https_urls_quoted_terminators() {
+        let urls = extract_https_urls(r#""https://quoted.example.com""#);
+        assert_eq!(urls, vec!["https://quoted.example.com"]);
+
+        let urls = extract_https_urls("'https://single-quoted.example.com'");
+        assert_eq!(urls, vec!["https://single-quoted.example.com"]);
+    }
+
+    #[test]
+    fn extract_https_urls_angle_bracket_terminators() {
+        let urls = extract_https_urls("<https://bracketed.example.com>");
+        assert_eq!(urls, vec!["https://bracketed.example.com"]);
+    }
+
+    #[test]
+    fn extract_https_urls_comma_terminator() {
+        let urls = extract_https_urls("https://a.com,https://b.com");
+        assert_eq!(urls, vec!["https://a.com", "https://b.com"]);
+    }
+
+    #[test]
+    fn extract_https_urls_paren_terminator() {
+        let urls = extract_https_urls("(https://paren.example.com)");
+        assert_eq!(urls, vec!["https://paren.example.com"]);
+    }
+
+    #[test]
+    fn extract_https_urls_with_path() {
+        let urls = extract_https_urls("at https://example.com/path/to/thing done");
+        assert_eq!(urls, vec!["https://example.com/path/to/thing"]);
+    }
+
+    #[test]
+    fn extract_https_urls_ignores_http() {
+        let urls = extract_https_urls("http://not-extracted.com https://extracted.com");
+        assert_eq!(urls, vec!["https://extracted.com"]);
+    }
+
+    // ---- tunnel_url_matches_mode ----
+
+    #[test]
+    fn tunnel_url_matches_cloudflared_exact_host() {
+        assert!(tunnel_url_matches_mode(
+            "cloudflared",
+            "https://trycloudflare.com"
+        ));
+    }
+
+    #[test]
+    fn tunnel_url_matches_cloudflared_subdomain() {
+        assert!(tunnel_url_matches_mode(
+            "cloudflared",
+            "https://abc-def.trycloudflare.com"
+        ));
+    }
+
+    #[test]
+    fn tunnel_url_rejects_cloudflared_wrong_domain() {
+        assert!(!tunnel_url_matches_mode(
+            "cloudflared",
+            "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn tunnel_url_matches_ngrok_free_app() {
+        assert!(tunnel_url_matches_mode(
+            "ngrok",
+            "https://abc123.ngrok-free.app"
+        ));
+    }
+
+    #[test]
+    fn tunnel_url_matches_ngrok_io() {
+        assert!(tunnel_url_matches_mode("ngrok", "https://abc123.ngrok.io"));
+    }
+
+    #[test]
+    fn tunnel_url_rejects_ngrok_wrong_domain() {
+        assert!(!tunnel_url_matches_mode("ngrok", "https://example.com"));
+    }
+
+    #[test]
+    fn tunnel_url_rejects_unknown_mode() {
+        assert!(!tunnel_url_matches_mode(
+            "unknown",
+            "https://demo.trycloudflare.com"
+        ));
+    }
+
+    #[test]
+    fn tunnel_url_rejects_http_scheme() {
+        assert!(!tunnel_url_matches_mode(
+            "cloudflared",
+            "http://demo.trycloudflare.com"
+        ));
+    }
+
+    #[test]
+    fn tunnel_url_rejects_malformed_url() {
+        assert!(!tunnel_url_matches_mode("cloudflared", "not a url"));
+    }
+
+    // ---- extract_tunnel_https_url (additional edge cases) ----
+
+    #[test]
+    fn extract_tunnel_url_empty_line() {
+        assert_eq!(extract_tunnel_https_url("cloudflared", ""), None);
+    }
+
+    #[test]
+    fn extract_tunnel_url_no_matching_domain() {
+        assert_eq!(
+            extract_tunnel_https_url("cloudflared", "https://unrelated.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_tunnel_url_ngrok_io_legacy() {
+        assert_eq!(
+            extract_tunnel_https_url("ngrok", "tunnel at https://abc.ngrok.io"),
+            Some("https://abc.ngrok.io".to_string())
+        );
+    }
+
+    // ---- is_ephemeral_tunnel_url (additional edge cases) ----
+
+    #[test]
+    fn ephemeral_url_http_not_ephemeral() {
+        assert!(!is_ephemeral_tunnel_url("http://demo.trycloudflare.com"));
+    }
+
+    #[test]
+    fn ephemeral_url_trycloudflare_exact_root() {
+        assert!(is_ephemeral_tunnel_url("https://trycloudflare.com"));
+    }
+
+    #[test]
+    fn ephemeral_url_ngrok_io_subdomain() {
+        assert!(is_ephemeral_tunnel_url("https://deep.sub.ngrok.io/path"));
+    }
+
+    #[test]
+    fn ephemeral_url_malformed_not_ephemeral() {
+        assert!(!is_ephemeral_tunnel_url("not-a-url"));
+    }
+
+    #[test]
+    fn ephemeral_url_mixed_case() {
+        assert!(is_ephemeral_tunnel_url("https://DEMO.TryCloudflare.COM"));
+    }
+
+    // ---- inject_setup_public_base_url ----
+
+    #[test]
     fn setup_tunnel_url_overrides_missing_or_non_https_provider_answers() {
         let mut answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
             "messaging-slack": {
@@ -589,10 +907,364 @@ mod tests {
     }
 
     #[test]
+    fn inject_skips_non_object_values() {
+        let mut answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "scalar": "not-an-object",
+            "array": [1, 2, 3],
+            "null": null,
+            "provider": { "enabled": true }
+        }))
+        .expect("answers");
+
+        inject_setup_public_base_url(&mut answers, "https://new.trycloudflare.com");
+
+        // Scalar, array, and null are skipped entirely.
+        assert_eq!(answers["scalar"], json!("not-an-object"));
+        assert_eq!(answers["array"], json!([1, 2, 3]));
+        assert_eq!(answers["null"], json!(null));
+        // Enabled object provider gets injected.
+        assert_eq!(
+            answers["provider"]["public_base_url"],
+            json!("https://new.trycloudflare.com")
+        );
+    }
+
+    #[test]
+    fn inject_preserves_ngrok_stale_url() {
+        let mut answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-telegram": {
+                "public_base_url": "https://old.ngrok-free.app"
+            }
+        }))
+        .expect("answers");
+
+        inject_setup_public_base_url(&mut answers, "https://new.ngrok-free.app");
+
+        assert_eq!(
+            answers["messaging-telegram"]["public_base_url"],
+            json!("https://new.ngrok-free.app")
+        );
+    }
+
+    #[test]
+    fn inject_whitespace_only_url_gets_replaced() {
+        let mut answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-slack": {
+                "public_base_url": "   "
+            }
+        }))
+        .expect("answers");
+
+        inject_setup_public_base_url(&mut answers, "https://demo.trycloudflare.com");
+
+        assert_eq!(
+            answers["messaging-slack"]["public_base_url"],
+            json!("https://demo.trycloudflare.com")
+        );
+    }
+
+    // ---- detects_ephemeral_tunnel_urls (original test preserved) ----
+
+    #[test]
     fn detects_ephemeral_tunnel_urls() {
         assert!(is_ephemeral_tunnel_url("https://demo.trycloudflare.com"));
         assert!(is_ephemeral_tunnel_url("https://demo.ngrok-free.app"));
         assert!(is_ephemeral_tunnel_url("https://demo.ngrok.io"));
         assert!(!is_ephemeral_tunnel_url("https://runtime.example.com"));
+    }
+
+    // ---- platform_executable_name ----
+
+    #[test]
+    fn platform_executable_name_returns_name() {
+        let name = platform_executable_name("cloudflared");
+        if cfg!(windows) {
+            assert_eq!(name, "cloudflared.exe");
+        } else {
+            assert_eq!(name, "cloudflared");
+        }
+    }
+
+    #[test]
+    fn platform_executable_name_ngrok() {
+        let name = platform_executable_name("ngrok");
+        if cfg!(windows) {
+            assert_eq!(name, "ngrok.exe");
+        } else {
+            assert_eq!(name, "ngrok");
+        }
+    }
+
+    // ---- executable_exists ----
+
+    #[test]
+    fn executable_exists_nonexistent_path() {
+        assert!(!executable_exists(Path::new("/nonexistent/path/to/binary")));
+    }
+
+    #[test]
+    fn executable_exists_regular_file_without_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("not-executable");
+        std::fs::write(&file_path, b"data").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+        }
+        assert!(!executable_exists(&file_path));
+    }
+
+    #[test]
+    fn executable_exists_with_exec_bit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("executable");
+        std::fs::write(&file_path, b"#!/bin/sh\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        assert!(executable_exists(&file_path));
+    }
+
+    #[test]
+    fn executable_exists_directory_is_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!executable_exists(dir.path()));
+    }
+
+    // ---- managed_tunnel_binary_path ----
+
+    #[test]
+    fn managed_binary_path_contains_binary_name() {
+        // Regardless of env, the filename portion should contain the binary name.
+        let path = managed_tunnel_binary_path("cloudflared");
+        let file_name = path.file_name().expect("has file name");
+        assert!(
+            file_name.to_str().expect("utf8").contains("cloudflared"),
+            "expected cloudflared in path, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn managed_binary_path_ngrok() {
+        let path = managed_tunnel_binary_path("ngrok");
+        let file_name = path.file_name().expect("has file name");
+        assert!(
+            file_name.to_str().expect("utf8").contains("ngrok"),
+            "expected ngrok in path, got {path:?}"
+        );
+    }
+
+    // ---- cloudflared_release_asset ----
+
+    #[test]
+    fn cloudflared_release_asset_returns_some_on_supported_platform() {
+        let asset = cloudflared_release_asset();
+        // We're running on a supported CI/dev platform (linux x86_64 or aarch64).
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => assert_eq!(asset, Some("cloudflared-linux-amd64")),
+            ("linux", "aarch64") => assert_eq!(asset, Some("cloudflared-linux-arm64")),
+            ("macos", "aarch64") => {
+                assert_eq!(asset, Some("cloudflared-darwin-arm64.tgz"))
+            }
+            ("macos", "x86_64") => {
+                assert_eq!(asset, Some("cloudflared-darwin-amd64.tgz"))
+            }
+            _ => {
+                // On unsupported platforms, Some or None is fine.
+            }
+        }
+    }
+
+    // ---- resolve_tunnel_binary error branch ----
+
+    #[test]
+    fn resolve_tunnel_binary_unsupported_mode() {
+        let err = resolve_tunnel_binary("unknown").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported"),
+            "expected 'unsupported' in error: {err}"
+        );
+    }
+
+    // ---- resolve_path_binary ----
+
+    #[test]
+    fn resolve_path_binary_finds_existing() {
+        // "sh" should exist on PATH on any POSIX system.
+        if cfg!(unix) {
+            let result = resolve_path_binary("sh");
+            assert!(result.is_some(), "sh should be found on PATH");
+        }
+    }
+
+    #[test]
+    fn resolve_path_binary_missing_returns_none() {
+        let result = resolve_path_binary("nonexistent-binary-xyz-12345");
+        assert!(result.is_none());
+    }
+
+    // ---- start_setup_tunnel error branch ----
+
+    #[test]
+    fn start_setup_tunnel_unsupported_mode() {
+        let result = start_setup_tunnel("unknown", "http://127.0.0.1:8080");
+        assert!(result.is_err());
+        let err = result.err().expect("should be Err");
+        assert!(
+            err.to_string().contains("unsupported"),
+            "expected 'unsupported' in error: {err}"
+        );
+    }
+
+    // ---- SetupTunnel struct / is_running with no child ----
+
+    #[test]
+    fn setup_tunnel_no_child_reports_running() {
+        // A reused shared-record tunnel has no child process.
+        let mut tunnel = SetupTunnel {
+            mode: "cloudflared".to_string(),
+            local_base_url: "http://127.0.0.1:8080".to_string(),
+            public_base_url: "https://demo.trycloudflare.com".to_string(),
+            child: None,
+            kill_on_drop: false,
+        };
+        // No child: is_running returns true (liveness is external).
+        assert!(tunnel.is_running());
+    }
+
+    #[test]
+    fn setup_tunnel_drop_no_child_no_kill() {
+        // Dropping with no child and kill_on_drop false should not panic.
+        let tunnel = SetupTunnel {
+            mode: "cloudflared".to_string(),
+            local_base_url: "http://127.0.0.1:8080".to_string(),
+            public_base_url: "https://demo.trycloudflare.com".to_string(),
+            child: None,
+            kill_on_drop: false,
+        };
+        drop(tunnel);
+    }
+
+    #[test]
+    fn setup_tunnel_drop_with_kill_on_drop_false() {
+        // Even with a finished child, kill_on_drop false means Drop does nothing.
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let tunnel = SetupTunnel {
+            mode: "ngrok".to_string(),
+            local_base_url: "http://127.0.0.1:9090".to_string(),
+            public_base_url: "https://demo.ngrok-free.app".to_string(),
+            child: Some(child),
+            kill_on_drop: false,
+        };
+        drop(tunnel);
+    }
+
+    #[test]
+    fn setup_tunnel_drop_with_kill_on_drop_true() {
+        // With kill_on_drop true, Drop kills and waits.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let tunnel = SetupTunnel {
+            mode: "ngrok".to_string(),
+            local_base_url: "http://127.0.0.1:9091".to_string(),
+            public_base_url: "https://demo.ngrok-free.app".to_string(),
+            child: Some(child),
+            kill_on_drop: true,
+        };
+        drop(tunnel);
+    }
+
+    #[test]
+    fn setup_tunnel_is_running_with_finished_child() {
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let mut tunnel = SetupTunnel {
+            mode: "ngrok".to_string(),
+            local_base_url: "http://127.0.0.1:9092".to_string(),
+            public_base_url: "https://demo.ngrok-free.app".to_string(),
+            child: Some(child),
+            kill_on_drop: false,
+        };
+        // Wait for the child to finish.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!tunnel.is_running());
+    }
+
+    #[test]
+    fn setup_tunnel_is_running_with_alive_child() {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let mut tunnel = SetupTunnel {
+            mode: "ngrok".to_string(),
+            local_base_url: "http://127.0.0.1:9093".to_string(),
+            public_base_url: "https://demo.ngrok-free.app".to_string(),
+            child: Some(child),
+            kill_on_drop: true,
+        };
+        assert!(tunnel.is_running());
+        // Clean up via kill_on_drop.
+    }
+
+    // ---- finalize_installed_binary ----
+
+    #[test]
+    fn finalize_installed_binary_renames_and_sets_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let temp = dir.path().join("temp-binary");
+        let target = dir.path().join("final-binary");
+        std::fs::write(&temp, b"fake binary content").expect("write");
+
+        finalize_installed_binary(&temp, &target).expect("finalize");
+
+        assert!(!temp.exists(), "temp file should be renamed away");
+        assert!(target.exists(), "target should exist");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target)
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "target should be executable");
+        }
+    }
+
+    // ---- spawn_tunnel_log_reader ----
+
+    #[test]
+    fn spawn_log_reader_sends_lines() {
+        let input = b"line one\nline two\nline three\n";
+        let cursor = std::io::Cursor::new(input.to_vec());
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        spawn_tunnel_log_reader(cursor, tx);
+
+        let mut lines = Vec::new();
+        while let Ok(line) = rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            lines.push(line);
+        }
+        assert_eq!(lines, vec!["line one", "line two", "line three"]);
+    }
+
+    #[test]
+    fn spawn_log_reader_empty_input() {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        spawn_tunnel_log_reader(cursor, tx);
+
+        // Should produce no lines and disconnect promptly.
+        let result = rx.recv_timeout(std::time::Duration::from_millis(500));
+        assert!(result.is_err());
     }
 }
