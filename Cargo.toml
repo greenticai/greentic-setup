@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "1.1.18"
+version = "1.2.0-dev.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -25,33 +25,22 @@ backhand = { version = "0.25", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
-# Floor pinned to the publish that adds the env-aware `manifest_form_spec_for_env`
-# (deployer#326): the wizard threads its target env so the `webchat_gui` question
-# defaults match the runtime resolver (on for `local`, off elsewhere). That publish
-# also carries `ManifestEnvironment.gui_enabled` + the `webchat_gui` question
-# (deployer#322) that `manifest_to_answers` maps back for edit-mode pre-fill.
-# Floor bumped to 1.1.15 (deployer#459) — a BEHAVIOUR floor, not an API one, so
-# the Cargo.lock bump beside it is what actually ships the fix. `env-deploy` is
-# the staging step of `gtc start <bundle>` and runs `env_apply::apply` in-process.
-# Before 1.1.15 that engine pinned only `packs/` into `pack-list.lock` and never
-# scanned `providers/<domain>/`, and `revision_boot` takes its pack paths solely
-# from that lock — so a bundle's provider packs reached the runtime not at all
-# (webchat GUI 405 on `/v1/web/webchat/{tenant}/`). Nothing failed to compile, so
-# only the floor keeps a `--locked` release build off the broken copy.
-greentic-deployer = { version = ">=1.1.15, <1.2.0-0", default-features = false }
-greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
-# Floor 1.1.6: every publish below it declares `async-nats = "0.46"` NON-optionally, and
-# every async-nats 0.46.x hard-pins `rustls-webpki = "0.102"`. Its newest release, 0.102.8,
-# carries GHSA-82j2-j2ch-gfr8 (high) and GHSA-pwjx-qhcg-rvj4, and no fixed 0.102.x exists --
-# async-nats only moved to the patched 0.103 line in 0.47. `default-features = false` turns
-# `agentic-worker` off but does NOT drop async-nats, so this crate was exposed regardless.
-# The `-dev` suffix is gone with it: this is a main-lane crate and must not resolve
-# develop-lane pre-releases.
-greentic-runner-host = { version = ">=1.1.6, <1.2.0-0", default-features = false }
-greentic-secrets-lib = { version = ">=1.1.0-dev.27563392344, <1.2.0-0", features = ["providers-dev"] }
-greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }
+# Floor re-armed to the deployer 1.1.3-dev publish (deployer#424 re-armed via
+# #426, run 28777598365). This is a pre-release-range fix, not a new-surface
+# floor: the develop lane moved deployer from the 1.1.2-dev line to 1.1.3-dev to
+# escape the stable-1.1.2 shadow, and per cargo's pre-release rule a comparator
+# on `1.1.0-dev` cannot match a `1.1.3-dev.*` version — so consumers that pull
+# both setup and deployer 1.1.3-dev (e.g. greentic-start) failed to resolve until
+# this floor names the 1.1.3-dev line. Still carries the env-aware
+# `manifest_form_spec_for_env` (deployer#326) + `ManifestEnvironment.gui_enabled`
+# / `webchat_gui` (deployer#322) surfaces the wizard consumes.
+greentic-deployer = { version = ">=1.2.0-dev, <1.3.0-0", default-features = false }
+greentic-distributor-client = { version = ">=1.2.0-dev, <1.3.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
+greentic-runner-host = { version = ">=1.2.0-dev, <1.3.0-0", default-features = false }
+greentic-secrets-lib = { version = ">=1.2.0-dev, <1.3.0-0", features = ["providers-dev"] }
+greentic-types = { version = ">=1.2.0-dev, <1.3.0-0", features = ["serde"] }
 hmac = "0.13"
-qa-spec = ">=1.1.0-dev.27541005498, <1.2.0-0"
+qa-spec = ">=1.2.0-dev, <1.3.0-0"
 regex = "1"
 dialoguer = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
