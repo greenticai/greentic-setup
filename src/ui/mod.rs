@@ -127,6 +127,47 @@ struct ProviderForm {
     questions: Vec<QuestionInfo>,
 }
 
+/// A provider the user can add to the bundle, from the embedded catalog
+/// (`assets/setup-ui/providers-catalog.json`, schema `providers@1`). Mirrors
+/// the `greentic-designer` providers-registry item shape so the two stay
+/// interchangeable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderCatalogItem {
+    /// Pack id, e.g. `messaging-slack`.
+    id: String,
+    /// Provider domain: `messaging` | `events` | `oauth`.
+    category: String,
+    label: ProviderCatalogLabel,
+    /// OCI/file/local pack reference, e.g.
+    /// `oci://ghcr.io/greenticai/packs/messaging/messaging-slack:stable`.
+    #[serde(rename = "ref")]
+    reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderCatalogLabel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    i18n_key: Option<String>,
+    fallback: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderCatalog {
+    #[serde(default)]
+    #[allow(dead_code)]
+    registry_version: Option<String>,
+    #[serde(default)]
+    items: Vec<ProviderCatalogItem>,
+}
+
+impl ProviderCatalog {
+    /// Parse the embedded catalog JSON.
+    fn load_embedded() -> anyhow::Result<Self> {
+        serde_json::from_str(assets::PROVIDERS_CATALOG)
+            .context("failed to parse embedded providers-catalog.json")
+    }
+}
+
 #[derive(Serialize, Clone)]
 struct QuestionInfo {
     id: String,
@@ -467,6 +508,8 @@ fn build_router(state: std::sync::Arc<UiState>) -> Router {
         .route("/api/scope", get(get_scope))
         .route("/api/existing-scopes", get(get_existing_scopes))
         .route("/api/providers", get(get_providers))
+        .route("/api/available-providers", get(get_available_providers))
+        .route("/api/add-provider", post(post_add_provider))
         .route("/api/result", get(get_result))
         .route(
             "/api/provider-setup-events",
@@ -516,6 +559,148 @@ async fn serve_css() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         assets::STYLE_CSS,
     )
+}
+
+// ── Provider catalog: add additional providers ──
+
+/// One row of the "add providers" list surfaced to the UI.
+#[derive(Serialize)]
+struct AvailableProvider {
+    id: String,
+    category: String,
+    label: String,
+    #[serde(rename = "ref")]
+    reference: String,
+}
+
+#[derive(Serialize)]
+struct AvailableProvidersResponse {
+    items: Vec<AvailableProvider>,
+}
+
+/// `GET /api/available-providers` — the embedded catalog minus the providers
+/// already present in the bundle, so the UI only offers packs that can still be
+/// added.
+async fn get_available_providers(
+    State(state): State<std::sync::Arc<UiState>>,
+) -> Json<AvailableProvidersResponse> {
+    let catalog = match ProviderCatalog::load_embedded() {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            tracing::warn!("providers catalog unavailable: {err:#}");
+            return Json(AvailableProvidersResponse { items: Vec::new() });
+        }
+    };
+
+    let installed: std::collections::HashSet<String> = discovery::discover(&state.bundle_path)
+        .map(|discovered| {
+            discovered
+                .providers
+                .into_iter()
+                .map(|provider| provider.provider_id)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Json(AvailableProvidersResponse {
+        items: available_provider_items(catalog, &installed),
+    })
+}
+
+/// Catalog items minus the providers already installed in the bundle.
+fn available_provider_items(
+    catalog: ProviderCatalog,
+    installed: &std::collections::HashSet<String>,
+) -> Vec<AvailableProvider> {
+    catalog
+        .items
+        .into_iter()
+        .filter(|item| !installed.contains(&item.id))
+        .map(|item| AvailableProvider {
+            id: item.id,
+            category: item.category,
+            label: item.label.fallback,
+            reference: item.reference,
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct AddProviderRequest {
+    id: String,
+}
+
+#[derive(Serialize)]
+struct AddProviderResponse {
+    ok: bool,
+    provider_id: String,
+}
+
+/// `POST /api/add-provider` — fetch a catalog provider's `.gtpack` and drop it
+/// into the bundle's `providers/<category>/` dir so it joins the toggle list on
+/// the next `GET /api/providers`. This is a bundle-level add (the layer this
+/// page owns); the pack is deployed into an environment later by the deploy path.
+async fn post_add_provider(
+    State(state): State<std::sync::Arc<UiState>>,
+    Json(req): Json<AddProviderRequest>,
+) -> Response {
+    let catalog = match ProviderCatalog::load_embedded() {
+        Ok(catalog) => catalog,
+        Err(err) => return add_provider_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let Some(item) = catalog.items.into_iter().find(|item| item.id == req.id) else {
+        return add_provider_error(
+            StatusCode::NOT_FOUND,
+            anyhow!("unknown provider id: {}", req.id),
+        );
+    };
+
+    match install_catalog_provider(&state.bundle_path, &item).await {
+        Ok(()) => Json(AddProviderResponse {
+            ok: true,
+            provider_id: item.id,
+        })
+        .into_response(),
+        Err(err) => add_provider_error(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+fn add_provider_error(status: StatusCode, err: anyhow::Error) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": format!("{err:#}") })),
+    )
+        .into_response()
+}
+
+/// Resolve a catalog item's pack reference to a local `.gtpack` and copy it into
+/// `<bundle>/providers/<category>/<id>.gtpack`. Handles `oci://`, `file://`, and
+/// local paths (the latter two keep tests hermetic — no network).
+async fn install_catalog_provider(
+    bundle_path: &std::path::Path,
+    item: &ProviderCatalogItem,
+) -> anyhow::Result<()> {
+    let source = crate::bundle_source::BundleSource::parse(&item.reference)?;
+    let pack_path = source.resolve_async().await?;
+    if !pack_path.is_file() {
+        anyhow::bail!(
+            "resolved provider pack is not a file: {}",
+            pack_path.display()
+        );
+    }
+
+    let domain_dir = bundle_path.join("providers").join(&item.category);
+    std::fs::create_dir_all(&domain_dir)
+        .with_context(|| format!("failed to create provider dir {}", domain_dir.display()))?;
+    let dest = domain_dir.join(format!("{}.gtpack", item.id));
+    std::fs::copy(&pack_path, &dest).with_context(|| {
+        format!(
+            "failed to copy provider pack {} -> {}",
+            pack_path.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
 }
 
 // ── API handlers ──
@@ -7945,6 +8130,122 @@ mod tests {
             shutdown_tx,
             result: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn providers_catalog_parses_and_refs_are_ghcr() {
+        let catalog = super::ProviderCatalog::load_embedded().expect("catalog parses");
+        assert!(!catalog.items.is_empty(), "catalog should not be empty");
+        for item in &catalog.items {
+            assert_eq!(item.category, "messaging", "seed is messaging-only");
+            assert!(
+                item.reference
+                    .starts_with("oci://ghcr.io/greenticai/packs/"),
+                "unexpected ref: {}",
+                item.reference
+            );
+            assert!(!item.label.fallback.is_empty(), "label needs a fallback");
+        }
+        assert!(
+            catalog
+                .items
+                .iter()
+                .any(|item| item.id == "messaging-slack"),
+            "slack should be in the seed catalog"
+        );
+    }
+
+    #[test]
+    fn available_provider_items_excludes_installed() {
+        let catalog = super::ProviderCatalog::load_embedded().expect("catalog");
+        let mut installed = std::collections::HashSet::new();
+        installed.insert("messaging-slack".to_string());
+        let items = super::available_provider_items(catalog, &installed);
+        assert!(
+            items.iter().all(|item| item.id != "messaging-slack"),
+            "installed provider must be filtered out"
+        );
+        assert!(
+            items.iter().any(|item| item.id == "messaging-telegram"),
+            "uninstalled providers remain addable"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_provider_copies_pack_into_bundle_providers_dir() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        // A stand-in .gtpack the catalog item points at via a local path — keeps
+        // the test hermetic (no OCI/network); `install_catalog_provider` only
+        // resolves + copies, it does not parse the pack.
+        let src = bundle.path().join("src-slack.gtpack");
+        std::fs::write(&src, b"fake-pack-bytes").expect("write src pack");
+        let item = super::ProviderCatalogItem {
+            id: "messaging-slack".to_string(),
+            category: "messaging".to_string(),
+            label: super::ProviderCatalogLabel {
+                i18n_key: None,
+                fallback: "Slack".to_string(),
+            },
+            reference: src.to_string_lossy().to_string(),
+        };
+
+        super::install_catalog_provider(bundle.path(), &item)
+            .await
+            .expect("install succeeds");
+
+        let dest = bundle
+            .path()
+            .join("providers/messaging/messaging-slack.gtpack");
+        assert!(dest.is_file(), "pack should land in providers/messaging");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"fake-pack-bytes");
+    }
+
+    #[tokio::test]
+    async fn available_providers_endpoint_lists_catalog_for_empty_bundle() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        let state = test_ui_state(bundle.path());
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/available-providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = json["items"].as_array().expect("items array");
+        assert!(
+            items.iter().any(|item| item["id"] == "messaging-slack"),
+            "empty bundle should offer the full catalog"
+        );
+    }
+
+    #[test]
+    fn app_js_renders_the_add_providers_list() {
+        // The embedded SPA must render the scrollable add-list and wire the
+        // add button — guards against the asset drifting out of sync.
+        let app_js = super::assets::APP_JS;
+        assert!(
+            app_js.contains("provider-add-list"),
+            "scrollable list markup"
+        );
+        assert!(app_js.contains("data-provider-add"), "add button hook");
+        assert!(app_js.contains("/api/available-providers"), "catalog fetch");
+        assert!(app_js.contains("/api/add-provider"), "add call");
+        // While adding: button loader + page blocker + single-flight guard.
+        assert!(app_js.contains("btn-spinner"), "add button shows a loader");
+        assert!(
+            app_js.contains("page-blocker"),
+            "page is blocked during add"
+        );
+        assert!(
+            app_js.contains("state.addingId"),
+            "in-flight add is tracked"
+        );
     }
 
     #[test]
