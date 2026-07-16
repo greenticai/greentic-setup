@@ -124,6 +124,8 @@
     phase: "loading",
     // global
     providers: [],
+    availableProviders: [],
+    addingId: null,
     sharedQuestions: [],
     providerForms: {},
     bundlePath: "",
@@ -254,6 +256,12 @@
           state.providerForms[pf.provider_id] = pf;
         });
         state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
+
+        // Load the "add more providers" catalog in the background; re-render the
+        // provider page when it arrives.
+        loadAvailableProviders().then(function () {
+          if (state.phase === "providers") render();
+        });
 
         if (state.providers.length === 0) {
           app.innerHTML =
@@ -699,6 +707,64 @@
 
   // ── Provider list ──
 
+  /** Fetch the catalog of addable providers into state. Returns a promise. */
+  function loadAvailableProviders() {
+    return fetch("/api/available-providers")
+      .then(function (r) { return r.json(); })
+      .then(function (data) { state.availableProviders = (data && data.items) || []; })
+      .catch(function () { state.availableProviders = []; });
+  }
+
+  /** Re-fetch the installed providers + their forms into state. Returns a promise. */
+  function reloadProviders() {
+    return fetch("/api/providers?locale=" + encodeURIComponent(currentLocale))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        state.providers = data.providers || [];
+        state.providerForms = {};
+        (data.provider_forms || []).forEach(function (pf) {
+          pf.questions = filterHiddenQuestions(pf.questions || []);
+          state.providerForms[pf.provider_id] = pf;
+        });
+        state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
+      });
+  }
+
+  /**
+   * Add a catalog provider to the bundle. Pauses the page (blocking overlay +
+   * button loader) until the pack is fetched AND the provider/catalog lists are
+   * refreshed, then re-renders with the provider moved into the toggle list.
+   */
+  function addProvider(id) {
+    if (state.addingId) return; // one add at a time
+    state.addingId = id;
+    render(); // button shows a loader; overlay blocks further interaction
+
+    fetch("/api/add-provider", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: id }),
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        if (!res.ok || !res.body || res.body.ok === false) {
+          throw new Error((res.body && res.body.error) || "add failed");
+        }
+        // Only unblock once BOTH lists are refreshed, so the re-render shows the
+        // new provider in the toggle list and gone from the add-list.
+        return reloadProviders().then(loadAvailableProviders);
+      })
+      .then(function () {
+        state.addingId = null;
+        render();
+      })
+      .catch(function (err) {
+        state.addingId = null;
+        render();
+        alert((t("ui.add_failed") || "Could not add provider") + ": " + err.message);
+      });
+  }
+
   function renderProviders() {
     var scope = cs();
     var allDone = state.providers.every(function (p) {
@@ -744,6 +810,36 @@
     });
 
     html += '</div>';
+
+    // Scrollable catalog of additional providers the user can add to the bundle.
+    if (state.availableProviders && state.availableProviders.length > 0) {
+      html +=
+        '<div class="provider-add-section">' +
+          '<div class="provider-add-title">' + esc(t("ui.add_providers") || "Add providers") + '</div>' +
+          '<div class="provider-add-list">';
+      state.availableProviders.forEach(function (a) {
+        var name = a.label || a.id;
+        var isAdding = state.addingId === a.id;
+        // A loader on the row being added; every Add button is disabled while
+        // any add is in flight (the overlay below also blocks the page).
+        var btnHtml = isAdding
+          ? '<button class="btn btn-ghost provider-add-btn" disabled>' +
+              '<span class="btn-spinner"></span>' + esc(t("ui.adding") || "Adding…") +
+            '</button>'
+          : '<button class="btn btn-ghost provider-add-btn" data-provider-add="' + esc(a.id) + '"' +
+              (state.addingId ? ' disabled' : '') + '>' + esc(t("ui.add") || "Add") + '</button>';
+        html +=
+          '<div class="provider-add-row">' +
+            '<div class="prov-icon">' + esc(name.charAt(0)) + '</div>' +
+            '<div class="provider-add-meta">' +
+              '<div class="prov-name">' + esc(name) + '</div>' +
+              '<div class="prov-domain">' + esc(a.category || "") + '</div>' +
+            '</div>' +
+            btnHtml +
+          '</div>';
+      });
+      html += '</div></div>';
+    }
 
     if (state.sharedQuestions.length > 0 && !scope.sharedAnswersDone) {
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
@@ -797,10 +893,25 @@
       });
     });
 
+    document.querySelectorAll('[data-provider-add]').forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        addProvider(btn.getAttribute("data-provider-add"));
+      });
+    });
+
     document.getElementById("btn-back-scope").addEventListener("click", function () {
       state.phase = state.cloudDeploy ? "scope-edit" : "tunnel";
       render();
     });
+
+    // While an add is in flight, block the whole page so toggles/navigation
+    // can't race the in-progress operation. Removed on the next re-render.
+    if (state.addingId) {
+      var blocker = document.createElement("div");
+      blocker.className = "page-blocker";
+      app.appendChild(blocker);
+    }
   }
 
   // ── Form rendering (reusable) ──

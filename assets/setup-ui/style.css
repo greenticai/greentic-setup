@@ -77,6 +77,39 @@ body.has-wide-form .container{max-width:1380px}
 .provider-enable input:checked + span::after{transform:translateX(.86rem);background:var(--primary)}
 .provider-enable + .prov-badge{margin-left:.5rem}
 
+/* ── Add-providers catalog (scrollable) ── */
+.provider-add-section{margin-bottom:1.5rem}
+.provider-add-title{font-size:.8125rem;font-weight:600;color:var(--muted);margin:.25rem 0 .5rem}
+.provider-add-list{
+  display:flex;flex-direction:column;gap:.5rem;
+  max-height:15rem;overflow-y:auto;
+  padding-right:.25rem;
+}
+.provider-add-row{
+  display:flex;align-items:center;gap:.875rem;width:100%;
+  padding:.625rem .875rem;
+  background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius);
+}
+.provider-add-row .prov-icon{
+  flex-shrink:0;width:2.25rem;height:2.25rem;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--primary-muted);color:var(--primary);
+  border-radius:.5rem;font-size:.75rem;font-weight:700;
+}
+.provider-add-meta{display:flex;flex-direction:column}
+.provider-add-row .prov-name{font-size:.875rem;font-weight:500}
+.provider-add-row .prov-domain{font-size:.75rem;color:var(--muted)}
+.provider-add-btn{margin-left:auto;flex-shrink:0}
+.provider-add-btn[disabled]{opacity:.7;cursor:progress}
+/* Inline loader shown on the Add button while a provider is being fetched. */
+.btn-spinner{
+  display:inline-block;width:.8rem;height:.8rem;margin-right:.4rem;vertical-align:-1px;
+  border:2px solid var(--card-border);border-top-color:var(--primary);
+  border-radius:50%;animation:spin .65s linear infinite;
+}
+/* Transparent full-page blocker that pauses interaction during an add. */
+.page-blocker{position:fixed;inset:0;z-index:50;background:transparent;cursor:progress}
+
 /* ── Card ── */
 .card{
   background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius);

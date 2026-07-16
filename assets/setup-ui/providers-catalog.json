@@ -1,0 +1,47 @@
+{
+  "registry_version": "providers@1",
+  "items": [
+    {
+      "id": "messaging-slack",
+      "category": "messaging",
+      "label": { "i18n_key": "provider.messaging.slack", "fallback": "Slack" },
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-slack:stable"
+    },
+    {
+      "id": "messaging-telegram",
+      "category": "messaging",
+      "label": { "i18n_key": "provider.messaging.telegram", "fallback": "Telegram" },
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-telegram:stable"
+    },
+    {
+      "id": "messaging-teams",
+      "category": "messaging",
+      "label": { "i18n_key": "provider.messaging.teams", "fallback": "MS Teams" },
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-teams:stable"
+    },
+    {
+      "id": "messaging-webex",
+      "category": "messaging",
+      "label": { "i18n_key": "provider.messaging.webex", "fallback": "Webex" },
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-webex:stable"
+    },
+    {
+      "id": "messaging-whatsapp",
+      "category": "messaging",
+      "label": { "i18n_key": "provider.messaging.whatsapp", "fallback": "WhatsApp" },
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-whatsapp:stable"
+    },
+    {
+      "id": "messaging-webchat",
+      "category": "messaging",
+      "label": { "i18n_key": "provider.messaging.webchat", "fallback": "Web Chat" },
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-webchat:stable"
+    },
+    {
+      "id": "messaging-email",
+      "category": "messaging",
+      "label": { "i18n_key": "provider.messaging.email", "fallback": "Email" },
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-email:stable"
+    }
+  ]
+}
