@@ -83,12 +83,6 @@ pub struct SetupSpec {
     pub setup_actions: Vec<Value>,
 }
 
-impl crate::qa::shared_questions::HasQuestionId for SetupQuestion {
-    fn question_id(&self) -> &str {
-        &self.name
-    }
-}
-
 /// A single setup question definition.
 #[derive(Debug, Default, Deserialize)]
 pub struct SetupQuestion {
@@ -376,7 +370,10 @@ pub fn collect_setup_answers(
             // satisfies the required-answer check. See
             // `qa::shared_questions::PUBLIC_URL_FILLER`.
             if let (Some(spec), Some(map)) = (spec.as_ref(), answers.as_object_mut()) {
-                crate::qa::shared_questions::fill_public_url_placeholders(&spec.questions, map);
+                crate::qa::shared_questions::fill_public_url_placeholders(
+                    spec.questions.iter().map(|q| q.name.as_str()),
+                    map,
+                );
             }
             ensure_required_answers(spec.as_ref(), &answers)?;
             return Ok(answers);
@@ -461,7 +458,10 @@ pub fn prompt_setup_answers(spec: &SetupSpec, provider: &str) -> anyhow::Result<
             answers.insert(question.name.clone(), value);
         }
     }
-    crate::qa::shared_questions::fill_public_url_placeholders(&spec.questions, &mut answers);
+    crate::qa::shared_questions::fill_public_url_placeholders(
+        spec.questions.iter().map(|q| q.name.as_str()),
+        &mut answers,
+    );
     Ok(Value::Object(answers))
 }
 

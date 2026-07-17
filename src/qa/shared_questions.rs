@@ -40,41 +40,27 @@ pub fn is_public_url_question(question_id: &str) -> bool {
     question_id == "public_base_url"
 }
 
-/// Insert [`PUBLIC_URL_FILLER`] for any public-URL question in `questions` that
-/// lacks a non-empty answer in `answers`.
+/// Insert [`PUBLIC_URL_FILLER`] for any public-URL question in `question_ids`
+/// that lacks a non-empty answer in `answers`.
 ///
-/// Called after prompting so the persisted answers carry a well-formed
-/// placeholder the runtime can overwrite, without ever asking the operator.
-pub fn fill_public_url_placeholders<'a, I, Q>(questions: I, answers: &mut JsonMap<String, Value>)
-where
-    I: IntoIterator<Item = &'a Q>,
-    Q: HasQuestionId + 'a,
-{
-    for question in questions {
-        let id = question.question_id();
+/// Callers pass the question ids straight off whatever spec they hold (FormSpec
+/// or the legacy setup spec). Called after prompting so the persisted answers
+/// carry a well-formed placeholder the runtime can overwrite, without ever
+/// asking the operator.
+pub fn fill_public_url_placeholders<'a>(
+    question_ids: impl IntoIterator<Item = &'a str>,
+    answers: &mut JsonMap<String, Value>,
+) {
+    for id in question_ids {
         if !is_public_url_question(id) {
             continue;
         }
         let has_value = answers
             .get(id)
-            .map(|v| !v.is_null() && v.as_str() != Some(""))
-            .unwrap_or(false);
+            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
         if !has_value {
             answers.insert(id.to_string(), Value::String(PUBLIC_URL_FILLER.to_string()));
         }
-    }
-}
-
-/// Minimal accessor so [`fill_public_url_placeholders`] can work over both the
-/// FormSpec `QuestionSpec` and the legacy `SetupQuestion`.
-pub trait HasQuestionId {
-    /// The question's stable identifier.
-    fn question_id(&self) -> &str;
-}
-
-impl HasQuestionId for QuestionSpec {
-    fn question_id(&self) -> &str {
-        &self.id
     }
 }
 
@@ -252,7 +238,10 @@ pub fn prompt_shared_questions(
                 }
             }
         }
-        fill_public_url_placeholders(&shared.shared_questions, &mut answers);
+        fill_public_url_placeholders(
+            shared.shared_questions.iter().map(|q| q.id.as_str()),
+            &mut answers,
+        );
         return Ok(Value::Object(answers));
     }
 
@@ -310,7 +299,10 @@ pub fn prompt_shared_questions(
         }
     }
 
-    fill_public_url_placeholders(&shared.shared_questions, &mut answers);
+    fill_public_url_placeholders(
+        shared.shared_questions.iter().map(|q| q.id.as_str()),
+        &mut answers,
+    );
 
     println!();
     Ok(Value::Object(answers))
@@ -493,7 +485,10 @@ mod tests {
     fn fill_public_url_placeholders_injects_filler_when_absent() {
         let form = make_provider_form_spec("p", &["public_base_url", "bot_token"]);
         let mut answers = JsonMap::new();
-        fill_public_url_placeholders(&form.form_spec.questions, &mut answers);
+        fill_public_url_placeholders(
+            form.form_spec.questions.iter().map(|q| q.id.as_str()),
+            &mut answers,
+        );
         assert_eq!(
             answers.get("public_base_url"),
             Some(&Value::String(PUBLIC_URL_FILLER.to_string()))
@@ -510,7 +505,10 @@ mod tests {
             "public_base_url".to_string(),
             Value::String("https://real.example.com".to_string()),
         );
-        fill_public_url_placeholders(&form.form_spec.questions, &mut answers);
+        fill_public_url_placeholders(
+            form.form_spec.questions.iter().map(|q| q.id.as_str()),
+            &mut answers,
+        );
         assert_eq!(
             answers.get("public_base_url"),
             Some(&Value::String("https://real.example.com".to_string()))

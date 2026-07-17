@@ -133,7 +133,10 @@ pub fn prompt_form_spec_answers_with_existing(
             answers.insert(question.id.clone(), value);
         }
     }
-    crate::qa::shared_questions::fill_public_url_placeholders(&spec.questions, &mut answers);
+    crate::qa::shared_questions::fill_public_url_placeholders(
+        spec.questions.iter().map(|q| q.id.as_str()),
+        &mut answers,
+    );
     Ok(Value::Object(answers))
 }
 
