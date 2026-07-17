@@ -79,11 +79,42 @@
       });
   }
 
-  // Questions intentionally hidden from the GUI. Keep public_base_url visible:
-  // setup-time OAuth/webhook registration may need a real HTTPS origin.
+  // Questions removed from `form.questions` entirely (server + client never see
+  // them). public_base_url is NOT listed here: it must stay in form.questions so
+  // a selected tunnel can still auto-generate a real HTTPS URL — it is instead
+  // hidden from the rendered form via withoutPublicUrl() and auto-filled with
+  // PUBLIC_URL_FILLER when no tunnel is active.
   var HIDDEN_QUESTION_IDS = [];
   function filterHiddenQuestions(questions) {
     return questions.filter(function (q) { return HIDDEN_QUESTION_IDS.indexOf(q.id) === -1; });
+  }
+
+  // The public URL question is never surfaced interactively: its value is always
+  // overwritten by the runtime (a selected tunnel, PUBLIC_BASE_URL, or a custom
+  // value), so anything an operator typed would be discarded.
+  var PUBLIC_URL_FILLER = "http://localhost:8080";
+  function isPublicUrlQuestion(id) { return id === "public_base_url"; }
+  // Strip the public URL question from a list of questions shown to the user.
+  function withoutPublicUrl(questions) {
+    return (questions || []).filter(function (q) { return !isPublicUrlQuestion(q.id); });
+  }
+  // Persist PUBLIC_URL_FILLER for any required public URL question in `store`
+  // that has no value yet. Never clobbers a value already present (e.g. one a
+  // tunnel just generated).
+  function forcePublicUrlFillerIfEmpty(store, questions) {
+    (questions || []).forEach(function (q) {
+      if (!isPublicUrlQuestion(q.id) || !q.required) return;
+      if (!String(store[q.id] || "").trim()) store[q.id] = PUBLIC_URL_FILLER;
+    });
+  }
+  // Shared-phase variant: only fill when no tunnel is selected. With a tunnel
+  // active the value is left empty so the per-provider tunnel flow
+  // (providerNeedsGeneratedPublicBaseUrl) can fill the real HTTPS URL instead.
+  function fillPublicUrlPlaceholder(store, questions) {
+    var scope = cs();
+    var tunnelOff = !scope.tunnel || scope.tunnel === "off";
+    if (!tunnelOff) return;
+    forcePublicUrlFillerIfEmpty(store, questions);
   }
 
   // ── State ──
@@ -217,7 +248,7 @@
       case "scope-edit": renderScopeEdit(); break;
       case "tunnel": renderTunnel(); break;
       case "providers": renderProviders(); break;
-      case "shared": renderForm(state.sharedQuestions, t("ui.shared.title"), t("ui.shared.description"), null, submitShared); break;
+      case "shared": renderSharedForm(); break;
       case "provider-form": renderProviderForm(); break;
       case "provider-setup-action": renderProviderSetupAction(); break;
       case "review": renderReview(); break;
@@ -1516,6 +1547,17 @@
 
   // ── Shared questions ──
 
+  function renderSharedForm() {
+    var scope = cs();
+    // Auto-fill (no tunnel) the public URL placeholder into shared answers and
+    // never render it as a question. If it was the only shared question, there
+    // is nothing to show — hand off straight to the per-provider forms.
+    fillPublicUrlPlaceholder(scope.sharedAnswers, state.sharedQuestions);
+    var visible = withoutPublicUrl(state.sharedQuestions);
+    if (visible.length === 0) { submitShared(); return; }
+    renderForm(visible, t("ui.shared.title"), t("ui.shared.description"), null, submitShared);
+  }
+
   function submitShared() {
     var scope = cs();
     scope.sharedAnswersDone = true;
@@ -1562,17 +1604,28 @@
         return;
       }
     }
+    // The public URL question is never surfaced here. Reaching this point means
+    // the tunnel flow above has already resolved it (value present) or will not
+    // run (no tunnel / tunnel failed), so persist the loopback filler for any
+    // still-empty required public URL and drop it from the displayed questions.
+    var providerStore = scope.answers[p.provider_id] || (scope.answers[p.provider_id] = {});
+    forcePublicUrlFillerIfEmpty(providerStore, form.questions);
+
     // For providers with an install action, only the action's input fields
     // (config tokens) show on this step; the action + its result field (the
     // bot token) show on the next step (provider-setup-action).
-    var pageQuestions = form.questions;
+    var pageQuestions = withoutPublicUrl(form.questions);
     if (providerSetupPhaseActions(p).length > 0) {
-      pageQuestions = preActionQuestions(p);
+      pageQuestions = withoutPublicUrl(preActionQuestions(p));
       if (pageQuestions.length === 0) {
         state.phase = "provider-setup-action";
         render();
         return;
       }
+    } else if (pageQuestions.length === 0) {
+      // The public URL filler was the only remaining field — nothing to ask.
+      completeProviderAndAdvance(p.provider_id);
+      return;
     }
     var backFn = function () {
       if (state.currentProvider > 0) { state.currentProvider--; state.phase = "provider-form"; }

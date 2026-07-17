@@ -99,6 +99,12 @@ pub fn prompt_form_spec_answers_with_existing(
         if question.id.is_empty() {
             continue;
         }
+        // The public URL question is never surfaced: its answer is always
+        // overwritten by the runtime, so we persist a placeholder instead of
+        // asking. See `qa::shared_questions::PUBLIC_URL_FILLER`.
+        if crate::qa::shared_questions::is_public_url_question(&question.id) {
+            continue;
+        }
         // Re-evaluate visibility with answers collected so far.
         if question.visible_if.is_some() {
             let current = Value::Object(answers.clone());
@@ -127,6 +133,10 @@ pub fn prompt_form_spec_answers_with_existing(
             answers.insert(question.id.clone(), value);
         }
     }
+    crate::qa::shared_questions::fill_public_url_placeholders(
+        spec.questions.iter().map(|q| q.id.as_str()),
+        &mut answers,
+    );
     Ok(Value::Object(answers))
 }
 
