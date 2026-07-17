@@ -364,7 +364,17 @@ pub fn collect_setup_answers(
     let spec = load_setup_spec(pack_path)?;
     if let Some(input) = setup_input {
         if let Some(value) = input.answers_for_provider(provider_id) {
-            let answers = ensure_object(value.clone())?;
+            let mut answers = ensure_object(value.clone())?;
+            // Auto-fill the public URL placeholder for packs that declare it,
+            // so an answers file that omits the never-prompted field still
+            // satisfies the required-answer check. See
+            // `qa::shared_questions::PUBLIC_URL_FILLER`.
+            if let (Some(spec), Some(map)) = (spec.as_ref(), answers.as_object_mut()) {
+                crate::qa::shared_questions::fill_public_url_placeholders(
+                    spec.questions.iter().map(|q| q.name.as_str()),
+                    map,
+                );
+            }
             ensure_required_answers(spec.as_ref(), &answers)?;
             return Ok(answers);
         }
@@ -438,10 +448,20 @@ pub fn prompt_setup_answers(spec: &SetupSpec, provider: &str) -> anyhow::Result<
         if question.name.trim().is_empty() {
             continue;
         }
+        // The public URL question is never surfaced: its answer is always
+        // overwritten by the runtime, so we persist a placeholder instead of
+        // asking. See `qa::shared_questions::PUBLIC_URL_FILLER`.
+        if crate::qa::shared_questions::is_public_url_question(&question.name) {
+            continue;
+        }
         if let Some(value) = ask_setup_question(question)? {
             answers.insert(question.name.clone(), value);
         }
     }
+    crate::qa::shared_questions::fill_public_url_placeholders(
+        spec.questions.iter().map(|q| q.name.as_str()),
+        &mut answers,
+    );
     Ok(Value::Object(answers))
 }
 
@@ -628,6 +648,47 @@ setup_actions:
         let error = collect_setup_answers(&pack_path, "messaging-slack", Some(&answers), false)
             .unwrap_err();
         assert!(error.to_string().contains("missing required setup answer"));
+        Ok(())
+    }
+
+    #[test]
+    fn collect_setup_answers_autofills_public_url_from_input() -> anyhow::Result<()> {
+        // A pack that requires `public_base_url` but an answers file that omits
+        // it: the never-prompted field is auto-filled with the placeholder so
+        // the required-answer check still passes.
+        let yaml =
+            "provider_id: telegram\nquestions:\n  - name: public_base_url\n    required: true\n";
+        let (_dir, pack_path) = create_test_pack(yaml)?;
+        let provider_keys = BTreeSet::from(["messaging-telegram".to_string()]);
+        let raw = json!({ "messaging-telegram": {} });
+        let answers = SetupInputAnswers::new(raw, provider_keys)?;
+        let collected =
+            collect_setup_answers(&pack_path, "messaging-telegram", Some(&answers), false)?;
+        assert_eq!(
+            collected.get("public_base_url"),
+            Some(&Value::String(
+                crate::qa::shared_questions::PUBLIC_URL_FILLER.to_string()
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_setup_answers_keeps_explicit_public_url() -> anyhow::Result<()> {
+        // An operator-supplied value is never clobbered by the placeholder.
+        let yaml =
+            "provider_id: telegram\nquestions:\n  - name: public_base_url\n    required: true\n";
+        let (_dir, pack_path) = create_test_pack(yaml)?;
+        let provider_keys = BTreeSet::from(["messaging-telegram".to_string()]);
+        let raw =
+            json!({ "messaging-telegram": { "public_base_url": "https://real.example.com" } });
+        let answers = SetupInputAnswers::new(raw, provider_keys)?;
+        let collected =
+            collect_setup_answers(&pack_path, "messaging-telegram", Some(&answers), false)?;
+        assert_eq!(
+            collected.get("public_base_url"),
+            Some(&Value::String("https://real.example.com".to_string()))
+        );
         Ok(())
     }
 }

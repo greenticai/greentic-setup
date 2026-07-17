@@ -79,11 +79,42 @@
       });
   }
 
-  // Questions intentionally hidden from the GUI. Keep public_base_url visible:
-  // setup-time OAuth/webhook registration may need a real HTTPS origin.
+  // Questions removed from `form.questions` entirely (server + client never see
+  // them). public_base_url is NOT listed here: it must stay in form.questions so
+  // a selected tunnel can still auto-generate a real HTTPS URL — it is instead
+  // hidden from the rendered form via withoutPublicUrl() and auto-filled with
+  // PUBLIC_URL_FILLER when no tunnel is active.
   var HIDDEN_QUESTION_IDS = [];
   function filterHiddenQuestions(questions) {
     return questions.filter(function (q) { return HIDDEN_QUESTION_IDS.indexOf(q.id) === -1; });
+  }
+
+  // The public URL question is never surfaced interactively: its value is always
+  // overwritten by the runtime (a selected tunnel, PUBLIC_BASE_URL, or a custom
+  // value), so anything an operator typed would be discarded.
+  var PUBLIC_URL_FILLER = "http://localhost:8080";
+  function isPublicUrlQuestion(id) { return id === "public_base_url"; }
+  // Strip the public URL question from a list of questions shown to the user.
+  function withoutPublicUrl(questions) {
+    return (questions || []).filter(function (q) { return !isPublicUrlQuestion(q.id); });
+  }
+  // Persist PUBLIC_URL_FILLER for any required public URL question in `store`
+  // that has no value yet. Never clobbers a value already present (e.g. one a
+  // tunnel just generated).
+  function forcePublicUrlFillerIfEmpty(store, questions) {
+    (questions || []).forEach(function (q) {
+      if (!isPublicUrlQuestion(q.id) || !q.required) return;
+      if (!String(store[q.id] || "").trim()) store[q.id] = PUBLIC_URL_FILLER;
+    });
+  }
+  // Shared-phase variant: only fill when no tunnel is selected. With a tunnel
+  // active the value is left empty so the per-provider tunnel flow
+  // (providerNeedsGeneratedPublicBaseUrl) can fill the real HTTPS URL instead.
+  function fillPublicUrlPlaceholder(store, questions) {
+    var scope = cs();
+    var tunnelOff = !scope.tunnel || scope.tunnel === "off";
+    if (!tunnelOff) return;
+    forcePublicUrlFillerIfEmpty(store, questions);
   }
 
   // ── State ──
@@ -124,6 +155,8 @@
     phase: "loading",
     // global
     providers: [],
+    availableProviders: [],
+    addingId: null,
     sharedQuestions: [],
     providerForms: {},
     bundlePath: "",
@@ -215,7 +248,7 @@
       case "scope-edit": renderScopeEdit(); break;
       case "tunnel": renderTunnel(); break;
       case "providers": renderProviders(); break;
-      case "shared": renderForm(state.sharedQuestions, t("ui.shared.title"), t("ui.shared.description"), null, submitShared); break;
+      case "shared": renderSharedForm(); break;
       case "provider-form": renderProviderForm(); break;
       case "provider-setup-action": renderProviderSetupAction(); break;
       case "review": renderReview(); break;
@@ -254,6 +287,12 @@
           state.providerForms[pf.provider_id] = pf;
         });
         state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
+
+        // Load the "add more providers" catalog in the background; re-render the
+        // provider page when it arrives.
+        loadAvailableProviders().then(function () {
+          if (state.phase === "providers") render();
+        });
 
         if (state.providers.length === 0) {
           app.innerHTML =
@@ -699,6 +738,64 @@
 
   // ── Provider list ──
 
+  /** Fetch the catalog of addable providers into state. Returns a promise. */
+  function loadAvailableProviders() {
+    return fetch("/api/available-providers")
+      .then(function (r) { return r.json(); })
+      .then(function (data) { state.availableProviders = (data && data.items) || []; })
+      .catch(function () { state.availableProviders = []; });
+  }
+
+  /** Re-fetch the installed providers + their forms into state. Returns a promise. */
+  function reloadProviders() {
+    return fetch("/api/providers?locale=" + encodeURIComponent(currentLocale))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        state.providers = data.providers || [];
+        state.providerForms = {};
+        (data.provider_forms || []).forEach(function (pf) {
+          pf.questions = filterHiddenQuestions(pf.questions || []);
+          state.providerForms[pf.provider_id] = pf;
+        });
+        state.sharedQuestions = filterHiddenQuestions(data.shared_questions || []);
+      });
+  }
+
+  /**
+   * Add a catalog provider to the bundle. Pauses the page (blocking overlay +
+   * button loader) until the pack is fetched AND the provider/catalog lists are
+   * refreshed, then re-renders with the provider moved into the toggle list.
+   */
+  function addProvider(id) {
+    if (state.addingId) return; // one add at a time
+    state.addingId = id;
+    render(); // button shows a loader; overlay blocks further interaction
+
+    fetch("/api/add-provider", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: id }),
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        if (!res.ok || !res.body || res.body.ok === false) {
+          throw new Error((res.body && res.body.error) || "add failed");
+        }
+        // Only unblock once BOTH lists are refreshed, so the re-render shows the
+        // new provider in the toggle list and gone from the add-list.
+        return reloadProviders().then(loadAvailableProviders);
+      })
+      .then(function () {
+        state.addingId = null;
+        render();
+      })
+      .catch(function (err) {
+        state.addingId = null;
+        render();
+        alert((t("ui.add_failed") || "Could not add provider") + ": " + err.message);
+      });
+  }
+
   function renderProviders() {
     var scope = cs();
     var allDone = state.providers.every(function (p) {
@@ -744,6 +841,36 @@
     });
 
     html += '</div>';
+
+    // Scrollable catalog of additional providers the user can add to the bundle.
+    if (state.availableProviders && state.availableProviders.length > 0) {
+      html +=
+        '<div class="provider-add-section">' +
+          '<div class="provider-add-title">' + esc(t("ui.add_providers") || "Add providers") + '</div>' +
+          '<div class="provider-add-list">';
+      state.availableProviders.forEach(function (a) {
+        var name = a.label || a.id;
+        var isAdding = state.addingId === a.id;
+        // A loader on the row being added; every Add button is disabled while
+        // any add is in flight (the overlay below also blocks the page).
+        var btnHtml = isAdding
+          ? '<button class="btn btn-ghost provider-add-btn" disabled>' +
+              '<span class="btn-spinner"></span>' + esc(t("ui.adding") || "Adding…") +
+            '</button>'
+          : '<button class="btn btn-ghost provider-add-btn" data-provider-add="' + esc(a.id) + '"' +
+              (state.addingId ? ' disabled' : '') + '>' + esc(t("ui.add") || "Add") + '</button>';
+        html +=
+          '<div class="provider-add-row">' +
+            '<div class="prov-icon">' + esc(name.charAt(0)) + '</div>' +
+            '<div class="provider-add-meta">' +
+              '<div class="prov-name">' + esc(name) + '</div>' +
+              '<div class="prov-domain">' + esc(a.category || "") + '</div>' +
+            '</div>' +
+            btnHtml +
+          '</div>';
+      });
+      html += '</div></div>';
+    }
 
     if (state.sharedQuestions.length > 0 && !scope.sharedAnswersDone) {
       html += '<button class="btn btn-primary btn-lg" id="btn-start" style="width:100%">' + esc(t("ui.start_config")) + '</button>';
@@ -797,10 +924,25 @@
       });
     });
 
+    document.querySelectorAll('[data-provider-add]').forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        addProvider(btn.getAttribute("data-provider-add"));
+      });
+    });
+
     document.getElementById("btn-back-scope").addEventListener("click", function () {
       state.phase = state.cloudDeploy ? "scope-edit" : "tunnel";
       render();
     });
+
+    // While an add is in flight, block the whole page so toggles/navigation
+    // can't race the in-progress operation. Removed on the next re-render.
+    if (state.addingId) {
+      var blocker = document.createElement("div");
+      blocker.className = "page-blocker";
+      app.appendChild(blocker);
+    }
   }
 
   // ── Form rendering (reusable) ──
@@ -1405,6 +1547,17 @@
 
   // ── Shared questions ──
 
+  function renderSharedForm() {
+    var scope = cs();
+    // Auto-fill (no tunnel) the public URL placeholder into shared answers and
+    // never render it as a question. If it was the only shared question, there
+    // is nothing to show — hand off straight to the per-provider forms.
+    fillPublicUrlPlaceholder(scope.sharedAnswers, state.sharedQuestions);
+    var visible = withoutPublicUrl(state.sharedQuestions);
+    if (visible.length === 0) { submitShared(); return; }
+    renderForm(visible, t("ui.shared.title"), t("ui.shared.description"), null, submitShared);
+  }
+
   function submitShared() {
     var scope = cs();
     scope.sharedAnswersDone = true;
@@ -1451,17 +1604,28 @@
         return;
       }
     }
+    // The public URL question is never surfaced here. Reaching this point means
+    // the tunnel flow above has already resolved it (value present) or will not
+    // run (no tunnel / tunnel failed), so persist the loopback filler for any
+    // still-empty required public URL and drop it from the displayed questions.
+    var providerStore = scope.answers[p.provider_id] || (scope.answers[p.provider_id] = {});
+    forcePublicUrlFillerIfEmpty(providerStore, form.questions);
+
     // For providers with an install action, only the action's input fields
     // (config tokens) show on this step; the action + its result field (the
     // bot token) show on the next step (provider-setup-action).
-    var pageQuestions = form.questions;
+    var pageQuestions = withoutPublicUrl(form.questions);
     if (providerSetupPhaseActions(p).length > 0) {
-      pageQuestions = preActionQuestions(p);
+      pageQuestions = withoutPublicUrl(preActionQuestions(p));
       if (pageQuestions.length === 0) {
         state.phase = "provider-setup-action";
         render();
         return;
       }
+    } else if (pageQuestions.length === 0) {
+      // The public URL filler was the only remaining field — nothing to ask.
+      completeProviderAndAdvance(p.provider_id);
+      return;
     }
     var backFn = function () {
       if (state.currentProvider > 0) { state.currentProvider--; state.phase = "provider-form"; }
