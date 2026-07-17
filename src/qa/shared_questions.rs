@@ -22,11 +22,69 @@ pub const SHARED_QUESTION_IDS: &[&str] = &[
     // (e.g., slack.com, telegram.org, webexapis.com)
 ];
 
+/// Placeholder persisted for the public base URL question.
+///
+/// The externally-reachable URL is never known at setup time — it is provided
+/// by an active tunnel, the `PUBLIC_BASE_URL` environment variable, or whatever
+/// the runtime resolves — so anything an operator typed here would be
+/// overwritten anyway. Rather than surface a question whose answer is always
+/// discarded, we skip the prompt and persist this loopback filler; the runtime
+/// replaces it with the real public URL when the endpoint comes up.
+pub const PUBLIC_URL_FILLER: &str = "http://localhost:8080";
+
+/// Whether `question_id` names the environment's public base URL question.
+///
+/// These questions are never surfaced interactively — they are auto-filled with
+/// [`PUBLIC_URL_FILLER`] and overwritten at runtime. See [`HIDDEN_FROM_PROMPTS`].
+pub fn is_public_url_question(question_id: &str) -> bool {
+    question_id == "public_base_url"
+}
+
+/// Insert [`PUBLIC_URL_FILLER`] for any public-URL question in `questions` that
+/// lacks a non-empty answer in `answers`.
+///
+/// Called after prompting so the persisted answers carry a well-formed
+/// placeholder the runtime can overwrite, without ever asking the operator.
+pub fn fill_public_url_placeholders<'a, I, Q>(questions: I, answers: &mut JsonMap<String, Value>)
+where
+    I: IntoIterator<Item = &'a Q>,
+    Q: HasQuestionId + 'a,
+{
+    for question in questions {
+        let id = question.question_id();
+        if !is_public_url_question(id) {
+            continue;
+        }
+        let has_value = answers
+            .get(id)
+            .map(|v| !v.is_null() && v.as_str() != Some(""))
+            .unwrap_or(false);
+        if !has_value {
+            answers.insert(id.to_string(), Value::String(PUBLIC_URL_FILLER.to_string()));
+        }
+    }
+}
+
+/// Minimal accessor so [`fill_public_url_placeholders`] can work over both the
+/// FormSpec `QuestionSpec` and the legacy `SetupQuestion`.
+pub trait HasQuestionId {
+    /// The question's stable identifier.
+    fn question_id(&self) -> &str;
+}
+
+impl HasQuestionId for QuestionSpec {
+    fn question_id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Questions hidden from interactive prompts (both terminal and web UI).
 ///
 /// Values may still be supplied via `--answers` file or prefill. Keep this list
-/// empty by default: providers such as OAuth/webhook integrations often need a
-/// real HTTPS `public_base_url` during setup-time app registration.
+/// empty by default. The public URL question is handled separately via
+/// [`is_public_url_question`] rather than here: the terminal wizard skips it
+/// outright, but the web UI keeps it in the form so a selected tunnel can still
+/// auto-generate a real HTTPS URL before falling back to [`PUBLIC_URL_FILLER`].
 pub const HIDDEN_FROM_PROMPTS: &[&str] = &[];
 
 /// Information about a provider and its FormSpec for multi-provider setup.
@@ -159,6 +217,11 @@ pub fn prompt_shared_questions(
             if HIDDEN_FROM_PROMPTS.contains(&q.id.as_str()) {
                 return false;
             }
+            // The public URL question is never surfaced in the terminal wizard;
+            // it is auto-filled below. See `PUBLIC_URL_FILLER`.
+            if is_public_url_question(&q.id) {
+                return false;
+            }
             // Skip optional questions in normal mode
             if !advanced && !q.required {
                 return false;
@@ -189,6 +252,7 @@ pub fn prompt_shared_questions(
                 }
             }
         }
+        fill_public_url_placeholders(&shared.shared_questions, &mut answers);
         return Ok(Value::Object(answers));
     }
 
@@ -212,6 +276,11 @@ pub fn prompt_shared_questions(
     for question in &shared.shared_questions {
         // Skip questions hidden from interactive prompts (auto-injected by operator)
         if HIDDEN_FROM_PROMPTS.contains(&question.id.as_str()) {
+            continue;
+        }
+
+        // The public URL question is never surfaced; it is auto-filled below.
+        if is_public_url_question(&question.id) {
             continue;
         }
 
@@ -240,6 +309,8 @@ pub fn prompt_shared_questions(
             answers.insert(question.id.clone(), value);
         }
     }
+
+    fill_public_url_placeholders(&shared.shared_questions, &mut answers);
 
     println!();
     Ok(Value::Object(answers))
@@ -409,5 +480,57 @@ mod tests {
 
         let result = collect_shared_questions(&providers);
         assert_eq!(result.shared_questions.len(), 1);
+    }
+
+    #[test]
+    fn public_url_question_is_recognized() {
+        assert!(is_public_url_question("public_base_url"));
+        assert!(!is_public_url_question("api_base_url"));
+        assert!(!is_public_url_question("bot_token"));
+    }
+
+    #[test]
+    fn fill_public_url_placeholders_injects_filler_when_absent() {
+        let form = make_provider_form_spec("p", &["public_base_url", "bot_token"]);
+        let mut answers = JsonMap::new();
+        fill_public_url_placeholders(&form.form_spec.questions, &mut answers);
+        assert_eq!(
+            answers.get("public_base_url"),
+            Some(&Value::String(PUBLIC_URL_FILLER.to_string()))
+        );
+        // Non-public-URL questions are left untouched.
+        assert!(answers.get("bot_token").is_none());
+    }
+
+    #[test]
+    fn fill_public_url_placeholders_keeps_existing_value() {
+        let form = make_provider_form_spec("p", &["public_base_url"]);
+        let mut answers = JsonMap::new();
+        answers.insert(
+            "public_base_url".to_string(),
+            Value::String("https://real.example.com".to_string()),
+        );
+        fill_public_url_placeholders(&form.form_spec.questions, &mut answers);
+        assert_eq!(
+            answers.get("public_base_url"),
+            Some(&Value::String("https://real.example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn prompt_shared_questions_fills_public_url_without_prompting() {
+        // public_base_url is the only shared question and it is hidden from
+        // prompts, so this returns the placeholder without reading stdin.
+        let providers = vec![
+            make_provider_form_spec("provider-a", &["public_base_url"]),
+            make_provider_form_spec("provider-b", &["public_base_url"]),
+        ];
+        let shared = collect_shared_questions(&providers);
+        let answers =
+            prompt_shared_questions(&shared, false, &Value::Object(JsonMap::new())).unwrap();
+        assert_eq!(
+            answers.get("public_base_url"),
+            Some(&Value::String(PUBLIC_URL_FILLER.to_string()))
+        );
     }
 }
