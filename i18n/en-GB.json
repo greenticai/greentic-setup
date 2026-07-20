@@ -217,6 +217,7 @@
   "ui.import.password_prompt": "This file contains encrypted secrets. Enter the decryption password:",
   "ui.new_setup": "New Setup",
   "ui.no_providers": "No providers found in bundle.",
+  "ui.add_providers": "Providers:",
   "ui.nothing_to_configure": "Nothing to configure.",
   "ui.pending": "Pending",
   "ui.provider.configure": "Configure {}",

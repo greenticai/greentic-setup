@@ -162,7 +162,7 @@ fn resolve_action(
         action_id: action_id.to_string(),
         label: label.clone(),
         kind: kind.clone(),
-        html: action_html(provider_id, action_id, &label, &url),
+        html: action_html(&label, &url),
         url,
         opens_new_window,
         copyable,
@@ -283,32 +283,15 @@ fn safe_action_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn action_html(provider_id: &str, action_id: &str, label: &str, url: &str) -> String {
+/// Build the copy-paste anchor for a final setup action. Deliberately
+/// class-free: the snippet is pasted into arbitrary external pages, so it must
+/// not depend on Greentic stylesheets. Same shape for every provider.
+fn action_html(label: &str, url: &str) -> String {
     format!(
-        r#"<a class="greentic-add-button {}" href="{}" target="_blank" rel="noopener noreferrer">{}</a>"#,
-        html_escape_attr(&css_class(&format!(
-            "greentic-add-{provider_id}-{action_id}"
-        ))),
+        r#"<a href="{}" target="_blank" rel="noopener noreferrer">{}</a>"#,
         html_escape_attr(url),
         html_escape_text(label)
     )
-}
-
-fn css_class(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            out.push(ch);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "greentic-add".to_string()
-    } else {
-        out
-    }
 }
 
 fn url_encode(value: &str) -> String {

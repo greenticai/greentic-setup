@@ -96,10 +96,10 @@
   "cli.simple.extracted_to": "  Extracted to: {}",
   "cli.simple.expected_bundle_format": "expected directory or .gtbundle file: {}",
   "cli.help.for_help": "For help: greentic-setup --help",
-
   "ui.title": "Greentic Setup",
   "ui.description": "Configure {} provider(s) in {}",
   "ui.no_providers": "No providers found in bundle.",
+  "ui.add_providers": "Providers:",
   "ui.nothing_to_configure": "Nothing to configure.",
   "ui.discovering": "Discovering providers...",
   "ui.discovering_sub": "Reading bundle configuration",
@@ -162,7 +162,6 @@
   "ui.result.closed_sub": "You can close this tab.",
   "ui.field.required": "{} is required.",
   "ui.select_action": "Select an action to get started.",
-
   "ui.q.public_base_url": "Public base URL",
   "ui.q.public_base_url.help": "Public-facing URL for webhook callbacks (e.g. https://xxxx.trycloudflare.com)",
   "ui.q.api_base_url": "API base URL",
