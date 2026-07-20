@@ -337,7 +337,7 @@ fn html_escape_attr(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn is_secret_key(key: &str) -> bool {
+pub(crate) fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key == "token"
         || key == "secret"
