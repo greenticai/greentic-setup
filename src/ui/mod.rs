@@ -142,6 +142,10 @@ struct ProviderCatalogItem {
     /// `oci://ghcr.io/greenticai/packs/messaging/messaging-slack:stable`.
     #[serde(rename = "ref")]
     reference: String,
+    /// Temporarily withhold this provider from the add-list without dropping
+    /// its catalog entry. Flip back to `false`/remove the key to re-expose it.
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,7 +619,7 @@ fn available_provider_items(
     catalog
         .items
         .into_iter()
-        .filter(|item| !installed.contains(&item.id))
+        .filter(|item| !item.hidden && !installed.contains(&item.id))
         .map(|item| AvailableProvider {
             id: item.id,
             category: item.category,
@@ -8334,6 +8338,24 @@ mod tests {
     }
 
     #[test]
+    fn available_provider_items_excludes_hidden() {
+        // WhatsApp / Web Chat / Email are withheld from the add-list for now.
+        // They stay in the catalog so re-exposing them is a one-key change.
+        let catalog = super::ProviderCatalog::load_embedded().expect("catalog");
+        let items = super::available_provider_items(catalog, &Default::default());
+        for hidden in ["messaging-whatsapp", "messaging-webchat", "messaging-email"] {
+            assert!(
+                items.iter().all(|item| item.id != hidden),
+                "{hidden} is marked hidden and must not be offered"
+            );
+        }
+        assert!(
+            items.iter().any(|item| item.id == "messaging-slack"),
+            "non-hidden providers must still be offered"
+        );
+    }
+
+    #[test]
     fn available_provider_items_excludes_installed() {
         let catalog = super::ProviderCatalog::load_embedded().expect("catalog");
         let mut installed = std::collections::HashSet::new();
@@ -8365,6 +8387,7 @@ mod tests {
                 fallback: "Slack".to_string(),
             },
             reference: src.to_string_lossy().to_string(),
+            hidden: false,
         };
 
         super::install_catalog_provider(bundle.path(), &item)

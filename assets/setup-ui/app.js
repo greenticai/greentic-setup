@@ -174,6 +174,18 @@
   /** Get the scope currently being edited. */
   function cs() { return state.scopes[state.currentScopeIdx]; }
 
+  // Providers with no questions and no web setup component are auto-done and
+  // skipped when rendering the list, so a header count taken from
+  // state.providers.length disagrees with what is actually on screen.
+  // Mirrors the skip condition in the provider-list render.
+  function configurableProviderCount() {
+    return state.providers.filter(function (p) {
+      var form = state.providerForms[p.provider_id];
+      var qCount = form ? form.questions.length : 0;
+      return qCount > 0 || p.setup_web_component;
+    }).length;
+  }
+
   function providerEnabled(scope, providerId) {
     var answers = scope.answers[providerId] || {};
     var value = answers.enabled;
@@ -377,7 +389,7 @@
             '<svg width="32" height="32" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill="#25c39e"/><path d="M10 16.5L14 20.5L22 12.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
           '</div>' +
           '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
-          '<p class="brand-desc">' + esc(t("ui.dashboard.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
+          '<p class="brand-desc">' + esc(t("ui.dashboard.description", [String(configurableProviderCount()), state.bundlePath])) + '</p>' +
           renderLocalePicker() +
         '</div>';
 
@@ -809,7 +821,7 @@
             '<svg width="32" height="32" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill="#25c39e"/><path d="M10 16.5L14 20.5L22 12.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
           '</div>' +
           '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
-          '<p class="brand-desc">' + esc(t("ui.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
+          '<p class="brand-desc">' + esc(t("ui.description", [String(configurableProviderCount()), state.bundlePath])) + '</p>' +
           '<p class="brand-desc" style="font-size:.8rem;opacity:.7">tenant=' + esc(scope.tenant) + ' env=' + esc(scope.env) + (scope.team ? ' team=' + esc(scope.team) : '') + '</p>' +
         '</div>' +
         '<div class="provider-list">';
@@ -846,7 +858,9 @@
     if (state.availableProviders && state.availableProviders.length > 0) {
       html +=
         '<div class="provider-add-section">' +
-          '<div class="provider-add-title">' + esc(t("ui.add_providers") || "Add providers") + '</div>' +
+          // Read the catalog directly: t() echoes the key when a locale lacks
+          // it, so `t(...) || fallback` can never reach the fallback.
+          '<div class="provider-add-title">' + esc(i18n["ui.add_providers"] || "Providers:") + '</div>' +
           '<div class="provider-add-list">';
       state.availableProviders.forEach(function (a) {
         var name = a.label || a.id;
@@ -2874,13 +2888,11 @@
     }
   }
 
+  // Mirror of setup_final_actions.rs::action_html — must stay identical.
+  // Class-free on purpose: the snippet is pasted into external pages and must
+  // not depend on Greentic stylesheets.
   function finalSetupActionHtml(providerId, actionId, label, url) {
-    var cls = "greentic-add-button " + sanitizeCssClass("greentic-add-" + providerId + "-" + actionId);
-    return '<a class="' + escAttr(cls) + '" href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>';
-  }
-
-  function sanitizeCssClass(value) {
-    return String(value || "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "greentic-add";
+    return '<a href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>';
   }
 
   function renderFinalSetupActions(actions) {
@@ -3196,7 +3208,10 @@
   }
 
   function escAttr(str) {
-    return esc(str);
+    // esc() escapes & < > but not quotes, so an attribute value containing a
+    // double quote (e.g. the generated `<a class="...">` snippet) terminates
+    // the attribute early and renders truncated.
+    return esc(str).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   function formatProviderName(provider) {
