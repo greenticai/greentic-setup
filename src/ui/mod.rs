@@ -5455,6 +5455,69 @@ fn render_setup_backend_contract_state(
     report
 }
 
+/// Fill in per-provider setup status for providers the client did not report on.
+///
+/// The final page's "Add to X" buttons (`greentic.setup.actions.v1`) are gated on
+/// `visible_when: {setup_status.ok: true}` and resolve their `requires` names out of the
+/// provider's `values`. Both come from `provider_setup_status`, which on this path is only ever
+/// echoed back from `req.provider_setup_status` — i.e. whatever the browser accumulated while
+/// stepping through providers one at a time. On an answers-driven run the client has nothing to
+/// send, so the map arrives empty and the buttons can never resolve no matter how well the pack
+/// is configured.
+///
+/// Rebuild the missing entries from the setup answers already persisted to
+/// `state/config/<provider_id>/setup-answers.json`. Client-supplied entries always win, so an
+/// interactive run keeps its richer per-provider state.
+///
+/// `ok` is written as a real JSON boolean: the frontend assigns `context.setup_status` directly
+/// rather than through `mergeFinalSetupActionContext` (which stringifies scalars), and compares
+/// with `===`, so a string here would silently fail the visibility check.
+fn fill_provider_setup_status_from_answers(
+    bundle_path: &Path,
+    success: bool,
+    status: &mut JsonMap<String, Value>,
+) {
+    let config_dir = bundle_path.join("state").join("config");
+    let Ok(entries) = std::fs::read_dir(&config_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(provider_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if status.contains_key(&provider_id) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path().join("setup-answers.json")) else {
+            continue;
+        };
+        let Ok(answers) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(answers) = answers.as_object() else {
+            continue;
+        };
+        let mut values = JsonMap::new();
+        for (key, value) in answers {
+            // Never surface secrets into a page context that renders copyable URLs.
+            if crate::setup_final_actions::is_secret_key(key) || value.is_null() {
+                continue;
+            }
+            values.insert(key.clone(), value.clone());
+        }
+        status.insert(
+            provider_id,
+            serde_json::json!({
+                "setup_status": {"ok": success},
+                "values": values,
+            }),
+        );
+    }
+}
+
 fn attach_final_setup_actions(state: &UiState, provider_id: &str, report: &mut Value) {
     let Ok(Some(descriptor)) = find_setup_actions_descriptor(&state.bundle_path, provider_id)
     else {
@@ -6356,6 +6419,7 @@ async fn post_execute(
     Json(req): Json<ExecuteRequest>,
 ) -> Json<ExecutionResult> {
     let bundle_path = state.bundle_path.clone();
+    let bundle_path_for_status = bundle_path.clone();
     // Use scope from UI request if provided, otherwise fall back to CLI defaults
     let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
     let team = req.team.or_else(|| state.team.clone());
@@ -6410,6 +6474,11 @@ async fn post_execute(
         provider_setup_status: JsonMap::new(),
     });
     result.provider_setup_status = provider_setup_status.clone();
+    fill_provider_setup_status_from_answers(
+        &bundle_path_for_status,
+        result.success,
+        &mut result.provider_setup_status,
+    );
     if let Some(public_base_url) = setup_public_base_url.as_deref()
         && result.success
     {
@@ -8092,11 +8161,12 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 mod tests {
     use super::{
         ProviderSetupEventRequest, TUNNEL_FAILURE_COOLDOWN, UiState, build_router,
-        persist_provider_setup_event, persist_setup_tunnel_handoff, persist_ui_draft,
-        prefill_has_cloud_deployment_targets, read_provider_setup_events,
-        redact_provider_setup_event_detail, setup_backend_record_step_attempt,
-        setup_backend_runtime_context, setup_backend_runtime_context_current,
-        setup_backend_tunnel_cooldown_remaining, setup_backend_tunnel_public_base_url_for_port_at,
+        fill_provider_setup_status_from_answers, persist_provider_setup_event,
+        persist_setup_tunnel_handoff, persist_ui_draft, prefill_has_cloud_deployment_targets,
+        read_provider_setup_events, redact_provider_setup_event_detail,
+        setup_backend_record_step_attempt, setup_backend_runtime_context,
+        setup_backend_runtime_context_current, setup_backend_tunnel_cooldown_remaining,
+        setup_backend_tunnel_public_base_url_for_port_at,
     };
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
@@ -8108,6 +8178,114 @@ mod tests {
     use tokio::sync::broadcast;
     use tower::ServiceExt;
     use zip::write::SimpleFileOptions;
+
+    fn write_setup_answers(bundle_root: &std::path::Path, provider_id: &str, answers: Value) {
+        let dir = bundle_root.join("state").join("config").join(provider_id);
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(
+            dir.join("setup-answers.json"),
+            serde_json::to_string(&answers).expect("serialize"),
+        )
+        .expect("write answers");
+    }
+
+    #[test]
+    fn fill_provider_setup_status_rebuilds_missing_entries_from_answers() {
+        // Regression: on an answers-driven run the client sends an empty provider_setup_status,
+        // so the final page had no `setup_status` and no `values` — the Add-to-X buttons could
+        // never resolve regardless of pack configuration.
+        let temp = tempfile::tempdir().expect("temp");
+        write_setup_answers(
+            temp.path(),
+            "messaging-telegram",
+            serde_json::json!({
+                "bot_username": "Greentic_ai_test",
+                "public_base_url": "https://example.com",
+                "telegram_bot_token": "super-secret",
+                "unset_field": null,
+            }),
+        );
+
+        let mut status = JsonMap::new();
+        fill_provider_setup_status_from_answers(temp.path(), true, &mut status);
+
+        let tg = status.get("messaging-telegram").expect("telegram entry");
+        assert_eq!(tg["values"]["bot_username"], "Greentic_ai_test");
+        assert_eq!(tg["values"]["public_base_url"], "https://example.com");
+
+        // Secrets must never reach a context that renders copyable URLs.
+        assert!(
+            tg["values"].get("telegram_bot_token").is_none(),
+            "secret leaked into final-page values: {tg}"
+        );
+        // Nulls are dropped so `requires` cannot be satisfied by an empty answer.
+        assert!(tg["values"].get("unset_field").is_none());
+    }
+
+    #[test]
+    fn fill_provider_setup_status_writes_ok_as_a_real_boolean() {
+        // The frontend compares with `===` against JSON `true`. A stringified "true" would
+        // silently fail `visible_when` and hide the button with no diagnostic.
+        let temp = tempfile::tempdir().expect("temp");
+        write_setup_answers(
+            temp.path(),
+            "messaging-telegram",
+            serde_json::json!({"bot_username": "x"}),
+        );
+
+        let mut status = JsonMap::new();
+        fill_provider_setup_status_from_answers(temp.path(), true, &mut status);
+
+        let ok = &status["messaging-telegram"]["setup_status"]["ok"];
+        assert_eq!(
+            ok,
+            &Value::Bool(true),
+            "ok must be a JSON boolean, got {ok}"
+        );
+        assert!(ok.is_boolean());
+    }
+
+    #[test]
+    fn fill_provider_setup_status_propagates_failure_and_never_clobbers_client_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        write_setup_answers(
+            temp.path(),
+            "messaging-telegram",
+            serde_json::json!({"bot_username": "x"}),
+        );
+        write_setup_answers(
+            temp.path(),
+            "messaging-webchat-gui",
+            serde_json::json!({"public_base_url": "https://example.com"}),
+        );
+
+        // An interactive run already reported richer state for one provider; it must win.
+        let mut status = JsonMap::new();
+        status.insert(
+            "messaging-webchat-gui".to_string(),
+            serde_json::json!({"setup_status": {"ok": true}, "values": {"from": "client"}}),
+        );
+
+        fill_provider_setup_status_from_answers(temp.path(), false, &mut status);
+
+        assert_eq!(
+            status["messaging-webchat-gui"]["values"]["from"], "client",
+            "client-supplied provider state must not be overwritten"
+        );
+        assert_eq!(
+            status["messaging-telegram"]["setup_status"]["ok"],
+            Value::Bool(false),
+            "a failed setup must not advertise ok=true"
+        );
+    }
+
+    #[test]
+    fn fill_provider_setup_status_tolerates_a_missing_config_dir() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut status = JsonMap::new();
+        fill_provider_setup_status_from_answers(temp.path(), true, &mut status);
+        assert!(status.is_empty());
+    }
 
     fn test_ui_state(bundle_root: &std::path::Path) -> std::sync::Arc<UiState> {
         let (shutdown_tx, _) = broadcast::channel(1);
