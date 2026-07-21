@@ -59,6 +59,12 @@ Binary: `src/bin/greentic_setup.rs`.
 | `bundle.rs`, `bundle_source.rs` | Bundle model and source resolution |
 | `capabilities.rs` | Capability extraction and validation |
 | `card_setup.rs` | Adaptive Card setup wizard |
+| `generated_secrets.rs` | Materialises provider-declared generated secrets into the local dev secrets store |
+| `schema_validation.rs` | Minimal JSON Schema validation subset for provider setup contracts |
+| `setup_machine.rs` | Provider-declared setup state machines: metadata loading, contract validation, resumable execution |
+| `setup_backend_contract.rs` | Shared helpers for provider setup backend contract execution (UI-independent mutation rules) |
+| `setup_final_actions.rs` | Resolved final setup actions (post-setup URLs, labels, copy targets) |
+| `shared_tunnel.rs` | Machine-wide shared quick-tunnel record, file-protocol compatible with greentic-start |
 
 ## Build and Test
 
@@ -100,11 +106,14 @@ Integration tests in `tests/`:
 - `perf_scaling.rs` — setup scaling characteristics
 - `perf_timeout.rs` — timeout behavior under load
 
-Helper scripts in `scripts/`: `demo.sh` (end-to-end demo run),
-`install-hooks.sh` (git hook setup), `make_test_bundle.sh` (test-bundle
-builder), `test_default_welcome.sh` (default-welcome smoke test), and
-`test_provider.sh` (provider setup smoke test). `tools/i18n.sh` regenerates
-i18n catalogs.
+Helper scripts in `scripts/`:
+- `demo.sh` — end-to-end demo run
+- `install-hooks.sh` — one-time git hook setup (points `core.hooksPath` at `.githooks/`)
+- `make_test_bundle.sh` — builds a deployable test bundle carrying the default-welcome pack (and optionally a messaging provider) for e2e testing with greentic-start
+- `test_default_welcome.sh` — e2e smoke test: verifies the default welcome pack renders its welcome card when the `default` flow runs
+- `test_provider.sh` — provider setup smoke test
+
+`tools/i18n.sh` regenerates i18n catalogs.
 
 ## i18n
 
@@ -113,7 +122,7 @@ CLI strings go through `cli_i18n.rs`; regenerate catalogs with `tools/i18n.sh`.
 
 ## CI Gate Detail
 
-`ci/local_check.sh` runs these 6 steps:
+`ci/local_check.sh` runs exactly the same commands documented in "Build and Test" above, in this order:
 1. `cargo fmt --all -- --check`
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 3. `cargo test --all-features`
