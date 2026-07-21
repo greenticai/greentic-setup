@@ -93,6 +93,12 @@ pub struct Cli {
     #[arg(long = "non-interactive", global = true)]
     pub non_interactive: bool,
 
+    /// Ignore any cached state: clear the persisted env secrets store and the
+    /// bundle's cached setup-state / extraction dirs before running, so setup
+    /// rebuilds from scratch instead of reusing prior values.
+    #[arg(long = "new-cache", global = true)]
+    pub new_cache: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

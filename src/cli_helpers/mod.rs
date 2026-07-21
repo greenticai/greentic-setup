@@ -32,6 +32,52 @@ pub use env_vars::{
 };
 pub use prompts::{SetupParams, prompt_setup_params};
 
+/// Clear cached state for `--new-cache` so a setup run rebuilds from scratch:
+/// the persisted **secrets** (the shared env store for `env`, plus any legacy
+/// bundle-local dev stores) and the bundle's **cached setup-state** (encrypted
+/// answers + setup-machine / backend-contract state) so the wizard re-prompts.
+///
+/// Best-effort: a failure to remove any single artifact only means that
+/// artifact is reused; it must never abort setup. Note it deliberately does
+/// **not** touch the freshly-extracted `bundle_dir` tree itself (that is the
+/// working copy for this run) beyond the bundle-local dev/state stores below.
+pub fn clear_bundle_cache(bundle_dir: &Path, env: &str) {
+    // 1. Secrets — the shared env store keyed by `env`
+    //    (~/.greentic/environments/<env>/.greentic/dev/.dev.secrets.env), the
+    //    same file `gtc start` reads and `op secrets` writes.
+    if let Some(store) = crate::secrets::env_store_dev_secrets_path(env) {
+        remove_cached_path(&store);
+    }
+
+    // 2. Legacy bundle-local dev stores (back-compat locations).
+    remove_cached_path(&bundle_dir.join(".greentic").join("dev"));
+    remove_cached_path(&bundle_dir.join(".greentic").join("state").join("dev"));
+
+    // 3. Bundle cached setup-state so the wizard re-prompts instead of
+    //    replaying prior answers / machine state.
+    remove_cached_path(&bundle_dir.join(".greentic").join("setup-state"));
+    remove_cached_path(&bundle_dir.join("state").join("setup"));
+    remove_cached_path(
+        &bundle_dir
+            .join("state")
+            .join("config")
+            .join("setup-actions"),
+    );
+}
+
+fn remove_cached_path(path: &Path) {
+    let result = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    };
+    if let Err(err) = result {
+        tracing::warn!("--new-cache: failed to remove {}: {err:#}", path.display());
+    }
+}
+
 /// Start a setup-time tunnel for non-UI setup and inject its public URL into
 /// provider answers that need `public_base_url`.
 ///
