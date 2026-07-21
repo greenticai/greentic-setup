@@ -1982,25 +1982,30 @@
     context.setup_status = result.setup_status || (result.state && result.state.setup_status) || {};
     context.values = result.values || (result.state && result.state.values) || {};
     context.provider_id = provider.provider_id;
-    // An explicit install_url (e.g. Slack's dashboard install-on-team page) is
-    // this action's one-time install target; the final deep_link actions below
-    // keep pointing at the installed app (app_redirect -> DM with the bot).
+    // This popup is the INSTALL step, so it must land on the install target,
+    // never on a share/deep_link like add-to-slack (slack.com/app_redirect ->
+    // the bot DM). Those belong only in the final "Share add buttons" section.
+    // Order matters: install_url, then the backend-resolved install URL
+    // (oauth_authorize_url = install-on-team), then an open_url install
+    // template, and ONLY as a last resort a deep_link action.
     var explicitInstall = deepValue(context, "install_url");
     if (explicitInstall) return String(explicitInstall);
-    for (var i = 0; i < actions.length; i++) {
-      var item = resolveFinalSetupAction(provider, actions[i], context);
-      if (item && item.url) return item.url;
-    }
-    // For an install action (kind: open_url), prefer its url_template — e.g.
+    var directUrl = deepValue(context, "oauth_authorize_url") || deepValue(context, "authorize_url");
+    if (directUrl) return String(directUrl);
+    // For an install action (kind: open_url), use its url_template — e.g.
     // Slack's api.slack.com/apps/{slack_app_id}/install-on-team link resolved
-    // with the returned app id — over any oauth redirect the component returned
-    // (which points at the workspace app_redirect page).
+    // with the returned app id.
     for (var k = 0; k < actions.length; k++) {
       var url = resolveOpenUrlActionTemplate(actions[k], context);
       if (url) return url;
     }
-    var directUrl = deepValue(context, "oauth_authorize_url") || deepValue(context, "authorize_url");
-    if (directUrl) return String(directUrl);
+    // Fallback: a final deep_link action. Reached only when no install target
+    // exists; the previous ordering surfaced add-to-slack (app_redirect) as the
+    // install popup URL, which is the bug this reorder fixes.
+    for (var i = 0; i < actions.length; i++) {
+      var item = resolveFinalSetupAction(provider, actions[i], context);
+      if (item && item.url) return item.url;
+    }
     return "";
   }
 
