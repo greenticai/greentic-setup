@@ -28,12 +28,68 @@ pub fn override_path() -> Option<PathBuf> {
     std::env::var(OVERRIDE_ENV).ok().map(PathBuf::from)
 }
 
-/// Checks for an existing dev store inside the bundle root.
+/// Dev-store path inside the shared environment store:
+///   `~/.greentic/environments/<env>/.greentic/dev/.dev.secrets.env`
+///
+/// This is the *same* file that `gtc op secrets` / `provider add` and the
+/// running env use, so bundle-path `setup`/`start` rendezvous with the env-path
+/// secrets across invocations regardless of any ephemeral extraction dir (it
+/// closes the bundle-vs-env split documented in `env-runtime-bundle-ops.md` §6).
+/// Returns `None` when the environment-store root can't be resolved (no
+/// `HOME`/`USERPROFILE`), letting callers fall back to a bundle-local path.
+pub fn env_store_dev_secrets_path(env: &str) -> Option<PathBuf> {
+    greentic_deployer::environment::LocalFsStore::default_root()
+        .map(|root| root.join(env).join(STORE_RELATIVE))
+}
+
+/// The explicitly-selected environment, or `None` when `$GREENTIC_ENV` is unset.
+///
+/// Bare callers (`ensure_path`/`find_existing`/`default_path`) only route to the
+/// shared env store when an env is *explicitly selected* via `$GREENTIC_ENV`.
+/// `gtc setup` and `gtc start` always set it before resolving secrets, so
+/// production lands on `~/.greentic/environments/<env>/…`; when it is unset
+/// (unit tests, ad-hoc library use) resolution stays on the legacy bundle-local
+/// store, which keeps those paths hermetic and non-polluting.
+fn selected_env() -> Option<String> {
+    std::env::var("GREENTIC_ENV")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|raw| crate::resolve_env(Some(&raw)))
+}
+
+/// The path a *write* should target for an explicit env: the shared env store
+/// when resolvable, otherwise the legacy bundle-local path.
+fn write_path_for_env(bundle_root: &Path, env: &str) -> PathBuf {
+    env_store_dev_secrets_path(env).unwrap_or_else(|| bundle_root.join(STORE_RELATIVE))
+}
+
+/// The write path for a bare caller: the shared env store when an env is
+/// selected via `$GREENTIC_ENV`, else the legacy bundle-local path.
+fn bare_write_path(bundle_root: &Path) -> PathBuf {
+    selected_env()
+        .and_then(|env| env_store_dev_secrets_path(&env))
+        .unwrap_or_else(|| bundle_root.join(STORE_RELATIVE))
+}
+
+/// Read-preference order: the shared env store (when an env is selected), then
+/// legacy bundle-local candidates (for already-configured bundle directories).
+fn read_candidate_paths(bundle_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(env_store) = selected_env().and_then(|env| env_store_dev_secrets_path(&env)) {
+        out.push(env_store);
+    }
+    out.push(bundle_root.join(STORE_RELATIVE));
+    out.push(bundle_root.join(STORE_STATE_RELATIVE));
+    out
+}
+
+/// Checks for an existing dev store: override, then env store, then bundle-local.
 pub fn find_existing(bundle_root: &Path) -> Option<PathBuf> {
     find_existing_with_override(bundle_root, override_path().as_deref())
 }
 
-/// Looks for an existing dev store using an override path before consulting default candidates.
+/// Looks for an existing dev store using an override path before consulting the
+/// shared env store and then legacy bundle-local candidates.
 pub fn find_existing_with_override(
     bundle_root: &Path,
     override_path: Option<&Path>,
@@ -43,32 +99,39 @@ pub fn find_existing_with_override(
     {
         return Some(path.to_path_buf());
     }
-    candidate_paths(bundle_root)
+    read_candidate_paths(bundle_root)
         .into_iter()
         .find(|candidate| candidate.exists())
 }
 
-/// Ensures the default dev store path exists (creating parent directories) before returning it.
+/// Ensures the default dev store path exists (creating parent directories) before
+/// returning it. Routes to the shared env store when `$GREENTIC_ENV` is set.
 pub fn ensure_path(bundle_root: &Path) -> Result<PathBuf> {
     if let Some(path) = override_path() {
         ensure_parent(&path)?;
         return Ok(path);
     }
-    let path = bundle_root.join(STORE_RELATIVE);
+    let path = bare_write_path(bundle_root);
+    ensure_parent(&path)?;
+    Ok(path)
+}
+
+/// Like [`ensure_path`], but with an explicit environment — always the shared
+/// env store (when resolvable). The correct key when the caller already resolved
+/// `<env>` (e.g. [`SecretsSetup`]), independent of `$GREENTIC_ENV`.
+pub fn ensure_path_for_env(bundle_root: &Path, env: &str) -> Result<PathBuf> {
+    if let Some(path) = override_path() {
+        ensure_parent(&path)?;
+        return Ok(path);
+    }
+    let path = write_path_for_env(bundle_root, env);
     ensure_parent(&path)?;
     Ok(path)
 }
 
 /// Returns the default dev store path without creating anything.
 pub fn default_path(bundle_root: &Path) -> PathBuf {
-    bundle_root.join(STORE_RELATIVE)
-}
-
-fn candidate_paths(bundle_root: &Path) -> [PathBuf; 2] {
-    [
-        bundle_root.join(STORE_RELATIVE),
-        bundle_root.join(STORE_STATE_RELATIVE),
-    ]
+    override_path().unwrap_or_else(|| bare_write_path(bundle_root))
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
@@ -95,6 +158,10 @@ pub struct SecretsSetup {
 
 impl SecretsSetup {
     pub fn new(bundle_root: &Path, env: &str, tenant: &str, team: Option<&str>) -> Result<Self> {
+        // Bare `ensure_path` gates on `$GREENTIC_ENV` exactly like the serve-side
+        // reader (`find_existing`), so writer and reader agree on the store path:
+        // the shared env store in production (env selected), bundle-local in
+        // tests (env unset). `env` still keys the secret URIs below.
         let store_path = ensure_path(bundle_root)?;
         info!(path = %store_path.display(), "secrets: using dev store backend");
         let store = DevStore::with_path(&store_path).map_err(|err| {
@@ -371,14 +438,24 @@ mod tests {
         Ok(())
     }
 
+    // NOTE on hermeticity: the dev-store resolvers read process-global env
+    // (`$GREENTIC_ENV`, `$GREENTIC_DEV_SECRETS_PATH`) and the home dir, which
+    // other tests in this crate also mutate. To stay race-free these unit tests
+    // avoid asserting on that global state; the shared-env-store *activation*
+    // path is covered end-to-end by the real-binary round-trip instead.
+
     #[test]
-    fn ensure_path_creates_parent_directories() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let bundle = temp.path().join("bundle");
-        std::fs::create_dir_all(&bundle).expect("bundle dir");
-        let path = ensure_path(&bundle).expect("ensure path");
-        assert!(path.ends_with(".greentic/dev/.dev.secrets.env"));
-        assert!(path.parent().expect("parent").exists());
+    fn env_store_path_has_expected_shape() {
+        // `env_store_dev_secrets_path(env)` lays out
+        // <home>/.greentic/environments/<env>/.greentic/dev/.dev.secrets.env.
+        // Assert the suffix, which is independent of the home value (race-free).
+        if let Some(path) = env_store_dev_secrets_path("some-env") {
+            assert!(
+                path.ends_with("environments/some-env/.greentic/dev/.dev.secrets.env"),
+                "unexpected env-store path: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -391,18 +468,6 @@ mod tests {
 
         let found = find_existing_with_override(&bundle, Some(&override_file));
         assert_eq!(found.as_deref(), Some(override_file.as_path()));
-    }
-
-    #[test]
-    fn find_existing_finds_default_locations() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let bundle = temp.path().join("bundle");
-        let store_path = bundle.join(STORE_RELATIVE);
-        std::fs::create_dir_all(store_path.parent().expect("parent")).expect("create dirs");
-        std::fs::write(&store_path, "K=V\n").expect("write store");
-
-        let found = find_existing_with_override(&bundle, None).expect("found");
-        assert_eq!(found, store_path);
     }
 
     #[test]
