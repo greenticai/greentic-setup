@@ -2884,10 +2884,14 @@
     });
   }
 
+  // Mirror of setup_final_actions.rs::SAFE_ACTION_URL_SCHEMES — must stay in
+  // sync. `https:` covers hosted share links; native-app deep-link schemes such
+  // as `webexteams:` (webexteams://im?email=…) open the provider's desktop/mobile
+  // client directly instead of routing through a browser.
   function isSafeFinalSetupActionUrl(url) {
     try {
       var parsed = new URL(url, window.location.href);
-      return parsed.protocol === "https:";
+      return parsed.protocol === "https:" || parsed.protocol === "webexteams:";
     } catch (e) {
       return false;
     }
