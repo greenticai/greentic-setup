@@ -467,6 +467,55 @@ mod tests {
     }
 
     #[test]
+    fn write_path_for_env_and_default_path_target_the_dev_store() {
+        // Both resolvers land on a `.dev.secrets.env` dev store, whether they
+        // route to the shared env store (home resolvable) or fall back to the
+        // bundle-local path. Assert the shared suffix — it holds either way and
+        // is independent of process-global `$GREENTIC_ENV` (race-free).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+
+        let write = write_path_for_env(&bundle, "some-env");
+        assert!(
+            write.ends_with(STORE_RELATIVE),
+            "unexpected write path: {}",
+            write.display()
+        );
+
+        let default = default_path(&bundle);
+        assert!(
+            default.ends_with(STORE_RELATIVE),
+            "unexpected default path: {}",
+            default.display()
+        );
+    }
+
+    #[test]
+    fn find_existing_locates_a_bundle_local_dev_store() {
+        // With no `$GREENTIC_DEV_SECRETS_PATH` override, `find_existing` walks
+        // the candidate list and returns an existing dev store. Hermetic: the
+        // store lives in a tempdir, so the result exists and carries the dev
+        // store suffix regardless of `$GREENTIC_ENV`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        let store = bundle.join(STORE_RELATIVE);
+        std::fs::create_dir_all(store.parent().expect("store parent")).expect("dev dir");
+        std::fs::write(&store, "KEY=value\n").expect("write store");
+
+        let found = find_existing(&bundle).expect("find dev store");
+        assert!(
+            found.exists(),
+            "found path should exist: {}",
+            found.display()
+        );
+        assert!(
+            found.ends_with(STORE_RELATIVE),
+            "unexpected found path: {}",
+            found.display()
+        );
+    }
+
+    #[test]
     fn find_existing_with_override_prefers_override() {
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
@@ -689,6 +738,31 @@ mod tests {
             "unexpected store path: {}",
             setup.store_path().display()
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_is_a_noop_without_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+
+        // A pack with no secret-requirements → `ensure_pack_secrets` short-circuits.
+        let pack = temp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())
+            .expect("start entry");
+        zip.write_all(b"questions: []\n").expect("write setup");
+        zip.finish().expect("finish zip");
+
+        let setup = SecretsSetup::new(&bundle, "dev", "tenant-a", None).expect("setup");
+        // The accessor resolves to the opened dev store file.
+        assert!(setup.store_path().ends_with(".dev.secrets.env"));
+
+        setup
+            .ensure_pack_secrets(&pack, "messaging-telegram")
+            .await
+            .expect("noop for empty requirements");
     }
 
     #[tokio::test]
