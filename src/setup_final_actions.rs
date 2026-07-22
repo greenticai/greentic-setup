@@ -409,14 +409,14 @@ mod tests {
 
     #[test]
     fn resolves_webex_native_app_deep_link_scheme() {
-        // Webex's "Add to WebEx" action hands the user straight to the native
+        // Webex's "Add to Webex" action hands the user straight to the native
         // client via a `webexteams://` deep link. It must survive the scheme
         // allowlist rather than being rejected as an unsafe scheme.
         let resolved = resolve_final_setup_actions(
             "messaging-test",
             &descriptor(json!({
                 "id": "add-to-webex",
-                "label": "Add to WebEx",
+                "label": "Add to Webex",
                 "kind": "deep_link",
                 "url_template": "webexteams://im?email={bot_email}",
                 "requires": ["bot_email"]
