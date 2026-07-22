@@ -458,6 +458,14 @@ mod tests {
         }
     }
 
+    /// Creates `<bundle>/.greentic/dev/.dev.secrets.env` and returns its path.
+    fn write_bundle_local_store(bundle: &Path) -> PathBuf {
+        let path = bundle.join(STORE_RELATIVE);
+        std::fs::create_dir_all(path.parent().expect("store parent")).expect("store dir");
+        std::fs::write(&path, "KEY=value\n").expect("write store");
+        path
+    }
+
     #[test]
     fn find_existing_with_override_prefers_override() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -468,6 +476,94 @@ mod tests {
 
         let found = find_existing_with_override(&bundle, Some(&override_file));
         assert_eq!(found.as_deref(), Some(override_file.as_path()));
+    }
+
+    #[test]
+    fn find_existing_with_override_falls_back_when_override_is_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        write_bundle_local_store(&bundle);
+        let missing_override = temp.path().join("does-not-exist.env");
+
+        // A non-existent override must not short-circuit the candidate walk.
+        // The concrete winner depends on `$GREENTIC_ENV`/home (process-global,
+        // mutated by other tests), so assert only what holds for every
+        // candidate: it resolves to an existing dev-store file.
+        for override_arg in [None, Some(missing_override.as_path())] {
+            let found = find_existing_with_override(&bundle, override_arg)
+                .expect("existing store must be discovered");
+            assert!(found.exists(), "resolved store does not exist: {found:?}");
+            assert!(
+                found.ends_with(".dev.secrets.env"),
+                "unexpected store file: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_existing_discovers_the_bundle_local_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        write_bundle_local_store(&bundle);
+
+        let found = find_existing(&bundle).expect("existing store must be discovered");
+        assert!(found.exists(), "resolved store does not exist: {found:?}");
+    }
+
+    #[test]
+    fn read_candidate_paths_ends_with_bundle_local_candidates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+
+        let candidates = read_candidate_paths(&bundle);
+        // The optional leading entry is the shared env store, which only
+        // appears when `$GREENTIC_ENV` is set; the bundle-local pair is always
+        // present, in order, at the end.
+        assert!(
+            candidates.len() == 2 || candidates.len() == 3,
+            "unexpected candidates: {candidates:?}"
+        );
+        assert_eq!(
+            &candidates[candidates.len() - 2..],
+            &[
+                bundle.join(STORE_RELATIVE),
+                bundle.join(STORE_STATE_RELATIVE)
+            ]
+        );
+    }
+
+    #[test]
+    fn write_path_for_env_always_targets_a_dev_store_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+
+        // Both branches (shared env store / bundle-local fallback) end in the
+        // same relative store path, so the suffix is home-independent.
+        let path = write_path_for_env(&bundle, "some-env");
+        assert!(
+            path.ends_with(STORE_RELATIVE),
+            "unexpected write path: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn default_path_creates_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+
+        let path = default_path(&bundle);
+        assert!(
+            path.ends_with(".dev.secrets.env"),
+            "unexpected default path: {}",
+            path.display()
+        );
+        assert!(
+            !bundle.exists(),
+            "default_path must not touch the filesystem"
+        );
     }
 
     #[test]
@@ -536,6 +632,63 @@ mod tests {
 
         let keys = load_secret_keys_from_pack(&pack).expect("load keys");
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn cbor_manifest_scan_skips_maps_that_are_not_secret_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pack = temp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", SimpleFileOptions::default())
+            .expect("start entry");
+        let manifest = serde_json::json!({
+            // Has a textual `key` but none of the secret-shaped companion
+            // fields — must not be mistaken for a secret requirement.
+            "routes": [{"key": "not-a-secret", "target": "node-a"}],
+            // `key` is not text, so the map is rejected outright.
+            "indexed": [{"key": 7, "required": true}],
+            // Secret-shaped, but `required` is not a bool: defaults to true.
+            "secrets": [{"key": "loose.secret", "required": "yes"}],
+        });
+        let bytes = serde_cbor::to_vec(&manifest).expect("serialize cbor");
+        zip.write_all(&bytes).expect("write manifest");
+        zip.finish().expect("finish zip");
+
+        let reqs = load_secret_requirements_from_pack(&pack).expect("load reqs");
+        assert_eq!(reqs.len(), 1, "unexpected requirements: {reqs:?}");
+        assert_eq!(reqs[0].key, "loose.secret");
+        assert!(reqs[0].required, "non-bool `required` must default to true");
+        assert!(reqs[0].description.is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_is_a_no_op_without_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        let pack = temp.path().join("provider.gtpack");
+        write_pack_with_secret_requirements(&pack, "[]").expect("pack");
+
+        let setup = SecretsSetup::new(&bundle, "dev", "tenant-a", Some("core")).expect("setup");
+        setup
+            .ensure_pack_secrets(&pack, "messaging-telegram")
+            .await
+            .expect("ensure secrets");
+
+        assert!(
+            setup
+                .store_path()
+                .parent()
+                .is_some_and(|parent| parent.is_dir()),
+            "store parent must be created: {}",
+            setup.store_path().display()
+        );
+        assert!(
+            setup.store_path().ends_with(".dev.secrets.env"),
+            "unexpected store path: {}",
+            setup.store_path().display()
+        );
     }
 
     #[tokio::test]
