@@ -89,6 +89,7 @@ pub fn deploy_bundle_to_env(
     dry_run: bool,
     non_interactive: bool,
     customer_id: Option<&str>,
+    tenant: &str,
 ) -> Result<()> {
     // ── Step 1: resolve to an absolute .gtbundle archive file ────────────
     let _temp_dir; // keep alive until after apply returns
@@ -138,7 +139,7 @@ pub fn deploy_bundle_to_env(
     };
 
     // ── Step 3: synthesize the env-manifest document ────────────────────
-    let manifest = build_env_manifest(env_id, &bundle_id, &archive_path, customer_id);
+    let manifest = build_env_manifest(env_id, &bundle_id, &archive_path, customer_id, tenant);
 
     // ── Step 4: write to a temp file and call env-apply ─────────────────
     let manifest_file = tempfile::NamedTempFile::new().context("create temporary manifest file")?;
@@ -169,15 +170,33 @@ pub fn deploy_bundle_to_env(
 /// Split out so tests exercise the real construction instead of re-deriving it:
 /// `customer_id` is required by the deployer's `resolve_customer_id` for every
 /// non-`local` env, so dropping it here silently breaks named environments.
+///
+/// `tenant` is stamped onto the bundle's `route_binding.tenant_selector` so the
+/// deployment binds — and therefore the runtime resolves secrets — under the
+/// SAME tenant `gtc setup` wrote them to. Without it the deployer falls back to
+/// its own default tenant (`default`), which diverges from the setup CLI's
+/// default (`demo`); the runtime then reads under `default` while the secrets
+/// live under `demo`, and only the reader-side tenant fallback rescues it.
+///
+/// The deployer rejects a `tenant_selector` with no host/path matcher (a
+/// binding with no matchers is unreachable), so we pair it with a `"/"`
+/// path prefix — a match-all that is byte-equivalent, for routing, to the
+/// empty-matcher binding the implicit default produced. Only the tenant
+/// segment changes; every request still routes to this single-tenant bundle.
 fn build_env_manifest(
     env_id: &str,
     bundle_id: &str,
     archive_path: &Path,
     customer_id: Option<&str>,
+    tenant: &str,
 ) -> serde_json::Value {
     let mut bundle_entry = json!({
         "bundle_id": bundle_id,
         "bundle_path": archive_path.to_string_lossy(),
+        "route_binding": {
+            "path_prefixes": ["/"],
+            "tenant_selector": { "tenant": tenant, "team": "default" }
+        },
     });
     if let Some(cid) = customer_id {
         bundle_entry
@@ -294,6 +313,7 @@ mod tests {
             "my-bundle",
             Path::new("/tmp/my-bundle.gtbundle"),
             Some("acme-billing"),
+            "demo",
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -311,6 +331,7 @@ mod tests {
             "my-bundle",
             Path::new("/tmp/my-bundle.gtbundle"),
             None,
+            "demo",
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -318,6 +339,45 @@ mod tests {
             parsed.bundles[0].customer_id.is_none(),
             "customer_id must be absent when not provided (local env defaults it)"
         );
+    }
+
+    // ── route_binding tenant_selector carries the setup tenant ──────────
+
+    #[test]
+    fn synthesized_manifest_binds_under_the_setup_tenant() {
+        // The deployment must bind under the SAME tenant `gtc setup` wrote
+        // secrets to, so the runtime resolves them directly. Without this the
+        // deployer defaults the binding to `default` while the setup CLI
+        // defaults to `demo`, and only the reader-side tenant fallback bridges
+        // the gap. Guard both: the tenant is honored, and hosts/path_prefixes
+        // stay empty so routing is unchanged from the previous implicit default.
+        let manifest = build_env_manifest(
+            "local",
+            "my-bundle",
+            Path::new("/tmp/my-bundle.gtbundle"),
+            None,
+            "demo",
+        );
+        let parsed: EnvManifest =
+            serde_json::from_value(manifest).expect("manifest must deserialize");
+        let rb = parsed.bundles[0]
+            .route_binding
+            .as_ref()
+            .expect("route_binding must be stamped");
+        let ts = rb
+            .tenant_selector
+            .as_ref()
+            .expect("tenant_selector must be present");
+        assert_eq!(ts.tenant, "demo", "binding must use the setup tenant");
+        // A `/` match-all prefix satisfies the deployer's "tenant_selector
+        // needs a matcher" rule while routing every request to the bundle,
+        // exactly as the previous empty-matcher default binding did.
+        assert_eq!(
+            rb.path_prefixes,
+            vec!["/".to_string()],
+            "match-all `/` prefix keeps routing unchanged while satisfying the matcher rule"
+        );
+        assert!(rb.hosts.is_empty(), "no host matcher is added");
     }
 
     // ── bundle_id from bundle-manifest.json, not filename ───────────────
@@ -378,7 +438,8 @@ mod tests {
         let not_a_bundle = temp.path().join("random.txt");
         fs::write(&not_a_bundle, "hello").unwrap();
 
-        let err = deploy_bundle_to_env(&not_a_bundle, "local", true, true, None).unwrap_err();
+        let err =
+            deploy_bundle_to_env(&not_a_bundle, "local", true, true, None, "demo").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not a .gtbundle"),
@@ -394,6 +455,7 @@ mod tests {
             true,
             true,
             None,
+            "demo",
         )
         .unwrap_err();
         let msg = format!("{err:#}");

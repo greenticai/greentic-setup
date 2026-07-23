@@ -132,6 +132,7 @@ fn main() -> Result<()> {
                 cli.dry_run,
                 cli.non_interactive,
                 None,
+                &cli.tenant,
             )
         }
         Some(Command::Provider(cmd)) => {
@@ -463,6 +464,7 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             false,
             true, // non-interactive
             None,
+            &cli.tenant,
         )
         .context("auto-deploy bundle to environment")?;
 
