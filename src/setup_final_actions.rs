@@ -146,7 +146,7 @@ fn resolve_action(
             provider_id,
             Some(action_id),
             "invalid_url_scheme",
-            "resolved setup action URL must use https",
+            "resolved setup action URL must use https or a supported app deep-link scheme",
         ));
     }
     let opens_new_window = action
@@ -277,9 +277,16 @@ fn public_scalar(value: &Value) -> Option<String> {
     }
 }
 
+/// Schemes a resolved `deep_link` action URL may use. `https` is the default
+/// for hosted share links; the native-app deep-link schemes let a provider hand
+/// the user straight into its desktop/mobile client (e.g. Webex's
+/// `webexteams://im?email=…`) instead of a browser round-trip. Must stay in sync
+/// with `isSafeFinalSetupActionUrl` in `assets/setup-ui/app.js`.
+const SAFE_ACTION_URL_SCHEMES: &[&str] = &["https", "webexteams"];
+
 fn safe_action_url(url: &str) -> bool {
     Url::parse(url)
-        .map(|parsed| parsed.scheme() == "https")
+        .map(|parsed| SAFE_ACTION_URL_SCHEMES.contains(&parsed.scheme()))
         .unwrap_or(false)
 }
 
@@ -398,6 +405,30 @@ mod tests {
         );
 
         assert_eq!(resolved.actions[0].url, "https://t.me/bot%20name");
+    }
+
+    #[test]
+    fn resolves_webex_native_app_deep_link_scheme() {
+        // Webex's "Add to Webex" action hands the user straight to the native
+        // client via a `webexteams://` deep link. It must survive the scheme
+        // allowlist rather than being rejected as an unsafe scheme.
+        let resolved = resolve_final_setup_actions(
+            "messaging-test",
+            &descriptor(json!({
+                "id": "add-to-webex",
+                "label": "Add to Webex",
+                "kind": "deep_link",
+                "url_template": "webexteams://im?email={bot_email}",
+                "requires": ["bot_email"]
+            })),
+            &json!({"values": {"bot_email": "barbara@example.com"}}),
+        );
+
+        assert_eq!(
+            resolved.actions[0].url,
+            "webexteams://im?email=barbara%40example.com"
+        );
+        assert!(resolved.diagnostics.is_empty());
     }
 
     #[test]
