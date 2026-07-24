@@ -22,7 +22,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use greentic_deployer::cli::dispatch::print_outcome;
 use greentic_deployer::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
-use greentic_deployer::environment::LocalFsStore;
+use greentic_deployer::environment::{EnvFlock, LocalFsStore, atomic_write_bytes};
 use serde_json::json;
 
 use crate::gtbundle;
@@ -229,22 +229,35 @@ fn build_env_manifest(
 /// no-op — first deploy wins; an operator's explicit choice or an earlier
 /// deploy is never silently re-pointed.
 ///
+/// The read-modify-write runs under the per-env flock (the same lock the
+/// deployer's `LocalFsStore::transact` acquires) so two concurrent deploys
+/// cannot race past the "already set?" check. The write itself goes through
+/// the deployer's atomic-write helper (temp + rename + fsync) so a crash
+/// mid-write never leaves a truncated `environment.json`.
+///
 /// Reads / writes `environment.json` as raw JSON (the same approach
 /// [`auto_detect_bundle_id`](crate::provider_commands::auto_detect_bundle_id)
-/// uses) because `EnvId` is a `greentic-deploy-spec` type that is not in
-/// this crate's direct dependency graph.
+/// uses) rather than the typed `Environment` struct, because the stamp is a
+/// single-field patch and the raw path avoids coupling to the full schema.
 fn stamp_default_bundle_if_unset(
     store: &LocalFsStore,
     env_id: &str,
     bundle_id: &str,
 ) -> Result<()> {
-    let env_json_path = store.root().join(env_id).join("environment.json");
+    let env_dir = store.root().join(env_id);
+    let env_json_path = env_dir.join("environment.json");
     if !env_json_path.is_file() {
         // The apply engine should have created this. If it didn't (e.g.
         // the env was torn down mid-apply), skip rather than hard-fail —
         // the deploy itself already printed its outcome.
         return Ok(());
     }
+
+    // Acquire the per-env flock so concurrent deploys serialize here.
+    let lock_path = env_dir.join(".lock");
+    let _guard = EnvFlock::acquire(&lock_path)
+        .with_context(|| format!("acquire env lock for `{env_id}`"))?;
+
     let raw = std::fs::read_to_string(&env_json_path)
         .with_context(|| format!("read {}", env_json_path.display()))?;
     let mut doc: serde_json::Value =
@@ -266,8 +279,8 @@ fn stamp_default_bundle_if_unset(
         );
         let updated =
             serde_json::to_string_pretty(&doc).context("serialize updated environment.json")?;
-        std::fs::write(&env_json_path, updated)
-            .with_context(|| format!("write {}", env_json_path.display()))?;
+        atomic_write_bytes(&env_json_path, updated.as_bytes())
+            .with_context(|| format!("atomic write {}", env_json_path.display()))?;
     }
 
     Ok(())
