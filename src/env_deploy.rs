@@ -162,6 +162,18 @@ pub fn deploy_bundle_to_env(
         Default::default(),
     )?;
     print_outcome(&outcome)?;
+
+    // ── Step 5: record this as the default bundle (first deploy wins) ──
+    //
+    // When the environment has no `host_config.default_bundle` yet, stamp
+    // the just-deployed bundle so the bare webchat URL
+    // `/v1/web/webchat/{tenant}/` resolves without the fallback ladder.
+    // FIRST DEPLOY WINS — an operator's explicit choice (or an earlier
+    // deploy) is never overwritten; and a dry-run never mutates the store.
+    if !dry_run {
+        stamp_default_bundle_if_unset(&store, env_id, &bundle_id)?;
+    }
+
     Ok(())
 }
 
@@ -210,6 +222,55 @@ fn build_env_manifest(
         "trust_root": "bootstrap",
         "bundles": [bundle_entry]
     })
+}
+
+/// If `host_config.default_bundle` is absent (or JSON-null), set it to
+/// `bundle_id` and write the environment back. If already set, this is a
+/// no-op — first deploy wins; an operator's explicit choice or an earlier
+/// deploy is never silently re-pointed.
+///
+/// Reads / writes `environment.json` as raw JSON (the same approach
+/// [`auto_detect_bundle_id`](crate::provider_commands::auto_detect_bundle_id)
+/// uses) because `EnvId` is a `greentic-deploy-spec` type that is not in
+/// this crate's direct dependency graph.
+fn stamp_default_bundle_if_unset(
+    store: &LocalFsStore,
+    env_id: &str,
+    bundle_id: &str,
+) -> Result<()> {
+    let env_json_path = store.root().join(env_id).join("environment.json");
+    if !env_json_path.is_file() {
+        // The apply engine should have created this. If it didn't (e.g.
+        // the env was torn down mid-apply), skip rather than hard-fail —
+        // the deploy itself already printed its outcome.
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&env_json_path)
+        .with_context(|| format!("read {}", env_json_path.display()))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", env_json_path.display()))?;
+
+    let already_set = doc
+        .pointer("/host_config/default_bundle")
+        .is_some_and(|v| !v.is_null());
+    if already_set {
+        return Ok(());
+    }
+
+    // Stamp the field. `host_config` must exist (the apply engine writes
+    // it), but guard defensively.
+    if let Some(hc) = doc.get_mut("host_config").and_then(|v| v.as_object_mut()) {
+        hc.insert(
+            "default_bundle".to_string(),
+            serde_json::Value::String(bundle_id.to_string()),
+        );
+        let updated =
+            serde_json::to_string_pretty(&doc).context("serialize updated environment.json")?;
+        std::fs::write(&env_json_path, updated)
+            .with_context(|| format!("write {}", env_json_path.display()))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -444,6 +505,122 @@ mod tests {
         assert!(
             msg.contains("not a .gtbundle"),
             "expected clear error for non-bundle file, got: {msg}"
+        );
+    }
+
+    // ── default_bundle stamping (first deploy wins) ──────────────────
+
+    /// Write a minimal `environment.json` into a temp store so
+    /// `stamp_default_bundle_if_unset` has something to read.
+    fn write_env_json(store: &LocalFsStore, env_id: &str, doc: &serde_json::Value) {
+        let dir = store.root().join(env_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("environment.json"),
+            serde_json::to_string_pretty(doc).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_env_json(store: &LocalFsStore, env_id: &str) -> serde_json::Value {
+        let raw = fs::read_to_string(store.root().join(env_id).join("environment.json")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// Minimal environment.json skeleton — just enough for
+    /// `stamp_default_bundle_if_unset` (it only touches `host_config`).
+    fn env_json_skeleton(env_id: &str) -> serde_json::Value {
+        json!({
+            "schema": "greentic.environment.v1",
+            "environment_id": env_id,
+            "name": env_id,
+            "host_config": {
+                "env_id": env_id
+            },
+            "packs": [],
+            "bundles": [],
+            "revisions": [],
+            "traffic_splits": [],
+            "messaging_endpoints": [],
+            "extensions": [],
+            "revocation": {},
+            "retention": {},
+            "health": {}
+        })
+    }
+
+    #[test]
+    fn first_deploy_stamps_default_bundle() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        write_env_json(&store, "local", &env_json_skeleton("local"));
+
+        stamp_default_bundle_if_unset(&store, "local", "my-bundle").unwrap();
+
+        let doc = read_env_json(&store, "local");
+        assert_eq!(
+            doc.pointer("/host_config/default_bundle")
+                .and_then(|v| v.as_str()),
+            Some("my-bundle"),
+            "first deploy must stamp default_bundle"
+        );
+    }
+
+    #[test]
+    fn second_deploy_does_not_overwrite_default_bundle() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let mut doc = env_json_skeleton("local");
+        doc["host_config"]["default_bundle"] = json!("first-bundle");
+        write_env_json(&store, "local", &doc);
+
+        stamp_default_bundle_if_unset(&store, "local", "second-bundle").unwrap();
+
+        let doc = read_env_json(&store, "local");
+        assert_eq!(
+            doc.pointer("/host_config/default_bundle")
+                .and_then(|v| v.as_str()),
+            Some("first-bundle"),
+            "second deploy must NOT overwrite the existing default_bundle"
+        );
+    }
+
+    #[test]
+    fn default_bundle_round_trips_through_json() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        write_env_json(&store, "local", &env_json_skeleton("local"));
+
+        stamp_default_bundle_if_unset(&store, "local", "round-trip-bundle").unwrap();
+
+        // Re-read and re-parse to verify the value survives a write/read cycle.
+        let raw = fs::read_to_string(store.root().join("local").join("environment.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            doc.pointer("/host_config/default_bundle")
+                .and_then(|v| v.as_str()),
+            Some("round-trip-bundle"),
+            "default_bundle must survive a JSON round-trip"
+        );
+        // The rest of the document must be intact.
+        assert_eq!(
+            doc.pointer("/environment_id").and_then(|v| v.as_str()),
+            Some("local"),
+        );
+        assert_eq!(
+            doc.pointer("/host_config/env_id").and_then(|v| v.as_str()),
+            Some("local"),
+        );
+    }
+
+    #[test]
+    fn stamp_skips_when_env_json_is_missing() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        // No environment.json at all.
+        assert!(
+            stamp_default_bundle_if_unset(&store, "local", "bundle").is_ok(),
+            "missing environment.json must not be an error"
         );
     }
 
