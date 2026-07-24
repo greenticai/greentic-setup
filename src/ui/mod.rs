@@ -7242,8 +7242,18 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     eprintln!("Setup tunnel: spawning {mode} tunnel for {local_base_url}");
     let mode_for_task = mode.to_string();
     let local_base_url_for_task = local_base_url.clone();
+    // For the Greentic self-hosted tunnel, derive the tunnel id from tenant/team
+    // (same rule greentic-start uses) so setup and start share one agent.
+    let gtunnel_ctx = if mode == "gtunnel" {
+        let team = state.team.as_deref().unwrap_or("default");
+        Some(crate::setup_tunnel::GtunnelSetupCtx::new(
+            crate::setup_tunnel::derive_gtunnel_id(&state.tenant, team),
+        ))
+    } else {
+        None
+    };
     let tunnel = tokio::task::spawn_blocking(move || {
-        start_setup_tunnel(&mode_for_task, &local_base_url_for_task)
+        start_setup_tunnel(&mode_for_task, &local_base_url_for_task, gtunnel_ctx)
     })
     .await
     .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;

@@ -53,8 +53,63 @@ impl SetupTunnel {
     }
 }
 
+/// Default Greentic-operated Worker tunnel base (mirrors greentic-start's
+/// `gtunnel::DEFAULT_WORKER_BASE_URL`; the crates don't share a dependency).
+const DEFAULT_GTUNNEL_WORKER_BASE_URL: &str = "https://greentic-webhook-proxy.greentic.workers.dev";
+
+/// Everything the setup binary needs to bring up the Greentic self-hosted tunnel.
+/// Derived by the caller (from tenant/team + env) so setup and start compute the
+/// same tunnel id and share one agent.
+#[derive(Clone, Debug)]
+pub struct GtunnelSetupCtx {
+    pub worker_url: String,
+    pub tunnel_id: String,
+    pub secret: String,
+}
+
+/// Derive a URL-path-safe tunnel id from tenant/team — identical to
+/// greentic-start's rule so both binaries key on the same id and share an agent.
+pub fn derive_gtunnel_id(tenant: &str, team: &str) -> String {
+    let raw = format!("{tenant}-{team}");
+    let slug: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed
+    }
+}
+
+impl GtunnelSetupCtx {
+    /// Zero-config context from the environment (worker URL / secret) plus an
+    /// explicit tunnel id. Used when the caller already derived the id.
+    pub fn new(tunnel_id: String) -> Self {
+        Self {
+            worker_url: std::env::var("GREENTIC_TUNNEL_WORKER_URL")
+                .unwrap_or_else(|_| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string()),
+            tunnel_id,
+            secret: std::env::var("GREENTIC_TUNNEL_SECRET").unwrap_or_default(),
+        }
+    }
+}
+
+fn gtunnel_ctx_from_env() -> GtunnelSetupCtx {
+    GtunnelSetupCtx::new(
+        std::env::var("GREENTIC_TUNNEL_ID").unwrap_or_else(|_| "default".to_string()),
+    )
+}
+
 pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -> bool {
-    matches!(mode, "cloudflared" | "ngrok")
+    matches!(mode, "cloudflared" | "ngrok" | "gtunnel")
         && answers.values().any(|provider_answers| {
             let Some(obj) = provider_answers.as_object() else {
                 return false;
@@ -70,7 +125,11 @@ pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -
         })
 }
 
-pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunnel> {
+pub fn start_setup_tunnel(
+    mode: &str,
+    local_base_url: &str,
+    gtunnel: Option<GtunnelSetupCtx>,
+) -> Result<SetupTunnel> {
     match mode {
         "cloudflared" => start_cloudflared_shared(local_base_url),
         "ngrok" => {
@@ -83,8 +142,119 @@ pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunne
                 kill_on_drop: true,
             })
         }
+        "gtunnel" => {
+            let ctx = gtunnel.unwrap_or_else(gtunnel_ctx_from_env);
+            start_gtunnel_shared(local_base_url, &ctx)
+        }
         other => Err(anyhow!("unsupported setup tunnel mode: {other}")),
     }
+}
+
+/// Adopt (or spawn) the Greentic self-hosted tunnel agent under the machine-wide
+/// shared record for this port, so `greentic-start` reuses the same agent. The
+/// public URL is deterministic (`<worker>/<tunnel_id>`) — no discovery needed.
+fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<SetupTunnel> {
+    let mode = "gtunnel";
+    let port = crate::shared_tunnel::local_port_from_base_url(local_base_url)
+        .ok_or_else(|| anyhow!("cannot derive a local port from {local_base_url}"))?;
+    let paths = crate::shared_tunnel::shared_service_tunnel_paths(mode, port);
+    let _lock =
+        crate::shared_tunnel::TunnelLock::acquire(&paths.lock_path, Duration::from_secs(30))?;
+
+    let public_base_url = format!("{}/{}", ctx.worker_url.trim_end_matches('/'), ctx.tunnel_id);
+
+    // Reuse a live agent (ours or greentic-start's) rather than spawn a second —
+    // the Worker allows only one socket per tunnel id.
+    let (recorded_pid, _recorded_url) = crate::shared_tunnel::read_record(&paths);
+    if let Some(pid) = recorded_pid
+        && crate::shared_tunnel::process_alive(pid)
+    {
+        eprintln!("Reusing shared {mode} agent (pid {pid}): {public_base_url}");
+        let _ = crate::shared_tunnel::write_record(&paths, pid, &public_base_url);
+        return Ok(reuse_shared_tunnel(mode, local_base_url, public_base_url));
+    }
+    crate::shared_tunnel::clear_record(&paths);
+
+    let child = spawn_gtunnel_agent(local_base_url, ctx, &paths.log_path)?;
+    if let Err(err) = crate::shared_tunnel::write_record(&paths, child.id(), &public_base_url) {
+        eprintln!("warning: could not publish shared gtunnel record: {err:#}");
+    }
+    eprintln!("Setup tunnel started via {mode}: {public_base_url}");
+    Ok(SetupTunnel {
+        mode: mode.to_string(),
+        local_base_url: local_base_url.trim_end_matches('/').to_string(),
+        public_base_url,
+        child: Some(child),
+        kill_on_drop: false,
+    })
+}
+
+/// Spawn `greentic-start __tunnel-agent`, forwarding to `local_base_url`, with
+/// stdout/stderr redirected to the shared tunnel log.
+fn spawn_gtunnel_agent(
+    local_base_url: &str,
+    ctx: &GtunnelSetupCtx,
+    log_path: &Path,
+) -> Result<Child> {
+    let binary = resolve_gtunnel_agent_binary()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("open gtunnel log {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .with_context(|| "clone gtunnel log handle")?;
+
+    let ws_base = if let Some(rest) = ctx
+        .worker_url
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+    {
+        format!("wss://{rest}")
+    } else if let Some(rest) = ctx.worker_url.trim_end_matches('/').strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        ctx.worker_url.trim_end_matches('/').to_string()
+    };
+    let edge_url = format!("{ws_base}/{}/_tunnel", ctx.tunnel_id);
+
+    Command::new(&binary)
+        .arg("__tunnel-agent")
+        .env("GREENTIC_TUNNEL_EDGE_URL", edge_url)
+        .env("GREENTIC_TUNNEL_SECRET", &ctx.secret)
+        .env(
+            "GREENTIC_TUNNEL_TARGET",
+            local_base_url.trim_end_matches('/'),
+        )
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .with_context(|| format!("spawn gtunnel agent via {}", binary.display()))
+}
+
+/// Locate the `greentic-start` binary that hosts the `__tunnel-agent` subcommand:
+/// explicit `GREENTIC_TUNNEL_AGENT_BIN`, else the first `greentic-start` on PATH.
+fn resolve_gtunnel_agent_binary() -> Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os("GREENTIC_TUNNEL_AGENT_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(anyhow!(
+            "GREENTIC_TUNNEL_AGENT_BIN points at {}, which does not exist",
+            path.display()
+        ));
+    }
+    resolve_path_binary("greentic-start").ok_or_else(|| {
+        anyhow!(
+            "greentic-start not found on PATH (needed to run the tunnel agent); \
+             set GREENTIC_TUNNEL_AGENT_BIN to its location"
+        )
+    })
 }
 
 /// Build a [`SetupTunnel`] that reuses an already-running shared tunnel: there
@@ -1112,7 +1282,7 @@ mod tests {
 
     #[test]
     fn start_setup_tunnel_unsupported_mode() {
-        let result = start_setup_tunnel("unknown", "http://127.0.0.1:8080");
+        let result = start_setup_tunnel("unknown", "http://127.0.0.1:8080", None);
         assert!(result.is_err());
         let err = result.err().expect("should be Err");
         assert!(

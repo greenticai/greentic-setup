@@ -101,7 +101,9 @@ pub fn maybe_start_cli_setup_tunnel(
         return Ok(None);
     }
 
-    let tunnel = crate::setup_tunnel::start_setup_tunnel(&mode, local_base_url)?;
+    // gtunnel context (tunnel id) falls back to env here; the interactive UI
+    // path derives it from tenant/team. See setup_tunnel::start_setup_tunnel.
+    let tunnel = crate::setup_tunnel::start_setup_tunnel(&mode, local_base_url, None)?;
     inject_setup_public_base_url(&mut loaded.setup_answers, &tunnel.public_base_url);
     persist_tunnel_handoff(bundle_root, &tunnel);
     Ok(Some(tunnel))
