@@ -38,7 +38,11 @@ flate2 = "1"
 # from that lock — so a bundle's provider packs reached the runtime not at all
 # (webchat GUI 405 on `/v1/web/webchat/{tenant}/`). Nothing failed to compile, so
 # only the floor keeps a `--locked` release build off the broken copy.
-greentic-deployer = { version = ">=1.1.15, <1.2.0-0", default-features = false }
+# Floor raised to 1.1.27 in lockstep with deploy-spec 0.2.5: `env-deploy` stamps
+# `EnvironmentHostConfig::default_bundle`, which 0.2.5 adds, and 1.1.26 and below
+# construct that struct with literals — the new spec against an older deployer is
+# E0063 rather than a missing-method error.
+greentic-deployer = { version = ">=1.1.27, <1.2.0-0", default-features = false }
 greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 # Floor 1.1.6: every publish below it declares `async-nats = "0.46"` NON-optionally, and
 # every async-nats 0.46.x hard-pins `rustls-webpki = "0.102"`. Its newest release, 0.102.8,
