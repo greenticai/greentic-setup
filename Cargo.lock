@@ -1191,6 +1191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2242,9 +2251,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.2.2"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33844530b686aac0b28dd2a4470a028b50d00fa51ee60dd26b6c9e81507b7dc3"
+checksum = "9201a90bc9f590a95b50409dc42eff039f98ebe1ff8f9ebe8c7a10508b8570b2"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2263,9 +2272,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.15"
+version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4c7fd4777caad1821c8d58e7ce5581afc163a3d67323097d60cbb36f8b3217e"
+checksum = "a4423922af13da898524f1b9d9452a8783c4c680d3751cb46459ee74fc08f751"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2277,11 +2286,12 @@ dependencies = [
  "greentic-bundle",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.5",
  "greentic-distributor-client",
  "greentic-operator-trust",
  "greentic-secrets-lib",
  "greentic-telemetry",
+ "greentic-trust",
  "greentic-types",
  "greentic-update",
  "hex",
@@ -2466,7 +2476,7 @@ checksum = "a031e3571c44d2aa0e1ee91c1bc18dc6393140aabfea9f73d53637cffb68d717"
 dependencies = [
  "chrono",
  "ed25519-dalek",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.5",
  "greentic-distributor-client",
  "hex",
  "libc",
@@ -2546,7 +2556,7 @@ dependencies = [
  "futures",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.5",
  "greentic-distributor-client",
  "greentic-flow",
  "greentic-interfaces",
@@ -2795,6 +2805,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "greentic-trust"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3107e6a10f98d6ddb6deb40a74ea05f287bf6ec10ac8953d0682145e8206f884"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "moka",
+ "rand_core 0.6.4",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "greentic-types"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2838,9 +2869,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "0.1.28859386871"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a47eb7b004ef9ad38b5d11acd9561c4b0cf28f9126c9cfe1d86fcf8ae66c6691"
+checksum = "c7cf9c5acb583c412ff792722a94760d1ea088850312b860058253eaba40f1de"
 dependencies = [
  "chrono",
  "flate2",
@@ -3844,6 +3875,26 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moka"
+version = "0.12.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "957228ad12042ee839f93c8f257b62b4c0ab5eaae1d4fa60de53b27c9d7c5046"
+dependencies = [
+ "async-lock",
+ "crossbeam-channel",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "equivalent",
+ "event-listener",
+ "futures-util",
+ "parking_lot",
+ "portable-atomic",
+ "smallvec",
+ "tagptr",
+ "uuid",
 ]
 
 [[package]]
@@ -5283,6 +5334,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5457,6 +5514,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacecf649bc1a7c5f0e299cc813977c6a78116abda2b93b1ee01735b71ead9a8"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6038,6 +6106,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "tagptr"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tap"
