@@ -164,14 +164,24 @@ fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<S
     let public_base_url = format!("{}/{}", ctx.worker_url.trim_end_matches('/'), ctx.tunnel_id);
 
     // Reuse a live agent (ours or greentic-start's) rather than spawn a second —
-    // the Worker allows only one socket per tunnel id.
+    // the Worker allows only one socket per tunnel id. But a pid can be alive
+    // while its WebSocket to the Worker is dead, so only adopt an agent that is
+    // actually SERVING; a stale one is killed and replaced (so the caller's
+    // reachability probe doesn't just fail on a reused-but-dead tunnel).
     let (recorded_pid, _recorded_url) = crate::shared_tunnel::read_record(&paths);
     if let Some(pid) = recorded_pid
         && crate::shared_tunnel::process_alive(pid)
     {
-        eprintln!("Reusing shared {mode} agent (pid {pid}): {public_base_url}");
-        let _ = crate::shared_tunnel::write_record(&paths, pid, &public_base_url);
-        return Ok(reuse_shared_tunnel(mode, local_base_url, public_base_url));
+        if gtunnel_serving(&public_base_url) {
+            eprintln!("Reusing shared {mode} agent (pid {pid}): {public_base_url}");
+            let _ = crate::shared_tunnel::write_record(&paths, pid, &public_base_url);
+            return Ok(reuse_shared_tunnel(mode, local_base_url, public_base_url));
+        }
+        eprintln!(
+            "Shared {mode} agent (pid {pid}) is alive but {public_base_url} is not serving — \
+             replacing the stale tunnel"
+        );
+        crate::shared_tunnel::terminate_recorded_pid_named(pid, "greentic-start");
     }
     crate::shared_tunnel::clear_record(&paths);
 
@@ -187,6 +197,22 @@ fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<S
         child: Some(child),
         kill_on_drop: false,
     })
+}
+
+/// Whether the tunnel serves end to end: a bounded GET to the public URL. A
+/// routed response (2xx/3xx/4xx) proves the agent is connected and forwarding;
+/// the Worker's `502 tunnel offline` (or any 5xx / transport error) means the
+/// recorded agent is stale. `< 500` mirrors `setup_backend_public_tunnel_responds`.
+fn gtunnel_serving(public_url: &str) -> bool {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    match agent.get(public_url).call() {
+        Ok(_) => true,
+        Err(ureq::Error::StatusCode(code)) => code < 500,
+        Err(_) => false,
+    }
 }
 
 /// Spawn `greentic-start __tunnel-agent`, forwarding to `local_base_url`, with

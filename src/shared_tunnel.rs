@@ -152,22 +152,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// PID reuse: a recorded pid recycled by the OS onto an unrelated process
 /// must neither count as tunnel liveness nor be terminated.
 fn process_is_cloudflared(pid: u32) -> bool {
+    process_matches(pid, "cloudflared")
+}
+
+/// Whether `pid`'s command line contains `needle`. Guards `terminate_*` against
+/// PID reuse: a recorded pid recycled by the OS onto an unrelated process must
+/// neither count as liveness nor be terminated.
+pub(crate) fn process_matches(pid: u32, needle: &str) -> bool {
     #[cfg(unix)]
     {
         std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "command="])
             .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("cloudflared"))
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(needle))
     }
     #[cfg(windows)]
     {
+        let needle = needle.to_ascii_lowercase();
         std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .output()
             .is_ok_and(|out| {
                 String::from_utf8_lossy(&out.stdout)
                     .to_ascii_lowercase()
-                    .contains("cloudflared")
+                    .contains(&needle)
             })
     }
 }
@@ -177,8 +185,15 @@ fn process_is_cloudflared(pid: u32) -> bool {
 /// and even then only when the pid still runs cloudflared, so a recycled pid
 /// cannot get an unrelated process killed.
 pub fn terminate_recorded_pid(pid: u32) {
-    if !process_is_cloudflared(pid) {
-        eprintln!("Shared tunnel: recorded pid {pid} is not a cloudflared process — not killing");
+    terminate_recorded_pid_named(pid, "cloudflared");
+}
+
+/// Terminate the recorded process, but only when its command line still matches
+/// `needle` (e.g. "greentic-start" for the gtunnel agent) — same PID-reuse guard
+/// as [`terminate_recorded_pid`], generalized to non-cloudflared tunnels.
+pub fn terminate_recorded_pid_named(pid: u32, needle: &str) {
+    if !process_matches(pid, needle) {
+        eprintln!("Shared tunnel: recorded pid {pid} is not a {needle} process — not killing");
         return;
     }
     #[cfg(unix)]
