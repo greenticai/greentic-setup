@@ -90,15 +90,109 @@ pub fn derive_gtunnel_id(tenant: &str, team: &str) -> String {
 }
 
 impl GtunnelSetupCtx {
-    /// Zero-config context from the environment (worker URL / secret) plus an
-    /// explicit tunnel id. Used when the caller already derived the id.
+    /// Zero-config context: worker URL from env/default and a per-tunnel secret
+    /// provisioned for `tunnel_id` (generated + persisted + pushed to the Worker
+    /// KV on first use). Setup owns provisioning; greentic-start only reads.
     pub fn new(tunnel_id: String) -> Self {
+        let secret = provision_tunnel_secret(&tunnel_id);
         Self {
             worker_url: std::env::var("GREENTIC_TUNNEL_WORKER_URL")
                 .unwrap_or_else(|_| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string()),
             tunnel_id,
-            secret: std::env::var("GREENTIC_TUNNEL_SECRET").unwrap_or_default(),
+            secret,
         }
+    }
+}
+
+/// Machine-wide per-tunnel secret file (shared on-disk format with
+/// greentic-start, which only reads it): `<root>/secrets/<tunnelId>`.
+fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
+    let root = std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".greentic")
+                .join("tunnel")
+        });
+    root.join("secrets").join(tunnel_id)
+}
+
+/// Resolve or provision the per-tunnel secret: explicit env override, else the
+/// local store, else generate a fresh one — persisting it locally AND pushing it
+/// to the Worker's SECRETS KV so the agent's registration is accepted.
+fn provision_tunnel_secret(tunnel_id: &str) -> String {
+    if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
+        && !secret.is_empty()
+    {
+        return secret;
+    }
+    let path = tunnel_secret_path(tunnel_id);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+
+    let secret = generate_secret();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(&path, &secret) {
+        eprintln!(
+            "gtunnel: failed to persist per-tunnel secret at {}: {err:#}",
+            path.display()
+        );
+    }
+    push_secret_to_kv(tunnel_id, &secret);
+    secret
+}
+
+/// A random 256-bit secret as lowercase hex.
+fn generate_secret() -> String {
+    (0..32)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect()
+}
+
+/// Publish a per-tunnel secret to the Worker's SECRETS KV via the Cloudflare API.
+/// Best-effort: needs CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID /
+/// GREENTIC_TUNNEL_KV_NAMESPACE_ID. Without them the secret is stored locally
+/// only and the agent falls back to the Worker's global secret.
+///
+/// NOTE (multi-customer hardening): this writes KV directly with a CF token on
+/// the setup box. For untrusted customer boxes, route it through an authorized
+/// Greentic endpoint instead — a drop-in swap that needs no agent changes.
+fn push_secret_to_kv(tunnel_id: &str, secret: &str) {
+    let (Ok(token), Ok(account), Ok(namespace)) = (
+        std::env::var("CLOUDFLARE_API_TOKEN"),
+        std::env::var("CLOUDFLARE_ACCOUNT_ID"),
+        std::env::var("GREENTIC_TUNNEL_KV_NAMESPACE_ID"),
+    ) else {
+        eprintln!(
+            "gtunnel: CF KV credentials not set (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / \
+             GREENTIC_TUNNEL_KV_NAMESPACE_ID); stored the per-tunnel secret for {tunnel_id} \
+             locally only — the agent will use the Worker's global secret until it is pushed"
+        );
+        return;
+    };
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{account}/storage/kv/namespaces/{namespace}/values/{tunnel_id}"
+    );
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    match agent
+        .put(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .send(secret)
+    {
+        Ok(_) => eprintln!("gtunnel: provisioned per-tunnel secret for {tunnel_id} into Worker KV"),
+        Err(err) => eprintln!("gtunnel: failed to push secret for {tunnel_id} to Worker KV: {err}"),
     }
 }
 
@@ -713,6 +807,22 @@ mod tests {
     use serde_json::{Map as JsonMap, Value, json};
 
     use super::*;
+
+    #[test]
+    fn generate_secret_is_64_hex_chars_and_random() {
+        let a = generate_secret();
+        let b = generate_secret();
+        assert_eq!(a.len(), 64, "256-bit secret is 64 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two provisions must differ");
+    }
+
+    #[test]
+    fn derive_gtunnel_id_matches_start_rule() {
+        assert_eq!(derive_gtunnel_id("Acme Corp", "Team A"), "acme-corp-team-a");
+        assert_eq!(derive_gtunnel_id("demo", "default"), "demo-default");
+        assert_eq!(derive_gtunnel_id("", ""), "default");
+    }
 
     // ---- should_start_setup_tunnel ----
 
