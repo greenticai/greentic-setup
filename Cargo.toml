@@ -47,7 +47,12 @@ flate2 = "1"
 # resolves it transitively through the deployer, so this floor is what protects
 # it. 1.1.29, not 1.1.28: main cut and published 1.1.28 from #520 while this
 # work was open, so that release predates the conversion.
-greentic-deployer = { version = ">=1.1.29, <1.2.0-0", default-features = false }
+# Floor raised to 1.1.30: deployer 1.1.30 adds `ManifestEnvironment.default_bundle`
+# (deployer#523, closing #521), which the two test-only manifest literals in
+# `src/env_wizard.rs` now name. Those literals are exhaustive, so building this
+# crate's tests against 1.1.29 fails with E0063. An API floor, not a behaviour
+# one — the lib and bin compile against either release.
+greentic-deployer = { version = ">=1.1.30, <1.2.0-0", default-features = false }
 greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 # Floor 1.1.6: every publish below it declares `async-nats = "0.46"` NON-optionally, and
 # every async-nats 0.46.x hard-pins `rustls-webpki = "0.102"`. Its newest release, 0.102.8,
