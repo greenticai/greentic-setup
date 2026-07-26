@@ -3,7 +3,23 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use greentic_types::DEFAULT_TENANT;
+
+/// Tenant a command binds, deploys, or writes secrets under when the operator
+/// names none.
+///
+/// Must equal `greentic_types::DEFAULT_TENANT`. It is duplicated rather than
+/// imported because raising the greentic-types floor to 1.1.4 drags ten crates
+/// back to 1.1.0 — `greentic-session 1.1.1` requires greentic-types `=1.1.2`
+/// exactly. `every_tenant_arg_in_the_command_tree_uses_the_shared_constant`
+/// and the literal assertion below guard the copy; delete it in favour of the
+/// import once that pin is relaxed.
+///
+/// Was `demo`, which disagreed with greentic-deployer and produced
+/// environments serving deployments under two tenants — tolerated by a dev
+/// store, refused by the Vault activation gate.
+const DEFAULT_TENANT: &str = "default";
+/// Team half of [`DEFAULT_TENANT`]. This one never diverged.
+pub(crate) const DEFAULT_TEAM: &str = "default";
 
 #[derive(Parser, Debug)]
 #[command(name = "greentic-setup")]
@@ -535,6 +551,10 @@ mod tests {
         let cli = Cli::parse_from(["greentic-setup", "env-deploy", "b.gtbundle"]);
         assert_eq!(cli.tenant, DEFAULT_TENANT);
         assert_ne!(cli.tenant, "demo");
+        // Pin the literal too: this is a copy of greentic_types::DEFAULT_TENANT
+        // that exists only because the greentic-types floor cannot move.
+        assert_eq!(DEFAULT_TENANT, "default");
+        assert_eq!(DEFAULT_TEAM, "default");
     }
 
     /// Every `--tenant` in the whole command tree, not just the ones that

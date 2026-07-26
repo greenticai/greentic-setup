@@ -23,9 +23,9 @@ use anyhow::{Context, Result, bail};
 use greentic_deployer::cli::dispatch::print_outcome;
 use greentic_deployer::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
 use greentic_deployer::environment::{EnvFlock, LocalFsStore, atomic_write_bytes};
-use greentic_types::DEFAULT_TEAM;
 use serde_json::json;
 
+use crate::cli_args::DEFAULT_TEAM;
 use crate::gtbundle;
 
 /// Bundle-manifest filename inside a built `.gtbundle` archive / directory.
@@ -221,10 +221,9 @@ fn build_env_manifest(
         "bundle_path": archive_path.to_string_lossy(),
         "route_binding": {
             "path_prefixes": ["/"],
-            // `DEFAULT_TEAM` comes from greentic-types, the same place the
-            // deployer takes its own implicit team from. That is the point of
-            // the constant: the two ends of this handoff cannot drift apart
-            // again the way the tenant defaults did.
+            // `DEFAULT_TEAM` holds the same value greentic-types publishes as
+            // `DEFAULT_TEAM` and the deployer applies for its own implicit
+            // team; see `cli_args::DEFAULT_TENANT` for why it is a local copy.
             "tenant_selector": { "tenant": tenant, "team": team.unwrap_or(DEFAULT_TEAM) }
         },
     });
