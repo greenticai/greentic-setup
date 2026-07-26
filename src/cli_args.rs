@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use greentic_types::DEFAULT_TENANT;
 
 #[derive(Parser, Debug)]
 #[command(name = "greentic-setup")]
@@ -60,7 +61,7 @@ pub struct Cli {
     pub key: Option<String>,
 
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo", global = true)]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT, global = true)]
     pub tenant: String,
 
     /// Team identifier
@@ -220,7 +221,7 @@ pub struct BundleAddArgs {
     #[arg(long = "bundle", short = 'b')]
     pub bundle: Option<PathBuf>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -249,7 +250,7 @@ pub struct BundleSetupArgs {
     #[arg(long = "key", value_name = "KEY")]
     pub key: Option<String>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -296,7 +297,7 @@ pub struct BundleSetupStatusArgs {
     #[arg(long = "bundle", short = 'b')]
     pub bundle: Option<PathBuf>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -318,7 +319,7 @@ pub struct BundleSetupNextArgs {
     #[arg(long = "bundle", short = 'b')]
     pub bundle: Option<PathBuf>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -343,7 +344,7 @@ pub struct BundleSetupRetryArgs {
     #[arg(long = "bundle", short = 'b')]
     pub bundle: Option<PathBuf>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -368,7 +369,7 @@ pub struct BundleSetupResetArgs {
     #[arg(long = "bundle", short = 'b')]
     pub bundle: Option<PathBuf>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -390,7 +391,7 @@ pub struct BundleSetupMigrateArgs {
     #[arg(long = "bundle", short = 'b')]
     pub bundle: Option<PathBuf>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -412,7 +413,7 @@ pub struct BundleRemoveArgs {
     #[arg(long = "bundle", short = 'b')]
     pub bundle: Option<PathBuf>,
     /// Tenant identifier
-    #[arg(long = "tenant", short = 't', default_value = "demo")]
+    #[arg(long = "tenant", short = 't', default_value = DEFAULT_TENANT)]
     pub tenant: String,
     /// Team identifier
     #[arg(long = "team")]
@@ -516,4 +517,65 @@ pub struct ProviderRemoveArgs {
     /// Endpoint id to remove (from `provider list`)
     #[arg(value_name = "ENDPOINT_ID")]
     pub endpoint_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// The tenant a bundle binds under when the operator names none.
+    ///
+    /// This used to be `demo` while greentic-deployer used `default`, so the
+    /// same environment ended up serving deployments in two namespaces —
+    /// tolerated by a dev store and refused outright by the Vault activation
+    /// gate. Both ends now read the same constant; this pins that they do.
+    #[test]
+    fn tenant_defaults_to_the_shared_constant_not_demo() {
+        let cli = Cli::parse_from(["greentic-setup", "env-deploy", "b.gtbundle"]);
+        assert_eq!(cli.tenant, DEFAULT_TENANT);
+        assert_ne!(cli.tenant, "demo");
+    }
+
+    /// Every `--tenant` in the whole command tree, not just the ones that
+    /// exist today. One straggler puts a single command's bundles in a
+    /// different namespace from every other command's, which is exactly the
+    /// shape of the original defect.
+    #[test]
+    fn every_tenant_arg_in_the_command_tree_uses_the_shared_constant() {
+        fn walk(cmd: &clap::Command, path: &str, seen: &mut usize) {
+            for arg in cmd.get_arguments() {
+                if arg.get_id() != "tenant" {
+                    continue;
+                }
+                let defaults: Vec<String> = arg
+                    .get_default_values()
+                    .iter()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .collect();
+                // No default at all is fine — that arg makes no guess, and the
+                // global `--tenant` covers it. A *wrong* default is the defect.
+                if defaults.is_empty() {
+                    continue;
+                }
+                *seen += 1;
+                assert_eq!(
+                    defaults,
+                    vec![DEFAULT_TENANT.to_string()],
+                    "`{path} --tenant` must default to DEFAULT_TENANT"
+                );
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), seen);
+            }
+        }
+
+        let mut seen = 0;
+        walk(&Cli::command(), "greentic-setup", &mut seen);
+        // 10 today: the 9 declared defaults plus one more the walk reaches
+        // through clap's `global = true` propagation of the root `--tenant`.
+        // A change here means a new `--tenant` appeared and needs the same
+        // treatment; update the number once you have checked it.
+        assert_eq!(seen, 10, "the defaulted tenant-arg count changed");
+    }
 }

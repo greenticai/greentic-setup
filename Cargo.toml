@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "1.1.27"
+version = "1.1.28"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -63,7 +63,10 @@ greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-featu
 # develop-lane pre-releases.
 greentic-runner-host = { version = ">=1.1.6, <1.2.0-0", default-features = false }
 greentic-secrets-lib = { version = ">=1.1.0-dev.27563392344, <1.2.0-0", features = ["providers-dev"] }
-greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }
+# Floor is 1.1.4: that publish adds DEFAULT_TENANT / DEFAULT_TEAM, which the
+# CLI tenant default and the env-deploy team default both read (see
+# `cli_args.rs` and `env_deploy.rs`).
+greentic-types = { version = ">=1.1.4, <1.2.0-0", features = ["serde"] }
 hmac = "0.13"
 qa-spec = ">=1.1.0-dev.27541005498, <1.2.0-0"
 regex = "1"
