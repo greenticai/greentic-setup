@@ -121,8 +121,11 @@ fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
 }
 
 /// Resolve or provision the per-tunnel secret: explicit env override, else the
-/// local store, else generate a fresh one — persisting it locally AND pushing it
-/// to the Worker's SECRETS KV so the agent's registration is accepted.
+/// local store, else generate a fresh one. A generated secret is ONLY persisted
+/// and returned once it has been accepted into the Worker's SECRETS KV — a secret
+/// the Worker doesn't know would make every agent registration 403, so we never
+/// poison the local store with an unpushed secret. Returns "" when no secret can
+/// be established (caller surfaces actionable guidance).
 fn provision_tunnel_secret(tunnel_id: &str) -> String {
     if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
         && !secret.is_empty()
@@ -137,7 +140,11 @@ fn provision_tunnel_secret(tunnel_id: &str) -> String {
         }
     }
 
+    // Only mint a per-tunnel secret if we can register it with the Worker.
     let secret = generate_secret();
+    if !push_secret_to_kv(tunnel_id, &secret) {
+        return String::new();
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -147,7 +154,6 @@ fn provision_tunnel_secret(tunnel_id: &str) -> String {
             path.display()
         );
     }
-    push_secret_to_kv(tunnel_id, &secret);
     secret
 }
 
@@ -166,18 +172,17 @@ fn generate_secret() -> String {
 /// NOTE (multi-customer hardening): this writes KV directly with a CF token on
 /// the setup box. For untrusted customer boxes, route it through an authorized
 /// Greentic endpoint instead — a drop-in swap that needs no agent changes.
-fn push_secret_to_kv(tunnel_id: &str, secret: &str) {
+fn push_secret_to_kv(tunnel_id: &str, secret: &str) -> bool {
     let (Ok(token), Ok(account), Ok(namespace)) = (
         std::env::var("CLOUDFLARE_API_TOKEN"),
         std::env::var("CLOUDFLARE_ACCOUNT_ID"),
         std::env::var("GREENTIC_TUNNEL_KV_NAMESPACE_ID"),
     ) else {
         eprintln!(
-            "gtunnel: CF KV credentials not set (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / \
-             GREENTIC_TUNNEL_KV_NAMESPACE_ID); stored the per-tunnel secret for {tunnel_id} \
-             locally only — the agent will use the Worker's global secret until it is pushed"
+            "gtunnel: cannot provision a per-tunnel secret for {tunnel_id} — CF KV credentials \
+             not set (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / GREENTIC_TUNNEL_KV_NAMESPACE_ID)"
         );
-        return;
+        return false;
     };
     let url = format!(
         "https://api.cloudflare.com/client/v4/accounts/{account}/storage/kv/namespaces/{namespace}/values/{tunnel_id}"
@@ -191,8 +196,14 @@ fn push_secret_to_kv(tunnel_id: &str, secret: &str) {
         .header("Authorization", &format!("Bearer {token}"))
         .send(secret)
     {
-        Ok(_) => eprintln!("gtunnel: provisioned per-tunnel secret for {tunnel_id} into Worker KV"),
-        Err(err) => eprintln!("gtunnel: failed to push secret for {tunnel_id} to Worker KV: {err}"),
+        Ok(_) => {
+            eprintln!("gtunnel: provisioned per-tunnel secret for {tunnel_id} into Worker KV");
+            true
+        }
+        Err(err) => {
+            eprintln!("gtunnel: failed to push secret for {tunnel_id} to Worker KV: {err}");
+            false
+        }
     }
 }
 
@@ -278,6 +289,19 @@ fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<S
         crate::shared_tunnel::terminate_recorded_pid_named(pid, "greentic-start");
     }
     crate::shared_tunnel::clear_record(&paths);
+
+    // No usable secret → the agent would 403 and the tunnel would never become
+    // reachable. Fail fast with guidance instead of spawning a doomed agent and
+    // letting the caller's reachability probe time out.
+    if ctx.secret.is_empty() {
+        anyhow::bail!(
+            "Greentic managed tunnel needs authentication, but none is configured. Either:\n  \
+             • set GREENTIC_TUNNEL_SECRET to the shared Greentic tunnel secret, or\n  \
+             • set CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID + GREENTIC_TUNNEL_KV_NAMESPACE_ID \
+             so setup can provision a per-tunnel secret automatically.\n\
+             Then re-run setup."
+        );
+    }
 
     let child = spawn_gtunnel_agent(local_base_url, ctx, &paths.log_path)?;
     if let Err(err) = crate::shared_tunnel::write_record(&paths, child.id(), &public_base_url) {
