@@ -25,20 +25,11 @@ use greentic_deployer::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
 use greentic_deployer::environment::{EnvFlock, LocalFsStore, atomic_write_bytes};
 use serde_json::json;
 
+use crate::cli_args::DEFAULT_TEAM;
 use crate::gtbundle;
 
 /// Bundle-manifest filename inside a built `.gtbundle` archive / directory.
 const BUNDLE_MANIFEST_JSON: &str = "bundle-manifest.json";
-
-/// Team a binding uses when the caller named none.
-///
-/// This is the value the `route_binding.tenant_selector.team` field was
-/// hardcoded to before `team` became a parameter, so it keeps every existing
-/// deployment binding byte-identical. It deliberately matches the deployer's
-/// own implicit team (`greentic-deploy-spec`'s `engine/bundles.rs`) rather
-/// than the setup CLI's tenant default — teams never diverged, only tenants
-/// did.
-const DEFAULT_TEAM: &str = "default";
 
 /// Read `bundle_id` from a bundle directory's metadata.
 ///
@@ -230,6 +221,9 @@ fn build_env_manifest(
         "bundle_path": archive_path.to_string_lossy(),
         "route_binding": {
             "path_prefixes": ["/"],
+            // `DEFAULT_TEAM` holds the same value greentic-types publishes as
+            // `DEFAULT_TEAM` and the deployer applies for its own implicit
+            // team; see `cli_args::DEFAULT_TENANT` for why it is a local copy.
             "tenant_selector": { "tenant": tenant, "team": team.unwrap_or(DEFAULT_TEAM) }
         },
     });

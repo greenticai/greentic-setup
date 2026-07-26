@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "1.1.27"
+version = "1.1.28"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -63,6 +63,11 @@ greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-featu
 # develop-lane pre-releases.
 greentic-runner-host = { version = ">=1.1.6, <1.2.0-0", default-features = false }
 greentic-secrets-lib = { version = ">=1.1.0-dev.27563392344, <1.2.0-0", features = ["providers-dev"] }
+# Floor stays 1.1.0: `greentic-session 1.1.1` requires greentic-types `=1.1.2`
+# exactly, so raising this to 1.1.4 (for DEFAULT_TENANT / DEFAULT_TEAM) forces
+# component-qa, greentic-config{,-types}, greentic-interfaces{,-guest,-host,
+# -wasmtime}, greentic-qa-lib, greentic-session and greentic-state down from
+# 1.1.1 to 1.1.0. `cli_args.rs` carries a guarded local copy instead.
 greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }
 hmac = "0.13"
 qa-spec = ">=1.1.0-dev.27541005498, <1.2.0-0"
