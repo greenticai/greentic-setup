@@ -140,7 +140,7 @@
       tenant: tenant || "demo",
       env: env || "dev",
       team: team || "",
-      tunnel: state.defaultTunnel || (state.cloudDeploy ? "off" : "cloudflared"),
+      tunnel: state.defaultTunnel || (state.cloudDeploy ? "off" : "gtunnel"),
       answers: answers,
       sharedAnswers: {},
       providersDone: providersDone,
@@ -162,7 +162,7 @@
     bundlePath: "",
     detectedTenant: null,
     cloudDeploy: false,
-    defaultTunnel: "cloudflared",
+    defaultTunnel: "gtunnel",
     // multi-scope
     scopes: [],
     currentScopeIdx: -1,
@@ -328,7 +328,7 @@
         var scopeData = results[1];
         state.detectedTenant = scopeData.detected_tenant || null;
         state.cloudDeploy = !!scopeData.cloud_deploy;
-        state.defaultTunnel = scopeData.tunnel || (state.cloudDeploy ? "off" : "cloudflared");
+        state.defaultTunnel = scopeData.tunnel || (state.cloudDeploy ? "off" : "gtunnel");
 
         var existingScopes = existingData.scopes || [];
         if (existingScopes.length > 0) {
@@ -702,6 +702,10 @@
             '<div class="field">' +
               '<label class="field-label">Tunnel service</label>' +
               '<div class="tunnel-options">' +
+                '<label class="tunnel-option' + (scope.tunnel === "gtunnel" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="gtunnel"' + (scope.tunnel === "gtunnel" ? ' checked' : '') + ' />' +
+                  '<div><strong>Greentic managed tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Recommended. Hosted by Greentic — no account, no binary, works instantly.</span></div>' +
+                '</label>' +
                 '<label class="tunnel-option' + (scope.tunnel === "cloudflared" ? ' selected' : '') + '">' +
                   '<input type="radio" name="tunnel" value="cloudflared"' + (scope.tunnel === "cloudflared" ? ' checked' : '') + ' />' +
                   '<div><strong>Cloudflare Tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Free, no account needed. Auto-installs if missing.</span></div>' +

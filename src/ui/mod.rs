@@ -4818,7 +4818,7 @@ async fn setup_backend_refresh_public_tunnel_if_needed(
     else {
         return Ok(None);
     };
-    if !matches!(mode.as_str(), "cloudflared" | "ngrok") {
+    if !matches!(mode.as_str(), "cloudflared" | "ngrok" | "gtunnel") {
         return Ok(None);
     }
     if !current.is_empty()
@@ -4925,7 +4925,7 @@ fn setup_backend_default_tunnel_mode(state: &UiState) -> Result<Option<String>> 
                 )
             })?;
     if deployer_candidates.is_empty() {
-        return Ok(Some("cloudflared".to_string()));
+        return Ok(Some("gtunnel".to_string()));
     }
 
     Ok(None)
