@@ -104,10 +104,9 @@ impl GtunnelSetupCtx {
     }
 }
 
-/// Machine-wide per-tunnel secret file (shared on-disk format with
-/// greentic-start, which only reads it): `<root>/secrets/<tunnelId>`.
-fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
-    let root = std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
+/// `~/.greentic/tunnel` (override: `GREENTIC_TUNNEL_STATE_DIR`).
+fn tunnel_state_root() -> PathBuf {
+    std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -116,8 +115,23 @@ fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
                 .unwrap_or_else(std::env::temp_dir)
                 .join(".greentic")
                 .join("tunnel")
-        });
-    root.join("secrets").join(tunnel_id)
+        })
+}
+
+/// Machine-wide per-tunnel secret file (shared on-disk format with
+/// greentic-start, which only reads it): `<root>/secrets/<tunnelId>`.
+fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
+    tunnel_state_root().join("secrets").join(tunnel_id)
+}
+
+/// Operator's shared tunnel secret (`<root>/secret`), set once so the managed
+/// tunnel is used with no per-run env var.
+fn operator_secret() -> Option<String> {
+    let s = std::fs::read_to_string(tunnel_state_root().join("secret"))
+        .ok()?
+        .trim()
+        .to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Resolve or provision the per-tunnel secret: explicit env override, else the
@@ -138,6 +152,11 @@ fn provision_tunnel_secret(tunnel_id: &str) -> String {
         if !existing.is_empty() {
             return existing;
         }
+    }
+
+    // Operator's shared secret, set once — use it instead of minting per-tunnel.
+    if let Some(secret) = operator_secret() {
+        return secret;
     }
 
     // Only mint a per-tunnel secret if we can register it with the Worker.
