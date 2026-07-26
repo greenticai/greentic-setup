@@ -30,6 +30,16 @@ use crate::gtbundle;
 /// Bundle-manifest filename inside a built `.gtbundle` archive / directory.
 const BUNDLE_MANIFEST_JSON: &str = "bundle-manifest.json";
 
+/// Team a binding uses when the caller named none.
+///
+/// This is the value the `route_binding.tenant_selector.team` field was
+/// hardcoded to before `team` became a parameter, so it keeps every existing
+/// deployment binding byte-identical. It deliberately matches the deployer's
+/// own implicit team (`greentic-deploy-spec`'s `engine/bundles.rs`) rather
+/// than the setup CLI's tenant default — teams never diverged, only tenants
+/// did.
+const DEFAULT_TEAM: &str = "default";
+
 /// Read `bundle_id` from a bundle directory's metadata.
 ///
 /// Tries `bundle-manifest.json` first (the build-time manifest emitted by
@@ -83,6 +93,11 @@ fn read_bundle_id_from_dir(dir: &Path) -> Result<String> {
 /// When `customer_id` is `Some`, it is included in the synthesized
 /// env-manifest so the deployer's `resolve_customer_id` finds it
 /// (required for non-local environments).
+///
+/// `team` is `None` when the caller did not name one; the binding then uses
+/// `default`, which is what every deployment bound before this parameter
+/// existed. Callers that DO know their team must pass it — see
+/// [`build_env_manifest`].
 pub fn deploy_bundle_to_env(
     bundle: &Path,
     env_id: &str,
@@ -90,6 +105,7 @@ pub fn deploy_bundle_to_env(
     non_interactive: bool,
     customer_id: Option<&str>,
     tenant: &str,
+    team: Option<&str>,
 ) -> Result<()> {
     // ── Step 1: resolve to an absolute .gtbundle archive file ────────────
     let _temp_dir; // keep alive until after apply returns
@@ -139,7 +155,7 @@ pub fn deploy_bundle_to_env(
     };
 
     // ── Step 3: synthesize the env-manifest document ────────────────────
-    let manifest = build_env_manifest(env_id, &bundle_id, &archive_path, customer_id, tenant);
+    let manifest = build_env_manifest(env_id, &bundle_id, &archive_path, customer_id, tenant, team);
 
     // ── Step 4: write to a temp file and call env-apply ─────────────────
     let manifest_file = tempfile::NamedTempFile::new().context("create temporary manifest file")?;
@@ -190,6 +206,12 @@ pub fn deploy_bundle_to_env(
 /// default (`demo`); the runtime then reads under `default` while the secrets
 /// live under `demo`, and only the reader-side tenant fallback rescues it.
 ///
+/// `team` is stamped the same way, and for the same reason: it was previously
+/// hardcoded to `default` here, so `--team` was accepted by the CLI, parsed,
+/// and then silently discarded — the binding always said `default` no matter
+/// what the operator asked for. `None` preserves that historical value; it is
+/// the "caller named no team" case, not a licence to ignore one.
+///
 /// The deployer rejects a `tenant_selector` with no host/path matcher (a
 /// binding with no matchers is unreachable), so we pair it with a `"/"`
 /// path prefix — a match-all that is byte-equivalent, for routing, to the
@@ -201,13 +223,14 @@ fn build_env_manifest(
     archive_path: &Path,
     customer_id: Option<&str>,
     tenant: &str,
+    team: Option<&str>,
 ) -> serde_json::Value {
     let mut bundle_entry = json!({
         "bundle_id": bundle_id,
         "bundle_path": archive_path.to_string_lossy(),
         "route_binding": {
             "path_prefixes": ["/"],
-            "tenant_selector": { "tenant": tenant, "team": "default" }
+            "tenant_selector": { "tenant": tenant, "team": team.unwrap_or(DEFAULT_TEAM) }
         },
     });
     if let Some(cid) = customer_id {
@@ -388,6 +411,7 @@ mod tests {
             Path::new("/tmp/my-bundle.gtbundle"),
             Some("acme-billing"),
             "demo",
+            None,
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -406,6 +430,7 @@ mod tests {
             Path::new("/tmp/my-bundle.gtbundle"),
             None,
             "demo",
+            None,
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -431,6 +456,7 @@ mod tests {
             Path::new("/tmp/my-bundle.gtbundle"),
             None,
             "demo",
+            None,
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -452,6 +478,57 @@ mod tests {
             "match-all `/` prefix keeps routing unchanged while satisfying the matcher rule"
         );
         assert!(rb.hosts.is_empty(), "no host matcher is added");
+    }
+
+    // ── route_binding tenant_selector carries the setup team ────────────
+
+    /// Extract the stamped `(tenant, team)` pair, which is the whole surface
+    /// these two tests care about.
+    fn stamped_selector(tenant: &str, team: Option<&str>) -> (String, String) {
+        let manifest = build_env_manifest(
+            "local",
+            "my-bundle",
+            Path::new("/tmp/my-bundle.gtbundle"),
+            None,
+            tenant,
+            team,
+        );
+        let parsed: EnvManifest =
+            serde_json::from_value(manifest).expect("manifest must deserialize");
+        let ts = parsed.bundles[0]
+            .route_binding
+            .as_ref()
+            .expect("route_binding must be stamped")
+            .tenant_selector
+            .clone()
+            .expect("tenant_selector must be present");
+        (ts.tenant, ts.team)
+    }
+
+    #[test]
+    fn synthesized_manifest_binds_under_the_setup_team() {
+        // `team` was hardcoded to "default" here, so `--team` was accepted by
+        // the CLI, parsed, threaded to the runtime — and silently discarded at
+        // the one place that decides where the deployment BINDS. Secrets are
+        // keyed on (tenant, team) (`deployer_secret_path`), so the write went
+        // to the real team while the binding claimed `default`.
+        assert_eq!(
+            stamped_selector("acme", Some("billing")),
+            ("acme".to_string(), "billing".to_string()),
+            "an explicitly named team must reach the binding"
+        );
+    }
+
+    #[test]
+    fn absent_team_still_binds_default() {
+        // `None` is "the caller named no team", and must keep producing the
+        // exact binding every pre-existing deployment already carries —
+        // otherwise this change silently re-binds live environments.
+        assert_eq!(
+            stamped_selector("demo", None),
+            ("demo".to_string(), "default".to_string()),
+            "no team named must stay byte-identical to the historical binding"
+        );
     }
 
     // ── bundle_id from bundle-manifest.json, not filename ───────────────
@@ -512,8 +589,8 @@ mod tests {
         let not_a_bundle = temp.path().join("random.txt");
         fs::write(&not_a_bundle, "hello").unwrap();
 
-        let err =
-            deploy_bundle_to_env(&not_a_bundle, "local", true, true, None, "demo").unwrap_err();
+        let err = deploy_bundle_to_env(&not_a_bundle, "local", true, true, None, "demo", None)
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not a .gtbundle"),
@@ -646,6 +723,7 @@ mod tests {
             true,
             None,
             "demo",
+            None,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
