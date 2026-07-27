@@ -9314,13 +9314,13 @@ questions:
     }
 
     #[test]
-    fn setup_backend_tunnel_mode_defaults_to_cloudflared_for_local_setup() {
+    fn setup_backend_tunnel_mode_defaults_to_gtunnel_for_local_setup() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
 
         let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
 
-        assert_eq!(mode.as_deref(), Some("cloudflared"));
+        assert_eq!(mode.as_deref(), Some("gtunnel"));
     }
 
     #[test]
