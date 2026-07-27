@@ -66,6 +66,10 @@ pub struct GtunnelSetupCtx {
     /// When set (`GREENTIC_TUNNEL_BASE_DOMAIN`), use subdomain routing
     /// (`https://<tunnelId>.<base>`) so the WebChat SPA works at the host root.
     pub base_domain: Option<String>,
+    /// Root-map mode (`GREENTIC_TUNNEL_ROOT_MAP`): the whole Worker host maps to
+    /// this one tunnel at its root (cloudflared-style), so the WebChat SPA works
+    /// on workers.dev with no custom domain. Ignored when `base_domain` is set.
+    pub root_map: bool,
     pub tunnel_id: String,
     pub secret: String,
 }
@@ -98,17 +102,34 @@ impl GtunnelSetupCtx {
     /// KV on first use). Setup owns provisioning; greentic-start only reads.
     pub fn new(tunnel_id: String) -> Self {
         let secret = provision_tunnel_secret(&tunnel_id);
+        let base_domain = std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // Root-map only applies without a base domain (a subdomain already gives
+        // each tunnel its own host root), matching greentic-start's precedence.
+        let root_map = base_domain.is_none() && env_flag("GREENTIC_TUNNEL_ROOT_MAP");
         Self {
             worker_url: std::env::var("GREENTIC_TUNNEL_WORKER_URL")
                 .unwrap_or_else(|_| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string()),
-            base_domain: std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+            base_domain,
+            root_map,
             tunnel_id,
             secret,
         }
     }
+}
+
+/// Truthy env flag: `1`, `true`, or `yes` (case-insensitive). Mirrors the same
+/// helper in greentic-start so both binaries read `GREENTIC_TUNNEL_ROOT_MAP`
+/// identically.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
 }
 
 /// `~/.greentic/tunnel` (override: `GREENTIC_TUNNEL_STATE_DIR`).
@@ -294,6 +315,8 @@ fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<S
 
     let public_base_url = match &ctx.base_domain {
         Some(base) => format!("https://{}.{}", ctx.tunnel_id, base.trim_matches('.')),
+        // Root-map: the Worker host itself is this tunnel — no path prefix.
+        None if ctx.root_map => ctx.worker_url.trim_end_matches('/').to_string(),
         None => format!("{}/{}", ctx.worker_url.trim_end_matches('/'), ctx.tunnel_id),
     };
 
@@ -398,7 +421,13 @@ fn spawn_gtunnel_agent(
             } else {
                 ctx.worker_url.trim_end_matches('/').to_string()
             };
-            format!("{ws_base}/{}/_tunnel", ctx.tunnel_id)
+            if ctx.root_map {
+                // Root-map: register at the Worker host root; the Worker maps
+                // every request (including /_tunnel) to TUNNEL_DEFAULT_ID.
+                format!("{ws_base}/_tunnel")
+            } else {
+                format!("{ws_base}/{}/_tunnel", ctx.tunnel_id)
+            }
         }
     };
 
