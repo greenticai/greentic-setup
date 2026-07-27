@@ -63,6 +63,9 @@ const DEFAULT_GTUNNEL_WORKER_BASE_URL: &str = "https://greentic-webhook-proxy.gr
 #[derive(Clone, Debug)]
 pub struct GtunnelSetupCtx {
     pub worker_url: String,
+    /// When set (`GREENTIC_TUNNEL_BASE_DOMAIN`), use subdomain routing
+    /// (`https://<tunnelId>.<base>`) so the WebChat SPA works at the host root.
+    pub base_domain: Option<String>,
     pub tunnel_id: String,
     pub secret: String,
 }
@@ -98,6 +101,10 @@ impl GtunnelSetupCtx {
         Self {
             worker_url: std::env::var("GREENTIC_TUNNEL_WORKER_URL")
                 .unwrap_or_else(|_| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string()),
+            base_domain: std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             tunnel_id,
             secret,
         }
@@ -285,7 +292,10 @@ fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<S
     let _lock =
         crate::shared_tunnel::TunnelLock::acquire(&paths.lock_path, Duration::from_secs(30))?;
 
-    let public_base_url = format!("{}/{}", ctx.worker_url.trim_end_matches('/'), ctx.tunnel_id);
+    let public_base_url = match &ctx.base_domain {
+        Some(base) => format!("https://{}.{}", ctx.tunnel_id, base.trim_matches('.')),
+        None => format!("{}/{}", ctx.worker_url.trim_end_matches('/'), ctx.tunnel_id),
+    };
 
     // Reuse a live agent (ours or greentic-start's) rather than spawn a second —
     // the Worker allows only one socket per tunnel id. But a pid can be alive
@@ -372,18 +382,25 @@ fn spawn_gtunnel_agent(
         .try_clone()
         .with_context(|| "clone gtunnel log handle")?;
 
-    let ws_base = if let Some(rest) = ctx
-        .worker_url
-        .trim_end_matches('/')
-        .strip_prefix("https://")
-    {
-        format!("wss://{rest}")
-    } else if let Some(rest) = ctx.worker_url.trim_end_matches('/').strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        ctx.worker_url.trim_end_matches('/').to_string()
+    let edge_url = match &ctx.base_domain {
+        // Subdomain routing: register at the tunnel's own host root.
+        Some(base) => format!("wss://{}.{}/_tunnel", ctx.tunnel_id, base.trim_matches('.')),
+        None => {
+            let ws_base = if let Some(rest) = ctx
+                .worker_url
+                .trim_end_matches('/')
+                .strip_prefix("https://")
+            {
+                format!("wss://{rest}")
+            } else if let Some(rest) = ctx.worker_url.trim_end_matches('/').strip_prefix("http://")
+            {
+                format!("ws://{rest}")
+            } else {
+                ctx.worker_url.trim_end_matches('/').to_string()
+            };
+            format!("{ws_base}/{}/_tunnel", ctx.tunnel_id)
+        }
     };
-    let edge_url = format!("{ws_base}/{}/_tunnel", ctx.tunnel_id);
 
     Command::new(&binary)
         .arg("__tunnel-agent")
