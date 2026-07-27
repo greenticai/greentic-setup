@@ -1,6 +1,6 @@
 [package]
 name = "greentic-setup"
-version = "1.1.26"
+version = "1.1.29"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -38,7 +38,21 @@ flate2 = "1"
 # from that lock — so a bundle's provider packs reached the runtime not at all
 # (webchat GUI 405 on `/v1/web/webchat/{tenant}/`). Nothing failed to compile, so
 # only the floor keeps a `--locked` release build off the broken copy.
-greentic-deployer = { version = ">=1.1.15, <1.2.0-0", default-features = false }
+# Floor raised to 1.1.29 in lockstep with deploy-spec 0.2.5: `env-deploy` stamps
+# `EnvironmentHostConfig::default_bundle`, which 0.2.5 adds and which also makes
+# the struct `#[non_exhaustive]`; every deployer up to and including the
+# published 1.1.28 constructs that struct with literals, so the new spec against
+# an older deployer fails inside the registry copy (E0639) rather than with a
+# missing-method error. This repo has no direct deploy-spec dependency and
+# resolves it transitively through the deployer, so this floor is what protects
+# it. 1.1.29, not 1.1.28: main cut and published 1.1.28 from #520 while this
+# work was open, so that release predates the conversion.
+# Floor raised to 1.1.30: deployer 1.1.30 adds `ManifestEnvironment.default_bundle`
+# (deployer#523, closing #521), which the two test-only manifest literals in
+# `src/env_wizard.rs` now name. Those literals are exhaustive, so building this
+# crate's tests against 1.1.29 fails with E0063. An API floor, not a behaviour
+# one — the lib and bin compile against either release.
+greentic-deployer = { version = ">=1.1.30, <1.2.0-0", default-features = false }
 greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-features = false, features = ["dist-client", "pack-fetch"], optional = true }
 # Floor 1.1.6: every publish below it declares `async-nats = "0.46"` NON-optionally, and
 # every async-nats 0.46.x hard-pins `rustls-webpki = "0.102"`. Its newest release, 0.102.8,
@@ -49,6 +63,11 @@ greentic-distributor-client = { version = ">=1.1.0-dev, <1.2.0-0", default-featu
 # develop-lane pre-releases.
 greentic-runner-host = { version = ">=1.1.6, <1.2.0-0", default-features = false }
 greentic-secrets-lib = { version = ">=1.1.0-dev.27563392344, <1.2.0-0", features = ["providers-dev"] }
+# Floor stays 1.1.0: `greentic-session 1.1.1` requires greentic-types `=1.1.2`
+# exactly, so raising this to 1.1.4 (for DEFAULT_TENANT / DEFAULT_TEAM) forces
+# component-qa, greentic-config{,-types}, greentic-interfaces{,-guest,-host,
+# -wasmtime}, greentic-qa-lib, greentic-session and greentic-state down from
+# 1.1.1 to 1.1.0. `cli_args.rs` carries a guarded local copy instead.
 greentic-types = { version = ">=1.1.0-dev, <1.2.0-0", features = ["serde"] }
 hmac = "0.13"
 qa-spec = ">=1.1.0-dev.27541005498, <1.2.0-0"

@@ -22,9 +22,10 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use greentic_deployer::cli::dispatch::print_outcome;
 use greentic_deployer::cli::env_manifest::ENV_MANIFEST_SCHEMA_V1;
-use greentic_deployer::environment::LocalFsStore;
+use greentic_deployer::environment::{EnvFlock, LocalFsStore, atomic_write_bytes};
 use serde_json::json;
 
+use crate::cli_args::DEFAULT_TEAM;
 use crate::gtbundle;
 
 /// Bundle-manifest filename inside a built `.gtbundle` archive / directory.
@@ -83,6 +84,11 @@ fn read_bundle_id_from_dir(dir: &Path) -> Result<String> {
 /// When `customer_id` is `Some`, it is included in the synthesized
 /// env-manifest so the deployer's `resolve_customer_id` finds it
 /// (required for non-local environments).
+///
+/// `team` is `None` when the caller did not name one; the binding then uses
+/// `default`, which is what every deployment bound before this parameter
+/// existed. Callers that DO know their team must pass it — see
+/// [`build_env_manifest`].
 pub fn deploy_bundle_to_env(
     bundle: &Path,
     env_id: &str,
@@ -90,6 +96,7 @@ pub fn deploy_bundle_to_env(
     non_interactive: bool,
     customer_id: Option<&str>,
     tenant: &str,
+    team: Option<&str>,
 ) -> Result<()> {
     // ── Step 1: resolve to an absolute .gtbundle archive file ────────────
     let _temp_dir; // keep alive until after apply returns
@@ -139,7 +146,7 @@ pub fn deploy_bundle_to_env(
     };
 
     // ── Step 3: synthesize the env-manifest document ────────────────────
-    let manifest = build_env_manifest(env_id, &bundle_id, &archive_path, customer_id, tenant);
+    let manifest = build_env_manifest(env_id, &bundle_id, &archive_path, customer_id, tenant, team);
 
     // ── Step 4: write to a temp file and call env-apply ─────────────────
     let manifest_file = tempfile::NamedTempFile::new().context("create temporary manifest file")?;
@@ -162,6 +169,18 @@ pub fn deploy_bundle_to_env(
         Default::default(),
     )?;
     print_outcome(&outcome)?;
+
+    // ── Step 5: record this as the default bundle (first deploy wins) ──
+    //
+    // When the environment has no `host_config.default_bundle` yet, stamp
+    // the just-deployed bundle so the bare webchat URL
+    // `/v1/web/webchat/{tenant}/` resolves without the fallback ladder.
+    // FIRST DEPLOY WINS — an operator's explicit choice (or an earlier
+    // deploy) is never overwritten; and a dry-run never mutates the store.
+    if !dry_run {
+        stamp_default_bundle_if_unset(&store, env_id, &bundle_id)?;
+    }
+
     Ok(())
 }
 
@@ -178,6 +197,12 @@ pub fn deploy_bundle_to_env(
 /// default (`demo`); the runtime then reads under `default` while the secrets
 /// live under `demo`, and only the reader-side tenant fallback rescues it.
 ///
+/// `team` is stamped the same way, and for the same reason: it was previously
+/// hardcoded to `default` here, so `--team` was accepted by the CLI, parsed,
+/// and then silently discarded — the binding always said `default` no matter
+/// what the operator asked for. `None` preserves that historical value; it is
+/// the "caller named no team" case, not a licence to ignore one.
+///
 /// The deployer rejects a `tenant_selector` with no host/path matcher (a
 /// binding with no matchers is unreachable), so we pair it with a `"/"`
 /// path prefix — a match-all that is byte-equivalent, for routing, to the
@@ -189,13 +214,17 @@ fn build_env_manifest(
     archive_path: &Path,
     customer_id: Option<&str>,
     tenant: &str,
+    team: Option<&str>,
 ) -> serde_json::Value {
     let mut bundle_entry = json!({
         "bundle_id": bundle_id,
         "bundle_path": archive_path.to_string_lossy(),
         "route_binding": {
             "path_prefixes": ["/"],
-            "tenant_selector": { "tenant": tenant, "team": "default" }
+            // `DEFAULT_TEAM` holds the same value greentic-types publishes as
+            // `DEFAULT_TEAM` and the deployer applies for its own implicit
+            // team; see `cli_args::DEFAULT_TENANT` for why it is a local copy.
+            "tenant_selector": { "tenant": tenant, "team": team.unwrap_or(DEFAULT_TEAM) }
         },
     });
     if let Some(cid) = customer_id {
@@ -210,6 +239,68 @@ fn build_env_manifest(
         "trust_root": "bootstrap",
         "bundles": [bundle_entry]
     })
+}
+
+/// If `host_config.default_bundle` is absent (or JSON-null), set it to
+/// `bundle_id` and write the environment back. If already set, this is a
+/// no-op — first deploy wins; an operator's explicit choice or an earlier
+/// deploy is never silently re-pointed.
+///
+/// The read-modify-write runs under the per-env flock (the same lock the
+/// deployer's `LocalFsStore::transact` acquires) so two concurrent deploys
+/// cannot race past the "already set?" check. The write itself goes through
+/// the deployer's atomic-write helper (temp + rename + fsync) so a crash
+/// mid-write never leaves a truncated `environment.json`.
+///
+/// Reads / writes `environment.json` as raw JSON (the same approach
+/// [`auto_detect_bundle_id`](crate::provider_commands::auto_detect_bundle_id)
+/// uses) rather than the typed `Environment` struct, because the stamp is a
+/// single-field patch and the raw path avoids coupling to the full schema.
+fn stamp_default_bundle_if_unset(
+    store: &LocalFsStore,
+    env_id: &str,
+    bundle_id: &str,
+) -> Result<()> {
+    let env_dir = store.root().join(env_id);
+    let env_json_path = env_dir.join("environment.json");
+    if !env_json_path.is_file() {
+        // The apply engine should have created this. If it didn't (e.g.
+        // the env was torn down mid-apply), skip rather than hard-fail —
+        // the deploy itself already printed its outcome.
+        return Ok(());
+    }
+
+    // Acquire the per-env flock so concurrent deploys serialize here.
+    let lock_path = env_dir.join(".lock");
+    let _guard = EnvFlock::acquire(&lock_path)
+        .with_context(|| format!("acquire env lock for `{env_id}`"))?;
+
+    let raw = std::fs::read_to_string(&env_json_path)
+        .with_context(|| format!("read {}", env_json_path.display()))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", env_json_path.display()))?;
+
+    let already_set = doc
+        .pointer("/host_config/default_bundle")
+        .is_some_and(|v| !v.is_null());
+    if already_set {
+        return Ok(());
+    }
+
+    // Stamp the field. `host_config` must exist (the apply engine writes
+    // it), but guard defensively.
+    if let Some(hc) = doc.get_mut("host_config").and_then(|v| v.as_object_mut()) {
+        hc.insert(
+            "default_bundle".to_string(),
+            serde_json::Value::String(bundle_id.to_string()),
+        );
+        let updated =
+            serde_json::to_string_pretty(&doc).context("serialize updated environment.json")?;
+        atomic_write_bytes(&env_json_path, updated.as_bytes())
+            .with_context(|| format!("atomic write {}", env_json_path.display()))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -314,6 +405,7 @@ mod tests {
             Path::new("/tmp/my-bundle.gtbundle"),
             Some("acme-billing"),
             "demo",
+            None,
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -332,6 +424,7 @@ mod tests {
             Path::new("/tmp/my-bundle.gtbundle"),
             None,
             "demo",
+            None,
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -357,6 +450,7 @@ mod tests {
             Path::new("/tmp/my-bundle.gtbundle"),
             None,
             "demo",
+            None,
         );
         let parsed: EnvManifest =
             serde_json::from_value(manifest).expect("manifest must deserialize");
@@ -378,6 +472,57 @@ mod tests {
             "match-all `/` prefix keeps routing unchanged while satisfying the matcher rule"
         );
         assert!(rb.hosts.is_empty(), "no host matcher is added");
+    }
+
+    // ── route_binding tenant_selector carries the setup team ────────────
+
+    /// Extract the stamped `(tenant, team)` pair, which is the whole surface
+    /// these two tests care about.
+    fn stamped_selector(tenant: &str, team: Option<&str>) -> (String, String) {
+        let manifest = build_env_manifest(
+            "local",
+            "my-bundle",
+            Path::new("/tmp/my-bundle.gtbundle"),
+            None,
+            tenant,
+            team,
+        );
+        let parsed: EnvManifest =
+            serde_json::from_value(manifest).expect("manifest must deserialize");
+        let ts = parsed.bundles[0]
+            .route_binding
+            .as_ref()
+            .expect("route_binding must be stamped")
+            .tenant_selector
+            .clone()
+            .expect("tenant_selector must be present");
+        (ts.tenant, ts.team)
+    }
+
+    #[test]
+    fn synthesized_manifest_binds_under_the_setup_team() {
+        // `team` was hardcoded to "default" here, so `--team` was accepted by
+        // the CLI, parsed, threaded to the runtime — and silently discarded at
+        // the one place that decides where the deployment BINDS. Secrets are
+        // keyed on (tenant, team) (`deployer_secret_path`), so the write went
+        // to the real team while the binding claimed `default`.
+        assert_eq!(
+            stamped_selector("acme", Some("billing")),
+            ("acme".to_string(), "billing".to_string()),
+            "an explicitly named team must reach the binding"
+        );
+    }
+
+    #[test]
+    fn absent_team_still_binds_default() {
+        // `None` is "the caller named no team", and must keep producing the
+        // exact binding every pre-existing deployment already carries —
+        // otherwise this change silently re-binds live environments.
+        assert_eq!(
+            stamped_selector("demo", None),
+            ("demo".to_string(), "default".to_string()),
+            "no team named must stay byte-identical to the historical binding"
+        );
     }
 
     // ── bundle_id from bundle-manifest.json, not filename ───────────────
@@ -438,12 +583,128 @@ mod tests {
         let not_a_bundle = temp.path().join("random.txt");
         fs::write(&not_a_bundle, "hello").unwrap();
 
-        let err =
-            deploy_bundle_to_env(&not_a_bundle, "local", true, true, None, "demo").unwrap_err();
+        let err = deploy_bundle_to_env(&not_a_bundle, "local", true, true, None, "demo", None)
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not a .gtbundle"),
             "expected clear error for non-bundle file, got: {msg}"
+        );
+    }
+
+    // ── default_bundle stamping (first deploy wins) ──────────────────
+
+    /// Write a minimal `environment.json` into a temp store so
+    /// `stamp_default_bundle_if_unset` has something to read.
+    fn write_env_json(store: &LocalFsStore, env_id: &str, doc: &serde_json::Value) {
+        let dir = store.root().join(env_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("environment.json"),
+            serde_json::to_string_pretty(doc).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_env_json(store: &LocalFsStore, env_id: &str) -> serde_json::Value {
+        let raw = fs::read_to_string(store.root().join(env_id).join("environment.json")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// Minimal environment.json skeleton — just enough for
+    /// `stamp_default_bundle_if_unset` (it only touches `host_config`).
+    fn env_json_skeleton(env_id: &str) -> serde_json::Value {
+        json!({
+            "schema": "greentic.environment.v1",
+            "environment_id": env_id,
+            "name": env_id,
+            "host_config": {
+                "env_id": env_id
+            },
+            "packs": [],
+            "bundles": [],
+            "revisions": [],
+            "traffic_splits": [],
+            "messaging_endpoints": [],
+            "extensions": [],
+            "revocation": {},
+            "retention": {},
+            "health": {}
+        })
+    }
+
+    #[test]
+    fn first_deploy_stamps_default_bundle() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        write_env_json(&store, "local", &env_json_skeleton("local"));
+
+        stamp_default_bundle_if_unset(&store, "local", "my-bundle").unwrap();
+
+        let doc = read_env_json(&store, "local");
+        assert_eq!(
+            doc.pointer("/host_config/default_bundle")
+                .and_then(|v| v.as_str()),
+            Some("my-bundle"),
+            "first deploy must stamp default_bundle"
+        );
+    }
+
+    #[test]
+    fn second_deploy_does_not_overwrite_default_bundle() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        let mut doc = env_json_skeleton("local");
+        doc["host_config"]["default_bundle"] = json!("first-bundle");
+        write_env_json(&store, "local", &doc);
+
+        stamp_default_bundle_if_unset(&store, "local", "second-bundle").unwrap();
+
+        let doc = read_env_json(&store, "local");
+        assert_eq!(
+            doc.pointer("/host_config/default_bundle")
+                .and_then(|v| v.as_str()),
+            Some("first-bundle"),
+            "second deploy must NOT overwrite the existing default_bundle"
+        );
+    }
+
+    #[test]
+    fn default_bundle_round_trips_through_json() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        write_env_json(&store, "local", &env_json_skeleton("local"));
+
+        stamp_default_bundle_if_unset(&store, "local", "round-trip-bundle").unwrap();
+
+        // Re-read and re-parse to verify the value survives a write/read cycle.
+        let raw = fs::read_to_string(store.root().join("local").join("environment.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            doc.pointer("/host_config/default_bundle")
+                .and_then(|v| v.as_str()),
+            Some("round-trip-bundle"),
+            "default_bundle must survive a JSON round-trip"
+        );
+        // The rest of the document must be intact.
+        assert_eq!(
+            doc.pointer("/environment_id").and_then(|v| v.as_str()),
+            Some("local"),
+        );
+        assert_eq!(
+            doc.pointer("/host_config/env_id").and_then(|v| v.as_str()),
+            Some("local"),
+        );
+    }
+
+    #[test]
+    fn stamp_skips_when_env_json_is_missing() {
+        let root = tempdir().unwrap();
+        let store = LocalFsStore::new(root.path());
+        // No environment.json at all.
+        assert!(
+            stamp_default_bundle_if_unset(&store, "local", "bundle").is_ok(),
+            "missing environment.json must not be an error"
         );
     }
 
@@ -456,6 +717,7 @@ mod tests {
             true,
             None,
             "demo",
+            None,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
