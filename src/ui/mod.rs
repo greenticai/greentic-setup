@@ -4818,7 +4818,7 @@ async fn setup_backend_refresh_public_tunnel_if_needed(
     else {
         return Ok(None);
     };
-    if !matches!(mode.as_str(), "cloudflared" | "ngrok") {
+    if !matches!(mode.as_str(), "cloudflared" | "ngrok" | "gtunnel") {
         return Ok(None);
     }
     if !current.is_empty()
@@ -4925,7 +4925,7 @@ fn setup_backend_default_tunnel_mode(state: &UiState) -> Result<Option<String>> 
                 )
             })?;
     if deployer_candidates.is_empty() {
-        return Ok(Some("cloudflared".to_string()));
+        return Ok(Some("gtunnel".to_string()));
     }
 
     Ok(None)
@@ -7242,8 +7242,18 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     eprintln!("Setup tunnel: spawning {mode} tunnel for {local_base_url}");
     let mode_for_task = mode.to_string();
     let local_base_url_for_task = local_base_url.clone();
+    // For the Greentic self-hosted tunnel, derive the tunnel id from tenant/team
+    // (same rule greentic-start uses) so setup and start share one agent.
+    let gtunnel_ctx = if mode == "gtunnel" {
+        let team = state.team.as_deref().unwrap_or("default");
+        Some(crate::setup_tunnel::GtunnelSetupCtx::new(
+            crate::setup_tunnel::derive_gtunnel_id(&state.tenant, team),
+        ))
+    } else {
+        None
+    };
     let tunnel = tokio::task::spawn_blocking(move || {
-        start_setup_tunnel(&mode_for_task, &local_base_url_for_task)
+        start_setup_tunnel(&mode_for_task, &local_base_url_for_task, gtunnel_ctx)
     })
     .await
     .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
@@ -9304,13 +9314,13 @@ questions:
     }
 
     #[test]
-    fn setup_backend_tunnel_mode_defaults_to_cloudflared_for_local_setup() {
+    fn setup_backend_tunnel_mode_defaults_to_gtunnel_for_local_setup() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
 
         let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
 
-        assert_eq!(mode.as_deref(), Some("cloudflared"));
+        assert_eq!(mode.as_deref(), Some("gtunnel"));
     }
 
     #[test]

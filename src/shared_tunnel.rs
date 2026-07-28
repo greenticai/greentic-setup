@@ -61,6 +61,29 @@ pub fn shared_tunnel_paths(port: u16) -> SharedTunnelPaths {
     shared_tunnel_paths_at(&tunnel_state_root(), port)
 }
 
+/// Shared-record paths for an arbitrary tunnel `service` (e.g. "gtunnel"),
+/// mirroring `greentic-start`'s `tunnel_state::shared_runtime_paths(service, port)`
+/// layout (`shared.<service>-<port>/<service>.pid`) so the two binaries adopt
+/// each other's tunnel instead of double-spawning.
+pub fn shared_service_tunnel_paths(service: &str, port: u16) -> SharedTunnelPaths {
+    shared_service_tunnel_paths_at(&tunnel_state_root(), service, port)
+}
+
+pub(crate) fn shared_service_tunnel_paths_at(
+    root: &Path,
+    service: &str,
+    port: u16,
+) -> SharedTunnelPaths {
+    let state = root.join("state");
+    let key = format!("shared.{service}-{port}");
+    SharedTunnelPaths {
+        pid_path: state.join("pids").join(&key).join(format!("{service}.pid")),
+        url_path: state.join("runtime").join(&key).join("public_base_url.txt"),
+        log_path: root.join("logs").join(&key).join(format!("{service}.log")),
+        lock_path: state.join(format!("{service}-{port}.lock")),
+    }
+}
+
 pub(crate) fn shared_tunnel_paths_at(root: &Path, port: u16) -> SharedTunnelPaths {
     let state = root.join("state");
     let key = format!("shared.cloudflared-{port}");
@@ -129,22 +152,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// PID reuse: a recorded pid recycled by the OS onto an unrelated process
 /// must neither count as tunnel liveness nor be terminated.
 fn process_is_cloudflared(pid: u32) -> bool {
+    process_matches(pid, "cloudflared")
+}
+
+/// Whether `pid`'s command line contains `needle`. Guards `terminate_*` against
+/// PID reuse: a recorded pid recycled by the OS onto an unrelated process must
+/// neither count as liveness nor be terminated.
+pub(crate) fn process_matches(pid: u32, needle: &str) -> bool {
     #[cfg(unix)]
     {
         std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "command="])
             .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("cloudflared"))
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(needle))
     }
     #[cfg(windows)]
     {
+        let needle = needle.to_ascii_lowercase();
         std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .output()
             .is_ok_and(|out| {
                 String::from_utf8_lossy(&out.stdout)
                     .to_ascii_lowercase()
-                    .contains("cloudflared")
+                    .contains(&needle)
             })
     }
 }
@@ -154,8 +185,15 @@ fn process_is_cloudflared(pid: u32) -> bool {
 /// and even then only when the pid still runs cloudflared, so a recycled pid
 /// cannot get an unrelated process killed.
 pub fn terminate_recorded_pid(pid: u32) {
-    if !process_is_cloudflared(pid) {
-        eprintln!("Shared tunnel: recorded pid {pid} is not a cloudflared process — not killing");
+    terminate_recorded_pid_named(pid, "cloudflared");
+}
+
+/// Terminate the recorded process, but only when its command line still matches
+/// `needle` (e.g. "greentic-start" for the gtunnel agent) — same PID-reuse guard
+/// as [`terminate_recorded_pid`], generalized to non-cloudflared tunnels.
+pub fn terminate_recorded_pid_named(pid: u32, needle: &str) {
+    if !process_matches(pid, needle) {
+        eprintln!("Shared tunnel: recorded pid {pid} is not a {needle} process — not killing");
         return;
     }
     #[cfg(unix)]
@@ -310,6 +348,45 @@ fn log_shows_registered_connection(log_path: &Path) -> bool {
     })
 }
 
+/// cloudflared's connection-lifecycle markers. It keeps up to four edge
+/// connections and logs `Registered tunnel connection` when one comes up; when a
+/// connection drops it logs a serve error and falls into a `Retrying connection`
+/// loop (strings observed in real logs, quotes stripped).
+const LOG_EDGE_UP: &str = "Registered tunnel connection";
+const LOG_EDGE_DOWN: &[&str] = &[
+    "Unregistered tunnel connection",
+    "control stream encountered a failure",
+    "failed to serve tunnel connection",
+    "Serve tunnel error",
+    "Retrying connection",
+    "Failed to dial a quic connection",
+    "Lost connection with edge",
+    "no more connections active",
+];
+
+/// Current edge-connection state of the recorded cloudflared, from its own log —
+/// the authoritative signal for "is our process connected to the edge right
+/// now", which neither a stale `Registered tunnel connection` line nor mere
+/// public-DNS presence can provide. Compares the position of the last "up" line
+/// against the last "down" line: a down after the most recent up means
+/// cloudflared lost its edge link and is stuck retrying (`Some(false)` — a
+/// corpse); an up last, or no down after it, means connected (`Some(true)`); no
+/// lifecycle lines at all is unknown (`None`).
+fn log_edge_connection_live(log_path: &Path) -> Option<bool> {
+    let contents = std::fs::read_to_string(log_path).ok()?;
+    let last_up = contents.rfind(LOG_EDGE_UP);
+    let last_down = LOG_EDGE_DOWN
+        .iter()
+        .filter_map(|marker| contents.rfind(marker))
+        .max();
+    match (last_up, last_down) {
+        (None, None) => None,
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (Some(up), Some(down)) => Some(up >= down),
+    }
+}
+
 /// Age of the shared record, from the url file's mtime — written once at
 /// spawn (reuse never rewrites it), so this is time since the tunnel was
 /// minted. `None` when the age cannot be established.
@@ -378,6 +455,20 @@ pub fn classify_recorded_tunnel(
                 "Shared tunnel {url}: not reachable via the local resolver; checking public DNS"
             );
         }
+    }
+
+    // 1b. Before trusting public DNS, ask cloudflared's own log whether it is
+    //     CURRENTLY edge-connected. A `*.trycloudflare.com` hostname keeps
+    //     resolving to Cloudflare's edge (which then answers 530) after the
+    //     tunnel behind it has died, so DNS presence cannot disprove a corpse —
+    //     one whose control stream is failing and stuck in a `Retrying
+    //     connection` loop. Catch it here so the DNS check below can't rescue it.
+    if log_edge_connection_live(&paths.log_path) == Some(false) {
+        eprintln!(
+            "Shared tunnel {url}: cloudflared lost its edge connection and is retry-looping \
+             — replacing (Down)"
+        );
+        return RecordedTunnelState::Down;
     }
 
     // 2. The local resolver may just be blind. Ask public DNS directly: if the
@@ -643,6 +734,47 @@ mod tests {
             !log_shows_registered_connection(&log),
             "unregistration alone must not match the registered needle"
         );
+    }
+
+    #[test]
+    fn log_edge_connection_live_flags_the_retry_looping_corpse() {
+        let dir = tempdir().expect("tempdir");
+        let log = dir.path().join("cloudflared.log");
+
+        assert_eq!(log_edge_connection_live(&log), None, "missing file → None");
+        std::fs::write(&log, "INF Starting metrics server\n").expect("write");
+        assert_eq!(
+            log_edge_connection_live(&log),
+            None,
+            "no lifecycle lines → None"
+        );
+
+        std::fs::write(&log, "INF Registered tunnel connection connIndex=0\n").expect("write");
+        assert_eq!(log_edge_connection_live(&log), Some(true));
+
+        // The exact incident: registered once, then the control stream fails and
+        // it is stuck retrying. The stale `Registered` line must not read as alive.
+        std::fs::write(
+            &log,
+            "INF Registered tunnel connection connIndex=0\n\
+             ERR Serve tunnel error error=\"control stream encountered a failure while serving\"\n\
+             INF Retrying connection in up to 1m4s connIndex=0\n",
+        )
+        .expect("write");
+        assert_eq!(
+            log_edge_connection_live(&log),
+            Some(false),
+            "failure after last registration → not connected (corpse)"
+        );
+
+        // Recovered after a blip: a fresh registration is the last event.
+        std::fs::write(
+            &log,
+            "ERR Serve tunnel error error=\"control stream encountered a failure while serving\"\n\
+             INF Registered tunnel connection connIndex=0\n",
+        )
+        .expect("write");
+        assert_eq!(log_edge_connection_live(&log), Some(true));
     }
 
     #[test]

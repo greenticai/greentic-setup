@@ -53,8 +53,215 @@ impl SetupTunnel {
     }
 }
 
+/// Default Greentic-operated Worker tunnel base (mirrors greentic-start's
+/// `gtunnel::DEFAULT_WORKER_BASE_URL`; the crates don't share a dependency).
+const DEFAULT_GTUNNEL_WORKER_BASE_URL: &str = "https://greentic-webhook-proxy.greentic.workers.dev";
+
+/// Everything the setup binary needs to bring up the Greentic self-hosted tunnel.
+/// Derived by the caller (from tenant/team + env) so setup and start compute the
+/// same tunnel id and share one agent.
+#[derive(Clone, Debug)]
+pub struct GtunnelSetupCtx {
+    pub worker_url: String,
+    /// When set (`GREENTIC_TUNNEL_BASE_DOMAIN`), use subdomain routing
+    /// (`https://<tunnelId>.<base>`) so the WebChat SPA works at the host root.
+    pub base_domain: Option<String>,
+    /// Root-map mode (`GREENTIC_TUNNEL_ROOT_MAP`): the whole Worker host maps to
+    /// this one tunnel at its root (cloudflared-style), so the WebChat SPA works
+    /// on workers.dev with no custom domain. Ignored when `base_domain` is set.
+    pub root_map: bool,
+    pub tunnel_id: String,
+    pub secret: String,
+}
+
+/// Derive a URL-path-safe tunnel id from tenant/team — identical to
+/// greentic-start's rule so both binaries key on the same id and share an agent.
+pub fn derive_gtunnel_id(tenant: &str, team: &str) -> String {
+    let raw = format!("{tenant}-{team}");
+    let slug: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed
+    }
+}
+
+impl GtunnelSetupCtx {
+    /// Zero-config context: worker URL from env/default and a per-tunnel secret
+    /// provisioned for `tunnel_id` (generated + persisted + pushed to the Worker
+    /// KV on first use). Setup owns provisioning; greentic-start only reads.
+    pub fn new(tunnel_id: String) -> Self {
+        let secret = provision_tunnel_secret(&tunnel_id);
+        let base_domain = std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // Root-map only applies without a base domain (a subdomain already gives
+        // each tunnel its own host root), matching greentic-start's precedence.
+        let root_map = base_domain.is_none() && env_flag("GREENTIC_TUNNEL_ROOT_MAP");
+        Self {
+            worker_url: std::env::var("GREENTIC_TUNNEL_WORKER_URL")
+                .unwrap_or_else(|_| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string()),
+            base_domain,
+            root_map,
+            tunnel_id,
+            secret,
+        }
+    }
+}
+
+/// Truthy env flag: `1`, `true`, or `yes` (case-insensitive). Mirrors the same
+/// helper in greentic-start so both binaries read `GREENTIC_TUNNEL_ROOT_MAP`
+/// identically.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// `~/.greentic/tunnel` (override: `GREENTIC_TUNNEL_STATE_DIR`).
+fn tunnel_state_root() -> PathBuf {
+    std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".greentic")
+                .join("tunnel")
+        })
+}
+
+/// Machine-wide per-tunnel secret file (shared on-disk format with
+/// greentic-start, which only reads it): `<root>/secrets/<tunnelId>`.
+fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
+    tunnel_state_root().join("secrets").join(tunnel_id)
+}
+
+/// Operator's shared tunnel secret (`<root>/secret`), set once so the managed
+/// tunnel is used with no per-run env var.
+fn operator_secret() -> Option<String> {
+    let s = std::fs::read_to_string(tunnel_state_root().join("secret"))
+        .ok()?
+        .trim()
+        .to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Resolve or provision the per-tunnel secret: explicit env override, else the
+/// local store, else generate a fresh one. A generated secret is ONLY persisted
+/// and returned once it has been accepted into the Worker's SECRETS KV — a secret
+/// the Worker doesn't know would make every agent registration 403, so we never
+/// poison the local store with an unpushed secret. Returns "" when no secret can
+/// be established (caller surfaces actionable guidance).
+fn provision_tunnel_secret(tunnel_id: &str) -> String {
+    if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
+        && !secret.is_empty()
+    {
+        return secret;
+    }
+    let path = tunnel_secret_path(tunnel_id);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+
+    // Operator's shared secret, set once — use it instead of minting per-tunnel.
+    if let Some(secret) = operator_secret() {
+        return secret;
+    }
+
+    // Only mint a per-tunnel secret if we can register it with the Worker.
+    let secret = generate_secret();
+    if !push_secret_to_kv(tunnel_id, &secret) {
+        return String::new();
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(&path, &secret) {
+        eprintln!(
+            "gtunnel: failed to persist per-tunnel secret at {}: {err:#}",
+            path.display()
+        );
+    }
+    secret
+}
+
+/// A random 256-bit secret as lowercase hex.
+fn generate_secret() -> String {
+    (0..32)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect()
+}
+
+/// Publish a per-tunnel secret to the Worker's SECRETS KV via the Cloudflare API.
+/// Best-effort: needs CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID /
+/// GREENTIC_TUNNEL_KV_NAMESPACE_ID. Without them the secret is stored locally
+/// only and the agent falls back to the Worker's global secret.
+///
+/// NOTE (multi-customer hardening): this writes KV directly with a CF token on
+/// the setup box. For untrusted customer boxes, route it through an authorized
+/// Greentic endpoint instead — a drop-in swap that needs no agent changes.
+fn push_secret_to_kv(tunnel_id: &str, secret: &str) -> bool {
+    let (Ok(token), Ok(account), Ok(namespace)) = (
+        std::env::var("CLOUDFLARE_API_TOKEN"),
+        std::env::var("CLOUDFLARE_ACCOUNT_ID"),
+        std::env::var("GREENTIC_TUNNEL_KV_NAMESPACE_ID"),
+    ) else {
+        eprintln!(
+            "gtunnel: cannot provision a per-tunnel secret for {tunnel_id} — CF KV credentials \
+             not set (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / GREENTIC_TUNNEL_KV_NAMESPACE_ID)"
+        );
+        return false;
+    };
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{account}/storage/kv/namespaces/{namespace}/values/{tunnel_id}"
+    );
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    match agent
+        .put(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .send(secret)
+    {
+        Ok(_) => {
+            eprintln!("gtunnel: provisioned per-tunnel secret for {tunnel_id} into Worker KV");
+            true
+        }
+        Err(err) => {
+            eprintln!("gtunnel: failed to push secret for {tunnel_id} to Worker KV: {err}");
+            false
+        }
+    }
+}
+
+fn gtunnel_ctx_from_env() -> GtunnelSetupCtx {
+    GtunnelSetupCtx::new(
+        std::env::var("GREENTIC_TUNNEL_ID").unwrap_or_else(|_| "default".to_string()),
+    )
+}
+
 pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -> bool {
-    matches!(mode, "cloudflared" | "ngrok")
+    matches!(mode, "cloudflared" | "ngrok" | "gtunnel")
         && answers.values().any(|provider_answers| {
             let Some(obj) = provider_answers.as_object() else {
                 return false;
@@ -70,7 +277,11 @@ pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -
         })
 }
 
-pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunnel> {
+pub fn start_setup_tunnel(
+    mode: &str,
+    local_base_url: &str,
+    gtunnel: Option<GtunnelSetupCtx>,
+) -> Result<SetupTunnel> {
     match mode {
         "cloudflared" => start_cloudflared_shared(local_base_url),
         "ngrok" => {
@@ -83,8 +294,176 @@ pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunne
                 kill_on_drop: true,
             })
         }
+        "gtunnel" => {
+            let ctx = gtunnel.unwrap_or_else(gtunnel_ctx_from_env);
+            start_gtunnel_shared(local_base_url, &ctx)
+        }
         other => Err(anyhow!("unsupported setup tunnel mode: {other}")),
     }
+}
+
+/// Adopt (or spawn) the Greentic self-hosted tunnel agent under the machine-wide
+/// shared record for this port, so `greentic-start` reuses the same agent. The
+/// public URL is deterministic (`<worker>/<tunnel_id>`) — no discovery needed.
+fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<SetupTunnel> {
+    let mode = "gtunnel";
+    let port = crate::shared_tunnel::local_port_from_base_url(local_base_url)
+        .ok_or_else(|| anyhow!("cannot derive a local port from {local_base_url}"))?;
+    let paths = crate::shared_tunnel::shared_service_tunnel_paths(mode, port);
+    let _lock =
+        crate::shared_tunnel::TunnelLock::acquire(&paths.lock_path, Duration::from_secs(30))?;
+
+    let public_base_url = match &ctx.base_domain {
+        Some(base) => format!("https://{}.{}", ctx.tunnel_id, base.trim_matches('.')),
+        // Root-map: the Worker host itself is this tunnel — no path prefix.
+        None if ctx.root_map => ctx.worker_url.trim_end_matches('/').to_string(),
+        None => format!("{}/{}", ctx.worker_url.trim_end_matches('/'), ctx.tunnel_id),
+    };
+
+    // Reuse a live agent (ours or greentic-start's) rather than spawn a second —
+    // the Worker allows only one socket per tunnel id. But a pid can be alive
+    // while its WebSocket to the Worker is dead, so only adopt an agent that is
+    // actually SERVING; a stale one is killed and replaced (so the caller's
+    // reachability probe doesn't just fail on a reused-but-dead tunnel).
+    let (recorded_pid, _recorded_url) = crate::shared_tunnel::read_record(&paths);
+    if let Some(pid) = recorded_pid
+        && crate::shared_tunnel::process_alive(pid)
+    {
+        if gtunnel_serving(&public_base_url) {
+            eprintln!("Reusing shared {mode} agent (pid {pid}): {public_base_url}");
+            let _ = crate::shared_tunnel::write_record(&paths, pid, &public_base_url);
+            return Ok(reuse_shared_tunnel(mode, local_base_url, public_base_url));
+        }
+        eprintln!(
+            "Shared {mode} agent (pid {pid}) is alive but {public_base_url} is not serving — \
+             replacing the stale tunnel"
+        );
+        crate::shared_tunnel::terminate_recorded_pid_named(pid, "greentic-start");
+    }
+    crate::shared_tunnel::clear_record(&paths);
+
+    // No usable secret → the agent would 403 and the tunnel would never become
+    // reachable. Fail fast with guidance instead of spawning a doomed agent and
+    // letting the caller's reachability probe time out.
+    if ctx.secret.is_empty() {
+        anyhow::bail!(
+            "Greentic managed tunnel needs authentication, but none is configured. Either:\n  \
+             • set GREENTIC_TUNNEL_SECRET to the shared Greentic tunnel secret, or\n  \
+             • set CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID + GREENTIC_TUNNEL_KV_NAMESPACE_ID \
+             so setup can provision a per-tunnel secret automatically.\n\
+             Then re-run setup."
+        );
+    }
+
+    let child = spawn_gtunnel_agent(local_base_url, ctx, &paths.log_path)?;
+    if let Err(err) = crate::shared_tunnel::write_record(&paths, child.id(), &public_base_url) {
+        eprintln!("warning: could not publish shared gtunnel record: {err:#}");
+    }
+    eprintln!("Setup tunnel started via {mode}: {public_base_url}");
+    Ok(SetupTunnel {
+        mode: mode.to_string(),
+        local_base_url: local_base_url.trim_end_matches('/').to_string(),
+        public_base_url,
+        child: Some(child),
+        kill_on_drop: false,
+    })
+}
+
+/// Whether the tunnel serves end to end: a bounded GET to the public URL. A
+/// routed response (2xx/3xx/4xx) proves the agent is connected and forwarding;
+/// the Worker's `502 tunnel offline` (or any 5xx / transport error) means the
+/// recorded agent is stale. `< 500` mirrors `setup_backend_public_tunnel_responds`.
+fn gtunnel_serving(public_url: &str) -> bool {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    match agent.get(public_url).call() {
+        Ok(_) => true,
+        Err(ureq::Error::StatusCode(code)) => code < 500,
+        Err(_) => false,
+    }
+}
+
+/// Spawn `greentic-start __tunnel-agent`, forwarding to `local_base_url`, with
+/// stdout/stderr redirected to the shared tunnel log.
+fn spawn_gtunnel_agent(
+    local_base_url: &str,
+    ctx: &GtunnelSetupCtx,
+    log_path: &Path,
+) -> Result<Child> {
+    let binary = resolve_gtunnel_agent_binary()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("open gtunnel log {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .with_context(|| "clone gtunnel log handle")?;
+
+    let edge_url = match &ctx.base_domain {
+        // Subdomain routing: register at the tunnel's own host root.
+        Some(base) => format!("wss://{}.{}/_tunnel", ctx.tunnel_id, base.trim_matches('.')),
+        None => {
+            let ws_base = if let Some(rest) = ctx
+                .worker_url
+                .trim_end_matches('/')
+                .strip_prefix("https://")
+            {
+                format!("wss://{rest}")
+            } else if let Some(rest) = ctx.worker_url.trim_end_matches('/').strip_prefix("http://")
+            {
+                format!("ws://{rest}")
+            } else {
+                ctx.worker_url.trim_end_matches('/').to_string()
+            };
+            if ctx.root_map {
+                // Root-map: register at the Worker host root; the Worker maps
+                // every request (including /_tunnel) to TUNNEL_DEFAULT_ID.
+                format!("{ws_base}/_tunnel")
+            } else {
+                format!("{ws_base}/{}/_tunnel", ctx.tunnel_id)
+            }
+        }
+    };
+
+    Command::new(&binary)
+        .arg("__tunnel-agent")
+        .env("GREENTIC_TUNNEL_EDGE_URL", edge_url)
+        .env("GREENTIC_TUNNEL_SECRET", &ctx.secret)
+        .env(
+            "GREENTIC_TUNNEL_TARGET",
+            local_base_url.trim_end_matches('/'),
+        )
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .with_context(|| format!("spawn gtunnel agent via {}", binary.display()))
+}
+
+/// Locate the `greentic-start` binary that hosts the `__tunnel-agent` subcommand:
+/// explicit `GREENTIC_TUNNEL_AGENT_BIN`, else the first `greentic-start` on PATH.
+fn resolve_gtunnel_agent_binary() -> Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os("GREENTIC_TUNNEL_AGENT_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(anyhow!(
+            "GREENTIC_TUNNEL_AGENT_BIN points at {}, which does not exist",
+            path.display()
+        ));
+    }
+    resolve_path_binary("greentic-start").ok_or_else(|| {
+        anyhow!(
+            "greentic-start not found on PATH (needed to run the tunnel agent); \
+             set GREENTIC_TUNNEL_AGENT_BIN to its location"
+        )
+    })
 }
 
 /// Build a [`SetupTunnel`] that reuses an already-running shared tunnel: there
@@ -517,6 +896,22 @@ mod tests {
     use serde_json::{Map as JsonMap, Value, json};
 
     use super::*;
+
+    #[test]
+    fn generate_secret_is_64_hex_chars_and_random() {
+        let a = generate_secret();
+        let b = generate_secret();
+        assert_eq!(a.len(), 64, "256-bit secret is 64 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two provisions must differ");
+    }
+
+    #[test]
+    fn derive_gtunnel_id_matches_start_rule() {
+        assert_eq!(derive_gtunnel_id("Acme Corp", "Team A"), "acme-corp-team-a");
+        assert_eq!(derive_gtunnel_id("demo", "default"), "demo-default");
+        assert_eq!(derive_gtunnel_id("", ""), "default");
+    }
 
     // ---- should_start_setup_tunnel ----
 
@@ -1112,7 +1507,7 @@ mod tests {
 
     #[test]
     fn start_setup_tunnel_unsupported_mode() {
-        let result = start_setup_tunnel("unknown", "http://127.0.0.1:8080");
+        let result = start_setup_tunnel("unknown", "http://127.0.0.1:8080", None);
         assert!(result.is_err());
         let err = result.err().expect("should be Err");
         assert!(

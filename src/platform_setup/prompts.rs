@@ -121,13 +121,19 @@ pub(crate) fn merge_prompt_seed(
 
 /// Prompt for tunnel mode when no deployer packs are present.
 ///
-/// Offers Cloudflare Tunnel (default), ngrok, or no tunnel.
+/// Offers Greentic managed tunnel (default), Cloudflare Tunnel, ngrok, or no tunnel.
 pub fn prompt_tunnel_mode(current: Option<&TunnelAnswers>) -> Result<TunnelAnswers> {
-    let choices = ["Cloudflare Tunnel (cloudflared)", "ngrok", "No tunnel"];
+    let choices = [
+        "Greentic managed tunnel",
+        "Cloudflare Tunnel (cloudflared)",
+        "ngrok",
+        "No tunnel",
+    ];
     let default_index = match current.and_then(|t| t.mode.as_deref()) {
-        Some("ngrok") => 1,
-        Some("off") => 2,
-        _ => 0, // cloudflared is default
+        Some("cloudflared") => 1,
+        Some("ngrok") => 2,
+        Some("off") => 3,
+        _ => 0, // Greentic managed tunnel is the default
     };
     let index = Select::new()
         .with_prompt("Tunnel for external webhooks (Webex, Telegram, etc.)")
@@ -135,8 +141,9 @@ pub fn prompt_tunnel_mode(current: Option<&TunnelAnswers>) -> Result<TunnelAnswe
         .default(default_index)
         .interact()?;
     let mode = match index {
-        0 => "cloudflared",
-        1 => "ngrok",
+        0 => "gtunnel",
+        1 => "cloudflared",
+        2 => "ngrok",
         _ => "off",
     };
     Ok(TunnelAnswers {
