@@ -57,6 +57,14 @@ impl SetupTunnel {
 /// `gtunnel::DEFAULT_WORKER_BASE_URL`; the crates don't share a dependency).
 const DEFAULT_GTUNNEL_WORKER_BASE_URL: &str = "https://greentic-webhook-proxy.greentic.workers.dev";
 
+/// Shared tunnel secret baked into the shipped binaries, matching the Worker's
+/// global `TUNNEL_SECRET` — so the managed tunnel needs no operator credentials.
+/// Mirrors greentic-start's `gtunnel::DEFAULT_TUNNEL_SECRET` (the crates don't
+/// share a dependency); the two MUST stay in sync or setup and start would
+/// register the same tunnel id under different secrets.
+const DEFAULT_TUNNEL_SECRET: &str =
+    "d00a7591949699785228c42504afa41ce168f84e4118bb127e47c5cb98e4dd90";
+
 /// Everything the setup binary needs to bring up the Greentic self-hosted tunnel.
 /// Derived by the caller (from tenant/team + env) so setup and start compute the
 /// same tunnel id and share one agent.
@@ -97,11 +105,12 @@ pub fn derive_gtunnel_id(tenant: &str, team: &str) -> String {
 }
 
 impl GtunnelSetupCtx {
-    /// Zero-config context: worker URL from env/default and a per-tunnel secret
-    /// provisioned for `tunnel_id` (generated + persisted + pushed to the Worker
-    /// KV on first use). Setup owns provisioning; greentic-start only reads.
+    /// Zero-config context: worker URL and tunnel secret both from env/default,
+    /// so the managed tunnel works on a fresh box with no operator input. Secret
+    /// resolution matches greentic-start's, so both binaries present the same
+    /// credential for the same tunnel id.
     pub fn new(tunnel_id: String) -> Self {
-        let secret = provision_tunnel_secret(&tunnel_id);
+        let secret = resolve_tunnel_secret(&tunnel_id);
         let base_domain = std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
             .ok()
             .map(|s| s.trim().to_string())
@@ -146,112 +155,32 @@ fn tunnel_state_root() -> PathBuf {
         })
 }
 
-/// Machine-wide per-tunnel secret file (shared on-disk format with
-/// greentic-start, which only reads it): `<root>/secrets/<tunnelId>`.
-fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
-    tunnel_state_root().join("secrets").join(tunnel_id)
-}
-
-/// Operator's shared tunnel secret (`<root>/secret`), set once so the managed
-/// tunnel is used with no per-run env var.
-fn operator_secret() -> Option<String> {
-    let s = std::fs::read_to_string(tunnel_state_root().join("secret"))
-        .ok()?
-        .trim()
-        .to_string();
+fn read_secret_file(path: PathBuf) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?.trim().to_string();
     (!s.is_empty()).then_some(s)
 }
 
-/// Resolve or provision the per-tunnel secret: explicit env override, else the
-/// local store, else generate a fresh one. A generated secret is ONLY persisted
-/// and returned once it has been accepted into the Worker's SECRETS KV — a secret
-/// the Worker doesn't know would make every agent registration 403, so we never
-/// poison the local store with an unpushed secret. Returns "" when no secret can
-/// be established (caller surfaces actionable guidance).
-fn provision_tunnel_secret(tunnel_id: &str) -> String {
+/// Resolve the tunnel secret: `GREENTIC_TUNNEL_SECRET` env > per-tunnel store
+/// (`<root>/secrets/<id>`) > operator secret (`<root>/secret`) >
+/// [`DEFAULT_TUNNEL_SECRET`]. Never empty — the baked-in constant is the whole
+/// point: the managed tunnel authenticates with no operator credentials at all.
+/// Must stay identical to greentic-start's `gtunnel::resolve_secret`, since
+/// either binary can be the one that spawns the agent for a given tunnel id.
+fn resolve_tunnel_secret(tunnel_id: &str) -> String {
     if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
         && !secret.is_empty()
     {
         return secret;
     }
-    let path = tunnel_secret_path(tunnel_id);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
-            return existing;
-        }
-    }
-
-    // Operator's shared secret, set once — use it instead of minting per-tunnel.
-    if let Some(secret) = operator_secret() {
-        return secret;
-    }
-
-    // Only mint a per-tunnel secret if we can register it with the Worker.
-    let secret = generate_secret();
-    if !push_secret_to_kv(tunnel_id, &secret) {
-        return String::new();
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(err) = std::fs::write(&path, &secret) {
-        eprintln!(
-            "gtunnel: failed to persist per-tunnel secret at {}: {err:#}",
-            path.display()
-        );
-    }
-    secret
+    resolve_tunnel_secret_in(&tunnel_state_root(), tunnel_id)
 }
 
-/// A random 256-bit secret as lowercase hex.
-fn generate_secret() -> String {
-    (0..32)
-        .map(|_| format!("{:02x}", rand::random::<u8>()))
-        .collect()
-}
-
-/// Publish a per-tunnel secret to the Worker's SECRETS KV via the Cloudflare API.
-/// Best-effort: needs CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID /
-/// GREENTIC_TUNNEL_KV_NAMESPACE_ID. Without them the secret is stored locally
-/// only and the agent falls back to the Worker's global secret.
-///
-/// NOTE (multi-customer hardening): this writes KV directly with a CF token on
-/// the setup box. For untrusted customer boxes, route it through an authorized
-/// Greentic endpoint instead — a drop-in swap that needs no agent changes.
-fn push_secret_to_kv(tunnel_id: &str, secret: &str) -> bool {
-    let (Ok(token), Ok(account), Ok(namespace)) = (
-        std::env::var("CLOUDFLARE_API_TOKEN"),
-        std::env::var("CLOUDFLARE_ACCOUNT_ID"),
-        std::env::var("GREENTIC_TUNNEL_KV_NAMESPACE_ID"),
-    ) else {
-        eprintln!(
-            "gtunnel: cannot provision a per-tunnel secret for {tunnel_id} — CF KV credentials \
-             not set (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / GREENTIC_TUNNEL_KV_NAMESPACE_ID)"
-        );
-        return false;
-    };
-    let url = format!(
-        "https://api.cloudflare.com/client/v4/accounts/{account}/storage/kv/namespaces/{namespace}/values/{tunnel_id}"
-    );
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .build()
-        .new_agent();
-    match agent
-        .put(&url)
-        .header("Authorization", &format!("Bearer {token}"))
-        .send(secret)
-    {
-        Ok(_) => {
-            eprintln!("gtunnel: provisioned per-tunnel secret for {tunnel_id} into Worker KV");
-            true
-        }
-        Err(err) => {
-            eprintln!("gtunnel: failed to push secret for {tunnel_id} to Worker KV: {err}");
-            false
-        }
-    }
+/// File-store half of [`resolve_tunnel_secret`], root passed explicitly so it is
+/// testable without touching the developer's real `~/.greentic/tunnel`.
+fn resolve_tunnel_secret_in(root: &Path, tunnel_id: &str) -> String {
+    read_secret_file(root.join("secrets").join(tunnel_id))
+        .or_else(|| read_secret_file(root.join("secret")))
+        .unwrap_or_else(|| DEFAULT_TUNNEL_SECRET.to_string())
 }
 
 fn gtunnel_ctx_from_env() -> GtunnelSetupCtx {
@@ -341,19 +270,6 @@ fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<S
         crate::shared_tunnel::terminate_recorded_pid_named(pid, "greentic-start");
     }
     crate::shared_tunnel::clear_record(&paths);
-
-    // No usable secret → the agent would 403 and the tunnel would never become
-    // reachable. Fail fast with guidance instead of spawning a doomed agent and
-    // letting the caller's reachability probe time out.
-    if ctx.secret.is_empty() {
-        anyhow::bail!(
-            "Greentic managed tunnel needs authentication, but none is configured. Either:\n  \
-             • set GREENTIC_TUNNEL_SECRET to the shared Greentic tunnel secret, or\n  \
-             • set CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID + GREENTIC_TUNNEL_KV_NAMESPACE_ID \
-             so setup can provision a per-tunnel secret automatically.\n\
-             Then re-run setup."
-        );
-    }
 
     let child = spawn_gtunnel_agent(local_base_url, ctx, &paths.log_path)?;
     if let Err(err) = crate::shared_tunnel::write_record(&paths, child.id(), &public_base_url) {
@@ -898,12 +814,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_secret_is_64_hex_chars_and_random() {
-        let a = generate_secret();
-        let b = generate_secret();
-        assert_eq!(a.len(), 64, "256-bit secret is 64 hex chars");
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b, "two provisions must differ");
+    fn default_tunnel_secret_is_64_hex_chars() {
+        assert_eq!(DEFAULT_TUNNEL_SECRET.len(), 64, "256-bit secret as hex");
+        assert!(DEFAULT_TUNNEL_SECRET.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn resolve_tunnel_secret_falls_back_to_baked_in_constant() {
+        // Empty store → the shipped constant, never empty: setup must never
+        // demand credentials for the managed tunnel.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_tunnel_secret_in(dir.path(), "demo-default"),
+            DEFAULT_TUNNEL_SECRET
+        );
+    }
+
+    #[test]
+    fn resolve_tunnel_secret_prefers_per_tunnel_file_then_operator_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("secret"), "operator-secret\n").expect("write operator");
+        assert_eq!(
+            resolve_tunnel_secret_in(dir.path(), "demo-default"),
+            "operator-secret"
+        );
+
+        std::fs::create_dir_all(dir.path().join("secrets")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("secrets").join("demo-default"),
+            "per-tunnel",
+        )
+        .expect("write per-tunnel");
+        assert_eq!(
+            resolve_tunnel_secret_in(dir.path(), "demo-default"),
+            "per-tunnel"
+        );
     }
 
     #[test]
