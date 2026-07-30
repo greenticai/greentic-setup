@@ -1002,7 +1002,6 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
-                default_bundle: None,
             },
             trust_root: Some(TrustRootDirective::Bootstrap),
             secrets: vec![ManifestSecret {
@@ -1160,7 +1159,6 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
-                default_bundle: None,
             },
             trust_root: None,
             secrets: Vec::new(),
