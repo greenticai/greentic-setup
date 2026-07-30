@@ -702,8 +702,25 @@ async fn install_catalog_provider(
         return Ok(());
     }
 
-    let source = crate::bundle_source::BundleSource::parse(&item.reference)?;
-    let pack_path = resolve_pack_source_with_retry(&source, &item.reference).await?;
+    // Resolve the catalogue's TAG to the digest the installed toolchain release
+    // pinned it to, so the fetcher's cache lookup can hit. `fetch_pack_to_cache`
+    // only consults its cache for digest-pinned refs, so a `:stable` ref pulls
+    // over the network every time — the cache is populated and never read. See
+    // `crate::release_index`. Falls back to the tag when the index cannot resolve
+    // it, which is the previous behaviour.
+    let reference = match crate::release_index::pinned_ref_for(&item.reference) {
+        Some(pinned) => {
+            eprintln!(
+                "add-provider {}: resolved {} to {pinned} via the release index — served from the \
+                 local pack cache instead of the registry",
+                item.id, item.reference
+            );
+            pinned
+        }
+        None => item.reference.clone(),
+    };
+    let source = crate::bundle_source::BundleSource::parse(&reference)?;
+    let pack_path = resolve_pack_source_with_retry(&source, &reference).await?;
     if !pack_path.is_file() {
         anyhow::bail!(
             "resolved provider pack is not a file: {}",
@@ -7751,7 +7768,10 @@ async fn load_saved_secrets(
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
     use greentic_secrets_lib::SecretsStore;
 
-    let store = match crate::secrets::open_dev_store(bundle_path) {
+    // Env-explicit, matching the write side. Reading the bundle-local store here
+    // would look in a location nothing writes to any more, so previously-saved
+    // answers would come back blank in the wizard.
+    let store = match crate::secrets::open_dev_store_for_env(bundle_path, env) {
         Ok(s) => s,
         Err(_) => return std::collections::HashMap::new(),
     };
@@ -8280,7 +8300,7 @@ mod tests {
         setup_backend_runtime_context_current, setup_backend_tunnel_cooldown_remaining,
         setup_backend_tunnel_public_base_url_for_port_at,
     };
-    use crate::secrets::open_dev_store;
+    use crate::secrets::open_dev_store_for_env;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use greentic_secrets_lib::{SecretFormat, SecretsStore};
@@ -11781,6 +11801,8 @@ setup_actions:
 
     #[tokio::test]
     async fn provider_api_does_not_return_saved_values_for_secret_questions() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11790,7 +11812,7 @@ setup_actions:
         )
         .expect("pack");
 
-        let store = open_dev_store(temp.path()).expect("open store");
+        let store = open_dev_store_for_env(temp.path(), "dev").expect("open store");
         store
             .put(
                 &crate::canonical_secret_uri(
@@ -12281,6 +12303,8 @@ setup_actions:
 
     #[tokio::test]
     async fn persist_ui_draft_writes_provider_answers_to_dev_store() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle_root = temp.path();
         std::fs::create_dir_all(bundle_root.join("packs")).expect("packs dir");
@@ -12308,7 +12332,7 @@ setup_actions:
             Some(&json!(["auth_param_get_weather_key"]))
         );
 
-        let store = open_dev_store(bundle_root).expect("open store");
+        let store = open_dev_store_for_env(bundle_root, "dev").expect("open store");
         let base_uri = crate::canonical_secret_uri(
             "dev",
             "dev-tenant",

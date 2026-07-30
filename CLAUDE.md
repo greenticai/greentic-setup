@@ -48,7 +48,7 @@ Binary: `src/bin/greentic_setup.rs`.
 | `provider_state.rs` | Per-provider setup state tracking |
 | `qa/` | QA subsystem: FormSpec bridge, wizard prompts, shared questions, answer persistence |
 | `reload.rs` | Hot-reload watcher for live setup changes |
-| `secrets.rs`, `secret_name.rs` | Secrets persistence (via `greentic-secrets-lib`) and naming |
+| `secrets.rs`, `secret_name.rs` | Secrets persistence (via `greentic-secrets-lib`) and naming. **Write side of the setup↔start secret contract — see [docs/secrets-flow.md](docs/secrets-flow.md).** |
 | `setup_actions.rs` | Concrete setup action implementations |
 | `setup_input.rs` | Setup input loading and validation |
 | `setup_to_formspec/` | Conversion: setup inputs to FormSpec (inference, pack handling) |

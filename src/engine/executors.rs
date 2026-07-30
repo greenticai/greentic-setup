@@ -1451,7 +1451,8 @@ timers: []
     // registration ops can recover previously-stored secrets on re-runs (e.g. the
     // Slack signing secret on app reuse). Best-effort: an unreadable store just
     // means the op sees only what it writes this invocation (prior behavior).
-    let dev_store = crate::secrets::open_dev_store(bundle_path)
+    let reg_env = crate::resolve_env(Some(&config.env));
+    let dev_store = crate::secrets::open_dev_store_for_env(bundle_path, &reg_env)
         .ok()
         .map(Arc::new);
     let secrets: greentic_runner_host::secrets::DynSecretsManager =

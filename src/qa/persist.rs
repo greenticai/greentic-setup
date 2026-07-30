@@ -71,6 +71,13 @@ pub async fn persist_qa_secrets(
                 continue;
             }
             let uri = canonical_secret_uri(env, tenant, team, provider_id, key);
+            // Redacted WRITE log (uri + length) — anchors the setup→runtime journey.
+            tracing::info!(
+                uri = %uri,
+                value_len = text.len(),
+                provider = %provider_id,
+                "setup secret WRITE (qa)"
+            );
             entries.push(SeedEntry {
                 uri,
                 format: SecretFormat::Text,
@@ -155,8 +162,10 @@ pub async fn persist_all_config_as_secrets(
     config: &Value,
     pack_path: Option<&Path>,
 ) -> Result<Vec<String>> {
-    let store_path = crate::secrets::ensure_path(bundle_root)?;
-    let store = crate::secrets::open_dev_store(bundle_root)?;
+    // Seam-1 fix: write to the shared ENV store for `env` (the file the runtime
+    // reads), NOT the `$GREENTIC_ENV`-gated bundle-local store.
+    let store_path = crate::secrets::ensure_path_for_env(bundle_root, env)?;
+    let store = crate::secrets::open_dev_store_for_env(bundle_root, env)?;
     let mut saved_keys = Vec::new();
 
     // Introduce pack-declared generated secrets (e.g. messaging-webchat-gui's
@@ -198,6 +207,14 @@ pub async fn persist_all_config_as_secrets(
             continue;
         }
         let uri = canonical_secret_uri(env, tenant, team, provider_id, key);
+        // Redacted WRITE log (uri + length).
+        tracing::info!(
+            uri = %uri,
+            value_len = text.len(),
+            provider = %provider_id,
+            store_path = %store_path.display(),
+            "setup secret WRITE (config)"
+        );
         entries.push(SeedEntry {
             uri,
             format: SecretFormat::Text,
@@ -210,6 +227,16 @@ pub async fn persist_all_config_as_secrets(
     // Seed aliases from secret-requirements.json so WASM components can find
     // secrets by their canonical requirement key (e.g. WEBEX_BOT_TOKEN →
     // webex_bot_token) even when the answers file uses a shorter key (bot_token).
+    if pack_path.is_none() {
+        // Seam-4: no pack_path → requirement-key aliases not seeded (short answer
+        // keys may be unresolvable at runtime).
+        tracing::warn!(
+            provider = %provider_id,
+            store_path = %store_path.display(),
+            "setup secret alias seeding SKIPPED (no pack_path) — requirement-key \
+             aliases not written; short answer keys may be unresolvable at runtime"
+        );
+    }
     if let Some(pp) = pack_path {
         seed_secret_requirement_aliases(
             &mut entries,
@@ -308,7 +335,8 @@ pub async fn persist_qa_results(
     form_spec: &FormSpec,
 ) -> Result<Vec<String>> {
     let env = crate::resolve_env(None);
-    let store = crate::secrets::open_dev_store(bundle_root)?;
+    // Seam-1 fix: open the shared ENV store for `env` (the file the runtime reads).
+    let store = crate::secrets::open_dev_store_for_env(bundle_root, &env)?;
 
     let keys =
         persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await?;
@@ -587,7 +615,7 @@ fn validate_segment(label: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::open_dev_store;
+    use crate::secrets::open_dev_store_for_env;
     use greentic_secrets_lib::SecretsStore;
     use qa_spec::{QuestionSpec, QuestionType};
     use serde_json::json;
@@ -684,8 +712,10 @@ mod tests {
 
     #[tokio::test]
     async fn persist_qa_secrets_persists_visible_non_empty_values() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = open_dev_store(temp.path()).expect("open dev store");
+        let store = open_dev_store_for_env(temp.path(), "dev").expect("open dev store");
         let spec = make_form_spec(vec![question("token", true), question("enabled", false)]);
         let config = json!({
             "token": "abc123",
@@ -731,6 +761,8 @@ mod tests {
 
     #[tokio::test]
     async fn persist_all_config_as_secrets_seeds_aliases_from_requirements() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle_root = temp.path();
         let pack = bundle_root.join("messaging-webex.gtpack");
@@ -752,7 +784,7 @@ mod tests {
         .expect("persist all");
         assert_eq!(saved, vec!["bot_token".to_string()]);
 
-        let store = open_dev_store(bundle_root).expect("open store");
+        let store = open_dev_store_for_env(bundle_root, "dev").expect("open store");
         let base_uri = crate::canonical_secret_uri(
             "dev",
             "tenant-a",
@@ -777,6 +809,8 @@ mod tests {
 
     #[tokio::test]
     async fn persist_skips_store_rewrite_when_values_unchanged() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         // The setup UI persists config drafts continuously. Re-seeding
         // unchanged values must be a no-op: every real write appends a new
         // version of every key and rewrites the whole store file, which
@@ -800,7 +834,8 @@ mod tests {
         .await
         .expect("first persist");
 
-        let store_path = crate::secrets::ensure_path(bundle_root).expect("store path");
+        let store_path =
+            crate::secrets::ensure_path_for_env(bundle_root, "dev").expect("store path");
         let before = std::fs::read(&store_path).expect("read store");
 
         persist_all_config_as_secrets(
@@ -836,7 +871,7 @@ mod tests {
         )
         .await
         .expect("third persist");
-        let store = open_dev_store(bundle_root).expect("open store");
+        let store = open_dev_store_for_env(bundle_root, "dev").expect("open store");
         let uri = crate::canonical_secret_uri(
             "dev",
             "tenant-a",

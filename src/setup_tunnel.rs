@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map as JsonMap, Value};
+use sha2::{Digest, Sha256};
 
 pub struct SetupTunnel {
     pub mode: String,
@@ -100,6 +101,17 @@ pub struct GtunnelSetupCtx {
 /// `=1.1.2` across this graph (the same reason `cli_args.rs` keeps a local copy
 /// of `DEFAULT_TENANT`).
 pub fn derive_gtunnel_id(tenant: &str, _team: &str) -> String {
+    let base = sanitize_tunnel_id(tenant);
+    match install_clash_suffix(&tunnel_state_root(), &base) {
+        Some(suffix) => format!("{base}-{suffix}"),
+        None => base,
+    }
+}
+
+/// Slug of `tenant`: lowercase alphanumerics and `-`, everything else folded to
+/// `-`, trimmed, empty falling back to `default`. Matches greentic-start's
+/// `sanitize_tunnel_id`.
+fn sanitize_tunnel_id(tenant: &str) -> String {
     let slug: String = tenant
         .chars()
         .map(|c| {
@@ -116,6 +128,56 @@ pub fn derive_gtunnel_id(tenant: &str, _team: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// 5-hex clash-avoidance suffix for `base`, derived from the per-install seed at
+/// `<root>/instance-seed`.
+///
+/// The managed tunnel is ONE shared Worker, and almost every operator runs the
+/// default tenant — so a bare `<tenant>` id means every install collides on the
+/// same public path. The suffix is what keeps them distinct.
+///
+/// It must be STABLE, because it ends up inside URLs registered with Slack,
+/// Webex and OAuth providers. It must also be the SAME value greentic-start
+/// derives, which is why the seed lives in the tunnel state root both binaries
+/// already share (alongside `secret` and `secrets/<tunnelId>`) and why the hash
+/// is byte-compatible with start's `tenant_clash_suffix_from_seed`:
+/// last 5 hex of `sha256(seed || 0x00 || base)`.
+///
+/// Returns `None` when no seed can be established, in which case the caller uses
+/// the bare id — degraded (collidable) but functional, rather than failing setup.
+fn install_clash_suffix(root: &Path, base: &str) -> Option<String> {
+    let seed = load_or_create_instance_seed(root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(base.as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(hex[hex.len() - 5..].to_string())
+}
+
+/// Read `<root>/instance-seed`, creating it on first use. Shared on-disk format
+/// with greentic-start, which reads the same file so both derive one suffix.
+fn load_or_create_instance_seed(root: &Path) -> Option<String> {
+    let path = root.join("instance-seed");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if existing.len() == 64 && existing.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(existing);
+        }
+    }
+    let seed: String = (0..32)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(&path, &seed).ok()?;
+    Some(seed)
 }
 
 impl GtunnelSetupCtx {
@@ -915,18 +977,28 @@ mod tests {
     }
 
     #[test]
-    fn derive_gtunnel_id_matches_start_rule() {
-        // The TENANT ALONE — team is ignored, so the id can equal the <tenant>
-        // segment of /v1/web/webchat/<tenant>/… (which has no team segment) and
-        // match greentic-start's sanitize_tunnel_id.
-        //
-        // This test previously asserted "acme-corp-team-a" / "demo-default"
-        // under the same name, while greentic-start keyed on the tenant alone —
-        // so it passed while documenting a rule the runtime did not follow.
-        assert_eq!(derive_gtunnel_id("Acme Corp", "Team A"), "acme-corp");
-        assert_eq!(derive_gtunnel_id("demo", "default"), "demo");
-        assert_eq!(derive_gtunnel_id("demo", "other-team"), "demo");
-        assert_eq!(derive_gtunnel_id("", ""), "default");
+    fn sanitize_tunnel_id_uses_the_tenant_alone() {
+        // The BASE is the tenant alone — team is ignored, so it can equal the
+        // <tenant> segment of /v1/web/webchat/<tenant>/… (which has no team
+        // segment) and match greentic-start's sanitize_tunnel_id.
+        assert_eq!(sanitize_tunnel_id("Acme Corp"), "acme-corp");
+        assert_eq!(sanitize_tunnel_id("demo"), "demo");
+        assert_eq!(sanitize_tunnel_id(""), "default");
+        // Each non-alphanumeric folds to its own `-`, so runs are preserved
+        // and only the edges are trimmed.
+        assert_eq!(sanitize_tunnel_id("--Weird__Tenant--"), "weird--tenant");
+    }
+
+    #[test]
+    fn derive_gtunnel_id_appends_a_clash_suffix_to_the_base() {
+        // The full id carries a per-install suffix: the managed tunnel is ONE
+        // shared Worker and nearly every operator runs the default tenant, so a
+        // bare `<tenant>` id would collide across installs.
+        let id = derive_gtunnel_id("demo", "default");
+        let (base, suffix) = id.rsplit_once('-').expect("id carries a suffix");
+        assert_eq!(base, "demo");
+        assert_eq!(suffix.len(), 5, "5-hex suffix, got {id}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
     }
 
     #[test]
@@ -938,10 +1010,68 @@ mod tests {
             .map(|team| derive_gtunnel_id("acme", team))
             .collect();
         assert_eq!(
-            ids,
-            ["acme".to_string()].into_iter().collect(),
-            "team must not influence the tunnel id"
+            ids.len(),
+            1,
+            "team must not influence the tunnel id: {ids:?}"
         );
+        assert!(
+            ids.iter().next().expect("one id").starts_with("acme-"),
+            "{ids:?}"
+        );
+    }
+
+    // ---- per-install clash suffix ----
+
+    #[test]
+    fn clash_suffix_is_stable_across_calls_and_distinct_per_tenant() {
+        // Stability is the whole point: the suffix ends up inside URLs registered
+        // with Slack/Webex/OAuth, so it must survive restarts. It previously came
+        // from a per-process nonce and changed on every start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = install_clash_suffix(dir.path(), "demo").expect("suffix");
+        let second = install_clash_suffix(dir.path(), "demo").expect("suffix");
+        assert_eq!(first, second, "same install + tenant must give one suffix");
+        assert_eq!(first.len(), 5);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Distinct per tenant, so two tenants on one install do not collide.
+        let other = install_clash_suffix(dir.path(), "acme").expect("suffix");
+        assert_ne!(first, other, "suffix must be tenant-scoped");
+    }
+
+    #[test]
+    fn clash_suffix_differs_across_installs() {
+        // Two installs must not land on the same public URL — that is the
+        // collision this exists to prevent.
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        assert_ne!(
+            install_clash_suffix(a.path(), "default").expect("suffix"),
+            install_clash_suffix(b.path(), "default").expect("suffix"),
+            "distinct seeds must yield distinct suffixes"
+        );
+    }
+
+    #[test]
+    fn instance_seed_is_persisted_and_reused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = load_or_create_instance_seed(dir.path()).expect("seed");
+        assert_eq!(first.len(), 64, "256-bit seed as hex");
+        assert!(dir.path().join("instance-seed").is_file(), "must persist");
+        assert_eq!(
+            load_or_create_instance_seed(dir.path()).as_deref(),
+            Some(first.as_str()),
+            "a second read must reuse the persisted seed, not mint a new one"
+        );
+    }
+
+    #[test]
+    fn corrupt_seed_file_is_replaced_rather_than_used() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("instance-seed"), "not-a-seed\n").expect("write");
+        let seed = load_or_create_instance_seed(dir.path()).expect("seed");
+        assert_eq!(seed.len(), 64);
+        assert!(seed.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // ---- should_start_setup_tunnel ----

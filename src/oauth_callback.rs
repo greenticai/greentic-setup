@@ -421,7 +421,8 @@ async fn load_setup_action_secret(
 ) -> Result<Option<String>> {
     use greentic_secrets_lib::SecretsStore;
 
-    let store = crate::secrets::open_dev_store(bundle_root)?;
+    // Seam-1: env store (the file the runtime reads), not bundle-local.
+    let store = crate::secrets::open_dev_store_for_env(bundle_root, env)?;
     for key in keys {
         let uri = crate::canonical_secret_uri(
             env,
@@ -733,6 +734,8 @@ mod tests {
     #[tokio::test]
     async fn callback_without_legacy_action_completes_setup_machine_oauth_step()
     -> anyhow::Result<()> {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir()?;
         let bundle = temp.path();
         std::fs::create_dir_all(bundle.join("providers/messaging"))?;
@@ -814,7 +817,7 @@ mod tests {
             state.status,
             crate::setup_machine::SetupMachineStatus::Complete
         );
-        let store = crate::secrets::open_dev_store(bundle)?;
+        let store = crate::secrets::open_dev_store_for_env(bundle, "dev")?;
         let uri = crate::canonical_secret_uri(
             "dev",
             "demo",
@@ -830,6 +833,8 @@ mod tests {
     #[tokio::test]
     async fn callback_completes_setup_action_oauth_install_without_setup_machine()
     -> anyhow::Result<()> {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir()?;
         let bundle = temp.path();
         std::fs::create_dir_all(bundle.join("providers/messaging"))?;
@@ -894,7 +899,7 @@ mod tests {
             action.status,
             crate::setup_actions::SetupActionStatus::Complete
         );
-        let store = crate::secrets::open_dev_store(bundle)?;
+        let store = crate::secrets::open_dev_store_for_env(bundle, "dev")?;
         let uri = crate::canonical_secret_uri(
             "dev",
             "demo",
@@ -910,6 +915,8 @@ mod tests {
     #[tokio::test]
     async fn live_callback_without_legacy_action_exchanges_setup_machine_oauth_code()
     -> anyhow::Result<()> {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir()?;
         let bundle = temp.path();
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -1037,7 +1044,7 @@ mod tests {
         server_handle.join().unwrap()?;
 
         assert_eq!(report.persisted_secret_keys, vec!["EXAMPLE_TOKEN"]);
-        let store = crate::secrets::open_dev_store(bundle)?;
+        let store = crate::secrets::open_dev_store_for_env(bundle, "dev")?;
         let uri = crate::canonical_secret_uri(
             "dev",
             "demo",
