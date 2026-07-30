@@ -684,8 +684,26 @@ async fn install_catalog_provider(
     bundle_path: &std::path::Path,
     item: &ProviderCatalogItem,
 ) -> anyhow::Result<()> {
+    let domain_dir = bundle_path.join("providers").join(&item.category);
+    let dest = domain_dir.join(format!("{}.gtpack", item.id));
+
+    // A pack already sitting in the bundle IS the provider being added, so reuse
+    // it instead of re-pulling. Adding must not depend on the registry when the
+    // artifact is already on disk: the catalog pins providers by TAG
+    // (`oci://…:stable`), and the fetcher only consults its local cache for
+    // DIGEST-pinned refs — so a tagged add can never be served from cache and a
+    // flaky registry fails an add that needs no download at all.
+    if pack_file_is_usable(&dest) {
+        eprintln!(
+            "add-provider {}: reusing the pack already in the bundle ({})",
+            item.id,
+            dest.display()
+        );
+        return Ok(());
+    }
+
     let source = crate::bundle_source::BundleSource::parse(&item.reference)?;
-    let pack_path = source.resolve_async().await?;
+    let pack_path = resolve_pack_source_with_retry(&source, &item.reference).await?;
     if !pack_path.is_file() {
         anyhow::bail!(
             "resolved provider pack is not a file: {}",
@@ -693,10 +711,8 @@ async fn install_catalog_provider(
         );
     }
 
-    let domain_dir = bundle_path.join("providers").join(&item.category);
     std::fs::create_dir_all(&domain_dir)
         .with_context(|| format!("failed to create provider dir {}", domain_dir.display()))?;
-    let dest = domain_dir.join(format!("{}.gtpack", item.id));
     std::fs::copy(&pack_path, &dest).with_context(|| {
         format!(
             "failed to copy provider pack {} -> {}",
@@ -705,6 +721,39 @@ async fn install_catalog_provider(
         )
     })?;
     Ok(())
+}
+
+/// Whether `path` is a pack we can install from: present and non-empty. Guards
+/// against adopting a zero-byte file left by an interrupted earlier download.
+fn pack_file_is_usable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+/// Resolve a pack source, retrying transient registry failures. Pulls from
+/// ghcr.io routinely die mid-body ("end of file before message length reached"),
+/// which is retryable — one flaky read should not fail an otherwise valid add.
+async fn resolve_pack_source_with_retry(
+    source: &crate::bundle_source::BundleSource,
+    reference: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    const ATTEMPTS: usize = 3;
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match source.resolve_async().await {
+            Ok(path) => return Ok(path),
+            Err(err) => {
+                if attempt < ATTEMPTS {
+                    eprintln!(
+                        "add-provider: fetch of {reference} failed (attempt {attempt}/{ATTEMPTS}), \
+                         retrying: {err:#}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once and only stores Err"))
 }
 
 // ── API handlers ──
@@ -8174,13 +8223,14 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderSetupEventRequest, TUNNEL_FAILURE_COOLDOWN, UiState, build_router,
-        fill_provider_setup_status_from_answers, persist_provider_setup_event,
+        ProviderCatalogItem, ProviderCatalogLabel, ProviderSetupEventRequest,
+        TUNNEL_FAILURE_COOLDOWN, UiState, build_router, fill_provider_setup_status_from_answers,
+        install_catalog_provider, pack_file_is_usable, persist_provider_setup_event,
         persist_setup_tunnel_handoff, persist_ui_draft, prefill_has_cloud_deployment_targets,
         read_provider_setup_events, redact_provider_setup_event_detail,
-        setup_backend_record_step_attempt, setup_backend_runtime_context,
-        setup_backend_runtime_context_current, setup_backend_tunnel_cooldown_remaining,
-        setup_backend_tunnel_public_base_url_for_port_at,
+        resolve_pack_source_with_retry, setup_backend_record_step_attempt,
+        setup_backend_runtime_context, setup_backend_runtime_context_current,
+        setup_backend_tunnel_cooldown_remaining, setup_backend_tunnel_public_base_url_for_port_at,
     };
     use crate::secrets::open_dev_store;
     use axum::body::{Body, to_bytes};
@@ -12252,5 +12302,130 @@ setup_actions:
         }))
         .expect("local prefill");
         assert!(!prefill_has_cloud_deployment_targets(Some(&local_prefill)));
+    }
+
+    // ---- add-provider: reuse a bundle-local pack instead of pulling ----
+
+    fn catalog_item(id: &str, reference: &str) -> ProviderCatalogItem {
+        ProviderCatalogItem {
+            id: id.to_string(),
+            category: "messaging".to_string(),
+            label: ProviderCatalogLabel {
+                i18n_key: None,
+                fallback: id.to_string(),
+            },
+            reference: reference.to_string(),
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn pack_file_is_usable_requires_a_non_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.gtpack");
+        assert!(!pack_file_is_usable(&missing), "absent file");
+
+        // A zero-byte file is what an interrupted download leaves behind — it
+        // must not be adopted as if it were a real pack.
+        let empty = dir.path().join("empty.gtpack");
+        std::fs::write(&empty, b"").expect("write empty");
+        assert!(!pack_file_is_usable(&empty), "zero-byte file");
+
+        let real = dir.path().join("real.gtpack");
+        std::fs::write(&real, b"pack bytes").expect("write pack");
+        assert!(pack_file_is_usable(&real), "non-empty file");
+
+        assert!(!pack_file_is_usable(dir.path()), "directory is not a pack");
+    }
+
+    /// The regression this guards: `add` used to resolve the catalog reference
+    /// before looking at the destination, so a bundle that already shipped the
+    /// pack still failed when the registry was unreachable. The reference here
+    /// is deliberately unresolvable — if the code touches it, the test fails.
+    #[tokio::test]
+    async fn install_catalog_provider_reuses_the_bundle_local_pack() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let dest_dir = bundle.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&dest_dir).expect("mkdir");
+        let dest = dest_dir.join("messaging-slack.gtpack");
+        std::fs::write(&dest, b"existing pack bytes").expect("seed pack");
+
+        let item = catalog_item(
+            "messaging-slack",
+            "oci://ghcr.invalid/greenticai/packs/messaging/messaging-slack:stable",
+        );
+        install_catalog_provider(bundle.path(), &item)
+            .await
+            .expect("reuses the local pack without any network access");
+
+        assert_eq!(
+            std::fs::read(&dest).expect("read pack"),
+            b"existing pack bytes",
+            "the existing pack must be left byte-for-byte alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_catalog_provider_installs_from_a_local_reference() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let pack = source.path().join("messaging-telegram.gtpack");
+        std::fs::write(&pack, b"fetched pack bytes").expect("write source pack");
+
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let item = catalog_item("messaging-telegram", &format!("file://{}", pack.display()));
+        install_catalog_provider(bundle.path(), &item)
+            .await
+            .expect("installs when the pack is absent");
+
+        let dest = bundle
+            .path()
+            .join("providers")
+            .join("messaging")
+            .join("messaging-telegram.gtpack");
+        assert_eq!(
+            std::fs::read(dest).expect("read installed pack"),
+            b"fetched pack bytes"
+        );
+    }
+
+    /// A zero-byte destination must not short-circuit the fetch: the pack is
+    /// re-resolved and overwritten.
+    #[tokio::test]
+    async fn install_catalog_provider_replaces_an_empty_destination() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let pack = source.path().join("messaging-telegram.gtpack");
+        std::fs::write(&pack, b"real bytes").expect("write source pack");
+
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let dest_dir = bundle.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&dest_dir).expect("mkdir");
+        let dest = dest_dir.join("messaging-telegram.gtpack");
+        std::fs::write(&dest, b"").expect("seed truncated download");
+
+        let item = catalog_item("messaging-telegram", &format!("file://{}", pack.display()));
+        install_catalog_provider(bundle.path(), &item)
+            .await
+            .expect("re-fetches over a zero-byte leftover");
+
+        assert_eq!(
+            std::fs::read(&dest).expect("read pack"),
+            b"real bytes",
+            "the empty leftover must be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pack_source_with_retry_surfaces_the_last_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.gtpack");
+        let source = crate::bundle_source::BundleSource::FileUri(missing.clone());
+
+        let err = resolve_pack_source_with_retry(&source, "file://nope.gtpack")
+            .await
+            .expect_err("an unresolvable source still fails after retries");
+        assert!(
+            !format!("{err:#}").is_empty(),
+            "the underlying resolve error is surfaced, not swallowed"
+        );
     }
 }
