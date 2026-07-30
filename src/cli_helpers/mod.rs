@@ -219,6 +219,7 @@ fn has_cloud_deployment_target(targets: &[DeploymentTargetRecord]) -> bool {
 fn default_no_tunnel_answers() -> TunnelAnswers {
     TunnelAnswers {
         mode: Some("off".to_string()),
+        ..Default::default()
     }
 }
 

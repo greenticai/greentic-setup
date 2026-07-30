@@ -82,11 +82,25 @@ pub struct GtunnelSetupCtx {
     pub secret: String,
 }
 
-/// Derive a URL-path-safe tunnel id from tenant/team — identical to
-/// greentic-start's rule so both binaries key on the same id and share an agent.
-pub fn derive_gtunnel_id(tenant: &str, team: &str) -> String {
-    let raw = format!("{tenant}-{team}");
-    let slug: String = raw
+/// Derive a URL-path-safe tunnel id from the TENANT ALONE — `team` is
+/// deliberately ignored.
+///
+/// The id becomes the first path segment of the public URL, and it must equal
+/// the `<tenant>` segment of the WebChat URL space (`/v1/web/webchat/<tenant>/…`)
+/// so the Worker routes the SPA's root-absolute calls to the right tunnel. That
+/// URL space has no team segment, so folding `team` in here produced a
+/// `<tenant>-<team>` id that could never match a webchat URL — and disagreed
+/// with greentic-start, which keys on the tenant alone.
+///
+/// This is only the FALLBACK derivation now: once setup has run it persists the
+/// resolved id to `.greentic/tunnel.json` and greentic-start reads it verbatim
+/// rather than re-deriving (see [`crate::platform_setup::types::TunnelAnswers`]).
+/// Kept in sync with greentic-start's `sanitize_tunnel_id` by convention — the
+/// crates cannot share the rule via `greentic-types`, which is exact-pinned at
+/// `=1.1.2` across this graph (the same reason `cli_args.rs` keeps a local copy
+/// of `DEFAULT_TENANT`).
+pub fn derive_gtunnel_id(tenant: &str, _team: &str) -> String {
+    let slug: String = tenant
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -853,9 +867,32 @@ mod tests {
 
     #[test]
     fn derive_gtunnel_id_matches_start_rule() {
-        assert_eq!(derive_gtunnel_id("Acme Corp", "Team A"), "acme-corp-team-a");
-        assert_eq!(derive_gtunnel_id("demo", "default"), "demo-default");
+        // The TENANT ALONE — team is ignored, so the id can equal the <tenant>
+        // segment of /v1/web/webchat/<tenant>/… (which has no team segment) and
+        // match greentic-start's sanitize_tunnel_id.
+        //
+        // This test previously asserted "acme-corp-team-a" / "demo-default"
+        // under the same name, while greentic-start keyed on the tenant alone —
+        // so it passed while documenting a rule the runtime did not follow.
+        assert_eq!(derive_gtunnel_id("Acme Corp", "Team A"), "acme-corp");
+        assert_eq!(derive_gtunnel_id("demo", "default"), "demo");
+        assert_eq!(derive_gtunnel_id("demo", "other-team"), "demo");
         assert_eq!(derive_gtunnel_id("", ""), "default");
+    }
+
+    #[test]
+    fn derive_gtunnel_id_ignores_team_entirely() {
+        // Guards the regression directly: any team must collapse to one id, so a
+        // second team on the same tenant cannot strand a registered webhook URL.
+        let ids: std::collections::BTreeSet<String> = ["default", "eng", "", "Team B"]
+            .iter()
+            .map(|team| derive_gtunnel_id("acme", team))
+            .collect();
+        assert_eq!(
+            ids,
+            ["acme".to_string()].into_iter().collect(),
+            "team must not influence the tunnel id"
+        );
     }
 
     // ---- should_start_setup_tunnel ----
