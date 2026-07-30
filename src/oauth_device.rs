@@ -1595,6 +1595,8 @@ mod tests {
 
     #[tokio::test]
     async fn poll_persists_device_outputs_to_runtime_config_and_secrets() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path();
         let provider_id = "messaging-teams";
@@ -1689,7 +1691,7 @@ mod tests {
         assert!(answers.get("MS_GRAPH_REFRESH_TOKEN").is_none());
         assert!(answers.get("MS_GRAPH_ACCESS_TOKEN").is_none());
 
-        let store = crate::secrets::open_dev_store(bundle).unwrap();
+        let store = crate::secrets::open_dev_store_for_env(bundle, "dev").unwrap();
         let refresh_uri = crate::canonical_secret_uri(
             "dev",
             tenant,
@@ -1703,6 +1705,8 @@ mod tests {
 
     #[tokio::test]
     async fn poll_invokes_apply_answers_before_completing_and_persists_provider_config() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path();
         let provider_id = "messaging-teams";
@@ -1784,7 +1788,7 @@ mod tests {
         assert!(answers.get("MS_GRAPH_REFRESH_TOKEN").is_none());
         assert!(answers.get("MS_GRAPH_ACCESS_TOKEN").is_none());
 
-        let store = crate::secrets::open_dev_store(bundle).unwrap();
+        let store = crate::secrets::open_dev_store_for_env(bundle, "dev").unwrap();
         let refresh_uri = crate::canonical_secret_uri(
             "dev",
             tenant,
@@ -1807,6 +1811,8 @@ mod tests {
 
     #[tokio::test]
     async fn poll_does_not_complete_when_apply_answers_returns_not_ok() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path();
         let provider_id = "messaging-teams";

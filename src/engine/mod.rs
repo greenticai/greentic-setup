@@ -880,6 +880,8 @@ setup_actions:
 
     #[test]
     fn execute_apply_pack_setup_uses_bundle_name_for_registration_app_name_template() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -939,7 +941,8 @@ setup_actions:
         // setup-answers.json, so assert against the store. `canonical_secret_uri`
         // collapses the literal "default" team into the `_` wildcard segment.
         use greentic_secrets_lib::SecretsStore as _;
-        let store = crate::secrets::open_dev_store(&bundle_root).expect("open dev store");
+        let store =
+            crate::secrets::open_dev_store_for_env(&bundle_root, "dev").expect("open dev store");
         let rt = tokio::runtime::Runtime::new().unwrap();
         // setup uses the A4b `dev` -> `local` env alias for the secrets URI.
         let env = crate::resolve_env(Some("dev"));

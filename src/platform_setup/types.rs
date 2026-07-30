@@ -51,10 +51,24 @@ pub struct TelemetryAnswers {
 /// flags or an interactive prompt.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TunnelAnswers {
-    /// `"cloudflared"`, `"ngrok"`, or `"off"`. When absent the runtime
-    /// falls back to its own default (auto-detect or interactive prompt).
+    /// `"cloudflared"`, `"ngrok"`, `"gtunnel"`, or `"off"`. When absent the
+    /// runtime falls back to its own default (auto-detect or interactive prompt).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// The resolved Greentic managed-tunnel id (`mode == "gtunnel"` only), i.e.
+    /// the first path segment of the public URL setup handed to providers.
+    ///
+    /// AUTHORITATIVE: setup decides the id once and records it here so
+    /// `greentic-start` reads it verbatim instead of re-deriving. Both binaries
+    /// used to derive independently and disagreed (`<tenant>-<team>` vs the
+    /// tenant alone, plus a per-process random suffix on the serving path), so a
+    /// webhook URL registered with Slack/Webex during setup pointed at an id the
+    /// runtime never served. Whoever registers the URL must own the id.
+    ///
+    /// Absent for non-gtunnel modes, and for bundles configured before this
+    /// field existed — the runtime falls back to deriving in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_id: Option<String>,
 }
 
 /// Handoff record for the tunnel `greentic-setup` speculatively started

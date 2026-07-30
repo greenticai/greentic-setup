@@ -148,5 +148,8 @@ pub fn prompt_tunnel_mode(current: Option<&TunnelAnswers>) -> Result<TunnelAnswe
     };
     Ok(TunnelAnswers {
         mode: Some(mode.to_string()),
+        // The id is resolved and recorded later, when the tunnel is actually
+        // acquired and proven reachable — the prompt only picks a mode.
+        ..Default::default()
     })
 }
