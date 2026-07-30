@@ -133,14 +133,29 @@ impl GtunnelSetupCtx {
         // each tunnel its own host root), matching greentic-start's precedence.
         let root_map = base_domain.is_none() && env_flag("GREENTIC_TUNNEL_ROOT_MAP");
         Self {
-            worker_url: std::env::var("GREENTIC_TUNNEL_WORKER_URL")
-                .unwrap_or_else(|_| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string()),
+            worker_url: gtunnel_worker_base_url(),
             base_domain,
             root_map,
             tunnel_id,
             secret,
         }
     }
+}
+
+/// Base URL of the managed-tunnel Worker: `GREENTIC_TUNNEL_WORKER_URL` when set
+/// and non-empty, else [`DEFAULT_GTUNNEL_WORKER_BASE_URL`].
+///
+/// Shared deliberately by [`GtunnelSetupCtx::new`], which BUILDS the public URL,
+/// and [`is_ephemeral_tunnel_url`], which decides whether an existing URL is one
+/// of ours to re-point. Those two must resolve the same host: if the predicate
+/// tested a different host than the builder used, a managed URL would once again
+/// look permanent and never be refreshed — the exact bug this helper prevents.
+fn gtunnel_worker_base_url() -> String {
+    std::env::var("GREENTIC_TUNNEL_WORKER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string())
 }
 
 /// Truthy env flag: `1`, `true`, or `yes` (case-insensitive). Mirrors the same
@@ -806,7 +821,37 @@ pub fn inject_setup_public_base_url(answers: &mut JsonMap<String, Value>, public
     }
 }
 
+/// Does `value` name a tunnel URL that SETUP HANDED OUT and may therefore
+/// re-point? Callers use it to tell an operator's permanent URL (preserve — never
+/// touch it) from one we produced ourselves (replace with the current one).
+///
+/// NOTE ON THE NAME: "ephemeral" here means "engine-assigned, ours to replace" —
+/// NOT "short-lived". The managed-tunnel Worker HOST is perfectly stable, yet the
+/// tunnel id in its first path segment changes between runs, so a managed URL is
+/// still refreshable and must be matched here. The name is kept because this is
+/// `pub` and consumed by three other modules, and because two payload keys embed
+/// it — `public_base_url_is_ephemeral_tunnel` (persisted in `runtime_context` and
+/// compared against earlier runs) and `"ephemeral"` in the setup-machine step
+/// detail. Renaming the function without those keys would mismatch, and renaming
+/// the keys would invalidate already-persisted state for no behavioural gain.
+///
+/// Before this matched the Worker host, a STALE managed URL looked permanent and
+/// was preserved forever: one real session left Webex and the state provider on
+/// `<worker>/default` while Slack moved to `<worker>/default-default`, and the
+/// webhook Webex had registered pointed at a path the tunnel no longer served.
 pub fn is_ephemeral_tunnel_url(value: &str) -> bool {
+    is_ephemeral_tunnel_url_for_worker_base(value, &gtunnel_worker_base_url())
+}
+
+/// Worker-base half of [`is_ephemeral_tunnel_url`], with the base passed
+/// explicitly so it is testable without mutating process env — the same pattern
+/// [`resolve_tunnel_secret_in`] uses for the state root.
+fn is_ephemeral_tunnel_url_for_worker_base(value: &str, worker_base_url: &str) -> bool {
+    // Derived from the configured Worker base rather than a hardcoded hostname,
+    // so a self-hosted Worker is treated exactly like the default one.
+    let managed_host = url::Url::parse(worker_base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()));
     url::Url::parse(value).ok().is_some_and(|url| {
         url.scheme() == "https"
             && url.host_str().is_some_and(|host| {
@@ -815,6 +860,10 @@ pub fn is_ephemeral_tunnel_url(value: &str) -> bool {
                     || host.ends_with(".trycloudflare.com")
                     || host.ends_with(".ngrok-free.app")
                     || host.ends_with(".ngrok.io")
+                    // Any URL on the managed Worker host is ours: the host does
+                    // not distinguish tunnel ids, the path segment does, and that
+                    // segment is exactly what goes stale.
+                    || managed_host.as_deref() == Some(host.as_str())
             })
     })
 }
@@ -1238,6 +1287,132 @@ mod tests {
     #[test]
     fn ephemeral_url_mixed_case() {
         assert!(is_ephemeral_tunnel_url("https://DEMO.TryCloudflare.COM"));
+    }
+
+    // ---- managed-tunnel (gtunnel) URLs are refreshable too ----
+    //
+    // The host is stable but the tunnel id in the first path segment is not, so a
+    // managed URL from an earlier run must be re-pointed rather than preserved as
+    // if an operator had supplied it.
+
+    #[test]
+    fn managed_worker_url_is_refreshable_on_the_default_worker_host() {
+        // Env-free: falls back to DEFAULT_GTUNNEL_WORKER_BASE_URL.
+        assert!(is_ephemeral_tunnel_url(&format!(
+            "{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default"
+        )));
+        assert!(is_ephemeral_tunnel_url(&format!(
+            "{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default-default"
+        )));
+        // Bare host, no id segment at all.
+        assert!(is_ephemeral_tunnel_url(DEFAULT_GTUNNEL_WORKER_BASE_URL));
+    }
+
+    #[test]
+    fn managed_worker_url_is_refreshable_on_a_self_hosted_worker_host() {
+        // Worker base passed explicitly rather than via env: this crate has no
+        // temp-env dev-dependency, and mutating process env would race the other
+        // tests in this binary.
+        assert!(is_ephemeral_tunnel_url_for_worker_base(
+            "https://tunnel.acme.example/default",
+            "https://tunnel.acme.example"
+        ));
+        // Host comparison is case-insensitive and ignores the base's trailing path.
+        assert!(is_ephemeral_tunnel_url_for_worker_base(
+            "https://Tunnel.ACME.example/demo",
+            "https://tunnel.acme.example/"
+        ));
+    }
+
+    #[test]
+    fn genuine_operator_url_is_still_preserved() {
+        // The whole point of the predicate: a permanent operator-supplied ingress
+        // must never be replaced by a tunnel URL.
+        assert!(!is_ephemeral_tunnel_url("https://hooks.example.com"));
+        assert!(!is_ephemeral_tunnel_url(
+            "https://hooks.example.com/webhooks"
+        ));
+        // And it stays preserved when a self-hosted Worker is configured.
+        assert!(!is_ephemeral_tunnel_url_for_worker_base(
+            "https://hooks.example.com",
+            "https://tunnel.acme.example"
+        ));
+    }
+
+    #[test]
+    fn managed_worker_host_matches_the_configured_base_only() {
+        // Documents the chosen semantics: the predicate keys on the CONFIGURED
+        // Worker base, so with a self-hosted Worker a leftover URL on the default
+        // Greentic Worker host is not claimed. Kept deliberately narrow — the
+        // configured host is the one this run can actually serve.
+        assert!(!is_ephemeral_tunnel_url_for_worker_base(
+            &format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default"),
+            "https://tunnel.acme.example"
+        ));
+        // A malformed worker base disables managed matching but must not break
+        // the trycloudflare/ngrok arms.
+        assert!(!is_ephemeral_tunnel_url_for_worker_base(
+            "https://hooks.example.com",
+            "not-a-url"
+        ));
+        assert!(is_ephemeral_tunnel_url_for_worker_base(
+            "https://demo.trycloudflare.com",
+            "not-a-url"
+        ));
+    }
+
+    #[test]
+    fn inject_replaces_a_stale_managed_url_under_a_different_id() {
+        // The live regression: an earlier run configured these providers under the
+        // old `default-default` id, the current run serves `default`, and the URL
+        // "looked stable" so it was preserved forever — leaving Webex's registered
+        // webhook pointing at a path the tunnel no longer serves.
+        let stale = format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default-default");
+        let current = format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default");
+        let mut answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-webex": { "public_base_url": stale },
+            "messaging-slack": { "public_base_url": current },
+            "messaging-operator": { "public_base_url": "https://hooks.example.com" },
+        }))
+        .expect("answers");
+
+        inject_setup_public_base_url(&mut answers, &current);
+
+        assert_eq!(
+            answers["messaging-webex"]["public_base_url"],
+            json!(current),
+            "a managed URL under the old id must be re-pointed at the current id"
+        );
+        assert_eq!(
+            answers["messaging-slack"]["public_base_url"],
+            json!(current)
+        );
+        assert_eq!(
+            answers["messaging-operator"]["public_base_url"],
+            json!("https://hooks.example.com"),
+            "a genuine operator URL must survive untouched"
+        );
+    }
+
+    #[test]
+    fn should_start_setup_tunnel_when_only_url_is_a_stale_managed_one() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-webex": {
+                "public_base_url": format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default-default")
+            },
+        }))
+        .expect("answers");
+        assert!(
+            should_start_setup_tunnel("gtunnel", &answers),
+            "a stale managed URL must not convince setup the tunnel is unnecessary"
+        );
+
+        // Contrast: a real operator URL genuinely needs no tunnel.
+        let operator = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-webex": { "public_base_url": "https://hooks.example.com" },
+        }))
+        .expect("answers");
+        assert!(!should_start_setup_tunnel("gtunnel", &operator));
     }
 
     // ---- inject_setup_public_base_url ----
