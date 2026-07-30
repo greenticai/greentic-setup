@@ -132,6 +132,8 @@ fn main() -> Result<()> {
                 cli.dry_run,
                 cli.non_interactive,
                 None,
+                &cli.tenant,
+                cli.team.as_deref(),
             )
         }
         Some(Command::Provider(cmd)) => {
@@ -215,7 +217,21 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     // (the subcommand path was already fixed by greentic-setup#114).
     env = greentic_setup::resolve_env(Some(&env));
 
+    // Propagate the resolved env into the process so bare dev-store callers
+    // (`open_dev_store`/`ensure_path`, which key the shared env store off
+    // `$GREENTIC_ENV`) land on the same `~/.greentic/environments/<env>/…`
+    // store that the explicit-env writers (`SecretsSetup`) and `gtc start` use.
+    // SAFETY: called early on the single-threaded CLI entry before any workers.
+    unsafe { std::env::set_var("GREENTIC_ENV", &env) };
+
     let bundle_dir = resolve_bundle_source(&bundle_path, i18n)?;
+
+    // `--new-cache`: clear the persisted secrets for this env and the bundle's
+    // cached data, so this run rebuilds from scratch rather than reusing a
+    // populated env store or stale setup-state / extraction caches.
+    if cli.new_cache {
+        greentic_setup::cli_helpers::clear_bundle_cache(&bundle_dir, &env);
+    }
 
     bundle::validate_bundle_exists(&bundle_dir).context(i18n.t("cli.error.invalid_bundle"))?;
     let loader_engine = SetupEngine::new(SetupConfig {
@@ -449,6 +465,8 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
             false,
             true, // non-interactive
             None,
+            &cli.tenant,
+            cli.team.as_deref(),
         )
         .context("auto-deploy bundle to environment")?;
 

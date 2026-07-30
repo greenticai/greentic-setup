@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map as JsonMap, Value};
+use sha2::{Digest, Sha256};
 
 pub struct SetupTunnel {
     pub mode: String,
@@ -53,8 +54,234 @@ impl SetupTunnel {
     }
 }
 
+/// Default Greentic-operated Worker tunnel base (mirrors greentic-start's
+/// `gtunnel::DEFAULT_WORKER_BASE_URL`; the crates don't share a dependency).
+const DEFAULT_GTUNNEL_WORKER_BASE_URL: &str = "https://greentic-webhook-proxy.greentic.workers.dev";
+
+/// Shared tunnel secret baked into the shipped binaries, matching the Worker's
+/// global `TUNNEL_SECRET` — so the managed tunnel needs no operator credentials.
+/// Mirrors greentic-start's `gtunnel::DEFAULT_TUNNEL_SECRET` (the crates don't
+/// share a dependency); the two MUST stay in sync or setup and start would
+/// register the same tunnel id under different secrets.
+const DEFAULT_TUNNEL_SECRET: &str =
+    "d00a7591949699785228c42504afa41ce168f84e4118bb127e47c5cb98e4dd90";
+
+/// Everything the setup binary needs to bring up the Greentic self-hosted tunnel.
+/// Derived by the caller (from tenant/team + env) so setup and start compute the
+/// same tunnel id and share one agent.
+#[derive(Clone, Debug)]
+pub struct GtunnelSetupCtx {
+    pub worker_url: String,
+    /// When set (`GREENTIC_TUNNEL_BASE_DOMAIN`), use subdomain routing
+    /// (`https://<tunnelId>.<base>`) so the WebChat SPA works at the host root.
+    pub base_domain: Option<String>,
+    /// Root-map mode (`GREENTIC_TUNNEL_ROOT_MAP`): the whole Worker host maps to
+    /// this one tunnel at its root (cloudflared-style), so the WebChat SPA works
+    /// on workers.dev with no custom domain. Ignored when `base_domain` is set.
+    pub root_map: bool,
+    pub tunnel_id: String,
+    pub secret: String,
+}
+
+/// Derive a URL-path-safe tunnel id from the TENANT ALONE — `team` is
+/// deliberately ignored.
+///
+/// The id becomes the first path segment of the public URL, and it must equal
+/// the `<tenant>` segment of the WebChat URL space (`/v1/web/webchat/<tenant>/…`)
+/// so the Worker routes the SPA's root-absolute calls to the right tunnel. That
+/// URL space has no team segment, so folding `team` in here produced a
+/// `<tenant>-<team>` id that could never match a webchat URL — and disagreed
+/// with greentic-start, which keys on the tenant alone.
+///
+/// This is only the FALLBACK derivation now: once setup has run it persists the
+/// resolved id to `.greentic/tunnel.json` and greentic-start reads it verbatim
+/// rather than re-deriving (see [`crate::platform_setup::types::TunnelAnswers`]).
+/// Kept in sync with greentic-start's `sanitize_tunnel_id` by convention — the
+/// crates cannot share the rule via `greentic-types`, which is exact-pinned at
+/// `=1.1.2` across this graph (the same reason `cli_args.rs` keeps a local copy
+/// of `DEFAULT_TENANT`).
+pub fn derive_gtunnel_id(tenant: &str, _team: &str) -> String {
+    let base = sanitize_tunnel_id(tenant);
+    match install_clash_suffix(&tunnel_state_root(), &base) {
+        Some(suffix) => format!("{base}-{suffix}"),
+        None => base,
+    }
+}
+
+/// Slug of `tenant`: lowercase alphanumerics and `-`, everything else folded to
+/// `-`, trimmed, empty falling back to `default`. Matches greentic-start's
+/// `sanitize_tunnel_id`.
+fn sanitize_tunnel_id(tenant: &str) -> String {
+    let slug: String = tenant
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// 5-hex clash-avoidance suffix for `base`, derived from the per-install seed at
+/// `<root>/instance-seed`.
+///
+/// The managed tunnel is ONE shared Worker, and almost every operator runs the
+/// default tenant — so a bare `<tenant>` id means every install collides on the
+/// same public path. The suffix is what keeps them distinct.
+///
+/// It must be STABLE, because it ends up inside URLs registered with Slack,
+/// Webex and OAuth providers. It must also be the SAME value greentic-start
+/// derives, which is why the seed lives in the tunnel state root both binaries
+/// already share (alongside `secret` and `secrets/<tunnelId>`) and why the hash
+/// is byte-compatible with start's `tenant_clash_suffix_from_seed`:
+/// last 5 hex of `sha256(seed || 0x00 || base)`.
+///
+/// Returns `None` when no seed can be established, in which case the caller uses
+/// the bare id — degraded (collidable) but functional, rather than failing setup.
+fn install_clash_suffix(root: &Path, base: &str) -> Option<String> {
+    let seed = load_or_create_instance_seed(root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(base.as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(hex[hex.len() - 5..].to_string())
+}
+
+/// Read `<root>/instance-seed`, creating it on first use. Shared on-disk format
+/// with greentic-start, which reads the same file so both derive one suffix.
+fn load_or_create_instance_seed(root: &Path) -> Option<String> {
+    let path = root.join("instance-seed");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if existing.len() == 64 && existing.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(existing);
+        }
+    }
+    let seed: String = (0..32)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(&path, &seed).ok()?;
+    Some(seed)
+}
+
+impl GtunnelSetupCtx {
+    /// Zero-config context: worker URL and tunnel secret both from env/default,
+    /// so the managed tunnel works on a fresh box with no operator input. Secret
+    /// resolution matches greentic-start's, so both binaries present the same
+    /// credential for the same tunnel id.
+    pub fn new(tunnel_id: String) -> Self {
+        let secret = resolve_tunnel_secret(&tunnel_id);
+        let base_domain = std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // Root-map only applies without a base domain (a subdomain already gives
+        // each tunnel its own host root), matching greentic-start's precedence.
+        let root_map = base_domain.is_none() && env_flag("GREENTIC_TUNNEL_ROOT_MAP");
+        Self {
+            worker_url: gtunnel_worker_base_url(),
+            base_domain,
+            root_map,
+            tunnel_id,
+            secret,
+        }
+    }
+}
+
+/// Base URL of the managed-tunnel Worker: `GREENTIC_TUNNEL_WORKER_URL` when set
+/// and non-empty, else [`DEFAULT_GTUNNEL_WORKER_BASE_URL`].
+///
+/// Shared deliberately by [`GtunnelSetupCtx::new`], which BUILDS the public URL,
+/// and [`is_ephemeral_tunnel_url`], which decides whether an existing URL is one
+/// of ours to re-point. Those two must resolve the same host: if the predicate
+/// tested a different host than the builder used, a managed URL would once again
+/// look permanent and never be refreshed — the exact bug this helper prevents.
+fn gtunnel_worker_base_url() -> String {
+    std::env::var("GREENTIC_TUNNEL_WORKER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_GTUNNEL_WORKER_BASE_URL.to_string())
+}
+
+/// Truthy env flag: `1`, `true`, or `yes` (case-insensitive). Mirrors the same
+/// helper in greentic-start so both binaries read `GREENTIC_TUNNEL_ROOT_MAP`
+/// identically.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// `~/.greentic/tunnel` (override: `GREENTIC_TUNNEL_STATE_DIR`).
+fn tunnel_state_root() -> PathBuf {
+    std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".greentic")
+                .join("tunnel")
+        })
+}
+
+fn read_secret_file(path: PathBuf) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Resolve the tunnel secret: `GREENTIC_TUNNEL_SECRET` env > per-tunnel store
+/// (`<root>/secrets/<id>`) > operator secret (`<root>/secret`) >
+/// [`DEFAULT_TUNNEL_SECRET`]. Never empty — the baked-in constant is the whole
+/// point: the managed tunnel authenticates with no operator credentials at all.
+/// Must stay identical to greentic-start's `gtunnel::resolve_secret`, since
+/// either binary can be the one that spawns the agent for a given tunnel id.
+fn resolve_tunnel_secret(tunnel_id: &str) -> String {
+    if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
+        && !secret.is_empty()
+    {
+        return secret;
+    }
+    resolve_tunnel_secret_in(&tunnel_state_root(), tunnel_id)
+}
+
+/// File-store half of [`resolve_tunnel_secret`], root passed explicitly so it is
+/// testable without touching the developer's real `~/.greentic/tunnel`.
+fn resolve_tunnel_secret_in(root: &Path, tunnel_id: &str) -> String {
+    read_secret_file(root.join("secrets").join(tunnel_id))
+        .or_else(|| read_secret_file(root.join("secret")))
+        .unwrap_or_else(|| DEFAULT_TUNNEL_SECRET.to_string())
+}
+
+fn gtunnel_ctx_from_env() -> GtunnelSetupCtx {
+    GtunnelSetupCtx::new(
+        std::env::var("GREENTIC_TUNNEL_ID").unwrap_or_else(|_| "default".to_string()),
+    )
+}
+
 pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -> bool {
-    matches!(mode, "cloudflared" | "ngrok")
+    matches!(mode, "cloudflared" | "ngrok" | "gtunnel")
         && answers.values().any(|provider_answers| {
             let Some(obj) = provider_answers.as_object() else {
                 return false;
@@ -70,7 +297,11 @@ pub fn should_start_setup_tunnel(mode: &str, answers: &JsonMap<String, Value>) -
         })
 }
 
-pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunnel> {
+pub fn start_setup_tunnel(
+    mode: &str,
+    local_base_url: &str,
+    gtunnel: Option<GtunnelSetupCtx>,
+) -> Result<SetupTunnel> {
     match mode {
         "cloudflared" => start_cloudflared_shared(local_base_url),
         "ngrok" => {
@@ -83,8 +314,163 @@ pub fn start_setup_tunnel(mode: &str, local_base_url: &str) -> Result<SetupTunne
                 kill_on_drop: true,
             })
         }
+        "gtunnel" => {
+            let ctx = gtunnel.unwrap_or_else(gtunnel_ctx_from_env);
+            start_gtunnel_shared(local_base_url, &ctx)
+        }
         other => Err(anyhow!("unsupported setup tunnel mode: {other}")),
     }
+}
+
+/// Adopt (or spawn) the Greentic self-hosted tunnel agent under the machine-wide
+/// shared record for this port, so `greentic-start` reuses the same agent. The
+/// public URL is deterministic (`<worker>/<tunnel_id>`) — no discovery needed.
+fn start_gtunnel_shared(local_base_url: &str, ctx: &GtunnelSetupCtx) -> Result<SetupTunnel> {
+    let mode = "gtunnel";
+    let port = crate::shared_tunnel::local_port_from_base_url(local_base_url)
+        .ok_or_else(|| anyhow!("cannot derive a local port from {local_base_url}"))?;
+    let paths = crate::shared_tunnel::shared_service_tunnel_paths(mode, port);
+    let _lock =
+        crate::shared_tunnel::TunnelLock::acquire(&paths.lock_path, Duration::from_secs(30))?;
+
+    let public_base_url = match &ctx.base_domain {
+        Some(base) => format!("https://{}.{}", ctx.tunnel_id, base.trim_matches('.')),
+        // Root-map: the Worker host itself is this tunnel — no path prefix.
+        None if ctx.root_map => ctx.worker_url.trim_end_matches('/').to_string(),
+        None => format!("{}/{}", ctx.worker_url.trim_end_matches('/'), ctx.tunnel_id),
+    };
+
+    // Reuse a live agent (ours or greentic-start's) rather than spawn a second —
+    // the Worker allows only one socket per tunnel id. But a pid can be alive
+    // while its WebSocket to the Worker is dead, so only adopt an agent that is
+    // actually SERVING; a stale one is killed and replaced (so the caller's
+    // reachability probe doesn't just fail on a reused-but-dead tunnel).
+    let (recorded_pid, _recorded_url) = crate::shared_tunnel::read_record(&paths);
+    if let Some(pid) = recorded_pid
+        && crate::shared_tunnel::process_alive(pid)
+    {
+        if gtunnel_serving(&public_base_url) {
+            eprintln!("Reusing shared {mode} agent (pid {pid}): {public_base_url}");
+            let _ = crate::shared_tunnel::write_record(&paths, pid, &public_base_url);
+            return Ok(reuse_shared_tunnel(mode, local_base_url, public_base_url));
+        }
+        eprintln!(
+            "Shared {mode} agent (pid {pid}) is alive but {public_base_url} is not serving — \
+             replacing the stale tunnel"
+        );
+        crate::shared_tunnel::terminate_recorded_pid_named(pid, "greentic-start");
+    }
+    crate::shared_tunnel::clear_record(&paths);
+
+    let child = spawn_gtunnel_agent(local_base_url, ctx, &paths.log_path)?;
+    if let Err(err) = crate::shared_tunnel::write_record(&paths, child.id(), &public_base_url) {
+        eprintln!("warning: could not publish shared gtunnel record: {err:#}");
+    }
+    eprintln!("Setup tunnel started via {mode}: {public_base_url}");
+    Ok(SetupTunnel {
+        mode: mode.to_string(),
+        local_base_url: local_base_url.trim_end_matches('/').to_string(),
+        public_base_url,
+        child: Some(child),
+        kill_on_drop: false,
+    })
+}
+
+/// Whether the tunnel serves end to end: a bounded GET to the public URL. A
+/// routed response (2xx/3xx/4xx) proves the agent is connected and forwarding;
+/// the Worker's `502 tunnel offline` (or any 5xx / transport error) means the
+/// recorded agent is stale. `< 500` mirrors `setup_backend_public_tunnel_responds`.
+fn gtunnel_serving(public_url: &str) -> bool {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    match agent.get(public_url).call() {
+        Ok(_) => true,
+        Err(ureq::Error::StatusCode(code)) => code < 500,
+        Err(_) => false,
+    }
+}
+
+/// Spawn `greentic-start __tunnel-agent`, forwarding to `local_base_url`, with
+/// stdout/stderr redirected to the shared tunnel log.
+fn spawn_gtunnel_agent(
+    local_base_url: &str,
+    ctx: &GtunnelSetupCtx,
+    log_path: &Path,
+) -> Result<Child> {
+    let binary = resolve_gtunnel_agent_binary()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("open gtunnel log {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .with_context(|| "clone gtunnel log handle")?;
+
+    let edge_url = match &ctx.base_domain {
+        // Subdomain routing: register at the tunnel's own host root.
+        Some(base) => format!("wss://{}.{}/_tunnel", ctx.tunnel_id, base.trim_matches('.')),
+        None => {
+            let ws_base = if let Some(rest) = ctx
+                .worker_url
+                .trim_end_matches('/')
+                .strip_prefix("https://")
+            {
+                format!("wss://{rest}")
+            } else if let Some(rest) = ctx.worker_url.trim_end_matches('/').strip_prefix("http://")
+            {
+                format!("ws://{rest}")
+            } else {
+                ctx.worker_url.trim_end_matches('/').to_string()
+            };
+            if ctx.root_map {
+                // Root-map: register at the Worker host root; the Worker maps
+                // every request (including /_tunnel) to TUNNEL_DEFAULT_ID.
+                format!("{ws_base}/_tunnel")
+            } else {
+                format!("{ws_base}/{}/_tunnel", ctx.tunnel_id)
+            }
+        }
+    };
+
+    Command::new(&binary)
+        .arg("__tunnel-agent")
+        .env("GREENTIC_TUNNEL_EDGE_URL", edge_url)
+        .env("GREENTIC_TUNNEL_SECRET", &ctx.secret)
+        .env(
+            "GREENTIC_TUNNEL_TARGET",
+            local_base_url.trim_end_matches('/'),
+        )
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .with_context(|| format!("spawn gtunnel agent via {}", binary.display()))
+}
+
+/// Locate the `greentic-start` binary that hosts the `__tunnel-agent` subcommand:
+/// explicit `GREENTIC_TUNNEL_AGENT_BIN`, else the first `greentic-start` on PATH.
+fn resolve_gtunnel_agent_binary() -> Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os("GREENTIC_TUNNEL_AGENT_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(anyhow!(
+            "GREENTIC_TUNNEL_AGENT_BIN points at {}, which does not exist",
+            path.display()
+        ));
+    }
+    resolve_path_binary("greentic-start").ok_or_else(|| {
+        anyhow!(
+            "greentic-start not found on PATH (needed to run the tunnel agent); \
+             set GREENTIC_TUNNEL_AGENT_BIN to its location"
+        )
+    })
 }
 
 /// Build a [`SetupTunnel`] that reuses an already-running shared tunnel: there
@@ -497,7 +883,37 @@ pub fn inject_setup_public_base_url(answers: &mut JsonMap<String, Value>, public
     }
 }
 
+/// Does `value` name a tunnel URL that SETUP HANDED OUT and may therefore
+/// re-point? Callers use it to tell an operator's permanent URL (preserve — never
+/// touch it) from one we produced ourselves (replace with the current one).
+///
+/// NOTE ON THE NAME: "ephemeral" here means "engine-assigned, ours to replace" —
+/// NOT "short-lived". The managed-tunnel Worker HOST is perfectly stable, yet the
+/// tunnel id in its first path segment changes between runs, so a managed URL is
+/// still refreshable and must be matched here. The name is kept because this is
+/// `pub` and consumed by three other modules, and because two payload keys embed
+/// it — `public_base_url_is_ephemeral_tunnel` (persisted in `runtime_context` and
+/// compared against earlier runs) and `"ephemeral"` in the setup-machine step
+/// detail. Renaming the function without those keys would mismatch, and renaming
+/// the keys would invalidate already-persisted state for no behavioural gain.
+///
+/// Before this matched the Worker host, a STALE managed URL looked permanent and
+/// was preserved forever: one real session left Webex and the state provider on
+/// `<worker>/default` while Slack moved to `<worker>/default-default`, and the
+/// webhook Webex had registered pointed at a path the tunnel no longer served.
 pub fn is_ephemeral_tunnel_url(value: &str) -> bool {
+    is_ephemeral_tunnel_url_for_worker_base(value, &gtunnel_worker_base_url())
+}
+
+/// Worker-base half of [`is_ephemeral_tunnel_url`], with the base passed
+/// explicitly so it is testable without mutating process env — the same pattern
+/// [`resolve_tunnel_secret_in`] uses for the state root.
+fn is_ephemeral_tunnel_url_for_worker_base(value: &str, worker_base_url: &str) -> bool {
+    // Derived from the configured Worker base rather than a hardcoded hostname,
+    // so a self-hosted Worker is treated exactly like the default one.
+    let managed_host = url::Url::parse(worker_base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()));
     url::Url::parse(value).ok().is_some_and(|url| {
         url.scheme() == "https"
             && url.host_str().is_some_and(|host| {
@@ -506,6 +922,10 @@ pub fn is_ephemeral_tunnel_url(value: &str) -> bool {
                     || host.ends_with(".trycloudflare.com")
                     || host.ends_with(".ngrok-free.app")
                     || host.ends_with(".ngrok.io")
+                    // Any URL on the managed Worker host is ours: the host does
+                    // not distinguish tunnel ids, the path segment does, and that
+                    // segment is exactly what goes stale.
+                    || managed_host.as_deref() == Some(host.as_str())
             })
     })
 }
@@ -517,6 +937,142 @@ mod tests {
     use serde_json::{Map as JsonMap, Value, json};
 
     use super::*;
+
+    #[test]
+    fn default_tunnel_secret_is_64_hex_chars() {
+        assert_eq!(DEFAULT_TUNNEL_SECRET.len(), 64, "256-bit secret as hex");
+        assert!(DEFAULT_TUNNEL_SECRET.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn resolve_tunnel_secret_falls_back_to_baked_in_constant() {
+        // Empty store → the shipped constant, never empty: setup must never
+        // demand credentials for the managed tunnel.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_tunnel_secret_in(dir.path(), "demo-default"),
+            DEFAULT_TUNNEL_SECRET
+        );
+    }
+
+    #[test]
+    fn resolve_tunnel_secret_prefers_per_tunnel_file_then_operator_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("secret"), "operator-secret\n").expect("write operator");
+        assert_eq!(
+            resolve_tunnel_secret_in(dir.path(), "demo-default"),
+            "operator-secret"
+        );
+
+        std::fs::create_dir_all(dir.path().join("secrets")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("secrets").join("demo-default"),
+            "per-tunnel",
+        )
+        .expect("write per-tunnel");
+        assert_eq!(
+            resolve_tunnel_secret_in(dir.path(), "demo-default"),
+            "per-tunnel"
+        );
+    }
+
+    #[test]
+    fn sanitize_tunnel_id_uses_the_tenant_alone() {
+        // The BASE is the tenant alone — team is ignored, so it can equal the
+        // <tenant> segment of /v1/web/webchat/<tenant>/… (which has no team
+        // segment) and match greentic-start's sanitize_tunnel_id.
+        assert_eq!(sanitize_tunnel_id("Acme Corp"), "acme-corp");
+        assert_eq!(sanitize_tunnel_id("demo"), "demo");
+        assert_eq!(sanitize_tunnel_id(""), "default");
+        // Each non-alphanumeric folds to its own `-`, so runs are preserved
+        // and only the edges are trimmed.
+        assert_eq!(sanitize_tunnel_id("--Weird__Tenant--"), "weird--tenant");
+    }
+
+    #[test]
+    fn derive_gtunnel_id_appends_a_clash_suffix_to_the_base() {
+        // The full id carries a per-install suffix: the managed tunnel is ONE
+        // shared Worker and nearly every operator runs the default tenant, so a
+        // bare `<tenant>` id would collide across installs.
+        let id = derive_gtunnel_id("demo", "default");
+        let (base, suffix) = id.rsplit_once('-').expect("id carries a suffix");
+        assert_eq!(base, "demo");
+        assert_eq!(suffix.len(), 5, "5-hex suffix, got {id}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+    }
+
+    #[test]
+    fn derive_gtunnel_id_ignores_team_entirely() {
+        // Guards the regression directly: any team must collapse to one id, so a
+        // second team on the same tenant cannot strand a registered webhook URL.
+        let ids: std::collections::BTreeSet<String> = ["default", "eng", "", "Team B"]
+            .iter()
+            .map(|team| derive_gtunnel_id("acme", team))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "team must not influence the tunnel id: {ids:?}"
+        );
+        assert!(
+            ids.iter().next().expect("one id").starts_with("acme-"),
+            "{ids:?}"
+        );
+    }
+
+    // ---- per-install clash suffix ----
+
+    #[test]
+    fn clash_suffix_is_stable_across_calls_and_distinct_per_tenant() {
+        // Stability is the whole point: the suffix ends up inside URLs registered
+        // with Slack/Webex/OAuth, so it must survive restarts. It previously came
+        // from a per-process nonce and changed on every start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = install_clash_suffix(dir.path(), "demo").expect("suffix");
+        let second = install_clash_suffix(dir.path(), "demo").expect("suffix");
+        assert_eq!(first, second, "same install + tenant must give one suffix");
+        assert_eq!(first.len(), 5);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Distinct per tenant, so two tenants on one install do not collide.
+        let other = install_clash_suffix(dir.path(), "acme").expect("suffix");
+        assert_ne!(first, other, "suffix must be tenant-scoped");
+    }
+
+    #[test]
+    fn clash_suffix_differs_across_installs() {
+        // Two installs must not land on the same public URL — that is the
+        // collision this exists to prevent.
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        assert_ne!(
+            install_clash_suffix(a.path(), "default").expect("suffix"),
+            install_clash_suffix(b.path(), "default").expect("suffix"),
+            "distinct seeds must yield distinct suffixes"
+        );
+    }
+
+    #[test]
+    fn instance_seed_is_persisted_and_reused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = load_or_create_instance_seed(dir.path()).expect("seed");
+        assert_eq!(first.len(), 64, "256-bit seed as hex");
+        assert!(dir.path().join("instance-seed").is_file(), "must persist");
+        assert_eq!(
+            load_or_create_instance_seed(dir.path()).as_deref(),
+            Some(first.as_str()),
+            "a second read must reuse the persisted seed, not mint a new one"
+        );
+    }
+
+    #[test]
+    fn corrupt_seed_file_is_replaced_rather_than_used() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("instance-seed"), "not-a-seed\n").expect("write");
+        let seed = load_or_create_instance_seed(dir.path()).expect("seed");
+        assert_eq!(seed.len(), 64);
+        assert!(seed.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     // ---- should_start_setup_tunnel ----
 
@@ -863,6 +1419,132 @@ mod tests {
         assert!(is_ephemeral_tunnel_url("https://DEMO.TryCloudflare.COM"));
     }
 
+    // ---- managed-tunnel (gtunnel) URLs are refreshable too ----
+    //
+    // The host is stable but the tunnel id in the first path segment is not, so a
+    // managed URL from an earlier run must be re-pointed rather than preserved as
+    // if an operator had supplied it.
+
+    #[test]
+    fn managed_worker_url_is_refreshable_on_the_default_worker_host() {
+        // Env-free: falls back to DEFAULT_GTUNNEL_WORKER_BASE_URL.
+        assert!(is_ephemeral_tunnel_url(&format!(
+            "{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default"
+        )));
+        assert!(is_ephemeral_tunnel_url(&format!(
+            "{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default-default"
+        )));
+        // Bare host, no id segment at all.
+        assert!(is_ephemeral_tunnel_url(DEFAULT_GTUNNEL_WORKER_BASE_URL));
+    }
+
+    #[test]
+    fn managed_worker_url_is_refreshable_on_a_self_hosted_worker_host() {
+        // Worker base passed explicitly rather than via env: this crate has no
+        // temp-env dev-dependency, and mutating process env would race the other
+        // tests in this binary.
+        assert!(is_ephemeral_tunnel_url_for_worker_base(
+            "https://tunnel.acme.example/default",
+            "https://tunnel.acme.example"
+        ));
+        // Host comparison is case-insensitive and ignores the base's trailing path.
+        assert!(is_ephemeral_tunnel_url_for_worker_base(
+            "https://Tunnel.ACME.example/demo",
+            "https://tunnel.acme.example/"
+        ));
+    }
+
+    #[test]
+    fn genuine_operator_url_is_still_preserved() {
+        // The whole point of the predicate: a permanent operator-supplied ingress
+        // must never be replaced by a tunnel URL.
+        assert!(!is_ephemeral_tunnel_url("https://hooks.example.com"));
+        assert!(!is_ephemeral_tunnel_url(
+            "https://hooks.example.com/webhooks"
+        ));
+        // And it stays preserved when a self-hosted Worker is configured.
+        assert!(!is_ephemeral_tunnel_url_for_worker_base(
+            "https://hooks.example.com",
+            "https://tunnel.acme.example"
+        ));
+    }
+
+    #[test]
+    fn managed_worker_host_matches_the_configured_base_only() {
+        // Documents the chosen semantics: the predicate keys on the CONFIGURED
+        // Worker base, so with a self-hosted Worker a leftover URL on the default
+        // Greentic Worker host is not claimed. Kept deliberately narrow — the
+        // configured host is the one this run can actually serve.
+        assert!(!is_ephemeral_tunnel_url_for_worker_base(
+            &format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default"),
+            "https://tunnel.acme.example"
+        ));
+        // A malformed worker base disables managed matching but must not break
+        // the trycloudflare/ngrok arms.
+        assert!(!is_ephemeral_tunnel_url_for_worker_base(
+            "https://hooks.example.com",
+            "not-a-url"
+        ));
+        assert!(is_ephemeral_tunnel_url_for_worker_base(
+            "https://demo.trycloudflare.com",
+            "not-a-url"
+        ));
+    }
+
+    #[test]
+    fn inject_replaces_a_stale_managed_url_under_a_different_id() {
+        // The live regression: an earlier run configured these providers under the
+        // old `default-default` id, the current run serves `default`, and the URL
+        // "looked stable" so it was preserved forever — leaving Webex's registered
+        // webhook pointing at a path the tunnel no longer serves.
+        let stale = format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default-default");
+        let current = format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default");
+        let mut answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-webex": { "public_base_url": stale },
+            "messaging-slack": { "public_base_url": current },
+            "messaging-operator": { "public_base_url": "https://hooks.example.com" },
+        }))
+        .expect("answers");
+
+        inject_setup_public_base_url(&mut answers, &current);
+
+        assert_eq!(
+            answers["messaging-webex"]["public_base_url"],
+            json!(current),
+            "a managed URL under the old id must be re-pointed at the current id"
+        );
+        assert_eq!(
+            answers["messaging-slack"]["public_base_url"],
+            json!(current)
+        );
+        assert_eq!(
+            answers["messaging-operator"]["public_base_url"],
+            json!("https://hooks.example.com"),
+            "a genuine operator URL must survive untouched"
+        );
+    }
+
+    #[test]
+    fn should_start_setup_tunnel_when_only_url_is_a_stale_managed_one() {
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-webex": {
+                "public_base_url": format!("{DEFAULT_GTUNNEL_WORKER_BASE_URL}/default-default")
+            },
+        }))
+        .expect("answers");
+        assert!(
+            should_start_setup_tunnel("gtunnel", &answers),
+            "a stale managed URL must not convince setup the tunnel is unnecessary"
+        );
+
+        // Contrast: a real operator URL genuinely needs no tunnel.
+        let operator = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-webex": { "public_base_url": "https://hooks.example.com" },
+        }))
+        .expect("answers");
+        assert!(!should_start_setup_tunnel("gtunnel", &operator));
+    }
+
     // ---- inject_setup_public_base_url ----
 
     #[test]
@@ -1112,7 +1794,7 @@ mod tests {
 
     #[test]
     fn start_setup_tunnel_unsupported_mode() {
-        let result = start_setup_tunnel("unknown", "http://127.0.0.1:8080");
+        let result = start_setup_tunnel("unknown", "http://127.0.0.1:8080", None);
         assert!(result.is_err());
         let err = result.err().expect("should be Err");
         assert!(

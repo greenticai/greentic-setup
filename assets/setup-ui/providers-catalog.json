@@ -29,19 +29,19 @@
       "id": "messaging-whatsapp",
       "category": "messaging",
       "label": { "i18n_key": "provider.messaging.whatsapp", "fallback": "WhatsApp" },
-      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-whatsapp:stable"
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-whatsapp:stable", "hidden": true
     },
     {
       "id": "messaging-webchat",
       "category": "messaging",
       "label": { "i18n_key": "provider.messaging.webchat", "fallback": "Web Chat" },
-      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-webchat:stable"
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-webchat:stable", "hidden": true
     },
     {
       "id": "messaging-email",
       "category": "messaging",
       "label": { "i18n_key": "provider.messaging.email", "fallback": "Email" },
-      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-email:stable"
+      "ref": "oci://ghcr.io/greenticai/packs/messaging/messaging-email:stable", "hidden": true
     }
   ]
 }

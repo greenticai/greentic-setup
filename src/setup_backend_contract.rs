@@ -2647,7 +2647,7 @@ fn hydrate_redacted_backend_config(
     let hydrated = block_on_backend_secret_task(async move {
         use greentic_secrets_lib::SecretsStore;
 
-        let store = crate::secrets::open_dev_store(&bundle_root)?;
+        let store = crate::secrets::open_dev_store_for_env(&bundle_root, "dev")?;
         let mut values = JsonMap::new();
         for key in lookup_keys {
             let uri =
@@ -3145,6 +3145,8 @@ mod tests {
 
     #[test]
     fn record_action_result_saves_state_and_appends_jsonl_event() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let action = json!({"id": "register"});
         let result = step_result(
@@ -3175,6 +3177,8 @@ mod tests {
 
     #[test]
     fn archive_file_copies_legacy_artifact_into_generic_archive() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let legacy =
             legacy_backend_state_path(temp.path(), "dev", "demo", "default", "messaging-teams")
@@ -3209,6 +3213,8 @@ mod tests {
 
     #[test]
     fn archive_and_reset_backend_state_preserve_prior_state() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let mut stored = JsonMap::new();
         stored.insert("config".to_string(), json!({"bot_app_id": "old"}));
@@ -3788,6 +3794,8 @@ mod tests {
 
     #[test]
     fn backend_state_uses_generic_path_without_legacy_fallback() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let legacy =
             legacy_backend_state_path(temp.path(), "dev", "demo", "default", "messaging-teams")
@@ -3822,6 +3830,8 @@ mod tests {
 
     #[test]
     fn backend_state_redacts_secret_config_on_disk_and_hydrates_on_load() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let mut stored = JsonMap::new();
         stored.insert(
@@ -3868,6 +3878,8 @@ mod tests {
 
     #[test]
     fn backend_state_drops_redacted_keys_missing_from_store_on_load() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         // A secret can vanish from the dev store after the state file was
         // written (e.g. a concurrent whole-file rewrite losing the update).
         // The load must then DROP the redacted key — an executor treats a
@@ -3888,7 +3900,8 @@ mod tests {
             .expect("save state");
 
         // Simulate the lost update: wipe the dev store the save persisted to.
-        let store_path = crate::secrets::ensure_path(temp.path()).expect("store path");
+        let store_path =
+            crate::secrets::ensure_path_for_env(temp.path(), "dev").expect("store path");
         std::fs::write(&store_path, "").expect("wipe dev store");
 
         let loaded = load_backend_state(temp.path(), "dev", "demo", "default", "messaging-teams")
@@ -3906,6 +3919,8 @@ mod tests {
 
     #[test]
     fn backend_state_repairs_redacted_display_code_from_device_login_message() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let path = backend_state_path(temp.path(), "demo", "default", "messaging-generic")
             .expect("state path");
@@ -3935,6 +3950,8 @@ mod tests {
 
     #[test]
     fn migrate_backend_state_archives_and_removes_legacy_state() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().unwrap();
         let legacy =
             legacy_backend_state_path(temp.path(), "dev", "demo", "default", "messaging-teams")

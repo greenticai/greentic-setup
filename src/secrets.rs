@@ -28,12 +28,68 @@ pub fn override_path() -> Option<PathBuf> {
     std::env::var(OVERRIDE_ENV).ok().map(PathBuf::from)
 }
 
-/// Checks for an existing dev store inside the bundle root.
+/// Dev-store path inside the shared environment store:
+///   `~/.greentic/environments/<env>/.greentic/dev/.dev.secrets.env`
+///
+/// This is the *same* file that `gtc op secrets` / `provider add` and the
+/// running env use, so bundle-path `setup`/`start` rendezvous with the env-path
+/// secrets across invocations regardless of any ephemeral extraction dir (it
+/// closes the bundle-vs-env split documented in `env-runtime-bundle-ops.md` §6).
+/// Returns `None` when the environment-store root can't be resolved (no
+/// `HOME`/`USERPROFILE`), letting callers fall back to a bundle-local path.
+pub fn env_store_dev_secrets_path(env: &str) -> Option<PathBuf> {
+    greentic_deployer::environment::LocalFsStore::default_root()
+        .map(|root| root.join(env).join(STORE_RELATIVE))
+}
+
+/// The explicitly-selected environment, or `None` when `$GREENTIC_ENV` is unset.
+///
+/// Bare callers (`ensure_path`/`find_existing`/`default_path`) only route to the
+/// shared env store when an env is *explicitly selected* via `$GREENTIC_ENV`.
+/// `gtc setup` and `gtc start` always set it before resolving secrets, so
+/// production lands on `~/.greentic/environments/<env>/…`; when it is unset
+/// (unit tests, ad-hoc library use) resolution stays on the legacy bundle-local
+/// store, which keeps those paths hermetic and non-polluting.
+fn selected_env() -> Option<String> {
+    std::env::var("GREENTIC_ENV")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|raw| crate::resolve_env(Some(&raw)))
+}
+
+/// The path a *write* should target for an explicit env: the shared env store
+/// when resolvable, otherwise the legacy bundle-local path.
+fn write_path_for_env(bundle_root: &Path, env: &str) -> PathBuf {
+    env_store_dev_secrets_path(env).unwrap_or_else(|| bundle_root.join(STORE_RELATIVE))
+}
+
+/// The write path for a bare caller: the shared env store when an env is
+/// selected via `$GREENTIC_ENV`, else the legacy bundle-local path.
+fn bare_write_path(bundle_root: &Path) -> PathBuf {
+    selected_env()
+        .and_then(|env| env_store_dev_secrets_path(&env))
+        .unwrap_or_else(|| bundle_root.join(STORE_RELATIVE))
+}
+
+/// Read-preference order: the shared env store (when an env is selected), then
+/// legacy bundle-local candidates (for already-configured bundle directories).
+fn read_candidate_paths(bundle_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(env_store) = selected_env().and_then(|env| env_store_dev_secrets_path(&env)) {
+        out.push(env_store);
+    }
+    out.push(bundle_root.join(STORE_RELATIVE));
+    out.push(bundle_root.join(STORE_STATE_RELATIVE));
+    out
+}
+
+/// Checks for an existing dev store: override, then env store, then bundle-local.
 pub fn find_existing(bundle_root: &Path) -> Option<PathBuf> {
     find_existing_with_override(bundle_root, override_path().as_deref())
 }
 
-/// Looks for an existing dev store using an override path before consulting default candidates.
+/// Looks for an existing dev store using an override path before consulting the
+/// shared env store and then legacy bundle-local candidates.
 pub fn find_existing_with_override(
     bundle_root: &Path,
     override_path: Option<&Path>,
@@ -43,32 +99,39 @@ pub fn find_existing_with_override(
     {
         return Some(path.to_path_buf());
     }
-    candidate_paths(bundle_root)
+    read_candidate_paths(bundle_root)
         .into_iter()
         .find(|candidate| candidate.exists())
 }
 
-/// Ensures the default dev store path exists (creating parent directories) before returning it.
+/// Ensures the default dev store path exists (creating parent directories) before
+/// returning it. Routes to the shared env store when `$GREENTIC_ENV` is set.
 pub fn ensure_path(bundle_root: &Path) -> Result<PathBuf> {
     if let Some(path) = override_path() {
         ensure_parent(&path)?;
         return Ok(path);
     }
-    let path = bundle_root.join(STORE_RELATIVE);
+    let path = bare_write_path(bundle_root);
+    ensure_parent(&path)?;
+    Ok(path)
+}
+
+/// Like [`ensure_path`], but with an explicit environment — always the shared
+/// env store (when resolvable). The correct key when the caller already resolved
+/// `<env>` (e.g. [`SecretsSetup`]), independent of `$GREENTIC_ENV`.
+pub fn ensure_path_for_env(bundle_root: &Path, env: &str) -> Result<PathBuf> {
+    if let Some(path) = override_path() {
+        ensure_parent(&path)?;
+        return Ok(path);
+    }
+    let path = write_path_for_env(bundle_root, env);
     ensure_parent(&path)?;
     Ok(path)
 }
 
 /// Returns the default dev store path without creating anything.
 pub fn default_path(bundle_root: &Path) -> PathBuf {
-    bundle_root.join(STORE_RELATIVE)
-}
-
-fn candidate_paths(bundle_root: &Path) -> [PathBuf; 2] {
-    [
-        bundle_root.join(STORE_RELATIVE),
-        bundle_root.join(STORE_STATE_RELATIVE),
-    ]
+    override_path().unwrap_or_else(|| bare_write_path(bundle_root))
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
@@ -95,7 +158,12 @@ pub struct SecretsSetup {
 
 impl SecretsSetup {
     pub fn new(bundle_root: &Path, env: &str, tenant: &str, team: Option<&str>) -> Result<Self> {
-        let store_path = ensure_path(bundle_root)?;
+        // Env-explicit, NOT `$GREENTIC_ENV`-gated. This is a write path: gating on
+        // the ambient env meant setup persisted into the bundle-local store while
+        // the runtime read the env store, so provisioned secrets went "missing" at
+        // runtime (the whole point of the env-store seam fix). `env` is already a
+        // parameter here — use it.
+        let store_path = ensure_path_for_env(bundle_root, env)?;
         info!(path = %store_path.display(), "secrets: using dev store backend");
         let store = DevStore::with_path(&store_path).map_err(|err| {
             anyhow!(
@@ -342,7 +410,23 @@ fn map_get_bool(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<bool>
         })
 }
 
-/// Open a `DevStore` from a bundle root path (convenience).
+/// Open a `DevStore` keyed to an explicit `env` — ALWAYS the shared env store,
+/// the exact file the greentic-start serve path reads. Use this on WRITE paths
+/// that already know the env, so a setup-provisioned secret lands where the
+/// runtime looks, never in the `$GREENTIC_ENV`-gated bundle-local store.
+pub fn open_dev_store_for_env(bundle_root: &Path, env: &str) -> Result<DevStore> {
+    let store_path = ensure_path_for_env(bundle_root, env)?;
+    DevStore::with_path(&store_path).map_err(|err| {
+        anyhow!(
+            "failed to open dev secrets store {}: {err}",
+            store_path.display()
+        )
+    })
+}
+
+/// Open a `DevStore` from a bundle root path (convenience). Prefer
+/// [`open_dev_store_for_env`] on write paths — this bare form gates on
+/// `$GREENTIC_ENV` and can diverge from the serve reader.
 pub fn open_dev_store(bundle_root: &Path) -> Result<DevStore> {
     let store_path = ensure_path(bundle_root)?;
     DevStore::with_path(&store_path).map_err(|err| {
@@ -351,6 +435,88 @@ pub fn open_dev_store(bundle_root: &Path) -> Result<DevStore> {
             store_path.display()
         )
     })
+}
+
+/// Test-only isolation for the dev secrets store.
+///
+/// Needed because the write path deliberately resolves to the SHARED env store
+/// (`~/.greentic/environments/<env>/…` via `LocalFsStore::default_root()`), which
+/// is the whole point of the env-store seam — setup and the runtime must meet in
+/// one file. In tests that means store writes escape the temp dir and land in the
+/// developer's real `~/.greentic`, so tests pollute real state and race each
+/// other over one file.
+///
+/// `GREENTIC_DEV_SECRETS_PATH` is consulted before any other resolution, so
+/// pointing it at a temp path isolates a test completely. It is process-global,
+/// so acquiring it also serialises the tests that use it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// THE process-wide env lock for this crate's tests.
+    ///
+    /// Must be the ONLY such lock: `lib.rs` previously kept its own `ENV_LOCK`
+    /// for `GREENTIC_ENV`/`GREENTIC_DISABLE_DEV_ALIAS`, so its tests mutated
+    /// those vars under one mutex while secrets tests read them under another —
+    /// two locks give no mutual exclusion, which is exactly how the store tests
+    /// raced. Everything that touches process-global env in tests takes this.
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Points the dev-store override at a path for as long as it is held, then
+    /// restores whatever was there before. Hold it for the whole test body.
+    pub(crate) struct StoreOverride {
+        _guard: MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl StoreOverride {
+        pub(crate) fn at(path: &Path) -> Self {
+            let guard = env_lock();
+            let previous = std::env::var(super::OVERRIDE_ENV).ok();
+            // SAFETY: the process-global env is mutated only while holding
+            // `env_lock`, so no other test observes a torn value, and Drop
+            // restores the prior state.
+            unsafe { std::env::set_var(super::OVERRIDE_ENV, path) };
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+
+        /// Isolate inside `dir`, using the conventional store filename.
+        pub(crate) fn in_dir(dir: &Path) -> Self {
+            Self::at(&dir.join(".dev.secrets.env"))
+        }
+    }
+
+    /// Serialises against [`StoreOverride`] WITHOUT changing anything.
+    ///
+    /// Needed by tests that assert path resolution in its natural state: they
+    /// read the same process-global var others set, so they must hold the lock or
+    /// they observe another test's override. Because `StoreOverride` restores the
+    /// previous value in `Drop` before releasing the lock, holding it here
+    /// guarantees the var is back to its pre-test state.
+    pub(crate) struct EnvLock(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    pub(crate) fn lock_env() -> EnvLock {
+        EnvLock(env_lock())
+    }
+
+    impl Drop for StoreOverride {
+        fn drop(&mut self) {
+            // SAFETY: still holding `env_lock` (dropped after this).
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(super::OVERRIDE_ENV, value) },
+                None => unsafe { std::env::remove_var(super::OVERRIDE_ENV) },
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -371,18 +537,115 @@ mod tests {
         Ok(())
     }
 
+    // NOTE on hermeticity: the dev-store resolvers read process-global env
+    // (`$GREENTIC_ENV`, `$GREENTIC_DEV_SECRETS_PATH`) and the home dir, which
+    // other tests in this crate also mutate. To stay race-free these unit tests
+    // avoid asserting on that global state; the shared-env-store *activation*
+    // path is covered end-to-end by the real-binary round-trip instead.
+
     #[test]
-    fn ensure_path_creates_parent_directories() {
+    fn env_store_path_has_expected_shape() {
+        // `env_store_dev_secrets_path(env)` lays out
+        // <home>/.greentic/environments/<env>/.greentic/dev/.dev.secrets.env.
+        // Assert the suffix, which is independent of the home value (race-free).
+        if let Some(path) = env_store_dev_secrets_path("some-env") {
+            assert!(
+                path.ends_with("environments/some-env/.greentic/dev/.dev.secrets.env"),
+                "unexpected env-store path: {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Creates `<bundle>/.greentic/dev/.dev.secrets.env` and returns its path.
+    fn write_bundle_local_store(bundle: &Path) -> PathBuf {
+        let path = bundle.join(STORE_RELATIVE);
+        std::fs::create_dir_all(path.parent().expect("store parent")).expect("store dir");
+        std::fs::write(&path, "KEY=value\n").expect("write store");
+        path
+    }
+
+    #[test]
+    fn write_path_for_env_and_default_path_target_the_dev_store() {
+        let _env_lock = crate::secrets::test_support::lock_env();
+        // Both resolvers land on a `.dev.secrets.env` dev store, whether they
+        // route to the shared env store (home resolvable) or fall back to the
+        // bundle-local path. Assert the shared suffix — it holds either way and
+        // is independent of process-global `$GREENTIC_ENV` (race-free).
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
-        std::fs::create_dir_all(&bundle).expect("bundle dir");
-        let path = ensure_path(&bundle).expect("ensure path");
-        assert!(path.ends_with(".greentic/dev/.dev.secrets.env"));
-        assert!(path.parent().expect("parent").exists());
+
+        let write = write_path_for_env(&bundle, "some-env");
+        assert!(
+            write.ends_with(STORE_RELATIVE),
+            "unexpected write path: {}",
+            write.display()
+        );
+
+        let default = default_path(&bundle);
+        assert!(
+            default.ends_with(STORE_RELATIVE),
+            "unexpected default path: {}",
+            default.display()
+        );
+    }
+
+    /// Guards the webex_bot_token seam: setup once wrote the bundle-local store
+    /// while the runtime read the env store, so the secret went "missing". An
+    /// env-explicit WRITE must target the shared env store and never the
+    /// bundle-local one — independent of `$GREENTIC_ENV` (race-free: env is
+    /// passed explicitly). Do NOT weaken without a new secrets plan.
+    #[test]
+    fn write_path_for_env_targets_the_env_store_not_bundle_local() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        let Some(env_store) = env_store_dev_secrets_path("guard-env") else {
+            return; // no HOME → covered by the real-binary round-trip instead
+        };
+        assert_eq!(
+            write_path_for_env(&bundle, "guard-env"),
+            env_store,
+            "env-explicit write must target the env store",
+        );
+        assert!(
+            !write_path_for_env(&bundle, "guard-env").starts_with(&bundle),
+            "env-explicit write must never land in the bundle-local store",
+        );
+    }
+
+    #[test]
+    fn find_existing_locates_a_bundle_local_dev_store() {
+        // Serialise: these assert path resolution in its natural state and
+        // read the same process-global override other tests set.
+        let _env_lock = test_support::lock_env();
+        // With no `$GREENTIC_DEV_SECRETS_PATH` override, `find_existing` walks
+        // the candidate list and returns an existing dev store. Hermetic: the
+        // store lives in a tempdir, so the result exists and carries the dev
+        // store suffix regardless of `$GREENTIC_ENV`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        let store = bundle.join(STORE_RELATIVE);
+        std::fs::create_dir_all(store.parent().expect("store parent")).expect("dev dir");
+        std::fs::write(&store, "KEY=value\n").expect("write store");
+
+        let found = find_existing(&bundle).expect("find dev store");
+        assert!(
+            found.exists(),
+            "found path should exist: {}",
+            found.display()
+        );
+        assert!(
+            found.ends_with(STORE_RELATIVE),
+            "unexpected found path: {}",
+            found.display()
+        );
     }
 
     #[test]
     fn find_existing_with_override_prefers_override() {
+        // Serialise: these assert path resolution in its natural state and
+        // read the same process-global override other tests set.
+        let _env_lock = test_support::lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         std::fs::create_dir_all(&bundle).expect("bundle dir");
@@ -394,15 +657,106 @@ mod tests {
     }
 
     #[test]
-    fn find_existing_finds_default_locations() {
+    fn find_existing_with_override_falls_back_when_override_is_absent() {
+        // Serialise: these assert path resolution in its natural state and
+        // read the same process-global override other tests set.
+        let _env_lock = test_support::lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
-        let store_path = bundle.join(STORE_RELATIVE);
-        std::fs::create_dir_all(store_path.parent().expect("parent")).expect("create dirs");
-        std::fs::write(&store_path, "K=V\n").expect("write store");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        write_bundle_local_store(&bundle);
+        let missing_override = temp.path().join("does-not-exist.env");
 
-        let found = find_existing_with_override(&bundle, None).expect("found");
-        assert_eq!(found, store_path);
+        // A non-existent override must not short-circuit the candidate walk.
+        // The concrete winner depends on `$GREENTIC_ENV`/home (process-global,
+        // mutated by other tests), so assert only what holds for every
+        // candidate: it resolves to an existing dev-store file.
+        for override_arg in [None, Some(missing_override.as_path())] {
+            let found = find_existing_with_override(&bundle, override_arg)
+                .expect("existing store must be discovered");
+            assert!(found.exists(), "resolved store does not exist: {found:?}");
+            assert!(
+                found.ends_with(".dev.secrets.env"),
+                "unexpected store file: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_existing_discovers_the_bundle_local_store() {
+        // Serialise: these assert path resolution in its natural state and
+        // read the same process-global override other tests set.
+        let _env_lock = test_support::lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        write_bundle_local_store(&bundle);
+
+        let found = find_existing(&bundle).expect("existing store must be discovered");
+        assert!(found.exists(), "resolved store does not exist: {found:?}");
+    }
+
+    #[test]
+    fn read_candidate_paths_ends_with_bundle_local_candidates() {
+        // Serialise: these assert path resolution in its natural state and
+        // read the same process-global override other tests set.
+        let _env_lock = test_support::lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+
+        let candidates = read_candidate_paths(&bundle);
+        // The optional leading entry is the shared env store, which only
+        // appears when `$GREENTIC_ENV` is set; the bundle-local pair is always
+        // present, in order, at the end.
+        assert!(
+            candidates.len() == 2 || candidates.len() == 3,
+            "unexpected candidates: {candidates:?}"
+        );
+        assert_eq!(
+            &candidates[candidates.len() - 2..],
+            &[
+                bundle.join(STORE_RELATIVE),
+                bundle.join(STORE_STATE_RELATIVE)
+            ]
+        );
+    }
+
+    #[test]
+    fn write_path_for_env_always_targets_a_dev_store_file() {
+        // Serialise: these assert path resolution in its natural state and
+        // read the same process-global override other tests set.
+        let _env_lock = test_support::lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+
+        // Both branches (shared env store / bundle-local fallback) end in the
+        // same relative store path, so the suffix is home-independent.
+        let path = write_path_for_env(&bundle, "some-env");
+        assert!(
+            path.ends_with(STORE_RELATIVE),
+            "unexpected write path: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn default_path_creates_nothing() {
+        // Serialise: these assert path resolution in its natural state and
+        // read the same process-global override other tests set.
+        let _env_lock = test_support::lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+
+        let path = default_path(&bundle);
+        assert!(
+            path.ends_with(".dev.secrets.env"),
+            "unexpected default path: {}",
+            path.display()
+        );
+        assert!(
+            !bundle.exists(),
+            "default_path must not touch the filesystem"
+        );
     }
 
     #[test]
@@ -473,8 +827,96 @@ mod tests {
         assert!(keys.is_empty());
     }
 
+    #[test]
+    fn cbor_manifest_scan_skips_maps_that_are_not_secret_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pack = temp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", SimpleFileOptions::default())
+            .expect("start entry");
+        let manifest = serde_json::json!({
+            // Has a textual `key` but none of the secret-shaped companion
+            // fields — must not be mistaken for a secret requirement.
+            "routes": [{"key": "not-a-secret", "target": "node-a"}],
+            // `key` is not text, so the map is rejected outright.
+            "indexed": [{"key": 7, "required": true}],
+            // Secret-shaped, but `required` is not a bool: defaults to true.
+            "secrets": [{"key": "loose.secret", "required": "yes"}],
+        });
+        let bytes = serde_cbor::to_vec(&manifest).expect("serialize cbor");
+        zip.write_all(&bytes).expect("write manifest");
+        zip.finish().expect("finish zip");
+
+        let reqs = load_secret_requirements_from_pack(&pack).expect("load reqs");
+        assert_eq!(reqs.len(), 1, "unexpected requirements: {reqs:?}");
+        assert_eq!(reqs[0].key, "loose.secret");
+        assert!(reqs[0].required, "non-bool `required` must default to true");
+        assert!(reqs[0].description.is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_is_a_no_op_without_requirements() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        let pack = temp.path().join("provider.gtpack");
+        write_pack_with_secret_requirements(&pack, "[]").expect("pack");
+
+        let setup = SecretsSetup::new(&bundle, "dev", "tenant-a", Some("core")).expect("setup");
+        setup
+            .ensure_pack_secrets(&pack, "messaging-telegram")
+            .await
+            .expect("ensure secrets");
+
+        assert!(
+            setup
+                .store_path()
+                .parent()
+                .is_some_and(|parent| parent.is_dir()),
+            "store parent must be created: {}",
+            setup.store_path().display()
+        );
+        assert!(
+            setup.store_path().ends_with(".dev.secrets.env"),
+            "unexpected store path: {}",
+            setup.store_path().display()
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_is_a_noop_without_requirements() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+
+        // A pack with no secret-requirements → `ensure_pack_secrets` short-circuits.
+        let pack = temp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/setup.yaml", SimpleFileOptions::default())
+            .expect("start entry");
+        zip.write_all(b"questions: []\n").expect("write setup");
+        zip.finish().expect("finish zip");
+
+        let setup = SecretsSetup::new(&bundle, "dev", "tenant-a", None).expect("setup");
+        // The accessor resolves to the opened dev store file.
+        assert!(setup.store_path().ends_with(".dev.secrets.env"));
+
+        setup
+            .ensure_pack_secrets(&pack, "messaging-telegram")
+            .await
+            .expect("noop for empty requirements");
+    }
+
     #[tokio::test]
     async fn ensure_pack_secrets_seeds_placeholders_for_missing_keys() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         std::fs::create_dir_all(&bundle).expect("bundle dir");
@@ -504,6 +946,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_pack_secrets_uses_seed_values_when_available() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         std::fs::create_dir_all(&bundle).expect("bundle dir");

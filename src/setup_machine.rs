@@ -7944,6 +7944,8 @@ setup_actions:
     #[tokio::test]
     async fn complete_setup_machine_oauth_authorization_code_persists_tokens_as_secrets()
     -> anyhow::Result<()> {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir()?;
         let machine: SetupMachine = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -8028,7 +8030,7 @@ setup_actions:
         assert_eq!(state.status, SetupMachineStatus::Complete);
         assert_eq!(state.outputs["oauth_result"]["ok"], true);
 
-        let store = crate::secrets::open_dev_store(temp.path())?;
+        let store = crate::secrets::open_dev_store_for_env(temp.path(), "dev")?;
         for (key, expected) in [
             ("EXAMPLE_ACCESS_TOKEN", "access-secret"),
             ("EXAMPLE_REFRESH_TOKEN", "refresh-secret"),
@@ -8808,6 +8810,8 @@ setup_actions:
     #[test]
     fn migrate_setup_machine_state_archives_legacy_artifacts_and_initializes_machine()
     -> anyhow::Result<()> {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir()?;
         let machine: SetupMachine = serde_json::from_value(serde_json::json!({
             "version": 1,

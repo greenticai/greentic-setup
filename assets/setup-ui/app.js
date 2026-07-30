@@ -140,7 +140,7 @@
       tenant: tenant || "demo",
       env: env || "dev",
       team: team || "",
-      tunnel: state.defaultTunnel || (state.cloudDeploy ? "off" : "cloudflared"),
+      tunnel: state.defaultTunnel || (state.cloudDeploy ? "off" : "gtunnel"),
       answers: answers,
       sharedAnswers: {},
       providersDone: providersDone,
@@ -162,7 +162,7 @@
     bundlePath: "",
     detectedTenant: null,
     cloudDeploy: false,
-    defaultTunnel: "cloudflared",
+    defaultTunnel: "gtunnel",
     // multi-scope
     scopes: [],
     currentScopeIdx: -1,
@@ -173,6 +173,18 @@
 
   /** Get the scope currently being edited. */
   function cs() { return state.scopes[state.currentScopeIdx]; }
+
+  // Providers with no questions and no web setup component are auto-done and
+  // skipped when rendering the list, so a header count taken from
+  // state.providers.length disagrees with what is actually on screen.
+  // Mirrors the skip condition in the provider-list render.
+  function configurableProviderCount() {
+    return state.providers.filter(function (p) {
+      var form = state.providerForms[p.provider_id];
+      var qCount = form ? form.questions.length : 0;
+      return qCount > 0 || p.setup_web_component;
+    }).length;
+  }
 
   function providerEnabled(scope, providerId) {
     var answers = scope.answers[providerId] || {};
@@ -316,7 +328,7 @@
         var scopeData = results[1];
         state.detectedTenant = scopeData.detected_tenant || null;
         state.cloudDeploy = !!scopeData.cloud_deploy;
-        state.defaultTunnel = scopeData.tunnel || (state.cloudDeploy ? "off" : "cloudflared");
+        state.defaultTunnel = scopeData.tunnel || (state.cloudDeploy ? "off" : "gtunnel");
 
         var existingScopes = existingData.scopes || [];
         if (existingScopes.length > 0) {
@@ -377,7 +389,7 @@
             '<svg width="32" height="32" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill="#25c39e"/><path d="M10 16.5L14 20.5L22 12.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
           '</div>' +
           '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
-          '<p class="brand-desc">' + esc(t("ui.dashboard.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
+          '<p class="brand-desc">' + esc(t("ui.dashboard.description", [String(configurableProviderCount()), state.bundlePath])) + '</p>' +
           renderLocalePicker() +
         '</div>';
 
@@ -690,6 +702,10 @@
             '<div class="field">' +
               '<label class="field-label">Tunnel service</label>' +
               '<div class="tunnel-options">' +
+                '<label class="tunnel-option' + (scope.tunnel === "gtunnel" ? ' selected' : '') + '">' +
+                  '<input type="radio" name="tunnel" value="gtunnel"' + (scope.tunnel === "gtunnel" ? ' checked' : '') + ' />' +
+                  '<div><strong>Greentic managed tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Recommended. Hosted by Greentic — no account, no binary, works instantly.</span></div>' +
+                '</label>' +
                 '<label class="tunnel-option' + (scope.tunnel === "cloudflared" ? ' selected' : '') + '">' +
                   '<input type="radio" name="tunnel" value="cloudflared"' + (scope.tunnel === "cloudflared" ? ' checked' : '') + ' />' +
                   '<div><strong>Cloudflare Tunnel</strong><br/><span style="opacity:.7;font-size:.85rem">Free, no account needed. Auto-installs if missing.</span></div>' +
@@ -809,7 +825,7 @@
             '<svg width="32" height="32" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill="#25c39e"/><path d="M10 16.5L14 20.5L22 12.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
           '</div>' +
           '<h1 class="brand-title">' + esc(t("ui.title")) + '</h1>' +
-          '<p class="brand-desc">' + esc(t("ui.description", [String(state.providers.length), state.bundlePath])) + '</p>' +
+          '<p class="brand-desc">' + esc(t("ui.description", [String(configurableProviderCount()), state.bundlePath])) + '</p>' +
           '<p class="brand-desc" style="font-size:.8rem;opacity:.7">tenant=' + esc(scope.tenant) + ' env=' + esc(scope.env) + (scope.team ? ' team=' + esc(scope.team) : '') + '</p>' +
         '</div>' +
         '<div class="provider-list">';
@@ -846,7 +862,9 @@
     if (state.availableProviders && state.availableProviders.length > 0) {
       html +=
         '<div class="provider-add-section">' +
-          '<div class="provider-add-title">' + esc(t("ui.add_providers") || "Add providers") + '</div>' +
+          // Read the catalog directly: t() echoes the key when a locale lacks
+          // it, so `t(...) || fallback` can never reach the fallback.
+          '<div class="provider-add-title">' + esc(i18n["ui.add_providers"] || "Providers:") + '</div>' +
           '<div class="provider-add-list">';
       state.availableProviders.forEach(function (a) {
         var name = a.label || a.id;
@@ -1968,25 +1986,30 @@
     context.setup_status = result.setup_status || (result.state && result.state.setup_status) || {};
     context.values = result.values || (result.state && result.state.values) || {};
     context.provider_id = provider.provider_id;
-    // An explicit install_url (e.g. Slack's dashboard install-on-team page) is
-    // this action's one-time install target; the final deep_link actions below
-    // keep pointing at the installed app (app_redirect -> DM with the bot).
+    // This popup is the INSTALL step, so it must land on the install target,
+    // never on a share/deep_link like add-to-slack (slack.com/app_redirect ->
+    // the bot DM). Those belong only in the final "Share add buttons" section.
+    // Order matters: install_url, then the backend-resolved install URL
+    // (oauth_authorize_url = install-on-team), then an open_url install
+    // template, and ONLY as a last resort a deep_link action.
     var explicitInstall = deepValue(context, "install_url");
     if (explicitInstall) return String(explicitInstall);
-    for (var i = 0; i < actions.length; i++) {
-      var item = resolveFinalSetupAction(provider, actions[i], context);
-      if (item && item.url) return item.url;
-    }
-    // For an install action (kind: open_url), prefer its url_template — e.g.
+    var directUrl = deepValue(context, "oauth_authorize_url") || deepValue(context, "authorize_url");
+    if (directUrl) return String(directUrl);
+    // For an install action (kind: open_url), use its url_template — e.g.
     // Slack's api.slack.com/apps/{slack_app_id}/install-on-team link resolved
-    // with the returned app id — over any oauth redirect the component returned
-    // (which points at the workspace app_redirect page).
+    // with the returned app id.
     for (var k = 0; k < actions.length; k++) {
       var url = resolveOpenUrlActionTemplate(actions[k], context);
       if (url) return url;
     }
-    var directUrl = deepValue(context, "oauth_authorize_url") || deepValue(context, "authorize_url");
-    if (directUrl) return String(directUrl);
+    // Fallback: a final deep_link action. Reached only when no install target
+    // exists; the previous ordering surfaced add-to-slack (app_redirect) as the
+    // install popup URL, which is the bug this reorder fixes.
+    for (var i = 0; i < actions.length; i++) {
+      var item = resolveFinalSetupAction(provider, actions[i], context);
+      if (item && item.url) return item.url;
+    }
     return "";
   }
 
@@ -2865,22 +2888,24 @@
     });
   }
 
+  // Mirror of setup_final_actions.rs::SAFE_ACTION_URL_SCHEMES — must stay in
+  // sync. `https:` covers hosted share links; native-app deep-link schemes such
+  // as `webexteams:` (webexteams://im?email=…) open the provider's desktop/mobile
+  // client directly instead of routing through a browser.
   function isSafeFinalSetupActionUrl(url) {
     try {
       var parsed = new URL(url, window.location.href);
-      return parsed.protocol === "https:";
+      return parsed.protocol === "https:" || parsed.protocol === "webexteams:";
     } catch (e) {
       return false;
     }
   }
 
+  // Mirror of setup_final_actions.rs::action_html — must stay identical.
+  // Class-free on purpose: the snippet is pasted into external pages and must
+  // not depend on Greentic stylesheets.
   function finalSetupActionHtml(providerId, actionId, label, url) {
-    var cls = "greentic-add-button " + sanitizeCssClass("greentic-add-" + providerId + "-" + actionId);
-    return '<a class="' + escAttr(cls) + '" href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>';
-  }
-
-  function sanitizeCssClass(value) {
-    return String(value || "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "greentic-add";
+    return '<a href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>';
   }
 
   function renderFinalSetupActions(actions) {
@@ -3196,7 +3221,10 @@
   }
 
   function escAttr(str) {
-    return esc(str);
+    // esc() escapes & < > but not quotes, so an attribute value containing a
+    // double quote (e.g. the generated `<a class="...">` snippet) terminates
+    // the attribute early and renders truncated.
+    return esc(str).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   function formatProviderName(provider) {

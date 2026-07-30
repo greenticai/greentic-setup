@@ -142,6 +142,10 @@ struct ProviderCatalogItem {
     /// `oci://ghcr.io/greenticai/packs/messaging/messaging-slack:stable`.
     #[serde(rename = "ref")]
     reference: String,
+    /// Temporarily withhold this provider from the add-list without dropping
+    /// its catalog entry. Flip back to `false`/remove the key to re-expose it.
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,7 +619,7 @@ fn available_provider_items(
     catalog
         .items
         .into_iter()
-        .filter(|item| !installed.contains(&item.id))
+        .filter(|item| !item.hidden && !installed.contains(&item.id))
         .map(|item| AvailableProvider {
             id: item.id,
             category: item.category,
@@ -680,8 +684,43 @@ async fn install_catalog_provider(
     bundle_path: &std::path::Path,
     item: &ProviderCatalogItem,
 ) -> anyhow::Result<()> {
-    let source = crate::bundle_source::BundleSource::parse(&item.reference)?;
-    let pack_path = source.resolve_async().await?;
+    let domain_dir = bundle_path.join("providers").join(&item.category);
+    let dest = domain_dir.join(format!("{}.gtpack", item.id));
+
+    // A pack already sitting in the bundle IS the provider being added, so reuse
+    // it instead of re-pulling. Adding must not depend on the registry when the
+    // artifact is already on disk: the catalog pins providers by TAG
+    // (`oci://…:stable`), and the fetcher only consults its local cache for
+    // DIGEST-pinned refs — so a tagged add can never be served from cache and a
+    // flaky registry fails an add that needs no download at all.
+    if pack_file_is_usable(&dest) {
+        eprintln!(
+            "add-provider {}: reusing the pack already in the bundle ({})",
+            item.id,
+            dest.display()
+        );
+        return Ok(());
+    }
+
+    // Resolve the catalogue's TAG to the digest the installed toolchain release
+    // pinned it to, so the fetcher's cache lookup can hit. `fetch_pack_to_cache`
+    // only consults its cache for digest-pinned refs, so a `:stable` ref pulls
+    // over the network every time — the cache is populated and never read. See
+    // `crate::release_index`. Falls back to the tag when the index cannot resolve
+    // it, which is the previous behaviour.
+    let reference = match crate::release_index::pinned_ref_for(&item.reference) {
+        Some(pinned) => {
+            eprintln!(
+                "add-provider {}: resolved {} to {pinned} via the release index — served from the \
+                 local pack cache instead of the registry",
+                item.id, item.reference
+            );
+            pinned
+        }
+        None => item.reference.clone(),
+    };
+    let source = crate::bundle_source::BundleSource::parse(&reference)?;
+    let pack_path = resolve_pack_source_with_retry(&source, &reference).await?;
     if !pack_path.is_file() {
         anyhow::bail!(
             "resolved provider pack is not a file: {}",
@@ -689,10 +728,8 @@ async fn install_catalog_provider(
         );
     }
 
-    let domain_dir = bundle_path.join("providers").join(&item.category);
     std::fs::create_dir_all(&domain_dir)
         .with_context(|| format!("failed to create provider dir {}", domain_dir.display()))?;
-    let dest = domain_dir.join(format!("{}.gtpack", item.id));
     std::fs::copy(&pack_path, &dest).with_context(|| {
         format!(
             "failed to copy provider pack {} -> {}",
@@ -701,6 +738,39 @@ async fn install_catalog_provider(
         )
     })?;
     Ok(())
+}
+
+/// Whether `path` is a pack we can install from: present and non-empty. Guards
+/// against adopting a zero-byte file left by an interrupted earlier download.
+fn pack_file_is_usable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+/// Resolve a pack source, retrying transient registry failures. Pulls from
+/// ghcr.io routinely die mid-body ("end of file before message length reached"),
+/// which is retryable — one flaky read should not fail an otherwise valid add.
+async fn resolve_pack_source_with_retry(
+    source: &crate::bundle_source::BundleSource,
+    reference: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    const ATTEMPTS: usize = 3;
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match source.resolve_async().await {
+            Ok(path) => return Ok(path),
+            Err(err) => {
+                if attempt < ATTEMPTS {
+                    eprintln!(
+                        "add-provider: fetch of {reference} failed (attempt {attempt}/{ATTEMPTS}), \
+                         retrying: {err:#}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once and only stores Err"))
 }
 
 // ── API handlers ──
@@ -4814,7 +4884,7 @@ async fn setup_backend_refresh_public_tunnel_if_needed(
     else {
         return Ok(None);
     };
-    if !matches!(mode.as_str(), "cloudflared" | "ngrok") {
+    if !matches!(mode.as_str(), "cloudflared" | "ngrok" | "gtunnel") {
         return Ok(None);
     }
     if !current.is_empty()
@@ -4921,7 +4991,7 @@ fn setup_backend_default_tunnel_mode(state: &UiState) -> Result<Option<String>> 
                 )
             })?;
     if deployer_candidates.is_empty() {
-        return Ok(Some("cloudflared".to_string()));
+        return Ok(Some("gtunnel".to_string()));
     }
 
     Ok(None)
@@ -5453,6 +5523,69 @@ fn render_setup_backend_contract_state(
     });
     attach_final_setup_actions(state, &contract.provider_id, &mut report);
     report
+}
+
+/// Fill in per-provider setup status for providers the client did not report on.
+///
+/// The final page's "Add to X" buttons (`greentic.setup.actions.v1`) are gated on
+/// `visible_when: {setup_status.ok: true}` and resolve their `requires` names out of the
+/// provider's `values`. Both come from `provider_setup_status`, which on this path is only ever
+/// echoed back from `req.provider_setup_status` — i.e. whatever the browser accumulated while
+/// stepping through providers one at a time. On an answers-driven run the client has nothing to
+/// send, so the map arrives empty and the buttons can never resolve no matter how well the pack
+/// is configured.
+///
+/// Rebuild the missing entries from the setup answers already persisted to
+/// `state/config/<provider_id>/setup-answers.json`. Client-supplied entries always win, so an
+/// interactive run keeps its richer per-provider state.
+///
+/// `ok` is written as a real JSON boolean: the frontend assigns `context.setup_status` directly
+/// rather than through `mergeFinalSetupActionContext` (which stringifies scalars), and compares
+/// with `===`, so a string here would silently fail the visibility check.
+fn fill_provider_setup_status_from_answers(
+    bundle_path: &Path,
+    success: bool,
+    status: &mut JsonMap<String, Value>,
+) {
+    let config_dir = bundle_path.join("state").join("config");
+    let Ok(entries) = std::fs::read_dir(&config_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(provider_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if status.contains_key(&provider_id) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path().join("setup-answers.json")) else {
+            continue;
+        };
+        let Ok(answers) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(answers) = answers.as_object() else {
+            continue;
+        };
+        let mut values = JsonMap::new();
+        for (key, value) in answers {
+            // Never surface secrets into a page context that renders copyable URLs.
+            if crate::setup_final_actions::is_secret_key(key) || value.is_null() {
+                continue;
+            }
+            values.insert(key.clone(), value.clone());
+        }
+        status.insert(
+            provider_id,
+            serde_json::json!({
+                "setup_status": {"ok": success},
+                "values": values,
+            }),
+        );
+    }
 }
 
 fn attach_final_setup_actions(state: &UiState, provider_id: &str, report: &mut Value) {
@@ -6356,6 +6489,7 @@ async fn post_execute(
     Json(req): Json<ExecuteRequest>,
 ) -> Json<ExecutionResult> {
     let bundle_path = state.bundle_path.clone();
+    let bundle_path_for_status = bundle_path.clone();
     // Use scope from UI request if provided, otherwise fall back to CLI defaults
     let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
     let team = req.team.or_else(|| state.team.clone());
@@ -6368,6 +6502,7 @@ async fn post_execute(
     if let Some(mode) = req.tunnel.as_deref() {
         let tunnel = crate::platform_setup::TunnelAnswers {
             mode: Some(mode.to_string()),
+            ..Default::default()
         };
         let _ = crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel);
     }
@@ -6410,6 +6545,11 @@ async fn post_execute(
         provider_setup_status: JsonMap::new(),
     });
     result.provider_setup_status = provider_setup_status.clone();
+    fill_provider_setup_status_from_answers(
+        &bundle_path_for_status,
+        result.success,
+        &mut result.provider_setup_status,
+    );
     if let Some(public_base_url) = setup_public_base_url.as_deref()
         && result.success
     {
@@ -6548,6 +6688,7 @@ async fn post_draft(
     if let Some(mode) = req.tunnel.as_deref() {
         let tunnel = crate::platform_setup::TunnelAnswers {
             mode: Some(mode.to_string()),
+            ..Default::default()
         };
         if let Err(err) =
             crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)
@@ -6621,6 +6762,7 @@ async fn ensure_setup_public_url(state: &UiState, req: SetupPublicUrlRequest) ->
     }
     let tunnel = crate::platform_setup::TunnelAnswers {
         mode: Some(mode.clone()),
+        ..Default::default()
     };
     crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)?;
     let _tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
@@ -6645,6 +6787,7 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
     if let Some(mode) = req.tunnel.as_deref() {
         let tunnel = crate::platform_setup::TunnelAnswers {
             mode: Some(mode.to_string()),
+            ..Default::default()
         };
         crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)?;
     }
@@ -7169,8 +7312,21 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     eprintln!("Setup tunnel: spawning {mode} tunnel for {local_base_url}");
     let mode_for_task = mode.to_string();
     let local_base_url_for_task = local_base_url.clone();
+    // For the Greentic self-hosted tunnel, derive the tunnel id from the tenant
+    // alone (the webchat URL space has no team segment). Setup OWNS this id: it
+    // is recorded in `.greentic/tunnel.json` below so greentic-start reads it
+    // instead of re-deriving and landing on a different one.
+    let gtunnel_ctx = if mode == "gtunnel" {
+        let team = state.team.as_deref().unwrap_or("default");
+        Some(crate::setup_tunnel::GtunnelSetupCtx::new(
+            crate::setup_tunnel::derive_gtunnel_id(&state.tenant, team),
+        ))
+    } else {
+        None
+    };
+    let gtunnel_tunnel_id = gtunnel_ctx.as_ref().map(|ctx| ctx.tunnel_id.clone());
     let tunnel = tokio::task::spawn_blocking(move || {
-        start_setup_tunnel(&mode_for_task, &local_base_url_for_task)
+        start_setup_tunnel(&mode_for_task, &local_base_url_for_task, gtunnel_ctx)
     })
     .await
     .map_err(|err| anyhow!("setup tunnel task failed: {err}"))??;
@@ -7178,6 +7334,13 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     eprintln!("Setup tunnel: probing reachability of {public_base_url}");
     if wait_for_setup_public_tunnel(&public_base_url).await {
         eprintln!("Setup tunnel: {public_base_url} is reachable, using it");
+        // Record the id we just proved serving, so greentic-start adopts THIS
+        // tunnel rather than deriving its own. Done only after the reachability
+        // probe passes: persisting an id we never reached would point the runtime
+        // at a dead tunnel.
+        if let Some(tunnel_id) = gtunnel_tunnel_id.as_deref() {
+            persist_gtunnel_tunnel_id(&state.bundle_path, tunnel_id);
+        }
         persist_setup_tunnel_handoff(&state.bundle_path, &state.local_base_url, &tunnel);
         let mut guard = state
             .setup_tunnel
@@ -7225,6 +7388,39 @@ fn setup_backend_tunnel_cooldown_remaining(state: &UiState) -> Result<Option<Dur
         .lock()
         .map_err(|_| anyhow!("tunnel failure cooldown lock poisoned"))?;
     Ok(guard.and_then(|failed_at| TUNNEL_FAILURE_COOLDOWN.checked_sub(failed_at.elapsed())))
+}
+
+/// Record the resolved managed-tunnel id in `.greentic/tunnel.json` so
+/// `greentic-start` adopts the tunnel setup actually used, instead of deriving
+/// its own id and serving a URL that nothing was registered against.
+///
+/// Merges into the existing artifact rather than replacing it — `mode` is
+/// written by a different code path (the UI's tunnel selection), and clobbering
+/// it would silently turn the tunnel off on the next boot.
+///
+/// Best effort: a write failure leaves the runtime deriving the id as before,
+/// which is the pre-existing behaviour, so it must not fail setup.
+fn persist_gtunnel_tunnel_id(bundle_path: &Path, tunnel_id: &str) {
+    let mut answers = crate::platform_setup::load_tunnel_artifact(bundle_path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if answers.tunnel_id.as_deref() == Some(tunnel_id) {
+        return;
+    }
+    answers.tunnel_id = Some(tunnel_id.to_string());
+    match crate::platform_setup::persist_tunnel_artifact(bundle_path, &answers) {
+        Ok(path) => eprintln!(
+            "[setup tunnel-id] recorded gtunnel id `{tunnel_id}` in {} — greentic-start \
+             will adopt this tunnel instead of deriving its own",
+            path.display()
+        ),
+        Err(err) => eprintln!(
+            "warning: could not record the gtunnel id in .greentic/tunnel.json ({err:#}); \
+             greentic-start will fall back to deriving it, which may not match the URL \
+             providers were configured with"
+        ),
+    }
 }
 
 /// Persist a [`crate::platform_setup::TunnelHandoff`] for `tunnel`, best
@@ -7572,7 +7768,10 @@ async fn load_saved_secrets(
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
     use greentic_secrets_lib::SecretsStore;
 
-    let store = match crate::secrets::open_dev_store(bundle_path) {
+    // Env-explicit, matching the write side. Reading the bundle-local store here
+    // would look in a location nothing writes to any more, so previously-saved
+    // answers would come back blank in the wizard.
+    let store = match crate::secrets::open_dev_store_for_env(bundle_path, env) {
         Ok(s) => s,
         Err(_) => return std::collections::HashMap::new(),
     };
@@ -8091,14 +8290,17 @@ fn form_question_to_info(q: &qa_spec::QuestionSpec, i18n: Option<&CliI18n>) -> Q
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderSetupEventRequest, TUNNEL_FAILURE_COOLDOWN, UiState, build_router,
+        ProviderCatalogItem, ProviderCatalogLabel, ProviderSetupEventRequest,
+        TUNNEL_FAILURE_COOLDOWN, UiState, build_router, fill_provider_setup_status_from_answers,
+        install_catalog_provider, pack_file_is_usable, persist_gtunnel_tunnel_id,
         persist_provider_setup_event, persist_setup_tunnel_handoff, persist_ui_draft,
         prefill_has_cloud_deployment_targets, read_provider_setup_events,
-        redact_provider_setup_event_detail, setup_backend_record_step_attempt,
-        setup_backend_runtime_context, setup_backend_runtime_context_current,
-        setup_backend_tunnel_cooldown_remaining, setup_backend_tunnel_public_base_url_for_port_at,
+        redact_provider_setup_event_detail, resolve_pack_source_with_retry,
+        setup_backend_record_step_attempt, setup_backend_runtime_context,
+        setup_backend_runtime_context_current, setup_backend_tunnel_cooldown_remaining,
+        setup_backend_tunnel_public_base_url_for_port_at,
     };
-    use crate::secrets::open_dev_store;
+    use crate::secrets::open_dev_store_for_env;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use greentic_secrets_lib::{SecretFormat, SecretsStore};
@@ -8108,6 +8310,114 @@ mod tests {
     use tokio::sync::broadcast;
     use tower::ServiceExt;
     use zip::write::SimpleFileOptions;
+
+    fn write_setup_answers(bundle_root: &std::path::Path, provider_id: &str, answers: Value) {
+        let dir = bundle_root.join("state").join("config").join(provider_id);
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(
+            dir.join("setup-answers.json"),
+            serde_json::to_string(&answers).expect("serialize"),
+        )
+        .expect("write answers");
+    }
+
+    #[test]
+    fn fill_provider_setup_status_rebuilds_missing_entries_from_answers() {
+        // Regression: on an answers-driven run the client sends an empty provider_setup_status,
+        // so the final page had no `setup_status` and no `values` — the Add-to-X buttons could
+        // never resolve regardless of pack configuration.
+        let temp = tempfile::tempdir().expect("temp");
+        write_setup_answers(
+            temp.path(),
+            "messaging-telegram",
+            serde_json::json!({
+                "bot_username": "Greentic_ai_test",
+                "public_base_url": "https://example.com",
+                "telegram_bot_token": "super-secret",
+                "unset_field": null,
+            }),
+        );
+
+        let mut status = JsonMap::new();
+        fill_provider_setup_status_from_answers(temp.path(), true, &mut status);
+
+        let tg = status.get("messaging-telegram").expect("telegram entry");
+        assert_eq!(tg["values"]["bot_username"], "Greentic_ai_test");
+        assert_eq!(tg["values"]["public_base_url"], "https://example.com");
+
+        // Secrets must never reach a context that renders copyable URLs.
+        assert!(
+            tg["values"].get("telegram_bot_token").is_none(),
+            "secret leaked into final-page values: {tg}"
+        );
+        // Nulls are dropped so `requires` cannot be satisfied by an empty answer.
+        assert!(tg["values"].get("unset_field").is_none());
+    }
+
+    #[test]
+    fn fill_provider_setup_status_writes_ok_as_a_real_boolean() {
+        // The frontend compares with `===` against JSON `true`. A stringified "true" would
+        // silently fail `visible_when` and hide the button with no diagnostic.
+        let temp = tempfile::tempdir().expect("temp");
+        write_setup_answers(
+            temp.path(),
+            "messaging-telegram",
+            serde_json::json!({"bot_username": "x"}),
+        );
+
+        let mut status = JsonMap::new();
+        fill_provider_setup_status_from_answers(temp.path(), true, &mut status);
+
+        let ok = &status["messaging-telegram"]["setup_status"]["ok"];
+        assert_eq!(
+            ok,
+            &Value::Bool(true),
+            "ok must be a JSON boolean, got {ok}"
+        );
+        assert!(ok.is_boolean());
+    }
+
+    #[test]
+    fn fill_provider_setup_status_propagates_failure_and_never_clobbers_client_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        write_setup_answers(
+            temp.path(),
+            "messaging-telegram",
+            serde_json::json!({"bot_username": "x"}),
+        );
+        write_setup_answers(
+            temp.path(),
+            "messaging-webchat-gui",
+            serde_json::json!({"public_base_url": "https://example.com"}),
+        );
+
+        // An interactive run already reported richer state for one provider; it must win.
+        let mut status = JsonMap::new();
+        status.insert(
+            "messaging-webchat-gui".to_string(),
+            serde_json::json!({"setup_status": {"ok": true}, "values": {"from": "client"}}),
+        );
+
+        fill_provider_setup_status_from_answers(temp.path(), false, &mut status);
+
+        assert_eq!(
+            status["messaging-webchat-gui"]["values"]["from"], "client",
+            "client-supplied provider state must not be overwritten"
+        );
+        assert_eq!(
+            status["messaging-telegram"]["setup_status"]["ok"],
+            Value::Bool(false),
+            "a failed setup must not advertise ok=true"
+        );
+    }
+
+    #[test]
+    fn fill_provider_setup_status_tolerates_a_missing_config_dir() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut status = JsonMap::new();
+        fill_provider_setup_status_from_answers(temp.path(), true, &mut status);
+        assert!(status.is_empty());
+    }
 
     fn test_ui_state(bundle_root: &std::path::Path) -> std::sync::Arc<UiState> {
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -8156,6 +8466,24 @@ mod tests {
     }
 
     #[test]
+    fn available_provider_items_excludes_hidden() {
+        // WhatsApp / Web Chat / Email are withheld from the add-list for now.
+        // They stay in the catalog so re-exposing them is a one-key change.
+        let catalog = super::ProviderCatalog::load_embedded().expect("catalog");
+        let items = super::available_provider_items(catalog, &Default::default());
+        for hidden in ["messaging-whatsapp", "messaging-webchat", "messaging-email"] {
+            assert!(
+                items.iter().all(|item| item.id != hidden),
+                "{hidden} is marked hidden and must not be offered"
+            );
+        }
+        assert!(
+            items.iter().any(|item| item.id == "messaging-slack"),
+            "non-hidden providers must still be offered"
+        );
+    }
+
+    #[test]
     fn available_provider_items_excludes_installed() {
         let catalog = super::ProviderCatalog::load_embedded().expect("catalog");
         let mut installed = std::collections::HashSet::new();
@@ -8187,6 +8515,7 @@ mod tests {
                 fallback: "Slack".to_string(),
             },
             reference: src.to_string_lossy().to_string(),
+            hidden: false,
         };
 
         super::install_catalog_provider(bundle.path(), &item)
@@ -9103,13 +9432,13 @@ questions:
     }
 
     #[test]
-    fn setup_backend_tunnel_mode_defaults_to_cloudflared_for_local_setup() {
+    fn setup_backend_tunnel_mode_defaults_to_gtunnel_for_local_setup() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = test_ui_state(temp.path());
 
         let mode = super::setup_backend_tunnel_mode(&state).expect("tunnel mode");
 
-        assert_eq!(mode.as_deref(), Some("cloudflared"));
+        assert_eq!(mode.as_deref(), Some("gtunnel"));
     }
 
     #[test]
@@ -9119,6 +9448,7 @@ questions:
             temp.path(),
             &crate::platform_setup::TunnelAnswers {
                 mode: Some("off".to_string()),
+                ..Default::default()
             },
         )
         .expect("persist tunnel");
@@ -9136,6 +9466,7 @@ questions:
             temp.path(),
             &crate::platform_setup::TunnelAnswers {
                 mode: Some("ngrok".to_string()),
+                ..Default::default()
             },
         )
         .expect("persist tunnel");
@@ -9153,6 +9484,7 @@ questions:
             temp.path(),
             &crate::platform_setup::TunnelAnswers {
                 mode: Some("ngrok".to_string()),
+                ..Default::default()
             },
         )
         .expect("persist tunnel");
@@ -10094,6 +10426,7 @@ questions:
             temp.path(),
             &crate::platform_setup::TunnelAnswers {
                 mode: Some("off".to_string()),
+                ..Default::default()
             },
         )
         .expect("persist tunnel off");
@@ -11468,6 +11801,8 @@ setup_actions:
 
     #[tokio::test]
     async fn provider_api_does_not_return_saved_values_for_secret_questions() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11477,7 +11812,7 @@ setup_actions:
         )
         .expect("pack");
 
-        let store = open_dev_store(temp.path()).expect("open store");
+        let store = open_dev_store_for_env(temp.path(), "dev").expect("open store");
         store
             .put(
                 &crate::canonical_secret_uri(
@@ -11968,6 +12303,8 @@ setup_actions:
 
     #[tokio::test]
     async fn persist_ui_draft_writes_provider_answers_to_dev_store() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle_root = temp.path();
         std::fs::create_dir_all(bundle_root.join("packs")).expect("packs dir");
@@ -11995,7 +12332,7 @@ setup_actions:
             Some(&json!(["auth_param_get_weather_key"]))
         );
 
-        let store = open_dev_store(bundle_root).expect("open store");
+        let store = open_dev_store_for_env(bundle_root, "dev").expect("open store");
         let base_uri = crate::canonical_secret_uri(
             "dev",
             "dev-tenant",
@@ -12041,5 +12378,195 @@ setup_actions:
         }))
         .expect("local prefill");
         assert!(!prefill_has_cloud_deployment_targets(Some(&local_prefill)));
+    }
+
+    // ---- gtunnel id persistence (setup owns the id) ----
+
+    #[test]
+    fn persist_gtunnel_tunnel_id_records_the_id_without_clobbering_mode() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        // The UI's tunnel selection writes `mode` from a different code path.
+        crate::platform_setup::persist_tunnel_artifact(
+            bundle.path(),
+            &crate::platform_setup::TunnelAnswers {
+                mode: Some("gtunnel".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("seed mode");
+
+        persist_gtunnel_tunnel_id(bundle.path(), "demo");
+
+        let saved = crate::platform_setup::load_tunnel_artifact(bundle.path())
+            .expect("load")
+            .expect("artifact present");
+        assert_eq!(saved.tunnel_id.as_deref(), Some("demo"));
+        assert_eq!(
+            saved.mode.as_deref(),
+            Some("gtunnel"),
+            "mode must survive: clobbering it would turn the tunnel off on the next boot"
+        );
+    }
+
+    #[test]
+    fn persist_gtunnel_tunnel_id_is_idempotent_and_creates_the_artifact() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        // No pre-existing tunnel.json at all.
+        persist_gtunnel_tunnel_id(bundle.path(), "acme");
+        persist_gtunnel_tunnel_id(bundle.path(), "acme");
+        let saved = crate::platform_setup::load_tunnel_artifact(bundle.path())
+            .expect("load")
+            .expect("artifact present");
+        assert_eq!(saved.tunnel_id.as_deref(), Some("acme"));
+
+        // A later run with a different tenant replaces it.
+        persist_gtunnel_tunnel_id(bundle.path(), "other");
+        let saved = crate::platform_setup::load_tunnel_artifact(bundle.path())
+            .expect("load")
+            .expect("artifact present");
+        assert_eq!(saved.tunnel_id.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn tunnel_answers_without_tunnel_id_still_deserialize() {
+        // Bundles configured before this field existed must keep loading, so the
+        // runtime falls back to deriving rather than failing to read the mode.
+        let legacy: crate::platform_setup::TunnelAnswers =
+            serde_json::from_str(r#"{"mode":"gtunnel"}"#).expect("legacy artifact parses");
+        assert_eq!(legacy.mode.as_deref(), Some("gtunnel"));
+        assert_eq!(legacy.tunnel_id, None);
+
+        // And the field is omitted entirely when unset (no `"tunnel_id":null`).
+        let json = serde_json::to_string(&crate::platform_setup::TunnelAnswers {
+            mode: Some("off".to_string()),
+            ..Default::default()
+        })
+        .expect("serialize");
+        assert_eq!(json, r#"{"mode":"off"}"#);
+    }
+
+    // ---- add-provider: reuse a bundle-local pack instead of pulling ----
+
+    fn catalog_item(id: &str, reference: &str) -> ProviderCatalogItem {
+        ProviderCatalogItem {
+            id: id.to_string(),
+            category: "messaging".to_string(),
+            label: ProviderCatalogLabel {
+                i18n_key: None,
+                fallback: id.to_string(),
+            },
+            reference: reference.to_string(),
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn pack_file_is_usable_requires_a_non_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.gtpack");
+        assert!(!pack_file_is_usable(&missing), "absent file");
+
+        // A zero-byte file is what an interrupted download leaves behind — it
+        // must not be adopted as if it were a real pack.
+        let empty = dir.path().join("empty.gtpack");
+        std::fs::write(&empty, b"").expect("write empty");
+        assert!(!pack_file_is_usable(&empty), "zero-byte file");
+
+        let real = dir.path().join("real.gtpack");
+        std::fs::write(&real, b"pack bytes").expect("write pack");
+        assert!(pack_file_is_usable(&real), "non-empty file");
+
+        assert!(!pack_file_is_usable(dir.path()), "directory is not a pack");
+    }
+
+    /// The regression this guards: `add` used to resolve the catalog reference
+    /// before looking at the destination, so a bundle that already shipped the
+    /// pack still failed when the registry was unreachable. The reference here
+    /// is deliberately unresolvable — if the code touches it, the test fails.
+    #[tokio::test]
+    async fn install_catalog_provider_reuses_the_bundle_local_pack() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let dest_dir = bundle.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&dest_dir).expect("mkdir");
+        let dest = dest_dir.join("messaging-slack.gtpack");
+        std::fs::write(&dest, b"existing pack bytes").expect("seed pack");
+
+        let item = catalog_item(
+            "messaging-slack",
+            "oci://ghcr.invalid/greenticai/packs/messaging/messaging-slack:stable",
+        );
+        install_catalog_provider(bundle.path(), &item)
+            .await
+            .expect("reuses the local pack without any network access");
+
+        assert_eq!(
+            std::fs::read(&dest).expect("read pack"),
+            b"existing pack bytes",
+            "the existing pack must be left byte-for-byte alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_catalog_provider_installs_from_a_local_reference() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let pack = source.path().join("messaging-telegram.gtpack");
+        std::fs::write(&pack, b"fetched pack bytes").expect("write source pack");
+
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let item = catalog_item("messaging-telegram", &format!("file://{}", pack.display()));
+        install_catalog_provider(bundle.path(), &item)
+            .await
+            .expect("installs when the pack is absent");
+
+        let dest = bundle
+            .path()
+            .join("providers")
+            .join("messaging")
+            .join("messaging-telegram.gtpack");
+        assert_eq!(
+            std::fs::read(dest).expect("read installed pack"),
+            b"fetched pack bytes"
+        );
+    }
+
+    /// A zero-byte destination must not short-circuit the fetch: the pack is
+    /// re-resolved and overwritten.
+    #[tokio::test]
+    async fn install_catalog_provider_replaces_an_empty_destination() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let pack = source.path().join("messaging-telegram.gtpack");
+        std::fs::write(&pack, b"real bytes").expect("write source pack");
+
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let dest_dir = bundle.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&dest_dir).expect("mkdir");
+        let dest = dest_dir.join("messaging-telegram.gtpack");
+        std::fs::write(&dest, b"").expect("seed truncated download");
+
+        let item = catalog_item("messaging-telegram", &format!("file://{}", pack.display()));
+        install_catalog_provider(bundle.path(), &item)
+            .await
+            .expect("re-fetches over a zero-byte leftover");
+
+        assert_eq!(
+            std::fs::read(&dest).expect("read pack"),
+            b"real bytes",
+            "the empty leftover must be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pack_source_with_retry_surfaces_the_last_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.gtpack");
+        let source = crate::bundle_source::BundleSource::FileUri(missing.clone());
+
+        let err = resolve_pack_source_with_retry(&source, "file://nope.gtpack")
+            .await
+            .expect_err("an unresolvable source still fails after retries");
+        assert!(
+            !format!("{err:#}").is_empty(),
+            "the underlying resolve error is surfaced, not swallowed"
+        );
     }
 }

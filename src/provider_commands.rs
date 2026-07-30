@@ -328,12 +328,29 @@ pub fn register_provider_core(
     payload: &RegisterProviderPayload<'_>,
     idempotency_key: Option<String>,
 ) -> Result<ProviderRegistrationResult> {
+    // Bind the deployment under the SAME tenant AND team the provider's
+    // secrets are written to (`payload.tenant` / `payload.team`, the same pair
+    // `deployer_secret_path` keys the secret URI with), so the runtime resolves
+    // them without leaning on the reader-side tenant fallback. The team half
+    // was previously dropped — the binding always said `default` while the
+    // secret was written under the real team. `&str` is `Copy`, so the closure
+    // captures the values, not a borrow of `payload`.
+    let deploy_tenant = payload.tenant;
+    let deploy_team = payload.team;
     register_provider_core_impl(
         store,
         payload,
         idempotency_key,
-        |bundle_copy, env_id, customer_id| {
-            crate::env_deploy::deploy_bundle_to_env(bundle_copy, env_id, false, true, customer_id)
+        move |bundle_copy, env_id, customer_id| {
+            crate::env_deploy::deploy_bundle_to_env(
+                bundle_copy,
+                env_id,
+                false,
+                true,
+                customer_id,
+                deploy_tenant,
+                deploy_team,
+            )
         },
     )
 }

@@ -33,6 +33,7 @@ pub mod platform_setup;
 pub mod provider_commands;
 pub mod provider_registry;
 pub mod provider_state;
+pub(crate) mod release_index;
 pub mod reload;
 pub mod schema_validation;
 pub mod secret_name;
@@ -205,15 +206,18 @@ pub fn canonical_secret_uri(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // `GREENTIC_ENV` and `GREENTIC_DISABLE_DEV_ALIAS` are process-global;
-    // serialize tests that mutate them so they don't interleave with each
-    // other or with tests in other modules that mutate the same vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    // serialize tests that mutate them so they don't interleave with each other
+    // or with tests in other modules that read the same vars.
+    //
+    // Shares `secrets::test_support::env_lock` rather than keeping a private
+    // mutex: a second lock gave no mutual exclusion against the secrets-store
+    // tests, which read `GREENTIC_ENV` and `GREENTIC_DEV_SECRETS_PATH` while
+    // these tests were rewriting them — the store tests failed intermittently,
+    // with a different pair failing on each parallel run.
     fn with_clean_env<R>(body: impl FnOnce() -> R) -> R {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::secrets::test_support::env_lock();
         let prev_env = std::env::var_os("GREENTIC_ENV");
         let prev_disable = std::env::var_os(DISABLE_ALIAS_ENV_VAR);
         // SAFETY: serialized by ENV_LOCK; tests are single-threaded inside
@@ -265,6 +269,37 @@ mod tests {
             "bot_token",
         );
         assert_eq!(uri, "secrets://dev/demo/_/messaging_slack/bot_token");
+    }
+
+    /// CROSS-SYSTEM SECRET CONTRACT — DO NOT CHANGE THIS TEST.
+    ///
+    /// greentic-setup WRITES a provider secret under this EXACT uri; the
+    /// greentic-start runtime READS it under the SAME uri (after its provider-slug
+    /// canonicalization). The golden string below is the single source of truth
+    /// both sides must agree on. Its mirror lives in greentic-start
+    /// (`secrets_gate.rs::webex_secret_read_uri_contract_do_not_change`) and pins
+    /// the read side to the same string. If they diverge, a setup-provisioned
+    /// secret silently goes "missing" at runtime — the exact bug this guards.
+    ///
+    /// Do NOT edit the expected value to make a build pass. Changing the
+    /// secret-uri scheme requires a NEW secrets plan verified end-to-end on BOTH
+    /// binaries (setup + start) and BOTH backends (local dev-store + cloud vault)
+    /// and public.
+    #[test]
+    fn webex_secret_uri_contract_do_not_change() {
+        // env=local, team=default→`_`, provider=messaging-webex→messaging_webex,
+        // key=webex_bot_token.
+        assert_eq!(
+            canonical_secret_uri(
+                "local",
+                "demo",
+                Some("default"),
+                "messaging-webex",
+                "webex_bot_token"
+            ),
+            "secrets://local/demo/_/messaging_webex/webex_bot_token",
+            "setup↔runtime secret-uri contract broke — read the DO-NOT-CHANGE doc above",
+        );
     }
 
     #[test]
