@@ -26,8 +26,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
+      # Without GITHUB_TOKEN, binstall queries api.github.com anonymously and gets
+      # rate-limited (403) per runner IP. It does not fail on that: it silently falls
+      # back to building from source with `cargo install` and NO `--locked`, which
+      # cargo-nextest rejects with a deliberate compile_error!, so the job burns ~11
+      # minutes and then exits 70 looking like a Rust break. The token raises the limit;
+      # `--disable-strategies compile` makes any remaining download failure loud and
+      # immediate instead of degrading. All three tools publish prebuilt binaries.
       - name: Install coverage toolchain binaries
-        run: cargo binstall --no-confirm --force greentic-dev cargo-llvm-cov cargo-nextest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo binstall --no-confirm --force --disable-strategies compile greentic-dev cargo-llvm-cov cargo-nextest
+          command -v greentic-dev
+          command -v cargo-llvm-cov
+          command -v cargo-nextest
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
       - name: Verify coverage toolchain
