@@ -257,6 +257,15 @@ mod tests {
         }
     }
 
+    /// Isolates the process-global dev-secrets store for one test.
+    ///
+    /// Every executor below persists answers through
+    /// `secrets::ensure_path_for_env`, which resolves `GREENTIC_DEV_SECRETS_PATH`
+    /// before anything else, so a test without this guard writes into the
+    /// developer's real `~/.greentic` environment store and races every sibling
+    /// test that *does* install an override.
+    use crate::secrets::test_support::isolated_store as isolated_dev_store;
+
     #[test]
     fn create_plan_is_deterministic() {
         let req = SetupRequest {
@@ -460,6 +469,7 @@ setup_answers:
 
     #[test]
     fn execute_persists_static_routes_artifact() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -549,6 +559,7 @@ setup_answers:
 
     #[test]
     fn execute_apply_pack_setup_persists_pack_declared_setup_actions() {
+        let _store = isolated_dev_store();
         use std::io::Write;
         use zip::write::{FileOptions, ZipWriter};
 
@@ -626,6 +637,7 @@ setup_actions:
 
     #[test]
     fn execute_apply_pack_setup_hydrates_oauth_install_url_from_answers() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -681,6 +693,7 @@ questions:
 
     #[test]
     fn execute_apply_pack_setup_runs_pack_declared_registration_before_oauth_hydration() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -748,6 +761,7 @@ setup_actions:
 
     #[test]
     fn execute_apply_pack_setup_resolves_open_url_action_even_when_already_registered() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -819,6 +833,7 @@ setup_actions:
 
     #[test]
     fn execute_apply_pack_setup_skips_actions_for_disabled_provider() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -880,8 +895,7 @@ setup_actions:
 
     #[test]
     fn execute_apply_pack_setup_uses_bundle_name_for_registration_app_name_template() {
-        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
-        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -965,6 +979,7 @@ setup_actions:
 
     #[test]
     fn execute_apply_pack_setup_registration_failure_does_not_persist_broken_action() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -1019,6 +1034,7 @@ setup_actions:
 
     #[test]
     fn execute_apply_pack_setup_registration_passes_original_input_field_names() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();
@@ -1114,6 +1130,7 @@ setup_actions:
 
     #[test]
     fn execute_create_persists_platform_metadata_without_provider_steps() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
 
@@ -1160,6 +1177,7 @@ setup_actions:
 
     #[test]
     fn remove_execute_deletes_provider_artifact_and_config_dir() {
+        let _store = isolated_dev_store();
         let temp = tempfile::tempdir().unwrap();
         let bundle_root = temp.path().join("bundle");
         bundle::create_demo_bundle_structure(&bundle_root, Some("demo")).unwrap();

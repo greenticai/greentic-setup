@@ -25,8 +25,32 @@ const OVERRIDE_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
 
 /// Returns a path explicitly configured via `$GREENTIC_DEV_SECRETS_PATH`.
 pub fn override_path() -> Option<PathBuf> {
+    assert_store_access_is_guarded();
     std::env::var(OVERRIDE_ENV).ok().map(PathBuf::from)
 }
+
+/// In test builds, refuse to resolve the dev-store path outside a
+/// `secrets::test_support` guard.
+///
+/// The override is process-global, so an unguarded test reads whatever a
+/// concurrent guarded test installed and can write into — or through — a temp
+/// dir that is about to be deleted. That surfaced as `failed to persist N
+/// secret(s): … No such file or directory` in tests that never touched the
+/// store deliberately. Asserting here converts that flake into a deterministic
+/// failure that names the offending test.
+#[cfg(test)]
+fn assert_store_access_is_guarded() {
+    assert!(
+        test_support::store_access_is_guarded(),
+        "dev secrets store resolved without a `secrets::test_support` guard — \
+         start this test with `let _store = crate::secrets::test_support::isolated_store();` \
+         (or `lock_env()` when it only reads path resolution)"
+    );
+}
+
+#[cfg(not(test))]
+#[inline]
+fn assert_store_access_is_guarded() {}
 
 /// Dev-store path inside the shared environment store:
 ///   `~/.greentic/environments/<env>/.greentic/dev/.dev.secrets.env`
@@ -452,7 +476,38 @@ pub fn open_dev_store(bundle_root: &Path) -> Result<DevStore> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Set while a guard from this module is alive.
+    ///
+    /// Read by [`super::assert_store_access_is_guarded`]: an unguarded test that
+    /// resolves the store path reads whatever override a *concurrent* guarded
+    /// test installed, and that test's temp dir can be removed mid-write — the
+    /// store call then fails with `No such file or directory`. Failing loudly on
+    /// the unguarded access turns that flake into a deterministic error naming
+    /// the test that has to be fixed.
+    static GUARDED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn store_access_is_guarded() -> bool {
+        GUARDED.load(Ordering::SeqCst)
+    }
+
+    /// Marks the guarded window. Held by every guard below for its lifetime.
+    struct GuardFlag;
+
+    impl GuardFlag {
+        fn set() -> Self {
+            GUARDED.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for GuardFlag {
+        fn drop(&mut self) {
+            GUARDED.store(false, Ordering::SeqCst);
+        }
+    }
 
     /// THE process-wide env lock for this crate's tests.
     ///
@@ -471,6 +526,9 @@ pub(crate) mod test_support {
     /// Points the dev-store override at a path for as long as it is held, then
     /// restores whatever was there before. Hold it for the whole test body.
     pub(crate) struct StoreOverride {
+        // Declaration order is drop order, and it runs after `Drop::drop` below:
+        // clear the flag and release the lock only once the env is restored.
+        _flag: GuardFlag,
         _guard: MutexGuard<'static, ()>,
         previous: Option<String>,
     }
@@ -484,6 +542,7 @@ pub(crate) mod test_support {
             // restores the prior state.
             unsafe { std::env::set_var(super::OVERRIDE_ENV, path) };
             Self {
+                _flag: GuardFlag::set(),
                 _guard: guard,
                 previous,
             }
@@ -495,6 +554,29 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A [`StoreOverride`] that owns the temp dir it points at.
+    ///
+    /// This is what a test that *writes* secrets wants: `let _store =
+    /// isolated_store();` as the first statement of the test body keeps the
+    /// override installed — and the directory alive — for the whole test.
+    pub(crate) struct IsolatedStore {
+        // Drop the override (restoring the env and releasing the lock) before the
+        // directory it points at is removed, so no other test can ever observe an
+        // override aimed at a deleted path.
+        _override: StoreOverride,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Points the dev store at a fresh temp dir for the rest of the test.
+    pub(crate) fn isolated_store() -> IsolatedStore {
+        let dir = tempfile::tempdir().expect("dev store isolation dir");
+        let guard = StoreOverride::in_dir(dir.path());
+        IsolatedStore {
+            _override: guard,
+            _dir: dir,
+        }
+    }
+
     /// Serialises against [`StoreOverride`] WITHOUT changing anything.
     ///
     /// Needed by tests that assert path resolution in its natural state: they
@@ -502,10 +584,14 @@ pub(crate) mod test_support {
     /// they observe another test's override. Because `StoreOverride` restores the
     /// previous value in `Drop` before releasing the lock, holding it here
     /// guarantees the var is back to its pre-test state.
-    pub(crate) struct EnvLock(#[allow(dead_code)] MutexGuard<'static, ()>);
+    pub(crate) struct EnvLock(
+        #[allow(dead_code)] GuardFlag,
+        #[allow(dead_code)] MutexGuard<'static, ()>,
+    );
 
     pub(crate) fn lock_env() -> EnvLock {
-        EnvLock(env_lock())
+        let guard = env_lock();
+        EnvLock(GuardFlag::set(), guard)
     }
 
     impl Drop for StoreOverride {

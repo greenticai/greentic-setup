@@ -99,7 +99,7 @@ Previously this logic was embedded in greentic-operator (~5,000 lines). This cra
 None. Current checks pass:
 - `cargo fmt --check` — clean
 - `cargo clippy -- -D warnings` — clean
-- `cargo test` — 108 tests pass
+- `cargo test` — 813 lib tests + 15 integration tests pass
 - `cargo doc` — clean (no warnings)
 - `cargo package --allow-dirty` — clean
 - `cargo publish --dry-run --allow-dirty` — clean
@@ -114,4 +114,11 @@ None. Current checks pass:
 - **Hot reload runtime:** ArcSwap-based component swapping and connection draining live in operator.
 - **JWT signing:** `card_setup.rs` uses session_id as token. Production should use signed JWTs.
 - **Reuse-first:** uses qa-spec, greentic-secrets-lib, greentic-distributor-client.
+- **Test hermeticity (dev secrets store):** the store path resolves through the
+  process-global `$GREENTIC_DEV_SECRETS_PATH`, so any test that reaches the store
+  — directly or via greentic-deployer — must start with `let _store =
+  crate::secrets::test_support::isolated_store();`. Without it the test writes to
+  the developer's real `~/.greentic` and races whichever sibling test installed an
+  override, failing intermittently with `storage error: No such file or directory`.
+  `secrets::override_path` asserts this in test builds.
 - **Version:** 0.4.x (matches greentic ecosystem). Includes both library APIs and the `greentic-setup` CLI binary.
