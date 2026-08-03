@@ -11238,6 +11238,7 @@ questions:
 
     #[tokio::test]
     async fn setup_backend_contract_is_exposed_and_handles_state_without_runtime_proxy() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11295,6 +11296,7 @@ questions:
 
     #[tokio::test]
     async fn setup_machine_is_exposed_and_advances_through_ui_route() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11379,6 +11381,7 @@ questions:
 
     #[tokio::test]
     async fn setup_actions_pack_extension_is_exposed_for_setup_targets() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11420,6 +11423,7 @@ questions:
 
     #[tokio::test]
     async fn legacy_setup_actions_are_exposed_for_setup_targets() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11469,6 +11473,7 @@ questions:
 
     #[tokio::test]
     async fn setup_actions_extension_and_legacy_actions_are_both_exposed() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11510,6 +11515,7 @@ questions:
 
     #[tokio::test]
     async fn setup_action_endpoint_runs_registration_and_returns_final_url_value() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11603,6 +11609,7 @@ questions:
 
     #[tokio::test]
     async fn setup_action_endpoint_returns_oauth_url_without_deep_link_action() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");
@@ -11711,6 +11718,7 @@ setup_actions:
 
     #[tokio::test]
     async fn setup_action_endpoint_runs_registration_for_open_url_action() {
+        let _store = crate::secrets::test_support::isolated_store();
         // Slack's "Setup Slack App" action has no client_id to drive an
         // oauth_install_button (Slack's apps.manifest.update never returns
         // one on reuse), so it uses a plain open_url action instead. The
@@ -11982,6 +11990,7 @@ setup_actions:
 
     #[tokio::test]
     async fn setup_backend_contract_descriptor_loads_asset_contract() {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir().expect("tempdir");
         let providers = temp.path().join("providers/messaging");
         std::fs::create_dir_all(&providers).expect("providers");

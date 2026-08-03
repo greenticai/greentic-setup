@@ -2117,6 +2117,7 @@ mod tests {
 
     #[test]
     fn register_provider_core_skips_deploy_when_not_linking_bundle() {
+        let _store = crate::secrets::test_support::isolated_store();
         // With link_bundle = false there is no env bundle to inject into, so the
         // deploy must not fire and the outcome must be AlreadyPresent.
         let root = tempfile::tempdir().unwrap();
@@ -2301,6 +2302,7 @@ mod tests {
 
     #[test]
     fn register_provider_core_registers_endpoint_and_writes_secrets() {
+        let _store = crate::secrets::test_support::isolated_store();
         let root = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(root.path());
         ensure_local_environment(&store, None).expect("bootstrap local env");
@@ -2384,6 +2386,7 @@ mod tests {
 
     #[test]
     fn register_provider_core_link_bundle_reports_missing_bundle() {
+        let _store = crate::secrets::test_support::isolated_store();
         let root = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(root.path());
         ensure_local_environment(&store, None).expect("bootstrap local env");
