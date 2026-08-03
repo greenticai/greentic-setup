@@ -8051,6 +8051,7 @@ setup_actions:
 
     #[test]
     fn advance_setup_machine_oauth_device_code_starts_then_polls_complete() -> anyhow::Result<()> {
+        let _store = crate::secrets::test_support::isolated_store();
         let temp = tempfile::tempdir()?;
         let base = serve_json_sequence(vec![
             (
