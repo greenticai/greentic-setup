@@ -162,13 +162,18 @@ fn install_clash_suffix(root: &Path, base: &str) -> Option<String> {
 
 /// Read `<root>/instance-seed`, creating it on first use. Shared on-disk format
 /// with greentic-start, which reads the same file so both derive one suffix.
+///
+/// Creation is exclusive (`create_new`), and a lost race re-reads the winner's
+/// seed rather than overwriting it. A plain write let every concurrent caller
+/// install its own random seed on a fresh install — last write won, so callers
+/// that had already derived an id kept a suffix nobody else would reproduce.
+/// The suffix ends up inside webhook URLs registered with Slack, Webex and
+/// OAuth providers, and `gtc setup` and `gtc start` derive it independently, so
+/// a divergent seed strands a registered URL.
 fn load_or_create_instance_seed(root: &Path) -> Option<String> {
     let path = root.join("instance-seed");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        if existing.len() == 64 && existing.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(existing);
-        }
+    if let Some(seed) = read_instance_seed(&path) {
+        return Some(seed);
     }
     let seed: String = (0..32)
         .map(|_| format!("{:02x}", rand::random::<u8>()))
@@ -176,8 +181,38 @@ fn load_or_create_instance_seed(root: &Path) -> Option<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    std::fs::write(&path, &seed).ok()?;
-    Some(seed)
+    // Stage the whole seed, then publish it with a link. Creating the file
+    // first and filling it after is not enough: a concurrent caller re-reading
+    // the winner's file would find it still empty, judge it unusable and
+    // overwrite it — the same last-write-wins outcome, in a narrower window.
+    // Linking publishes an already-complete file, so a loser only ever reads a
+    // seed it can safely adopt.
+    let staged = path.with_file_name(format!("instance-seed.{:016x}.tmp", rand::random::<u64>()));
+    std::fs::write(&staged, &seed).ok()?;
+    let outcome = match std::fs::hard_link(&staged, &path) {
+        Ok(()) => Some(seed),
+        // Someone else published first: theirs wins, because they may already
+        // have handed the derived id to a provider.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match read_instance_seed(&path) {
+                Some(existing) => Some(existing),
+                // Present but unusable (truncated, hand-edited): no id anyone
+                // registered can have come from it, so replace it with ours.
+                None => std::fs::rename(&staged, &path).ok().map(|()| seed),
+            }
+        }
+        // No link support (some network/removable filesystems): fall back to a
+        // rename, which is still atomic — it just cannot detect a loser.
+        Err(_) => std::fs::rename(&staged, &path).ok().map(|()| seed),
+    };
+    let _ = std::fs::remove_file(&staged);
+    outcome
+}
+
+/// The seed at `path`, or `None` when it is absent or not 64 hex chars.
+fn read_instance_seed(path: &Path) -> Option<String> {
+    let existing = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (existing.len() == 64 && existing.chars().all(|c| c.is_ascii_hexdigit())).then_some(existing)
 }
 
 impl GtunnelSetupCtx {
@@ -999,6 +1034,65 @@ mod tests {
         assert_eq!(base, "demo");
         assert_eq!(suffix.len(), 5, "5-hex suffix, got {id}");
         assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+    }
+
+    #[test]
+    fn concurrent_first_use_settles_on_one_instance_seed() {
+        // The failure this guards: on a fresh install several callers reach an
+        // absent `instance-seed` at once. With a plain write each installed its
+        // own random seed and the last write won, so callers that had already
+        // derived a suffix kept one nobody could reproduce — and that suffix
+        // sits inside webhook URLs registered with Slack, Webex and OAuth
+        // providers. Exclusive creation makes the first writer win for everyone.
+        //
+        // Takes the root as an argument rather than mutating
+        // `GREENTIC_TUNNEL_STATE_DIR`, which is process-global and would race
+        // every other test the way the seed itself used to.
+        let root = tempfile::tempdir().expect("seed root");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let suffixes: std::collections::BTreeSet<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let path = root.path().to_path_buf();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        install_clash_suffix(&path, "acme").expect("suffix")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+        assert_eq!(
+            suffixes.len(),
+            1,
+            "concurrent first use must settle on one seed: {suffixes:?}"
+        );
+        // And the settled seed is the one on disk, so later processes agree.
+        assert_eq!(
+            install_clash_suffix(root.path(), "acme").as_ref(),
+            suffixes.iter().next(),
+            "the persisted seed must reproduce the suffix callers already used"
+        );
+    }
+
+    #[test]
+    fn instance_seed_is_healed_when_the_file_is_unusable() {
+        // A truncated or hand-edited seed cannot have produced any registered
+        // id, so it is replaced rather than propagated as `None` (which would
+        // silently drop the suffix from the tunnel id).
+        let root = tempfile::tempdir().expect("seed root");
+        std::fs::write(root.path().join("instance-seed"), "not-a-seed").expect("write");
+        let suffix = install_clash_suffix(root.path(), "acme").expect("suffix");
+        assert_eq!(suffix.len(), 5, "{suffix}");
+        assert_eq!(
+            install_clash_suffix(root.path(), "acme").as_deref(),
+            Some(suffix.as_str()),
+            "the healed seed must be stable across calls"
+        );
     }
 
     #[test]
