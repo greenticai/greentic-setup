@@ -237,7 +237,8 @@ pub fn start_oauth_device_code(
     }
 
     let metadata = load_provider_device_metadata(bundle_root, &input.provider_id, extension_key)?;
-    let setup_answers = load_provider_setup_answers(bundle_root, &input.provider_id)?;
+    let setup_answers =
+        load_provider_setup_answers(bundle_root, &input.provider_id, &input.tenant, &team)?;
     let client_id = lookup_client_id(&metadata, &setup_answers)?;
     let request_form = device_code_request_form(&metadata, &client_id);
     let mut response = crate::http_client::api_agent()
@@ -374,7 +375,14 @@ async fn poll_oauth_device_code_with_token_response(
         finalize_provider_apply_answers(bundle_root, env, session, metadata, response, &mapped)
             .await?;
     let final_mapped = final_mapped.as_ref().unwrap_or(&mapped);
-    persist_device_config_outputs(bundle_root, &session.provider_id, metadata, final_mapped)?;
+    persist_device_config_outputs(
+        bundle_root,
+        &session.provider_id,
+        &session.tenant,
+        &session.team,
+        metadata,
+        final_mapped,
+    )?;
     crate::setup_actions::mark_setup_action_complete(
         bundle_root,
         &session.tenant,
@@ -414,7 +422,12 @@ async fn finalize_provider_apply_answers(
                 session.provider_id
             )
         })?;
-    let answers = load_provider_setup_answers(bundle_root, &session.provider_id)?;
+    let answers = load_provider_setup_answers(
+        bundle_root,
+        &session.provider_id,
+        &session.tenant,
+        &session.team,
+    )?;
     let request =
         json_apply_answers_request(&answers, metadata, response, &session.client_id, mapped)?;
     let config = crate::engine::SetupConfig {
@@ -665,6 +678,8 @@ pub fn map_device_token_response(
 fn persist_device_config_outputs(
     bundle_root: &Path,
     provider_id: &str,
+    tenant: &str,
+    team: &str,
     metadata: &OAuthDeviceMetadata,
     mapped: &BTreeMap<String, String>,
 ) -> Result<()> {
@@ -677,8 +692,10 @@ fn persist_device_config_outputs(
         return Ok(());
     }
 
-    let path = provider_setup_answers_path(bundle_root, provider_id);
-    let mut answers = load_provider_setup_answers(bundle_root, provider_id)?;
+    // Write scoped, read via the legacy fallback so existing answers carry
+    // forward instead of starting empty.
+    let path = provider_setup_answers_path(bundle_root, provider_id, tenant, team);
+    let mut answers = load_provider_setup_answers(bundle_root, provider_id, tenant, team)?;
     let Some(answer_map) = answers.as_object_mut() else {
         bail!(
             "provider setup answers must be a JSON object: {}",
@@ -696,7 +713,7 @@ fn persist_device_config_outputs(
     std::fs::write(&path, payload)
         .with_context(|| format!("failed to write {}", path.display()))?;
 
-    let verified = load_provider_setup_answers(bundle_root, provider_id)?;
+    let verified = load_provider_setup_answers(bundle_root, provider_id, tenant, team)?;
     for (key, value) in mapped {
         if is_sensitive_device_output_key(metadata, key) {
             continue;
@@ -1011,8 +1028,15 @@ fn poll_error_message(error: &str, response: &Value) -> String {
         .unwrap_or_else(|| format!("OAuth device-code polling failed: {error}"))
 }
 
-fn load_provider_setup_answers(bundle_root: &Path, provider_id: &str) -> Result<Value> {
-    let path = provider_setup_answers_path(bundle_root, provider_id);
+/// This tenant's answers, falling back to the legacy unscoped file.
+fn load_provider_setup_answers(
+    bundle_root: &Path,
+    provider_id: &str,
+    tenant: &str,
+    team: &str,
+) -> Result<Value> {
+    let path =
+        crate::provider_answers::answers_path_for_read(bundle_root, provider_id, tenant, team);
     if !path.exists() {
         return Ok(Value::Object(JsonMap::new()));
     }
@@ -1021,12 +1045,14 @@ fn load_provider_setup_answers(bundle_root: &Path, provider_id: &str) -> Result<
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn provider_setup_answers_path(bundle_root: &Path, provider_id: &str) -> PathBuf {
-    bundle_root
-        .join("state")
-        .join("config")
-        .join(provider_id)
-        .join("setup-answers.json")
+/// Where this tenant's answers are written.
+fn provider_setup_answers_path(
+    bundle_root: &Path,
+    provider_id: &str,
+    tenant: &str,
+    team: &str,
+) -> PathBuf {
+    crate::provider_answers::answers_path(bundle_root, provider_id, tenant, team)
 }
 
 fn save_session(bundle_root: &Path, state: &OAuthDeviceSessionState) -> Result<()> {
@@ -1680,7 +1706,7 @@ mod tests {
 
         assert_eq!(report.status, OAuthDevicePollStatus::Complete);
 
-        let answers = load_provider_setup_answers(bundle, provider_id).unwrap();
+        let answers = load_provider_setup_answers(bundle, provider_id, "demo", "default").unwrap();
         assert_eq!(answers["client_id"], json!("client-123"));
         assert_eq!(answers["public_base_url"], json!("https://tunnel.example"));
         assert_eq!(answers["tenant_id"], json!("tenant-123"));
@@ -1775,7 +1801,7 @@ mod tests {
             crate::setup_actions::SetupActionStatus::Complete
         );
 
-        let answers = load_provider_setup_answers(bundle, provider_id).unwrap();
+        let answers = load_provider_setup_answers(bundle, provider_id, "demo", "default").unwrap();
         assert_eq!(answers["client_id"], json!("client-123"));
         assert_eq!(answers["user_id"], json!("user-123"));
         assert_eq!(answers["team_id"], json!("team-123"));

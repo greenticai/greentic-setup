@@ -333,7 +333,7 @@ pub fn resolve_public_base_url(
     team: Option<&str>,
     provider_id: &str,
 ) -> Result<String> {
-    if let Some(value) = load_provider_setup_answers(bundle_root, provider_id)?
+    if let Some(value) = load_provider_setup_answers(bundle_root, provider_id, tenant, team)?
         .get("public_base_url")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -352,12 +352,19 @@ pub fn resolve_public_base_url(
     bail!("This provider requires a public_base_url to generate OAuth callback and webhook URLs.")
 }
 
-fn load_provider_setup_answers(bundle_root: &Path, provider_id: &str) -> Result<Value> {
-    let path = bundle_root
-        .join("state")
-        .join("config")
-        .join(provider_id)
-        .join("setup-answers.json");
+/// This tenant's answers, falling back to the legacy unscoped file.
+fn load_provider_setup_answers(
+    bundle_root: &Path,
+    provider_id: &str,
+    tenant: &str,
+    team: Option<&str>,
+) -> Result<Value> {
+    let path = crate::provider_answers::answers_path_for_read(
+        bundle_root,
+        provider_id,
+        tenant,
+        team.unwrap_or("default"),
+    );
     if !path.exists() {
         return Ok(Value::Object(JsonMap::new()));
     }
@@ -681,7 +688,8 @@ mod tests {
     #[test]
     fn setup_answer_helpers_handle_missing_file_and_nonempty_aliases() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let empty = load_provider_setup_answers(temp.path(), "messaging-example")?;
+        let empty =
+            load_provider_setup_answers(temp.path(), "messaging-example", "demo", Some("default"))?;
         assert_eq!(empty, Value::Object(JsonMap::new()));
 
         let answers = json!({"client_id": "  ", "oauth_client_id": "client"});

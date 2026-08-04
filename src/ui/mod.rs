@@ -489,6 +489,7 @@ pub async fn launch(
         env!("CARGO_PKG_VERSION"),
         env!("GREENTIC_SETUP_BUILD_SHA")
     );
+    spawn_setup_tunnel_warmup(state.clone());
     if std::env::var("GREENTIC_SETUP_NO_OPEN").ok().as_deref() != Some("1") {
         let _ = open::that(&url);
     }
@@ -4059,10 +4060,13 @@ fn setup_backend_refresh_runtime_observation_from_runtime_logs(
     {
         return Ok(());
     }
+    let floor = setup_backend_runtime_activity_line_floor(state, stored)?;
+    setup_backend_discard_pre_floor_observation(stored, state_key, floor);
     let Some(observed) = setup_backend_latest_runtime_activity_from_logs(
         state,
         tenant,
         state.team.as_deref().unwrap_or("default"),
+        floor,
     )?
     else {
         return Ok(());
@@ -4072,10 +4076,89 @@ fn setup_backend_refresh_runtime_observation_from_runtime_logs(
     Ok(())
 }
 
+/// Key under which the observation's "ignore everything already in the log"
+/// watermark is persisted.
+const RUNTIME_ACTIVITY_LINE_FLOOR_KEY: &str = "runtime_activity_line_floor";
+
+/// Drop an already-stored observation that came from a pre-existing log line.
+///
+/// The floor alone only stops NEW false matches. A state file written before
+/// the floor existed can already hold an observation harvested from a line the
+/// bundle shipped with (observed: `log_line: 45` of a system.log from the
+/// machine that built the bundle) — and the completion check only asks whether
+/// the observation EXISTS, so the step would still read as done. Discarding it
+/// forces the proof to be re-earned from a real message.
+fn setup_backend_discard_pre_floor_observation(
+    stored: &mut JsonMap<String, Value>,
+    state_key: &str,
+    floor: usize,
+) {
+    let stale = stored
+        .get(state_key)
+        .and_then(|value| value.get("log_line"))
+        .and_then(Value::as_u64)
+        .is_some_and(|line| line as usize <= floor);
+    if !stale {
+        return;
+    }
+    eprintln!(
+        "[setup runtime-observation] discarding stored {state_key}: it was harvested from a \
+         log line that predates this setup session, so it is not evidence of a real message"
+    );
+    stored.remove(state_key);
+    stored.remove("last_activity_received_at");
+}
+
+/// How many leading `system.log` lines predate this setup's interest in it.
+///
+/// `first_bot_framework_post` proves a REAL Teams message reached the bot, so
+/// it must only ever match a line written after setup started watching. The
+/// setup-started-runtime path already supplies a floor, but under `gtc start`
+/// the runtime is already up, that floor is absent, and the scan defaulted to
+/// 0 — matching whatever was already in the file. A `.gtbundle` can ship a
+/// `logs/system.log` from the machine that BUILT it (observed: a Jul-24 log
+/// from another user's box, whose line 45 is a matching `[fast2flow:gate]`
+/// line), so the step could report "a Teams activity arrived" for a message
+/// that was never sent, on a bot that was never reachable.
+///
+/// So: the first time setup looks, record the log's current length and treat
+/// everything up to it as pre-existing. Persisted, so the watermark survives
+/// the wizard being restarted mid-run.
+fn setup_backend_runtime_activity_line_floor(
+    state: &UiState,
+    stored: &mut JsonMap<String, Value>,
+) -> Result<usize> {
+    let runtime_floor = setup_backend_setup_runtime_info(state)
+        .and_then(|info| info.system_log_line_floor)
+        .unwrap_or(0);
+    if let Some(recorded) = stored
+        .get(RUNTIME_ACTIVITY_LINE_FLOOR_KEY)
+        .and_then(Value::as_u64)
+    {
+        // Whichever watermark is higher wins: a setup-started runtime knows
+        // exactly where its own output begins.
+        return Ok(runtime_floor.max(recorded as usize));
+    }
+    let existing = setup_runtime_system_log_line_count(&state.bundle_path).unwrap_or(0);
+    let floor = runtime_floor.max(existing);
+    stored.insert(
+        RUNTIME_ACTIVITY_LINE_FLOOR_KEY.to_string(),
+        Value::from(floor as u64),
+    );
+    if existing > 0 {
+        eprintln!(
+            "[setup runtime-observation] ignoring {existing} pre-existing line(s) in the bundle's \
+             system.log; only activity logged from here on counts as a real Teams message"
+        );
+    }
+    Ok(floor)
+}
+
 fn setup_backend_latest_runtime_activity_from_logs(
     state: &UiState,
     tenant: &str,
     team: &str,
+    line_floor: usize,
 ) -> Result<Option<Value>> {
     let log_path = state.bundle_path.join("logs").join("system.log");
     let file = match std::fs::File::open(&log_path) {
@@ -4083,9 +4166,6 @@ fn setup_backend_latest_runtime_activity_from_logs(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("read {}", log_path.display())),
     };
-    let line_floor = setup_backend_setup_runtime_info(state)
-        .and_then(|info| info.system_log_line_floor)
-        .unwrap_or(0);
     let team_some = format!("team=Some(\"{team}\")");
     let team_plain = format!("team={team}");
     let tenant_match = format!("tenant={tenant}");
@@ -4783,6 +4863,20 @@ fn setup_backend_apply_host_defaults_with_runtime_base(
     _runtime_base: Option<&str>,
     config: &mut JsonMap<String, Value>,
 ) {
+    // An operator override is AUTHORITATIVE and applied unconditionally: it is
+    // the supported way to point setup at a URL the engine cannot discover — a
+    // permanent hostname, a reverse proxy, a tunnel the operator runs
+    // themselves. It used to be consulted only when `public_base_url` was
+    // empty, which it never is (`default_setup_backend_config` seeds the
+    // runtime-local URL), so exporting `PUBLIC_BASE_URL` had no effect here and
+    // setup spun up a tunnel anyway.
+    if let Some(public_base_url) = injected_setup_public_base_url() {
+        config.insert(
+            "public_base_url".to_string(),
+            Value::String(public_base_url.trim_end_matches('/').to_string()),
+        );
+        return;
+    }
     setup_backend_refresh_ephemeral_public_base_url(state, tenant, config);
     if setup_backend_config_str(config, "public_base_url").is_empty()
         && let Some(public_base_url) = setup_backend_public_base_url(state, tenant)
@@ -4817,6 +4911,11 @@ fn setup_backend_adopt_runtime_public_base_url(
     tenant: &str,
     config: &mut JsonMap<String, Value>,
 ) -> Result<Option<String>> {
+    // Never adopt over an operator override — it outranks anything the engine
+    // discovers, including an ephemeral URL the operator deliberately chose.
+    if injected_setup_public_base_url().is_some() {
+        return Ok(None);
+    }
     // Resolve through the single ingress source of truth (live per-port
     // tunnel record first, then the runtime-reported endpoints) so the URL
     // adopted into config is the same one every currency check compares
@@ -4878,6 +4977,20 @@ async fn setup_backend_refresh_public_tunnel_if_needed(
     tenant: &str,
     config: &mut JsonMap<String, Value>,
 ) -> Result<Option<String>> {
+    // The operator gave us a public URL, so there is nothing to tunnel TO —
+    // this is the "no tunnels" deployment (permanent hostname / reverse proxy /
+    // operator-run tunnel). Spinning one up anyway would both waste a tunnel
+    // and overwrite the URL they chose.
+    if let Some(public_base_url) = injected_setup_public_base_url() {
+        let public_base_url = public_base_url.trim_end_matches('/').to_string();
+        if setup_backend_config_str(config, "public_base_url") != public_base_url {
+            config.insert(
+                "public_base_url".to_string(),
+                Value::String(public_base_url.clone()),
+            );
+        }
+        return Ok(Some(public_base_url));
+    }
     let current = setup_backend_config_str(config, "public_base_url");
     let Some(mode) = setup_backend_tunnel_mode(state)?
         .or_else(|| setup_backend_infer_tunnel_mode_from_public_base_url(&current))
@@ -4916,7 +5029,7 @@ async fn setup_backend_refresh_public_tunnel_if_needed(
         }
     }
     let local_base_url = setup_backend_tunnel_local_base_url(state, tenant)?;
-    let public_base_url = ensure_setup_tunnel(state, &mode, &local_base_url).await?;
+    let public_base_url = ensure_setup_tunnel(state, &mode, &local_base_url, tenant).await?;
     config.insert(
         "public_base_url".to_string(),
         Value::String(public_base_url.clone()),
@@ -5695,6 +5808,12 @@ fn setup_backend_render_values(
         ) {
             continue;
         }
+        // Storage bookkeeping, not wizard state — the browser has no use for
+        // the secret-ref map and it would only widen what the page context
+        // carries around.
+        if key == crate::setup_backend_contract::SECRET_REFS_KEY {
+            continue;
+        }
         values.insert(key.clone(), value.clone());
     }
     Value::Object(values)
@@ -5730,7 +5849,11 @@ fn setup_backend_filter_stale_action_values(
         let Some(step_id) = action.get("id").and_then(Value::as_str) else {
             continue;
         };
+        let log_key = format!("{}/{step_id}", contract.provider_id);
         if item_states.get(step_id) == Some(&"done") {
+            // The step is current again, so the next invalidation is genuinely
+            // new and deserves its own line.
+            setup_backend_forget_stale_log(&log_key);
             continue;
         }
         let current_action_is_done =
@@ -5741,7 +5864,7 @@ fn setup_backend_filter_stale_action_values(
             .and_then(Value::as_str)
             == Some("oauth_device_code")
         {
-            setup_backend_mark_oauth_action_value_stale(values_obj, action, step_id);
+            setup_backend_mark_oauth_action_value_stale(values_obj, action, step_id, &log_key);
         }
         if setup_backend_action_is_runtime_context_durable(action) {
             continue;
@@ -5757,17 +5880,45 @@ fn setup_backend_filter_stale_action_values(
             continue;
         }
         if let Some(value) = values_obj.get_mut(state_key) {
-            setup_backend_mark_action_value_stale(value, step_id);
+            setup_backend_mark_action_value_stale(value, step_id, &log_key);
         }
     }
     values
 }
 
-fn setup_backend_mark_action_value_stale(value: &mut Value, step_id: &str) {
+/// Steps already reported stale, so a pending step logs once per invalidation
+/// instead of once per render.
+///
+/// The dedup CANNOT live on the value being marked: the caller rebuilds these
+/// values from the stored state on every render (setup_backend_render_values)
+/// and the `stale` marker is never persisted, so an in-value check always sees
+/// a fresh object and fires again — one line per Setup-UI poll, forever.
+fn setup_backend_stale_log_memo() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// True the first time `log_key` goes stale, false while it stays stale.
+fn setup_backend_note_stale_log(log_key: &str) -> bool {
+    match setup_backend_stale_log_memo().lock() {
+        Ok(mut seen) => seen.insert(log_key.to_string()),
+        // A poisoned memo must not silence the diagnostic it exists to pace.
+        Err(_) => true,
+    }
+}
+
+fn setup_backend_forget_stale_log(log_key: &str) {
+    if let Ok(mut seen) = setup_backend_stale_log_memo().lock() {
+        seen.remove(log_key);
+    }
+}
+
+fn setup_backend_mark_action_value_stale(value: &mut Value, step_id: &str, log_key: &str) {
     if let Some(object) = value.as_object_mut() {
         // Log only the fresh→stale transition, not the idempotent re-mark on
         // every render, so a stuck step shows one line per invalidation.
-        if object.get("stale").and_then(Value::as_bool) != Some(true) {
+        if setup_backend_note_stale_log(log_key) {
             eprintln!(
                 "[setup] marking stored result for step {step_id} as stale (step is not \
                  done under the current runtime context); its completion will not count \
@@ -5784,6 +5935,7 @@ fn setup_backend_mark_oauth_action_value_stale(
     values: &mut JsonMap<String, Value>,
     action: &Value,
     step_id: &str,
+    log_key: &str,
 ) {
     let oauth_kind = action
         .get("executor")
@@ -5794,7 +5946,7 @@ fn setup_backend_mark_oauth_action_value_stale(
         return;
     };
     if let Some(value) = oauth.get_mut(oauth_kind) {
-        setup_backend_mark_action_value_stale(value, step_id);
+        setup_backend_mark_action_value_stale(value, step_id, &format!("{log_key}/{oauth_kind}"));
     }
 }
 
@@ -6513,7 +6665,14 @@ async fn post_execute(
         inject_setup_public_base_url(&mut answers, &url);
         Some(url)
     } else if should_start_setup_tunnel(&tunnel_mode, &answers) {
-        match ensure_setup_tunnel(state.as_ref(), &tunnel_mode, &state.local_base_url).await {
+        match ensure_setup_tunnel(
+            state.as_ref(),
+            &tunnel_mode,
+            &state.local_base_url,
+            &state.tenant,
+        )
+        .await
+        {
             Ok(url) => {
                 inject_setup_public_base_url(&mut answers, &url);
                 Some(url)
@@ -6765,10 +6924,10 @@ async fn ensure_setup_public_url(state: &UiState, req: SetupPublicUrlRequest) ->
         ..Default::default()
     };
     crate::platform_setup::persist_tunnel_artifact(&state.bundle_path, &tunnel)?;
-    let _tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
+    let tenant = req.tenant.unwrap_or_else(|| state.tenant.clone());
     let _team = req.team.or_else(|| state.team.clone());
     let _env = req.env.unwrap_or_else(|| state.env.clone());
-    ensure_setup_tunnel(state, &mode, &state.local_base_url).await
+    ensure_setup_tunnel(state, &mode, &state.local_base_url, &tenant).await
 }
 
 async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Result<Value> {
@@ -6803,7 +6962,7 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             "[setup-action {}/{}] acquiring {tunnel_mode} tunnel for public_base_url...",
             req.provider_id, req.action_id
         );
-        let url = ensure_setup_tunnel(state, &tunnel_mode, &state.local_base_url).await?;
+        let url = ensure_setup_tunnel(state, &tunnel_mode, &state.local_base_url, &tenant).await?;
         eprintln!(
             "[setup-action {}/{}] tunnel ready, public_base_url={url}",
             req.provider_id, req.action_id
@@ -7273,7 +7432,94 @@ fn append_line(existing: &str, line: &str) -> String {
 /// one as dead (it never became reachable) and replaces it, forever.
 const TUNNEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(20);
 
-async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) -> Result<String> {
+/// Bring the configured ingress tunnel up at startup and leave it in the
+/// session slot, so the first step that needs a public URL finds one already
+/// serving instead of paying the spin-up mid-step.
+///
+/// Only ever warms a tunnel for the RUNTIME INGRESS port, never the Setup-UI
+/// port: fronting the wizard's own port is the classic wrong-tunnel bug, where
+/// provider webhooks get registered against the setup UI instead of the
+/// runtime. If the runtime is not listening yet there is nothing safe to front,
+/// so warm-up is skipped and the on-demand path handles it later.
+fn spawn_setup_tunnel_warmup(state: std::sync::Arc<UiState>) {
+    tokio::spawn(async move {
+        if let Some(public_base_url) = injected_setup_public_base_url() {
+            eprintln!(
+                "[setup tunnel-warmup] skipped: operator override {public_base_url} is in effect, \
+                 so no tunnel is needed"
+            );
+            return;
+        }
+        let mode = match setup_backend_tunnel_mode(state.as_ref()) {
+            Ok(Some(mode)) => mode,
+            Ok(None) => return,
+            Err(err) => {
+                eprintln!("[setup tunnel-warmup] could not resolve tunnel mode: {err}");
+                return;
+            }
+        };
+        if !matches!(mode.as_str(), "cloudflared" | "ngrok" | "gtunnel") {
+            return;
+        }
+        let tenant = state.tenant.clone();
+        let Some(local_base_url) = setup_backend_ingress_local_base_url(state.as_ref(), &tenant)
+        else {
+            return;
+        };
+        if !local_ingress_is_listening(&local_base_url).await {
+            eprintln!(
+                "[setup tunnel-warmup] runtime ingress {local_base_url} is not listening yet; \
+                 the {mode} tunnel will be started when a step needs it"
+            );
+            return;
+        }
+        match ensure_setup_tunnel(state.as_ref(), &mode, &local_base_url, &tenant).await {
+            Ok(public_base_url) => eprintln!(
+                "[setup tunnel-warmup] {mode} tunnel ready at {public_base_url} \
+                 (fronting {local_base_url}) before any step needed it"
+            ),
+            Err(err) => eprintln!(
+                "[setup tunnel-warmup] could not pre-start the {mode} tunnel ({err}); \
+                 it will be retried on demand"
+            ),
+        }
+    });
+}
+
+/// The runtime ingress base URL, WITHOUT the Setup-UI fallback that
+/// [`setup_backend_tunnel_local_base_url`] applies — see
+/// [`spawn_setup_tunnel_warmup`] for why fronting the wizard's port is wrong.
+fn setup_backend_ingress_local_base_url(state: &UiState, tenant: &str) -> Option<String> {
+    configured_runtime_proxy_base_url()
+        .or_else(|| setup_backend_runtime_local_base_url(state, tenant))
+        .map(|value| value.trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Is something actually accepting connections on the ingress port? The
+/// recorded runtime base URL survives the runtime exiting, so warming a tunnel
+/// on it alone would front a dead port and then fail its own reachability probe.
+async fn local_ingress_is_listening(local_base_url: &str) -> bool {
+    let Some(port) = crate::shared_tunnel::local_port_from_base_url(local_base_url) else {
+        return false;
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+/// `tenant` keys the gtunnel id, so it must be the tenant the provider is being
+/// set up FOR, not the Setup UI's session tenant. Registering a provider for
+/// one tenant against another's tunnel sends its webhooks to the wrong runtime.
+async fn ensure_setup_tunnel(
+    state: &UiState,
+    mode: &str,
+    local_base_url: &str,
+    tenant: &str,
+) -> Result<String> {
     if let Some(existing) = active_setup_tunnel_public_base_url(state, mode, local_base_url)? {
         if setup_backend_public_tunnel_responds(&existing).await {
             return Ok(existing);
@@ -7312,14 +7558,14 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     eprintln!("Setup tunnel: spawning {mode} tunnel for {local_base_url}");
     let mode_for_task = mode.to_string();
     let local_base_url_for_task = local_base_url.clone();
-    // For the Greentic self-hosted tunnel, derive the tunnel id from the tenant
-    // alone (the webchat URL space has no team segment). Setup OWNS this id: it
-    // is recorded in `.greentic/tunnel.json` below so greentic-start reads it
-    // instead of re-deriving and landing on a different one.
+    // For the Greentic self-hosted tunnel, adopt the id already recorded for
+    // this bundle, or mint one now if this is the first time. Setup OWNS this
+    // id: it is recorded in `.greentic/tunnel.json` so greentic-start reads it
+    // instead of re-deriving and landing on a different one. Keyed on the
+    // tenant alone — the webchat URL space has no team segment.
     let gtunnel_ctx = if mode == "gtunnel" {
-        let team = state.team.as_deref().unwrap_or("default");
         Some(crate::setup_tunnel::GtunnelSetupCtx::new(
-            crate::setup_tunnel::derive_gtunnel_id(&state.tenant, team),
+            crate::setup_tunnel::resolve_gtunnel_id_for_bundle(&state.bundle_path, tenant),
         ))
     } else {
         None
@@ -7334,10 +7580,9 @@ async fn ensure_setup_tunnel(state: &UiState, mode: &str, local_base_url: &str) 
     eprintln!("Setup tunnel: probing reachability of {public_base_url}");
     if wait_for_setup_public_tunnel(&public_base_url).await {
         eprintln!("Setup tunnel: {public_base_url} is reachable, using it");
-        // Record the id we just proved serving, so greentic-start adopts THIS
-        // tunnel rather than deriving its own. Done only after the reachability
-        // probe passes: persisting an id we never reached would point the runtime
-        // at a dead tunnel.
+        // Confirm the id we just proved serving. Normally a no-op — the
+        // resolver above already persisted it — but it also covers an id that
+        // arrived from somewhere else, and it is what logs the confirmation.
         if let Some(tunnel_id) = gtunnel_tunnel_id.as_deref() {
             persist_gtunnel_tunnel_id(&state.bundle_path, tunnel_id);
         }
@@ -10483,9 +10728,13 @@ questions:
         let state = test_ui_state(temp.path());
         let logs = temp.path().join("logs");
         std::fs::create_dir_all(&logs).expect("logs dir");
+        // A line ALREADY in the log when setup first looks. A .gtbundle can
+        // ship a logs/system.log from the machine that built it, and such a
+        // line must never be mistaken for a Teams message sent during setup.
         std::fs::write(
             logs.join("system.log"),
-            r#"2026-06-19T12:00:00Z INFO [fast2flow:gate] enter tenant=demo team=Some("support")"#,
+            "2026-06-19T12:00:00Z INFO [fast2flow:gate] enter tenant=demo \
+             team=Some(\"support\") (pre-existing, shipped in the bundle)\n",
         )
         .expect("system log");
         let contract = super::ProviderBackendContract {
@@ -10521,6 +10770,30 @@ questions:
         super::save_setup_backend_contract_state(&state, &contract.provider_id, "demo", &stored)
             .expect("save state");
 
+        // First look: the only matching line predates setup, so the step is
+        // NOT satisfied — and the watermark is recorded.
+        let rendered =
+            super::setup_backend_contract_state(&state, &contract, "demo").expect("render state");
+        assert_eq!(
+            rendered["setup_status"]["items"][0]["state"], "pending",
+            "a pre-existing log line must not satisfy the activity observation"
+        );
+        assert!(rendered["values"]["last_activity"].is_null());
+
+        // A real activity arrives while setup is watching.
+        {
+            use std::io::Write;
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(logs.join("system.log"))
+                .expect("open log");
+            writeln!(
+                log,
+                r#"2026-06-19T12:05:00Z INFO [fast2flow:gate] enter tenant=demo team=Some("support")"#
+            )
+            .expect("append activity");
+        }
+
         let rendered =
             super::setup_backend_contract_state(&state, &contract, "demo").expect("render state");
 
@@ -10531,6 +10804,168 @@ questions:
             "bot_framework_activity_received"
         );
         assert!(rendered["values"]["last_activity_received_at"].is_number());
+    }
+
+    /// Sets `PUBLIC_BASE_URL` for the test body under the crate-wide env lock,
+    /// restoring the previous value on drop.
+    struct PublicBaseUrlOverride {
+        _guard: crate::secrets::test_support::EnvLock,
+        previous: Option<String>,
+    }
+
+    impl PublicBaseUrlOverride {
+        fn set(value: &str) -> Self {
+            let guard = crate::secrets::test_support::lock_env();
+            let previous = std::env::var("PUBLIC_BASE_URL").ok();
+            // SAFETY: process env is mutated only under the shared env lock,
+            // and Drop restores the prior value.
+            unsafe { std::env::set_var("PUBLIC_BASE_URL", value) };
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for PublicBaseUrlOverride {
+        fn drop(&mut self) {
+            // SAFETY: still holding the env lock (dropped after this).
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("PUBLIC_BASE_URL", value) },
+                None => unsafe { std::env::remove_var("PUBLIC_BASE_URL") },
+            }
+        }
+    }
+
+    #[test]
+    fn gtunnel_id_follows_the_request_tenant_not_the_ui_session() {
+        // The helpdesk bundle registered Slack for tenant `somedude` against
+        // `default-ba564` — the Setup UI session's tunnel — so its webhooks
+        // went to another tenant's runtime. The id must key on the tenant the
+        // provider is being set up for.
+        let session = crate::setup_tunnel::derive_gtunnel_id("default", "default");
+        let request = crate::setup_tunnel::derive_gtunnel_id("somedude", "default");
+
+        assert_ne!(
+            session, request,
+            "a per-request tenant must not share the session tenant's tunnel"
+        );
+        assert!(request.starts_with("somedude-"), "got {request}");
+        assert!(session.starts_with("default-"), "got {session}");
+    }
+
+    #[test]
+    fn operator_public_base_url_override_wins_over_the_engine_default() {
+        // The "no tunnels" deployment: an operator exports a permanent public
+        // URL (reverse proxy, own hostname, own tunnel). It must survive the
+        // engine's own resolution — previously it was consulted only when
+        // config had no public_base_url, which never happens because the
+        // defaults seed the runtime-local URL.
+        let _override = PublicBaseUrlOverride::set("https://bot.example.com");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let mut config = JsonMap::new();
+        config.insert(
+            "public_base_url".to_string(),
+            json!("http://127.0.0.1:8080"),
+        );
+
+        super::setup_backend_apply_host_defaults(&state, "demo", &mut config);
+
+        assert_eq!(
+            config["public_base_url"], "https://bot.example.com",
+            "an operator override must outrank the engine-derived local URL"
+        );
+    }
+
+    #[test]
+    fn operator_public_base_url_override_is_not_clobbered_by_runtime_adoption() {
+        // Adoption exists to replace an empty/ephemeral URL with the resolved
+        // ingress. It must not touch an operator's chosen URL.
+        let _override = PublicBaseUrlOverride::set("https://bot.example.com");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let mut config = JsonMap::new();
+        config.insert(
+            "public_base_url".to_string(),
+            json!("https://bot.example.com"),
+        );
+
+        let adopted =
+            super::setup_backend_adopt_runtime_public_base_url(&state, "demo", &mut config)
+                .expect("adopt");
+
+        assert!(
+            adopted.is_none(),
+            "must not adopt over an operator override"
+        );
+        assert_eq!(config["public_base_url"], "https://bot.example.com");
+    }
+
+    #[test]
+    fn stored_observation_from_a_pre_existing_log_line_is_discarded() {
+        // The state this session was actually found in: an observation already
+        // harvested from a line the bundle shipped with. The floor stops new
+        // false matches, but this one is already stored and the completion
+        // check only asks whether it exists — so it must be discarded, or the
+        // step stays "done" for a message that was never sent.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_ui_state(temp.path());
+        let logs = temp.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(
+            logs.join("system.log"),
+            "2026-06-19T12:00:00Z INFO [fast2flow:gate] enter tenant=demo \
+             team=Some(\"support\") (shipped in the bundle)\n",
+        )
+        .expect("system log");
+        let contract = super::ProviderBackendContract {
+            provider_id: "messaging-teams".to_string(),
+            inline: json!({
+                "schema_id": "greentic.setup.backend-contract.v1",
+                "required_order": ["first_bot_framework_post"],
+                "actions": [{
+                    "id": "first_bot_framework_post",
+                    "executor": {
+                        "kind": "runtime_observation",
+                        "source": "greentic-start",
+                        "event": "bot_framework_activity_received",
+                        "state_store_key": "last_activity"
+                    },
+                    "completion": {"state_path": "last_activity", "exists": true}
+                }]
+            }),
+            load_error: None,
+        };
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({"tenant": "demo", "team": "support"}),
+        );
+        stored.insert(
+            "last_activity".to_string(),
+            json!({
+                "source": "greentic-start",
+                "event": "bot_framework_activity_received",
+                "log_line": 1,
+                "log_path": logs.join("system.log").to_string_lossy(),
+            }),
+        );
+        stored.insert(
+            "last_activity_received_at".to_string(),
+            json!(1_785_506_086u64),
+        );
+        super::save_setup_backend_contract_state(&state, &contract.provider_id, "demo", &stored)
+            .expect("save state");
+
+        let rendered =
+            super::setup_backend_contract_state(&state, &contract, "demo").expect("render state");
+
+        assert_eq!(
+            rendered["setup_status"]["items"][0]["state"], "pending",
+            "an observation harvested from a pre-existing line must not count"
+        );
+        assert!(rendered["values"]["last_activity"].is_null());
     }
 
     #[test]
@@ -11977,7 +12412,14 @@ setup_actions:
         let ui_rs = include_str!("mod.rs");
         assert!(ui_rs.contains(".route(\"/api/setup-public-url\", post(post_setup_public_url))"));
         assert!(ui_rs.contains("async fn ensure_setup_public_url"));
-        assert!(ui_rs.contains("ensure_setup_tunnel(state, &mode, &state.local_base_url).await"));
+        // `include_str!("mod.rs")` includes THIS assertion, so a bare
+        // `contains` matches its own literal and can never fail. Require a
+        // second occurrence: the real call site.
+        let call = "ensure_setup_tunnel(state, &mode, &state.local_base_url, &tenant).await";
+        assert!(
+            ui_rs.matches(call).count() >= 2,
+            "expected a real call site for {call}, found only this assertion"
+        );
     }
 
     #[tokio::test]
@@ -12425,6 +12867,39 @@ setup_actions:
             .expect("load")
             .expect("artifact present");
         assert_eq!(saved.tunnel_id.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn ui_mode_only_tunnel_writes_do_not_wipe_the_recorded_gtunnel_id() {
+        // The wipe seen in the field: `ensure_setup_tunnel` records the id it
+        // proved serving, then the UI's debounced draft autosave (and
+        // /api/setup-action, and the next /api/execute) re-sends only the tunnel
+        // MODE. Those writes must not reduce the artifact back to
+        // {"mode":"gtunnel"} — greentic-start would then re-derive an id nothing
+        // was registered against.
+        let bundle = tempfile::tempdir().expect("tempdir");
+        persist_gtunnel_tunnel_id(bundle.path(), "stating-81015");
+
+        for _ in 0..3 {
+            crate::platform_setup::persist_tunnel_artifact(
+                bundle.path(),
+                &crate::platform_setup::TunnelAnswers {
+                    mode: Some("gtunnel".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("mode-only write");
+        }
+
+        let saved = crate::platform_setup::load_tunnel_artifact(bundle.path())
+            .expect("load")
+            .expect("artifact present");
+        assert_eq!(saved.mode.as_deref(), Some("gtunnel"));
+        assert_eq!(
+            saved.tunnel_id.as_deref(),
+            Some("stating-81015"),
+            "the recorded gtunnel id must survive later mode-only writes"
+        );
     }
 
     #[test]

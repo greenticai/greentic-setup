@@ -1,0 +1,224 @@
+{
+  "config": {
+    "tenant": "demo",
+    "team": "default",
+    "env": "local",
+    "public_base_url": "https://example.test/path",
+    "runtime_provider": "",
+    "teams_app_version": "",
+    "teams_app_id": "",
+    "bot_display_name": "Greentic Bot",
+    "bot_app_id": "00000000-0000-0000-0000-000000000000",
+    "azure_location": "",
+    "azure_auth_tenant": "",
+    "graph_setup_client_id": "",
+    "azure_setup_client_id": "",
+    "azure_subscription_id": "",
+    "azure_resource_group": "",
+    "azure_resource_group_location": "",
+    "azure_bot_name": "",
+    "oauth_verification_uri": "https://example.test/path",
+    "graph_access_token": "[redacted:dev-secret]",
+    "azure_management_access_token": "[redacted:dev-secret]",
+    "bot_app_password": "[redacted:dev-secret]",
+    "oauth_client_id": "00000000-0000-0000-0000-000000000000",
+    "oauth_token_url": "https://example.test/path"
+  },
+  "step_attempts": {
+    "graph_admin_consent": {
+      "count": 1,
+      "public_base_url": "https://example.test/path"
+    },
+    "bot_app_identity": {
+      "count": 1,
+      "public_base_url": "https://example.test/path"
+    },
+    "microsoft_bot_channel_registration_consent": {
+      "count": 1,
+      "public_base_url": "https://example.test/path"
+    },
+    "bot_framework_endpoint_registration": {
+      "count": 1,
+      "public_base_url": "https://example.test/path"
+    },
+    "teams_app_publish": {
+      "count": 1,
+      "public_base_url": "https://example.test/path"
+    },
+    "teams_app_user_install": {
+      "count": 1,
+      "public_base_url": "https://example.test/path"
+    }
+  },
+  "last_oauth": {
+    "kind": "management",
+    "response": {
+      "user_code": "GPGBB2LRU",
+      "message": "To sign in, use a web browser to open the page https://login.microsoft.com/device and enter the code GPGBB2LRU to authenticate.",
+      "verification_uri": "https://example.test/path",
+      "expires_in": 900,
+      "interval": 5
+    }
+  },
+  "last_setup_result": {
+    "ok": true,
+    "step": "teams_app_user_install",
+    "next": "click again to continue setup",
+    "result": {
+      "ok": true,
+      "target": "/v1/setup/messaging-teams/demo/default/teams-app-install",
+      "response": {
+        "action": "exists",
+        "add_to_teams_url": "https://example.test/path",
+        "catalog_app_id": "00000000-0000-0000-0000-000000000000",
+        "installed_for": "00000000-0000-0000-0000-000000000000",
+        "ok": true,
+        "open_bot_chat_url": "https://example.test/path",
+        "teams_app_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "runtime_context": {
+        "public_base_url": "https://example.test/path",
+        "public_base_url_is_ephemeral_tunnel": true,
+        "active_tunnel_public_base_url": "https://example.test/path",
+        "runtime_local_base_url": "https://example.test/path"
+      }
+    }
+  },
+  "oauth": {
+    "graph": {
+      "ok": true,
+      "completed_at": 1784877917874,
+      "token_store_key": "graph_access_token"
+    },
+    "management": {
+      "ok": true,
+      "completed_at": 1784877930350,
+      "token_store_key": "azure_management_access_token"
+    }
+  },
+  "last_app_registration": {
+    "ok": true,
+    "action": "reuse",
+    "secret_action": "[redacted:dev-secret]",
+    "app_id": "00000000-0000-0000-0000-000000000000",
+    "bot_app_id": "00000000-0000-0000-0000-000000000000",
+    "app_object_id": "00000000-0000-0000-0000-000000000000",
+    "display_name": "Greentic Bot",
+    "provider_id": "messaging-teams"
+  },
+  "last_reconcile": {
+    "ok": true,
+    "target": "/v1/setup/messaging-teams/demo/default/bot-framework-registration",
+    "response": {
+      "action": "register",
+      "channel": "msteams",
+      "microsoft_bot_channel_registration": {
+        "actions": [
+          {
+            "action": "selected_subscription",
+            "candidates": 1,
+            "display_name": "Azure subscription 1",
+            "subscription_id": "00000000-0000-0000-0000-000000000000"
+          },
+          {
+            "action": "selected_resource_group",
+            "candidates": 1,
+            "resource_group": "greentic"
+          },
+          {
+            "action": "derived_bot_name",
+            "azure_bot_name": "greenticbot"
+          },
+          {
+            "action": "selected_resource_group",
+            "resource_group": "greentic"
+          }
+        ],
+        "bot_name": "greenticbot",
+        "channel": "msteams",
+        "endpoint": "https://example.test/path",
+        "kind": "microsoft_bot_channel_registration",
+        "resource_group": "greentic",
+        "status": "registered",
+        "subscription_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "ok": true,
+      "provider_id": "messaging-teams",
+      "registration": {
+        "bot_app_id": "00000000-0000-0000-0000-000000000000",
+        "bot_app_password_ref": "[redacted:dev-secret]",
+        "channel": "msteams",
+        "kind": "greentic_bot_framework",
+        "messaging_endpoint": "https://example.test/path",
+        "provider_id": "messaging-teams",
+        "public_base_url": "https://example.test/path",
+        "status": "registered",
+        "team": "default",
+        "tenant": "demo"
+      },
+      "target_messaging_endpoint": "https://example.test/path",
+      "team": "default",
+      "tenant": "demo"
+    },
+    "runtime_context": {
+      "public_base_url": "https://example.test/path",
+      "public_base_url_is_ephemeral_tunnel": true,
+      "active_tunnel_public_base_url": "https://example.test/path",
+      "runtime_local_base_url": "https://example.test/path"
+    }
+  },
+  "last_teams_app_publish": {
+    "ok": true,
+    "target": "/v1/setup/messaging-teams/demo/default/teams-app-publish",
+    "response": {
+      "action": "exists",
+      "add_to_teams_url": "https://example.test/path",
+      "catalog_app_id": "00000000-0000-0000-0000-000000000000",
+      "external_id": "00000000-0000-0000-0000-000000000000",
+      "manifest_version": "1.0.0",
+      "ok": true,
+      "teams_app_id": "00000000-0000-0000-0000-000000000000"
+    },
+    "runtime_context": {
+      "public_base_url": "https://example.test/path",
+      "public_base_url_is_ephemeral_tunnel": true,
+      "active_tunnel_public_base_url": "https://example.test/path",
+      "runtime_local_base_url": "https://example.test/path"
+    }
+  },
+  "last_teams_app_install": {
+    "ok": true,
+    "target": "/v1/setup/messaging-teams/demo/default/teams-app-install",
+    "response": {
+      "action": "exists",
+      "add_to_teams_url": "https://example.test/path",
+      "catalog_app_id": "00000000-0000-0000-0000-000000000000",
+      "installed_for": "00000000-0000-0000-0000-000000000000",
+      "ok": true,
+      "open_bot_chat_url": "https://example.test/path",
+      "teams_app_id": "00000000-0000-0000-0000-000000000000"
+    },
+    "runtime_context": {
+      "public_base_url": "https://example.test/path",
+      "public_base_url_is_ephemeral_tunnel": true,
+      "active_tunnel_public_base_url": "https://example.test/path",
+      "runtime_local_base_url": "https://example.test/path"
+    }
+  },
+  "last_activity_received_at": 1784877962893,
+  "last_activity": {
+    "source": "greentic-start",
+    "event": "bot_framework_activity_received",
+    "tenant": "demo",
+    "team": "default",
+    "log_path": "/var/folders/dr/bk_mmj8j6qbcyg5tvymk9svm0000gn/T/gtbundle-koncar-demo/logs/system.log",
+    "log_line": 187,
+    "runtime_context": {
+      "public_base_url": "https://example.test/path",
+      "public_base_url_is_ephemeral_tunnel": true,
+      "active_tunnel_public_base_url": "https://example.test/path",
+      "runtime_local_base_url": "https://example.test/path"
+    },
+    "last_activity_received_at": 1784877962893
+  }
+}

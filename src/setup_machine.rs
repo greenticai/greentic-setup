@@ -1121,7 +1121,7 @@ pub fn load_or_init_setup_machine_state_with_context(
         .map(setup_machine_hash_file)
         .transpose()
         .with_context(|| format!("hash setup provider pack for {provider_id}"))?;
-    let current_answers_hash = setup_machine_answers_hash(bundle_root, provider_id)?;
+    let current_answers_hash = setup_machine_answers_hash(bundle_root, provider_id, tenant, team)?;
     let path = setup_machine_state_path(bundle_root, tenant, team, provider_id);
     if path.is_file() {
         let mut state = load_setup_machine_state(&path)?;
@@ -1236,14 +1236,18 @@ fn setup_machine_state_compatibility_error(state: &SetupMachineState) -> Option<
         .map(str::to_string)
 }
 
+/// Hash of the answers THIS tenant was set up with. A mismatch is
+/// unrecoverable (`setup_answers_changed`), and while the file was shared a
+/// second tenant's setup wedged the first. Falls back to the legacy file so an
+/// existing bundle's recorded hash still matches on upgrade.
 fn setup_machine_answers_hash(
     bundle_root: &Path,
     provider_id: &str,
+    tenant: &str,
+    team: &str,
 ) -> anyhow::Result<Option<String>> {
-    let path = bundle_root
-        .join("state/config")
-        .join(provider_id)
-        .join("setup-answers.json");
+    let path =
+        crate::provider_answers::answers_path_for_read(bundle_root, provider_id, tenant, team);
     if !path.is_file() {
         return Ok(None);
     }
@@ -3692,11 +3696,14 @@ fn execute_persist_runtime_config_step(
         }
     };
 
-    let config_dir = bundle_root
-        .join("state")
-        .join("config")
-        .join(&state.provider_id);
-    let config_path = config_dir.join("setup-answers.json");
+    // Tenant-scoped so another tenant's setup can't overwrite these. The
+    // legacy file is left as-is: read fallback, and what a downgrade reads.
+    let config_path = crate::provider_answers::answers_path(
+        bundle_root,
+        &state.provider_id,
+        &state.tenant,
+        &state.team,
+    );
     if let Some(parent) = config_path.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
@@ -3727,6 +3734,13 @@ fn execute_persist_runtime_config_step(
     };
     if let Err(err) = std::fs::write(&config_path, bytes) {
         return pause_runtime_config_write_error(step, state, "setup_answers", err);
+    }
+    // Re-anchor to the file just written: an upgraded bundle recorded the
+    // LEGACY hash, and this write makes the scoped file the read source. Without
+    // this the next load reports `setup_answers_changed` (recoverable: false)
+    // and wedges a provider that is correctly configured.
+    if let Ok(hash) = setup_machine_hash_file(&config_path) {
+        state.answers_hash = Some(hash);
     }
 
     let mut envelope_path = Value::Null;
@@ -5811,6 +5825,48 @@ mod tests {
     use std::io::Read;
     use std::io::Write;
     use zip::write::{FileOptions, ZipWriter};
+
+    #[test]
+    fn answers_hash_reads_the_legacy_file_until_a_tenant_scoped_one_exists() {
+        // Upgrade path: an existing bundle has only the legacy file, and its
+        // recorded hash must keep matching or the machine goes Failed with
+        // recoverable: false.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let legacy = crate::provider_answers::legacy_answers_path(root, "messaging-slack");
+        std::fs::create_dir_all(legacy.parent().unwrap()).expect("dir");
+        std::fs::write(&legacy, br#"{"enabled":true}"#).expect("write legacy");
+
+        let before =
+            setup_machine_answers_hash(root, "messaging-slack", "koncar", "default").expect("hash");
+        assert_eq!(
+            before,
+            Some(setup_machine_hash_file(&legacy).expect("legacy hash")),
+            "legacy answers must still be hashed when no scoped file exists"
+        );
+
+        // A second tenant writing its own answers must not change what the
+        // first tenant hashes — the cross-tenant wedge this fixes.
+        let other =
+            crate::provider_answers::answers_path(root, "messaging-slack", "acme", "default");
+        std::fs::create_dir_all(other.parent().unwrap()).expect("dir");
+        std::fs::write(&other, br#"{"enabled":false,"other":"tenant"}"#).expect("write other");
+        assert_eq!(
+            setup_machine_answers_hash(root, "messaging-slack", "koncar", "default").expect("hash"),
+            before,
+            "another tenant's answers must not invalidate this tenant"
+        );
+
+        // Once this tenant has its own file, that is what it hashes.
+        let scoped =
+            crate::provider_answers::answers_path(root, "messaging-slack", "koncar", "default");
+        std::fs::create_dir_all(scoped.parent().unwrap()).expect("dir");
+        std::fs::write(&scoped, br#"{"enabled":true,"scoped":true}"#).expect("write scoped");
+        assert_eq!(
+            setup_machine_answers_hash(root, "messaging-slack", "koncar", "default").expect("hash"),
+            Some(setup_machine_hash_file(&scoped).expect("scoped hash"))
+        );
+    }
 
     fn valid_machine() -> SetupMachine {
         serde_json::from_value(serde_json::json!({
@@ -8599,9 +8655,12 @@ setup_actions:
 
         assert_eq!(output["ok"], true);
         assert_eq!(output["result"]["detail"]["envelope_skipped"], true);
-        let config_path = temp
-            .path()
-            .join("state/config/messaging-example/setup-answers.json");
+        let config_path = crate::provider_answers::answers_path(
+            temp.path(),
+            "messaging-example",
+            "demo",
+            "default",
+        );
         let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
         assert_eq!(config["bot_app_id"], "app-123");
         assert_eq!(config["team_id"], "team-123");

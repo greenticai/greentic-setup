@@ -93,13 +93,57 @@ user hits a silent "missing secret." Changing the scheme requires a new plan
 verified on **both binaries** (setup + start), **both backends** (local dev-store
 + cloud vault), and public.
 
+## The third path: setup reading back its OWN secrets
+
+Everything above describes setup→start. There is a **third** path this doc used
+to leave unnamed, and a bug lived in exactly that gap: `gtc setup` writes a
+secret, redacts it in `state/setup/…/backend-contract.json`, and then has to
+read it back on the next state load (`hydrate_redacted_backend_config`).
+
+That reader faces a problem the runtime does not. Setup state is **bundle-local
+and env-less** (`<bundle>/state/setup/{tenant}/{team}/{provider}/`) while the
+store is **env-keyed**, so the reader had to *reconstruct* the URI and the store
+env from ambient context. It reconstructed with a hardcoded `"dev"` while the
+writer used `config.env` (`local`), read a different file, missed every secret,
+and dropped the key — surfacing as `device_login_not_started` immediately after
+a device login the user had just completed.
+
+**The rule: a reader must not re-derive what the writer already knew.** Each
+save records the URIs it wrote in a top-level `secret_refs` map:
+
+```json
+"config":      { "oauth_device_code": "[redacted:dev-secret]" },
+"secret_refs": { "oauth_device_code": "secrets://local/default/_/messaging_teams/oauth_device_code" }
+```
+
+Load prefers the ref (taking the store env from the URI's own `env` segment) and
+falls back to reconstruction only when there is no ref.
+
+Two compatibility properties, both pinned by tests:
+
+- **Backward** — state written before refs existed has none, hydrates by
+  reconstruction exactly as before
+  (`backend_state_hydrates_legacy_state_written_without_secret_refs`,
+  `legacy_bundle_state_round_trips_without_loss_or_corruption`).
+- **Forward** — the config value stays the *literal* `[redacted:dev-secret]`
+  string, and the refs live in a sibling map. This is why the ref is NOT stored
+  in place of the marker: an older binary's persist filter treats "not the
+  marker" as a real value and would write the ref over the live secret
+  (`backend_state_keeps_the_plain_redacted_marker_for_older_binaries`).
+
+Refs are rebuilt on every save from the keys that save actually persisted, never
+carried forward from the loaded state — a ref must not outlive the write that
+justified it.
+
 ## Checklist when touching secret persistence
 
 1. Open the store with `open_dev_store_for_env(bundle_root, env)` — never the bare
-   form on a real write path.
+   form on a real write path, and never a hardcoded env on a READ path either.
 2. Build URIs with `canonical_secret_uri` — do not hand-assemble.
 3. Keep team `default` → `_` and provider hyphen → underscore.
 4. If the runtime can't find it, compare setup's WRITE `store_path` against the
    runtime's READ store path — they must be the same env-store file.
+5. Prefer a recorded `secret_refs` entry over reconstructing a URI. Reconstruction
+   is the legacy fallback, not the primary path.
 
 See also: greentic-start `docs/secrets-flow.md` (the READ side).
