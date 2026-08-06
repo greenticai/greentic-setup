@@ -258,7 +258,10 @@ pub async fn introduce_into_store(
         )
         .await
         {
-            anyhow::bail!("{}", crate::secret_collision::message(&collision));
+            anyhow::bail!(
+                "{}",
+                crate::secret_collision::message_unattributed(&collision)
+            );
         }
         store
             .put(&uri, SecretFormat::Text, value.as_bytes())
@@ -548,6 +551,71 @@ mod tests {
         assert!(
             text.contains("--team"),
             "the error must tell the operator how to proceed: {text}"
+        );
+        assert!(
+            !text.contains("written by a different bundle"),
+            "the guard cannot verify who wrote it — bundle B is the only bundle in this \
+             test, so claiming a second one would be false: {text}"
+        );
+    }
+
+    /// The landmine this fail-closed choice creates, pinned so CI catches it
+    /// the day someone flips a pack to `regenerate_if_present: true`: the
+    /// *same* bundle, re-running `introduce_into_store` a second time for a
+    /// secret it generated itself, is refused exactly like a different
+    /// bundle would be — there is no did-I-write-this marker that can tell
+    /// the two apart (see the doc comment on `introduce_into_store`). No
+    /// pack in the workspace sets this flag today, so nothing breaks in
+    /// practice yet; this test exists so the day one does, the trade-off is
+    /// enforced by CI rather than discovered in production.
+    #[tokio::test]
+    async fn same_bundle_regenerating_an_existing_secret_is_refused_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("messaging-webchat-gui.gtpack");
+        write_pack(
+            &pack,
+            &[(
+                "pack.manifest.json",
+                serde_json::to_vec(&jwt_manifest_regenerating()).unwrap(),
+            )],
+        );
+        let store = DevStore::with_path(dir.path().join(".dev.secrets.env")).expect("store");
+
+        introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+            None,
+        )
+        .await
+        .expect("this bundle's own first introduction must not be refused");
+
+        // Same bundle, same `existing_answers` (`None`, exactly as before —
+        // a generated secret's key was never going to be in there either
+        // way), running setup again.
+        let err = introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+            None,
+        )
+        .await
+        .expect_err(
+            "fail-closed means even this same bundle's second run is refused, \
+             not just a different bundle's — that is the documented trade-off",
+        );
+
+        let text = err.to_string();
+        assert!(text.contains("jwt_signing_key"), "{text}");
+        assert!(
+            !text.contains("written by a different bundle"),
+            "no other bundle exists in this test — the message must not claim one does: {text}"
         );
     }
 

@@ -181,7 +181,19 @@ secret has been written once, any later write to that address, including by
 the same bundle, is refused unless a distinct `--team` is used. As of this
 writing no pack in the workspace declares `regenerate_if_present: true` (every
 instance uses `false`), so this is a real but currently unexercised
-trade-off, not a regression of an observed working flow.
+trade-off, not a regression of an observed working flow. It is pinned by
+`generated_secrets::tests::same_bundle_regenerating_an_existing_secret_is_refused_fail_closed`
+so the day a pack does flip the flag, CI catches the refusal instead of an
+operator discovering it in production.
+
+Because this path cannot tell a different bundle from this same bundle on a
+later run, it does not use `secret_collision::message` — that function
+asserts "written by a different bundle" as fact, which may be false here.
+It uses `secret_collision::message_unattributed` instead, which states only
+what the guard actually verified (this run did not write the current value)
+and offers the same `--team` remedy as a possibility rather than a
+diagnosis. `message` keeps the stronger, accurate wording for the two paths
+below, whose marker really is this bundle's own recorded answers.
 
 **Requirement-key aliases** (`seed_secret_requirement_aliases`, e.g.
 `webex_bot_token` aliasing `bot_token`) are guarded independently from the

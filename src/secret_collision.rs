@@ -16,6 +16,9 @@
 //! So the addressing is left exactly as it is and the collision is refused
 //! where it would happen, with a message telling the operator to separate the
 //! bundles with a distinct `--team`. `team` is already threaded end-to-end.
+//! Two message functions exist ([`message`] and [`message_unattributed`])
+//! because not every caller can actually back up "a different bundle wrote
+//! this" — see [`message_unattributed`]'s doc comment.
 //!
 //! `greentic-start` calls this same function from its onboarding wizard rather
 //! than reimplementing the rule — a guard that fires at one door and not the
@@ -34,21 +37,62 @@ pub struct Collision {
     pub key: String,
 }
 
-/// The operator-facing explanation. This is the last point at which the
-/// operator can still fix the situation, so it names the remedy, not just the
-/// problem.
-pub fn message(collision: &Collision) -> String {
-    let scope = match collision.team.as_deref() {
+/// The `tenant '...'` / `tenant '...' / team '...'` prefix shared by both
+/// operator-facing messages below.
+fn scope_description(collision: &Collision) -> String {
+    match collision.team.as_deref() {
         Some(team) if !team.is_empty() => {
             format!("tenant '{}' / team '{}'", collision.tenant, team)
         }
         _ => format!("tenant '{}'", collision.tenant),
-    };
+    }
+}
+
+/// The operator-facing explanation for a collision guarded by a reliable
+/// did-I-write-this marker (the operator-answer loop, and the
+/// requirement-key aliases derived from it — see
+/// `qa::persist::seed_secret_requirement_aliases`). In both cases
+/// `existing_answers` is this bundle's own recorded answers file, so
+/// "the marker doesn't have this key" really does mean a different bundle
+/// wrote the value: this is the last point at which the operator can still
+/// fix the situation, so it names both the fact and the remedy.
+pub fn message(collision: &Collision) -> String {
+    let scope = scope_description(collision);
     format!(
         "{scope} already holds {key} for {provider}, written by a different bundle.\n\
          \n\
          Two bundles cannot share one (tenant, team) for the same secret. Re-run with a\n\
          distinct team to separate them, for example:\n\
+         \n\
+             gtc setup --team <name>\n",
+        key = collision.key,
+        provider = collision.provider_id,
+    )
+}
+
+/// The operator-facing explanation for a collision guarded with no usable
+/// did-I-write-this marker at all — currently only
+/// `generated_secrets::introduce_into_store`, whose generated values are
+/// never recorded as operator answers and can't be compared by value either
+/// (a fresh random value is generated on every call). `check()` there runs
+/// fail-closed: any pre-existing, differing value is refused, whether it was
+/// written by another bundle or by this same bundle on a prior run.
+///
+/// [`message`] would be misleading here: it asserts "written by a different
+/// bundle" as fact, but that may be false — the guard genuinely cannot tell.
+/// An operator sent looking for a second bundle that does not exist would be
+/// chasing a phantom. This message instead states only what the guard
+/// verified (this run did not write the current value) and offers the same
+/// `--team` remedy as a possibility, not a diagnosis.
+pub fn message_unattributed(collision: &Collision) -> String {
+    let scope = scope_description(collision);
+    format!(
+        "{scope} already holds {key} for {provider}, and this run did not write it.\n\
+         \n\
+         This may be a different bundle's value, or a prior run of this same bundle whose\n\
+         value cannot be re-derived. Two bundles cannot share one (tenant, team) for the\n\
+         same secret — if this is a collision, re-run with a distinct team to separate\n\
+         them, for example:\n\
          \n\
              gtc setup --team <name>\n",
         key = collision.key,
@@ -293,6 +337,33 @@ mod tests {
         assert!(
             text.contains("--team"),
             "the operator must be told how to proceed: {text}"
+        );
+    }
+
+    /// `message_unattributed` must not repeat `message`'s "written by a
+    /// different bundle" claim — that's true for the reliable-marker paths
+    /// but not for generated secrets, where the guard cannot tell who wrote
+    /// the existing value. It must still name the address and the `--team`
+    /// remedy.
+    #[test]
+    fn the_unattributed_message_does_not_claim_a_different_bundle() {
+        let collision = Collision {
+            tenant: "demo".into(),
+            team: None,
+            provider_id: "messaging-webchat-gui".into(),
+            key: "jwt_signing_key".into(),
+        };
+        let text = message_unattributed(&collision);
+        assert!(text.contains("demo"), "{text}");
+        assert!(text.contains("messaging-webchat-gui"), "{text}");
+        assert!(text.contains("jwt_signing_key"), "{text}");
+        assert!(
+            text.contains("--team"),
+            "the operator must still be told how to proceed: {text}"
+        );
+        assert!(
+            !text.contains("written by a different bundle"),
+            "the guard cannot actually verify this, so it must not assert it: {text}"
         );
     }
 
