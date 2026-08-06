@@ -188,6 +188,7 @@ pub async fn persist_all_config_as_secrets(
             team,
             provider_id,
             pp,
+            existing_answers,
         )
         .await?;
         if !generated.is_empty() {
@@ -261,14 +262,17 @@ pub async fn persist_all_config_as_secrets(
     }
     if let Some(pp) = pack_path {
         seed_secret_requirement_aliases(
+            &store,
             &mut entries,
             config_map,
+            existing_answers,
             env,
             tenant,
             team,
             provider_id,
             pp,
-        );
+        )
+        .await?;
     }
 
     let entries = retain_changed_entries(&store, entries).await;
@@ -415,18 +419,43 @@ pub fn oauth_authorize_stub(provider_id: &str, auth_url: Option<&str>) -> Option
 /// Read `assets/secret-requirements.json` from a pack and seed alias entries
 /// for any requirement key that differs from the answers key after
 /// canonicalization.
-fn seed_secret_requirement_aliases(
+///
+/// An alias is written under its own address (`canonical_req_key`, e.g.
+/// `webex_bot_token`), distinct from the primary answer's address (e.g.
+/// `bot_token`) — the two are separate slots in the one-file-per-env dev
+/// store, so a different bundle can have written a different value at the
+/// alias address even when nothing is contested at the primary address.
+/// Carrying the same text as the primary does not make its address the same
+/// address, so each alias is guarded independently rather than inheriting
+/// the primary's already-passed check.
+///
+/// The did-I-write-this marker used for that guard is the *primary* answer
+/// key (`cfg_key`, e.g. `bot_token`), not the alias's own key
+/// (`canonical_req_key`, e.g. `webex_bot_token`). The alias key is a derived
+/// requirement-key spelling, not a QA question id — it never appears
+/// literally in `setup-answers.json`, so checking `existing_answers` under
+/// the alias key would read "not mine" on every legitimate re-run (this
+/// bundle updating the same answer a second time) and over-refuse. Checking
+/// under the primary key instead asks the question this guard actually
+/// needs answered: did this bundle ever record the answer this alias
+/// mirrors? The returned `Collision`'s `key` is then corrected to the alias
+/// key before use, so the operator-facing message still names the address
+/// that actually collided.
+#[allow(clippy::too_many_arguments)]
+async fn seed_secret_requirement_aliases(
+    store: &DevStore,
     entries: &mut Vec<SeedEntry>,
     config_map: &JsonMap<String, Value>,
+    existing_answers: Option<&Value>,
     env: &str,
     tenant: &str,
     team: Option<&str>,
     provider_id: &str,
     pack_path: &Path,
-) {
+) -> Result<()> {
     let reqs = match read_secret_requirements(pack_path) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
     let normalize = crate::secret_name::canonical_secret_name;
     let existing_keys: std::collections::HashSet<String> = entries
@@ -439,21 +468,39 @@ fn seed_secret_requirement_aliases(
         if existing_keys.contains(&canonical_req_key) {
             continue;
         }
-        let matched_value = config_map.iter().find_map(|(cfg_key, cfg_val)| {
+        let matched = config_map.iter().find_map(|(cfg_key, cfg_val)| {
             let norm_cfg = normalize(cfg_key);
             if canonical_req_key.ends_with(&norm_cfg) {
                 let text = value_to_text(cfg_val);
                 if text.is_empty() || text == "null" {
                     None
                 } else {
-                    Some(text)
+                    Some((cfg_key.as_str(), text))
                 }
             } else {
                 None
             }
         });
-        if let Some(text) = matched_value {
+        if let Some((primary_key, text)) = matched {
             let uri = canonical_secret_uri(env, tenant, team, provider_id, &canonical_req_key);
+            if let Some(collision) = crate::secret_collision::check(
+                store,
+                existing_answers,
+                tenant,
+                team,
+                provider_id,
+                primary_key,
+                &uri,
+                &text,
+            )
+            .await
+            {
+                let collision = crate::secret_collision::Collision {
+                    key: canonical_req_key.clone(),
+                    ..collision
+                };
+                anyhow::bail!("{}", crate::secret_collision::message(&collision));
+            }
             entries.push(SeedEntry {
                 uri,
                 format: SecretFormat::Text,
@@ -462,6 +509,7 @@ fn seed_secret_requirement_aliases(
             });
         }
     }
+    Ok(())
 }
 
 fn read_secret_requirements(
@@ -1081,6 +1129,103 @@ mod tests {
         )
         .await
         .expect("a distinct team is the documented remedy and must work");
+    }
+
+    // ── secret-collision guard: requirement-key aliases (Task 3b) ──────────
+
+    /// An alias occupies its OWN address in the shared dev store, distinct
+    /// from the primary answer key it mirrors. A second bundle can collide
+    /// on the alias address while its own primary-key write is perfectly
+    /// uncontested — this seeds the alias directly (as if an unrelated
+    /// bundle had already claimed it) and confirms the guarded loop's
+    /// success on `bot_token` does not also clear the alias write.
+    #[tokio::test]
+    async fn a_second_bundle_writing_a_colliding_alias_is_refused() {
+        let (bundle_a, bundle_b, env) = two_bundles_one_env();
+        let pack = bundle_a.join("messaging-webex.gtpack");
+        write_pack_with_secret_requirements(&pack, r#"[{"key":"WEBEX_BOT_TOKEN"}]"#);
+
+        // Bundle A's alias value, already in the store — its primary
+        // `bot_token` address is left untouched so this test isolates the
+        // alias guard from the guarded loop's own primary-key check.
+        let store = open_dev_store_for_env(&bundle_a, &env).expect("open store");
+        let alias_uri =
+            crate::canonical_secret_uri(&env, "demo", None, "messaging-webex", "WEBEX_BOT_TOKEN");
+        store
+            .put(&alias_uri, SecretFormat::Text, b"alias-a")
+            .await
+            .expect("seed alias");
+
+        let err = persist_all_config_as_secrets(
+            &bundle_b,
+            &env,
+            "demo",
+            None,
+            "messaging-webex",
+            &json!({ "bot_token": "alias-b" }),
+            Some(&pack),
+            None,
+        )
+        .await
+        .expect_err("a colliding alias must be refused even though the primary key is uncontested");
+
+        let text = err.to_string();
+        assert!(text.to_lowercase().contains("webex_bot_token"), "{text}");
+        assert!(
+            text.contains("--team"),
+            "the error must tell the operator how to proceed: {text}"
+        );
+    }
+
+    /// A bundle updating its own previously-recorded answer must also be
+    /// free to update the alias derived from it — the did-I-write-this
+    /// marker for the alias write is the PRIMARY answer key (`bot_token`),
+    /// not the alias's own key (`webex_bot_token`), because the alias key
+    /// never appears literally in `setup-answers.json`.
+    #[tokio::test]
+    async fn a_bundles_own_alias_update_is_allowed() {
+        let (bundle_a, _bundle_b, env) = two_bundles_one_env();
+        let pack = bundle_a.join("messaging-webex.gtpack");
+        write_pack_with_secret_requirements(&pack, r#"[{"key":"WEBEX_BOT_TOKEN"}]"#);
+
+        let store = open_dev_store_for_env(&bundle_a, &env).expect("open store");
+        let primary_uri =
+            crate::canonical_secret_uri(&env, "demo", None, "messaging-webex", "bot_token");
+        let alias_uri =
+            crate::canonical_secret_uri(&env, "demo", None, "messaging-webex", "WEBEX_BOT_TOKEN");
+        store
+            .put(&primary_uri, SecretFormat::Text, b"old-token")
+            .await
+            .expect("seed primary");
+        store
+            .put(&alias_uri, SecretFormat::Text, b"old-token")
+            .await
+            .expect("seed alias");
+
+        // This bundle's own recorded answers show it already owns `bot_token`.
+        let existing_answers = json!({ "bot_token": "old-token" });
+
+        persist_all_config_as_secrets(
+            &bundle_a,
+            &env,
+            "demo",
+            None,
+            "messaging-webex",
+            &json!({ "bot_token": "new-token" }),
+            Some(&pack),
+            Some(&existing_answers),
+        )
+        .await
+        .expect(
+            "a bundle updating its own answer, and the alias derived from it, must not be refused",
+        );
+
+        // `DevStore::get` reads purely from in-memory state loaded once at
+        // construction — re-open to observe the write the call above just
+        // made through its own, separately-opened store handle.
+        let store = open_dev_store_for_env(&bundle_a, &env).expect("re-open store");
+        let value = String::from_utf8(store.get(&alias_uri).await.expect("alias")).expect("utf8");
+        assert_eq!(value, "new-token");
     }
 
     #[test]

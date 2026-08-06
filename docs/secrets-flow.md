@@ -157,18 +157,53 @@ second persist call (after registration) merges this session-tracked set with
 the on-disk `setup-answers.json` read, so both "this session just drafted it"
 and "a prior committed run already had it" count as this bundle's own.
 
+### Generated secrets and requirement-key aliases have no did-I-write-this marker
+
+`persist_all_config_as_secrets` has two more write paths besides its main
+loop, and both now call `secret_collision::check` too — but neither has a
+file-based marker to hand it, for different reasons.
+
+**Generated secrets** (`generated_secrets::introduce_into_store`, e.g.
+`messaging-webchat-gui`'s `jwt_signing_key`) are never operator answers: setup
+synthesises the value itself, so the key never appears in
+`state/config/<provider_id>/setup-answers.json`. There is also no way to use
+the *stored value* as a stand-in marker the way the main loop's "same value
+already there" shortcut does, because [`generate_secret_value`] mints a fresh
+random value on every call — even this same bundle regenerating its own
+secret would essentially never produce byte-identical output. In practice
+this only matters when a pack opts into `regenerate_if_present: true` (the
+default, `false`, never reaches a write once a value is present — the
+existing "skip if already there" check returns first). `existing_answers` is
+threaded through this call anyway, for consistency with the other guarded
+callers, but it is honest to say plainly: for this path it is always a
+no-op, and the guard runs fail-closed — once a `regenerate_if_present: true`
+secret has been written once, any later write to that address, including by
+the same bundle, is refused unless a distinct `--team` is used. As of this
+writing no pack in the workspace declares `regenerate_if_present: true` (every
+instance uses `false`), so this is a real but currently unexercised
+trade-off, not a regression of an observed working flow.
+
+**Requirement-key aliases** (`seed_secret_requirement_aliases`, e.g.
+`webex_bot_token` aliasing `bot_token`) are guarded independently from the
+primary answer they mirror, because each alias occupies its own address in
+the one-file-per-env store — a different bundle can hold a different value
+under the alias address even when the primary address is completely
+uncontested. The alias write does have a usable marker, but it is not the
+alias's own key: `canonical_req_key` (e.g. `webex_bot_token`) is a derived
+requirement-key spelling that never appears literally in
+`setup-answers.json`, so checking `existing_answers` under it would read "not
+mine" on a bundle's own legitimate re-run. The check instead runs under the
+*primary* answer key (e.g. `bot_token`) — the question this guard needs
+answered is "did this bundle ever record the answer this alias mirrors?" —
+and the returned `Collision`'s `key` field is corrected to the alias key
+before it reaches the operator-facing message, so the error still names the
+address that actually collided.
+
 ### What remains uncovered
 
 - **`greentic-start`'s onboarding wizard** does not call `secret_collision::check`
   yet — that is a separate, not-yet-started task. Until it lands, a collision
   introduced through `greentic-start`'s own write path is not caught.
-- **Alias entries** seeded by `seed_secret_requirement_aliases` (from a pack's
-  `secret-requirements.json`) are written outside the guarded loop in
-  `persist_all_config_as_secrets` and are not individually checked for
-  collision.
-- **Generated secrets** introduced via `generated_secrets::introduce_into_store`
-  (e.g. `messaging-webchat-gui`'s `jwt_signing_key`) are written before the
-  guarded loop runs and are likewise not checked.
 
 ## The guard tests (DO NOT CHANGE)
 
