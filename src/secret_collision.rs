@@ -75,6 +75,25 @@ fn is_not_found(err: &SecretError) -> bool {
     matches!(err, SecretError::NotFound { .. })
 }
 
+/// What reading `uri` from the store told us.
+///
+/// Kept as three explicit outcomes rather than folding "cannot tell" into
+/// `Value(Vec::new())`: an empty `Vec<u8>` is a legitimate stored value (an
+/// empty-string secret), and comparing an unreadable read against
+/// `new_value.as_bytes()` would make an unreadable store compare equal to an
+/// empty write, taking the same-value path and silently returning `None` —
+/// exactly the bypass the "cannot tell" fallback exists to prevent.
+enum StoreRead {
+    /// Nothing is stored at this address.
+    Absent,
+    /// The stored bytes, verbatim.
+    Value(Vec<u8>),
+    /// The store returned an error other than "not found" — the address
+    /// could not be resolved or the read otherwise failed. We cannot tell
+    /// what, if anything, is stored here.
+    Unreadable,
+}
+
 /// `Some(Collision)` when writing `new_value` to `uri` would overwrite a value
 /// this bundle did not write.
 ///
@@ -97,13 +116,19 @@ pub async fn check(
     // collide with; any other error means we cannot tell, and guessing "safe"
     // here is how the overwrite this guard exists to stop gets through. Treat
     // "cannot tell" the same as "occupied" and let the answers check decide.
-    let held = match store.get(uri).await {
-        Ok(bytes) => Some(bytes),
-        Err(err) if is_not_found(&err) => None,
-        Err(_) => Some(Vec::new()),
+    let read = match store.get(uri).await {
+        Ok(bytes) => StoreRead::Value(bytes),
+        Err(err) if is_not_found(&err) => StoreRead::Absent,
+        Err(_) => StoreRead::Unreadable,
     };
-    let held = held?;
-    if held == new_value.as_bytes() {
+    let value_differs = match read {
+        StoreRead::Absent => return None,
+        StoreRead::Value(bytes) => bytes != new_value.as_bytes(),
+        // We cannot tell what is stored, so we cannot tell it is the same
+        // value either — assume it differs and let the answers check decide.
+        StoreRead::Unreadable => true,
+    };
+    if !value_differs {
         return None;
     }
     let this_bundle_wrote_it = existing_answers
@@ -274,19 +299,12 @@ mod tests {
     /// `DevStore::get` (via `BrokerStore`, `greentic-secrets-core` 1.1.6) reads
     /// purely from in-memory state loaded once when the store is opened —
     /// `DevBackend::get` never touches the filesystem again after
-    /// construction. So a real `DevStore` whose `.get()` fails for a reason
-    /// other than "not found" cannot be built at this seam without either:
-    ///
-    /// - passing a malformed uri (a caller bug, not an unreadable store), or
-    /// - forcing a decrypt/MAC-mismatch by racing `GREENTIC_DEV_MASTER_KEY`
-    ///   between the writer and reader — an *unexported* `const` inside
-    ///   `greentic-secrets-provider-dev`, several dependency hops from
-    ///   `greentic-secrets-lib`'s public surface and not covered by its semver
-    ///   contract.
-    ///
-    /// Neither is a clean fixture, so per the brief's fallback this pins
-    /// `is_not_found` directly instead of faking an end-to-end unreadable
-    /// store.
+    /// construction, so an I/O-style failure cannot be induced post-open.
+    /// This unit-pins the classifier itself, in isolation from any store, as
+    /// a belt-and-braces check on the two `SecretError` shapes it must tell
+    /// apart. `an_unreadable_address_is_treated_as_occupied_not_as_free`
+    /// below exercises the same discrimination through `check()` end-to-end
+    /// with a real `DevStore` and a malformed uri.
     #[test]
     fn is_not_found_distinguishes_absence_from_read_failure() {
         assert!(is_not_found(&SecretError::NotFound {
@@ -296,5 +314,33 @@ mod tests {
         assert!(!is_not_found(&SecretError::Backend(
             "broker unreachable".into()
         )));
+    }
+
+    /// `BrokerStore::get` (`greentic-secrets-core/src/seed.rs`) calls
+    /// `SecretUri::parse(uri)?` before it ever touches the backend, and
+    /// `SecretUri::parse` on a string that doesn't start with `secrets://`
+    /// returns `Error::InvalidScheme` — not `NotFound`. That is a real,
+    /// ordinary way for `store.get` to fail for a reason other than
+    /// "absent", with a plain `DevStore` and no fixture trickery at all: a
+    /// malformed `uri` argument is enough. `check` must not treat that as
+    /// "free to write".
+    #[tokio::test]
+    async fn an_unreadable_address_is_treated_as_occupied_not_as_free() {
+        let (_dir, store) = empty_test_store().await;
+        let found = check(
+            &store,
+            None,
+            "demo",
+            None,
+            "messaging-telegram",
+            "bot_token",
+            "not-a-secrets-uri",
+            "token-b",
+        )
+        .await;
+        assert!(
+            found.is_some(),
+            "when the store cannot be read we must refuse, not assume the address is free",
+        );
     }
 }
