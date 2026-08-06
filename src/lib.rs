@@ -36,6 +36,7 @@ pub mod provider_state;
 pub(crate) mod release_index;
 pub mod reload;
 pub mod schema_validation;
+pub mod secret_collision;
 pub mod secret_name;
 pub mod secrets;
 pub mod setup_actions;
