@@ -124,9 +124,51 @@ exists. An operator whose two bundles already collided (silently, before this
 guard shipped) must still re-run `gtc setup --team <name>` for one of them —
 the guard only stops it from happening again going forward.
 
-`greentic-start`'s onboarding wizard calls the same `secret_collision::check`
-function from its own write path (a separate task) rather than reimplementing
-the rule, so the guard fires the same way at both doors.
+### The UI's did-I-write-this marker is session-tracked, not file-based
+
+Every write path above (`gtc setup` apply-pack-setup, OAuth callbacks,
+device-code polling, backend-contract state) builds `existing_answers` from
+something already on disk for this bundle — `setup-answers.json` or the
+config envelope — because each of those callers does its one persist call
+*after* the prior state it needs to compare against already exists on disk.
+
+The setup UI's debounced draft-autosave path (`persist_ui_draft`, behind
+`POST /api/draft` and also invoked once at the top of `execute_setup_action`)
+is different: it runs continuously while the operator is still typing, well
+before `gtc setup` ever commits `setup-answers.json`. A file-based read would
+be empty on every autosave before commit, which would refuse every changed
+keystroke as a false collision — worse than the bug, since it would fire
+continuously rather than once. It must also **not** use the value map being
+written as its own marker: the key being written is by construction always
+present in that map, so `check()`'s `contains_key` would always find it and
+the guard could never fire — that shape shipped once, and it was a bug (a
+draft session's own second autosave could silently overwrite a value another
+bundle had already committed to the same address; see the round-1 review of
+this task for the reproduction).
+
+Instead, `UiState.autosaved_answer_keys` tracks, per provider, the keys *this
+wizard session* has itself successfully autosaved so far. A key already in
+that set is this same session continuing to type or refine (e.g. a
+registration op replacing a placeholder `client_id` with the value the
+provider's own API just issued) — allowed. A key that is **not** in that set,
+with the store already holding a different value under it, belongs to another
+bundle — refused, on the first autosave that collides. `execute_setup_action`'s
+second persist call (after registration) merges this session-tracked set with
+the on-disk `setup-answers.json` read, so both "this session just drafted it"
+and "a prior committed run already had it" count as this bundle's own.
+
+### What remains uncovered
+
+- **`greentic-start`'s onboarding wizard** does not call `secret_collision::check`
+  yet — that is a separate, not-yet-started task. Until it lands, a collision
+  introduced through `greentic-start`'s own write path is not caught.
+- **Alias entries** seeded by `seed_secret_requirement_aliases` (from a pack's
+  `secret-requirements.json`) are written outside the guarded loop in
+  `persist_all_config_as_secrets` and are not individually checked for
+  collision.
+- **Generated secrets** introduced via `generated_secrets::introduce_into_store`
+  (e.g. `messaging-webchat-gui`'s `jwt_signing_key`) are written before the
+  guarded loop runs and are likewise not checked.
 
 ## The guard tests (DO NOT CHANGE)
 
