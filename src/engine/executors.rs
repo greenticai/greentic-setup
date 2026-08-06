@@ -378,6 +378,11 @@ pub fn execute_apply_pack_setup(
         if !crate::provider_state::provider_enabled(&effective_answers) {
             let persisted_answers = crate::setup_actions::strip_setup_actions(&effective_answers);
             let config_dir = bundle_path.join("state").join("config").join(&provider_id);
+            // This bundle's own prior answers for this provider, read BEFORE
+            // the on-disk file below is overwritten — used only as the
+            // did-I-write-this marker for the collision guard.
+            let existing_answers =
+                crate::qa::persist::read_provider_setup_answers(bundle_path, &provider_id)?;
             std::fs::create_dir_all(&config_dir)?;
             let config_path = config_dir.join("setup-answers.json");
             let content = serde_json::to_string_pretty(&persisted_answers)
@@ -399,6 +404,7 @@ pub fn execute_apply_pack_setup(
                 &provider_id,
                 &persisted_answers,
                 pack_path,
+                Some(&existing_answers),
             ))?;
             if let Some(pack_path) = pack_path {
                 crate::config_envelope::write_provider_config_envelope(
@@ -540,6 +546,23 @@ pub fn execute_apply_pack_setup(
                 println!("  [secrets] answer keys: {keys:?}");
             }
         }
+        // This bundle's own prior answers for this provider, used only as the
+        // did-I-write-this marker for the collision guard below. The B12a
+        // on-disk `setup-answers.json` never carries secret keys (they're
+        // stripped for `answers_for_disk` above), so it can't tell "I wrote
+        // this secret before" from "I never had it" — the config envelope
+        // can: after B12a it still carries secret-marked keys, just as
+        // `secrets://` URI refs instead of plaintext, and key presence is all
+        // the guard checks. It is read here, before this run's envelope
+        // write below (which happens after the persist call regardless), so
+        // it reflects the PREVIOUS run, not this one.
+        let existing_answers = crate::config_envelope::read_provider_config_envelope(
+            &bundle_path.join(".providers"),
+            &provider_id,
+        )
+        .ok()
+        .flatten()
+        .map(|envelope| envelope.config);
         let rt = tokio::runtime::Runtime::new()
             .context("failed to create tokio runtime for secrets persistence")?;
         let persisted = rt.block_on(crate::qa::persist::persist_all_config_as_secrets(
@@ -550,6 +573,7 @@ pub fn execute_apply_pack_setup(
             &provider_id,
             &persisted_answers,
             pack_path,
+            existing_answers.as_ref(),
         ))?;
         if config.verbose {
             if persisted.is_empty() {

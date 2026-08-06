@@ -6992,6 +6992,10 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             req.provider_id, req.action_id
         );
     }
+    // This bundle's own prior answers for this provider, used only as the
+    // did-I-write-this marker for the collision guard below.
+    let existing_answers =
+        crate::qa::persist::read_provider_setup_answers(&state.bundle_path, &req.provider_id)?;
     crate::qa::persist::persist_all_config_as_secrets(
         &state.bundle_path,
         &env,
@@ -7000,6 +7004,7 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         &req.provider_id,
         &Value::Object(config.clone()),
         Some(&provider.pack_path),
+        Some(&existing_answers),
     )
     .await?;
     eprintln!(
@@ -7818,6 +7823,20 @@ async fn persist_ui_draft(
                 .map(|provider| provider.pack_path.as_path())
         });
 
+        // This debounced autosave path runs continuously while the operator
+        // is still typing, well before anything is committed to this
+        // bundle's `state/config/<provider>/setup-answers.json` (that file
+        // is only written by the CLI's apply-pack-setup step). There is no
+        // per-bundle "prior answers" record to read here yet, so reading one
+        // (and getting nothing back) would make the guard refuse every
+        // keystroke that changes a value from what the last autosave wrote —
+        // exactly the "refuses legitimate flows" failure this task warns
+        // against, and worse here because it would fire continuously rather
+        // than once. `provider_answers` is this same request's own answers
+        // for this provider, so passing it as the did-I-write-this marker
+        // keeps autosave working; cross-bundle collisions are still caught
+        // for real at the apply-pack-setup commit step in
+        // `engine/executors.rs`, which does read genuinely prior state.
         let keys = crate::qa::persist::persist_all_config_as_secrets(
             bundle_path,
             env,
@@ -7826,6 +7845,7 @@ async fn persist_ui_draft(
             provider_id,
             provider_answers,
             pack_path,
+            Some(provider_answers),
         )
         .await?;
 

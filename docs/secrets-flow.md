@@ -79,6 +79,55 @@ lets WASM components look secrets up by their canonical requirement key
 key. When `pack_path` is `None` the aliases are NOT seeded (logged as a warning) —
 short answer keys may then be unresolvable at runtime.
 
+## Cross-bundle secret collisions (the guard)
+
+The env store above is **one file per environment**, keyed by
+`secrets://{env}/{tenant}/{team}/{provider}/{key}` — there is **no bundle
+segment**. Two different bundles under the same tenant (and same/absent team)
+therefore compute the exact same address for the same provider+key. Before
+this guard existed, the second `gtc setup` silently overwrote the first, and
+both bundles then resolved the second bundle's value — e.g. two Telegram bots,
+one per bundle, both ending up pointed at the same bundle's token.
+
+This is deliberately **not** fixed by making the address bundle-unique — an
+earlier attempt did that and converted every reader; three whole-branch
+reviews found ten Criticals and it was abandoned (see
+`docs/superpowers/specs/2026-08-06-secret-collision-guard-design.md`, "Why the
+previous approach was abandoned"). The addressing stays exactly as documented
+above.
+
+Instead, `secret_collision::check` (called from inside
+`persist_all_config_as_secrets`, in the loop that builds the seed entries) is
+consulted before every write:
+
+- If the store holds **nothing** at the address, the write proceeds — nothing
+  to collide with.
+- If the store holds the **same value** already being written, the write
+  proceeds — two bundles deliberately sharing one credential (e.g. one shared
+  Telegram bot) keeps working, and it stays idempotent.
+- If the store holds a **different** value, and this bundle's own recorded
+  answers (`existing_answers`, threaded through as the last parameter of
+  `persist_all_config_as_secrets`) show no record of this key, the write is
+  **refused** with an error naming the tenant/team, provider, and key, and
+  telling the operator to re-run with a distinct `--team` — the same
+  `(tenant, team)` scope already used to separate multi-workspace setups
+  elsewhere in this repo.
+- If the store holds a different value but this bundle's own answers already
+  had that key (e.g. rotating its own token on a re-run), the write proceeds —
+  this is the bundle updating its own secret, not a collision.
+- A store read that fails for a reason other than "not found" is treated as
+  **occupied, not free** — the guard errs toward refusing rather than risking
+  a silent overwrite it could not actually verify was safe.
+
+This guard prevents a **new** collision; it does not repair one that already
+exists. An operator whose two bundles already collided (silently, before this
+guard shipped) must still re-run `gtc setup --team <name>` for one of them —
+the guard only stops it from happening again going forward.
+
+`greentic-start`'s onboarding wizard calls the same `secret_collision::check`
+function from its own write path (a separate task) rather than reimplementing
+the rule, so the guard fires the same way at both doors.
+
 ## The guard tests (DO NOT CHANGE)
 
 - **This repo:** `lib.rs::webex_secret_uri_contract_do_not_change`

@@ -360,6 +360,9 @@ async fn poll_oauth_device_code_with_token_response(
             .map(|(key, value)| (key.clone(), Value::String(value.clone())))
             .collect::<JsonMap<_, _>>(),
     );
+    // This bundle's own prior answers for this provider, used only as the
+    // did-I-write-this marker for the collision guard below.
+    let existing_answers = load_provider_setup_answers(bundle_root, &session.provider_id)?;
     crate::qa::persist::persist_all_config_as_secrets(
         bundle_root,
         env,
@@ -368,6 +371,7 @@ async fn poll_oauth_device_code_with_token_response(
         &session.provider_id,
         &config,
         None,
+        Some(&existing_answers),
     )
     .await?;
     let final_mapped =
@@ -449,6 +453,21 @@ async fn finalize_provider_apply_answers(
     let Some(config) = apply_answers_result_config(&result)? else {
         return Ok(None);
     };
+    // `mapped` is exactly what the sibling persist call in
+    // `poll_oauth_device_code_with_token_response` just wrote for this same
+    // poll, moments before this apply-answers call runs — before it ever
+    // reaches this bundle's on-disk `setup-answers.json`. Fold its keys into
+    // the did-I-write-this marker so a key both calls touch (e.g. a
+    // provider-assigned id that apply-answers refines) is recognized as this
+    // same operation updating its own value, not a collision with the
+    // earlier write.
+    let mut existing_answers = answers;
+    if let Some(map) = existing_answers.as_object_mut() {
+        for key in mapped.keys() {
+            map.entry(key.clone())
+                .or_insert_with(|| Value::String(String::new()));
+        }
+    }
     crate::qa::persist::persist_all_config_as_secrets(
         bundle_root,
         env,
@@ -457,6 +476,7 @@ async fn finalize_provider_apply_answers(
         &session.provider_id,
         &config,
         Some(&provider.pack_path),
+        Some(&existing_answers),
     )
     .await?;
     Ok(Some(map_config_object(&config)))

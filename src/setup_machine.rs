@@ -1443,6 +1443,10 @@ pub async fn complete_setup_machine_oauth_authorization_code_for_machine(
     }
 
     let config = map_oauth_authorization_token_response(&step, token_response)?;
+    // This bundle's own prior answers for this provider, used only as the
+    // did-I-write-this marker for the collision guard below.
+    let existing_answers =
+        crate::qa::persist::read_provider_setup_answers(bundle_root, &oauth_state.provider_id)?;
     let persisted_keys = crate::qa::persist::persist_all_config_as_secrets(
         bundle_root,
         env,
@@ -1451,6 +1455,7 @@ pub async fn complete_setup_machine_oauth_authorization_code_for_machine(
         &oauth_state.provider_id,
         &Value::Object(config.clone()),
         pack_path,
+        Some(&existing_answers),
     )
     .await?;
 
@@ -2668,6 +2673,12 @@ fn execute_oauth_device_code_poll(
         .get("env")
         .and_then(Value::as_str)
         .unwrap_or("dev");
+    // This bundle's own prior answers for this provider, used only as the
+    // did-I-write-this marker for the collision guard below. A read failure
+    // falls back to "no record", the safe direction.
+    let existing_answers =
+        crate::qa::persist::read_provider_setup_answers(bundle_root, &state.provider_id)
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
     let persist_result = tokio::runtime::Runtime::new()
         .map_err(|err| err.to_string())
         .and_then(|runtime| {
@@ -2680,6 +2691,7 @@ fn execute_oauth_device_code_poll(
                     &state.provider_id,
                     &config,
                     None,
+                    Some(&existing_answers),
                 ))
                 .map_err(|err| err.to_string())
         });
