@@ -168,6 +168,15 @@ pub async fn persist_all_config_as_secrets(
     let store = crate::secrets::open_dev_store_for_env(bundle_root, env)?;
     let mut saved_keys = Vec::new();
 
+    // MCP credentials go to their own URI shape — env pinned to `default`,
+    // `mcp` as the provider segment, and the server id verbatim. The universal
+    // write below canonicalizes the key and uses the wizard's env, producing a
+    // URI greentic-runner never reads. This is the path the wizard actually
+    // takes (`engine::executors`), so the MCP write has to happen here.
+    for server_id in crate::mcp_setup::persist_mcp_secrets(&store, tenant, team, config).await? {
+        saved_keys.push(crate::mcp_setup::token_question_id(&server_id));
+    }
+
     // Introduce pack-declared generated secrets (e.g. messaging-webchat-gui's
     // jwt_signing_key) into the local store regardless of answer values, so
     // `gtc start` can move the already-resolved value into the deployment
@@ -340,18 +349,6 @@ pub async fn persist_qa_results(
 
     let keys =
         persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await?;
-
-    // MCP credentials go to their own URI shape — env pinned to `default`,
-    // `mcp` as the provider segment, and the server id verbatim. The universal
-    // write above would canonicalize the hyphenated UUID and pin the wizard's
-    // env, producing a URI greentic-runner never reads.
-    let mcp_servers = crate::mcp_setup::persist_mcp_secrets(&store, tenant, team, config).await?;
-    if !mcp_servers.is_empty() {
-        tracing::info!(
-            servers = ?mcp_servers,
-            "persisted MCP credentials for pack-declared servers"
-        );
-    }
 
     let bundle_id = infer_bundle_id(bundle_root);
     if let Err(err) = emit_pack_config_input(
