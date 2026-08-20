@@ -341,6 +341,18 @@ pub async fn persist_qa_results(
     let keys =
         persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await?;
 
+    // MCP credentials go to their own URI shape — env pinned to `default`,
+    // `mcp` as the provider segment, and the server id verbatim. The universal
+    // write above would canonicalize the hyphenated UUID and pin the wizard's
+    // env, producing a URI greentic-runner never reads.
+    let mcp_servers = crate::mcp_setup::persist_mcp_secrets(&store, tenant, team, config).await?;
+    if !mcp_servers.is_empty() {
+        tracing::info!(
+            servers = ?mcp_servers,
+            "persisted MCP credentials for pack-declared servers"
+        );
+    }
+
     let bundle_id = infer_bundle_id(bundle_root);
     if let Err(err) = emit_pack_config_input(
         bundle_root,
