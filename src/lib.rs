@@ -25,6 +25,7 @@ pub mod flow;
 pub mod generated_secrets;
 pub mod gtbundle;
 pub mod http_client;
+pub mod mcp_setup;
 pub mod no_ui_oauth;
 pub mod oauth_callback;
 pub mod oauth_device;

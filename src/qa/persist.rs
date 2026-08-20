@@ -168,6 +168,15 @@ pub async fn persist_all_config_as_secrets(
     let store = crate::secrets::open_dev_store_for_env(bundle_root, env)?;
     let mut saved_keys = Vec::new();
 
+    // MCP credentials go to their own URI shape — env pinned to `default`,
+    // `mcp` as the provider segment, and the server id verbatim. The universal
+    // write below canonicalizes the key and uses the wizard's env, producing a
+    // URI greentic-runner never reads. This is the path the wizard actually
+    // takes (`engine::executors`), so the MCP write has to happen here.
+    for server_id in crate::mcp_setup::persist_mcp_secrets(&store, tenant, team, config).await? {
+        saved_keys.push(crate::mcp_setup::token_question_id(&server_id));
+    }
+
     // Introduce pack-declared generated secrets (e.g. messaging-webchat-gui's
     // jwt_signing_key) into the local store regardless of answer values, so
     // `gtc start` can move the already-resolved value into the deployment
