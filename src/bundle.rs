@@ -508,12 +508,42 @@ fn prune_scaffold_default_pack(root: &Path, workspace: &YamlValue) -> anyhow::Re
     Ok(())
 }
 
+/// The bundle's own id, read from its `bundle.yaml` and only INFERRED from the
+/// directory name when the manifest cannot supply one.
+///
+/// The directory name is not the id and can differ from it: a builder is free
+/// to stage `create-ticket` into a directory called `gtbundle-create-ticket`,
+/// and one does. Every pack-config this crate emits is stamped with whatever
+/// this returns, so taking the directory name wrote a `bundle_id` the deployer
+/// then refused — `pack-config-input …: bundle_id `gtbundle-create-ticket`
+/// does not match target bundle `create-ticket`` — with the correct value
+/// sitting in `bundle.yaml` beside it the whole time.
+///
+/// The fallback stays for a root that is not a bundle workspace at all (a bare
+/// directory in a test, a pack being inspected before it is staged), where the
+/// directory name is the only name there is.
 pub(crate) fn infer_bundle_id(root: &Path) -> String {
+    if let Some(id) = bundle_id_from_manifest(root) {
+        return id;
+    }
     root.file_name()
         .and_then(|value| value.to_str())
         .map(ToOwned::to_owned)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "bundle".to_string())
+}
+
+/// `bundle_id` as declared by `<root>/bundle.yaml`, if that file exists, parses
+/// as a mapping, and carries a non-empty value.
+///
+/// Every failure is `None` rather than an error: this runs on paths that are
+/// legitimately not bundle workspaces, and an unreadable manifest must fall
+/// back to the old behaviour rather than break a caller that never had one.
+fn bundle_id_from_manifest(root: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(root.join(BUNDLE_WORKSPACE_MARKER)).ok()?;
+    let parsed: YamlValue = serde_yaml_bw::from_str(&raw).ok()?;
+    let id = yaml_get_string(parsed.as_mapping()?, "bundle_id")?;
+    (!id.trim().is_empty()).then_some(id)
 }
 
 fn infer_bundle_name(root: &Path) -> String {
@@ -946,4 +976,62 @@ mod tests {
         let tenants = discover_tenants(bundle.path(), Some("events")).unwrap();
         assert_eq!(tenants, vec!["delta".to_string()]);
     }
+}
+
+#[cfg(test)]
+mod bundle_id_tests {
+    use std::path::Path;
+
+    /// The defect this exists for: a bundle staged into a directory whose name
+    /// is not its id. Taking the directory name stamped every pack-config with
+    /// `gtbundle-create-ticket`, which the deployer then refused against the
+    /// manifest's own `create-ticket`.
+    #[test]
+    fn the_manifest_wins_over_a_differently_named_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("gtbundle-create-ticket");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("bundle.yaml"), "bundle_id: create-ticket\n").expect("write");
+        assert_eq!(super::infer_bundle_id(&root), "create-ticket");
+    }
+
+    /// A root that is not a bundle workspace has no manifest to read, and the
+    /// directory name is the only name there is — unchanged behaviour.
+    #[test]
+    fn a_root_without_a_manifest_still_falls_back_to_its_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("some-pack");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        assert_eq!(super::infer_bundle_id(&root), "some-pack");
+    }
+
+    /// An unreadable or id-less manifest must not be worse than no manifest:
+    /// a caller that never had one keeps working.
+    #[test]
+    fn a_manifest_without_a_usable_id_falls_back_rather_than_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (name, body) in [
+            ("blank", "bundle_id: \"   \"\n"),
+            ("absent", "mode: create\n"),
+            ("broken", "{{{"),
+        ] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).expect("mkdir");
+            std::fs::write(root.join("bundle.yaml"), body).expect("write");
+            assert_eq!(super::infer_bundle_id(&root), name, "case {name}");
+        }
+    }
+
+    /// Guards the path join: the manifest is read from the root itself, never
+    /// from a parent, so a sibling bundle's id cannot leak in.
+    #[test]
+    fn a_parents_manifest_is_not_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("bundle.yaml"), "bundle_id: parent\n").expect("write");
+        let root = tmp.path().join("child");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        assert_eq!(super::infer_bundle_id(&root), "child");
+    }
+
+    fn _path_type_is_used(_: &Path) {}
 }
