@@ -1147,6 +1147,10 @@ questions:
         let spec = setup_input::SetupSpec {
             title: None,
             description: None,
+            // Named rather than filled by a struct-update: develop added this
+            // field after the commit this test came from, and naming it keeps
+            // the next addition a compile error here too.
+            setup_actions: Vec::new(),
             questions: vec![
                 setup_input::SetupQuestion {
                     name: "api_key".to_string(),
