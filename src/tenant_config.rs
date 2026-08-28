@@ -52,6 +52,45 @@ const OIDC_PROVIDERS: &[OidcProviderDef] = &[
 /// Resolve the target tenant config file, scaffolding `<tenant>.json` from
 /// `default.json` when it does not yet exist.
 ///
+/// Materialize `assets/webchat-gui/config/tenants/default.json` into the bundle
+/// from the provider's own `.gtpack`, which ships it.
+///
+/// Returns `Ok(false)` when the pack or the entry is absent, leaving the caller
+/// to decide (it warns).
+fn seed_default_tenant_config_from_pack(
+    bundle_path: &Path,
+    provider_id: &str,
+    default_path: &Path,
+) -> Result<bool> {
+    use std::io::Read;
+
+    let pack_path = bundle_path
+        .join("providers/messaging")
+        .join(format!("{provider_id}.gtpack"));
+    if !pack_path.exists() {
+        return Ok(false);
+    }
+
+    let file = std::fs::File::open(&pack_path)
+        .with_context(|| format!("open provider pack {}", pack_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("read provider pack {}", pack_path.display()))?;
+    let mut entry = match archive.by_name("assets/webchat-gui/config/tenants/default.json") {
+        Ok(entry) => entry,
+        Err(_) => return Ok(false),
+    };
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+
+    if let Some(parent) = default_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create tenant config dir {}", parent.display()))?;
+    }
+    std::fs::write(default_path, &bytes)
+        .with_context(|| format!("seed tenant config {}", default_path.display()))?;
+    Ok(true)
+}
+
 /// The webchat-gui SPA's runtime-bootstrap fetches `/config/tenants/<tenant>.json`
 /// directly via `originalFetch` (bypassing its own 404-fallback interceptor) when
 /// resolving skin / nav_links overrides. If we instead patched `default.json`
@@ -62,7 +101,11 @@ const OIDC_PROVIDERS: &[OidcProviderDef] = &[
 ///
 /// Returns `Ok(None)` when neither `<tenant>.json` nor `default.json` exists —
 /// callers should treat that as a no-op.
-fn resolve_or_scaffold_tenant_config(bundle_path: &Path, tenant: &str) -> Result<Option<PathBuf>> {
+fn resolve_or_scaffold_tenant_config(
+    bundle_path: &Path,
+    tenant: &str,
+    provider_id: &str,
+) -> Result<Option<PathBuf>> {
     let tenants_dir = bundle_path.join("assets/webchat-gui/config/tenants");
     let tenant_path = tenants_dir.join(format!("{tenant}.json"));
     if tenant_path.exists() {
@@ -71,7 +114,17 @@ fn resolve_or_scaffold_tenant_config(bundle_path: &Path, tenant: &str) -> Result
 
     let default_path = tenants_dir.join("default.json");
     if !default_path.exists() {
-        return Ok(None);
+        // A freshly scaffolded bundle has no `assets/` tree at all — nothing in
+        // this repo creates one — so every sync below used to no-op in silence
+        // and the operator's skin / issuer / nav_links answers were discarded.
+        // Seed the template from the provider pack that ships it.
+        if !seed_default_tenant_config_from_pack(bundle_path, provider_id, &default_path)? {
+            eprintln!(
+                "  WARNING: no tenant config for `{tenant}` and none could be seeded from the \
+                 {provider_id} pack — skin, OAuth and nav_links answers will not reach the SPA"
+            );
+            return Ok(None);
+        }
     }
 
     let raw = std::fs::read_to_string(&default_path)
@@ -112,7 +165,7 @@ pub fn sync_oauth_to_tenant_config(
         .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
         .unwrap_or(false);
 
-    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant, provider_id)? else {
         return Ok(false);
     };
 
@@ -221,6 +274,74 @@ fn update_tenant_config(
             entry.insert(
                 "responseType".to_string(),
                 Value::String("code".to_string()),
+            );
+            providers_arr.push(Value::Object(entry));
+            changed = true;
+        }
+    }
+
+    // Greentic SSO. Not in OIDC_PROVIDERS: the SDK owns the popup + PKCE flow,
+    // so the entry carries an `issuer` instead of an `authorizationUrl`. The
+    // runtime drops a greentic provider that has no issuer — deriving one from
+    // the (attacker-controlled) tenant is exactly what that guard prevents — so
+    // an enabled-but-issuerless answer must disable the button, not ship it.
+    {
+        let greentic_enabled = oauth_enabled
+            && answers
+                .get("oauth_enable_greentic")
+                .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
+                // The setup question ships default-on, so an absent answer means
+                // "unchanged", not "off".
+                .unwrap_or(true);
+        let issuer = answers
+            .get("oauth_greentic_issuer")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let client_id = answers
+            .get("oauth_greentic_client_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("webchat-gui")
+            .to_string();
+
+        if greentic_enabled && issuer.is_empty() {
+            eprintln!(
+                "  WARNING: Greentic SSO is enabled but oauth_greentic_issuer is empty — \
+                 the login button will not be shown"
+            );
+        }
+        let effective = greentic_enabled && !issuer.is_empty();
+
+        let existing = providers_arr.iter_mut().find(|p| {
+            let id = p.get("id").and_then(Value::as_str).unwrap_or("");
+            id == "greentic" || id == format!("{tenant}-greentic")
+        });
+        if let Some(existing) = existing {
+            if let Some(obj) = existing.as_object_mut() {
+                obj.insert("enabled".to_string(), Value::Bool(effective));
+                obj.insert("clientId".to_string(), Value::String(client_id));
+                if !issuer.is_empty() {
+                    obj.insert("issuer".to_string(), Value::String(issuer));
+                }
+                changed = true;
+            }
+        } else if effective {
+            let mut entry = Map::new();
+            entry.insert("id".to_string(), Value::String("greentic".to_string()));
+            entry.insert(
+                "label".to_string(),
+                Value::String("Greentic SSO".to_string()),
+            );
+            entry.insert("type".to_string(), Value::String("greentic".to_string()));
+            entry.insert("enabled".to_string(), Value::Bool(true));
+            entry.insert("clientId".to_string(), Value::String(client_id));
+            entry.insert("issuer".to_string(), Value::String(issuer));
+            entry.insert(
+                "scope".to_string(),
+                Value::String("openid profile email greentic.webchat".to_string()),
             );
             providers_arr.push(Value::Object(entry));
             changed = true;
@@ -500,7 +621,7 @@ pub fn sync_skin_to_tenant_config(
         return Ok(false);
     };
 
-    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant, provider_id)? else {
         return Ok(false);
     };
 
@@ -647,7 +768,7 @@ pub fn sync_nav_links_to_tenant_config(
             return Ok(false);
         };
 
-    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant)? else {
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant, provider_id)? else {
         return Ok(false);
     };
 
@@ -1119,9 +1240,10 @@ mod tests {
         let tenant_file = tenants_dir.join("demo.json");
         std::fs::write(&tenant_file, r#"{"tenant_id":"demo","skin":"existing"}"#).unwrap();
 
-        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "demo")
-            .unwrap()
-            .unwrap();
+        let resolved =
+            resolve_or_scaffold_tenant_config(temp.path(), "demo", "messaging-webchat-gui")
+                .unwrap()
+                .unwrap();
         assert_eq!(resolved, tenant_file);
 
         // File contents must be untouched
@@ -1131,10 +1253,118 @@ mod tests {
         );
     }
 
+    /// A freshly scaffolded bundle has no `assets/` tree, so every sync used to
+    /// no-op in silence. The template is seeded from the pack that ships it.
+    #[test]
+    fn resolve_seeds_the_default_template_from_the_provider_pack() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let packs = root.join("providers/messaging");
+        std::fs::create_dir_all(&packs).expect("pack dir");
+
+        let pack_path = packs.join("messaging-webchat-gui.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>(
+            "assets/webchat-gui/config/tenants/default.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("start entry");
+        use std::io::Write;
+        zip.write_all(br#"{"tenant_id":"default","skin":"default"}"#)
+            .expect("write entry");
+        zip.finish().expect("finish pack");
+
+        let resolved = resolve_or_scaffold_tenant_config(root, "acme", "messaging-webchat-gui")
+            .expect("resolve")
+            .expect("seeded and scaffolded");
+        assert_eq!(resolved.file_name().unwrap(), "acme.json");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&resolved).unwrap()).unwrap();
+        assert_eq!(written["tenant_id"], "acme");
+        assert!(
+            root.join("assets/webchat-gui/config/tenants/default.json")
+                .exists(),
+            "the seeded template must stay for the next tenant"
+        );
+    }
+
+    /// The SPA drops a greentic provider with no issuer, so an enabled answer
+    /// without one must disable the button rather than ship a dead entry.
+    #[test]
+    fn sync_oauth_writes_the_greentic_provider_with_its_issuer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let tenants = root.join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants).expect("tenants dir");
+        std::fs::write(
+            tenants.join("default.json"),
+            r#"{"tenant_id":"default","auth":{"providers":[]}}"#,
+        )
+        .expect("seed");
+
+        let answers = serde_json::json!({
+            "oauth_enabled": "true",
+            "oauth_enable_greentic": "true",
+            "oauth_greentic_issuer": "https://id.example.com",
+            "oauth_greentic_client_id": "webchat-gui"
+        });
+        assert!(
+            sync_oauth_to_tenant_config(root, "acme", "messaging-webchat-gui", &answers)
+                .expect("sync")
+        );
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(tenants.join("acme.json")).unwrap())
+                .unwrap();
+        let provider = written["auth"]["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "greentic")
+            .expect("greentic entry");
+        assert_eq!(provider["issuer"], "https://id.example.com");
+        assert_eq!(provider["clientId"], "webchat-gui");
+        assert_eq!(provider["enabled"], true);
+    }
+
+    #[test]
+    fn sync_oauth_disables_greentic_when_the_issuer_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let tenants = root.join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants).expect("tenants dir");
+        std::fs::write(
+            tenants.join("default.json"),
+            r#"{"tenant_id":"default","auth":{"providers":[{"id":"greentic","type":"greentic","enabled":true}]}}"#,
+        )
+        .expect("seed");
+
+        let answers = serde_json::json!({
+            "oauth_enabled": "true",
+            "oauth_enable_greentic": "true"
+        });
+        sync_oauth_to_tenant_config(root, "acme", "messaging-webchat-gui", &answers).expect("sync");
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(tenants.join("acme.json")).unwrap())
+                .unwrap();
+        let provider = written["auth"]["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "greentic")
+            .expect("greentic entry");
+        assert_eq!(provider["enabled"], false);
+        assert!(provider.get("issuer").is_none());
+    }
+
     #[test]
     fn resolve_or_scaffold_returns_none_when_neither_exists() {
         let temp = tempfile::tempdir().unwrap();
-        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "demo").unwrap();
+        let resolved =
+            resolve_or_scaffold_tenant_config(temp.path(), "demo", "messaging-webchat-gui")
+                .unwrap();
         assert!(resolved.is_none());
     }
 
@@ -1146,9 +1376,10 @@ mod tests {
         let default_file = tenants_dir.join("default.json");
         std::fs::write(&default_file, r#"{"tenant_id":"default"}"#).unwrap();
 
-        let resolved = resolve_or_scaffold_tenant_config(temp.path(), "default")
-            .unwrap()
-            .unwrap();
+        let resolved =
+            resolve_or_scaffold_tenant_config(temp.path(), "default", "messaging-webchat-gui")
+                .unwrap()
+                .unwrap();
         assert_eq!(resolved, default_file);
     }
 }
