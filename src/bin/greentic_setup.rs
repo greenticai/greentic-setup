@@ -175,7 +175,15 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     println!("{}", i18n.tf("cli.bundle.add.env", &[&env]));
     println!();
 
-    let loaded_answers = if cli.answers.is_some() {
+    // `--emit-answers` is pure discovery: it writes the answers template +
+    // `answers_schema` for a caller (e.g. the designer setup gate) to inspect.
+    // It must NOT prompt for or validate secret/required answers — those are
+    // supplied later at apply time. Passing `--answers` (which callers do only
+    // to satisfy the `--non-interactive` guard) or `--non-interactive` must not
+    // drag emit through the interactive answer-completion / required-answer
+    // checks, or a bundle declaring a required secret makes emit hang/error.
+    let emit_only = cli.emit_answers.is_some();
+    let loaded_answers = if cli.answers.is_some() && !emit_only {
         complete_loaded_answers_with_prompts(
             &bundle_dir,
             &tenant,
@@ -188,10 +196,10 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     } else {
         loaded_answers
     };
-    if cli.answers.is_some() {
+    if cli.answers.is_some() && !emit_only {
         ensure_deployment_targets_present(&bundle_dir, &loaded_answers)?;
     }
-    if cli.non_interactive {
+    if cli.non_interactive && !emit_only {
         ensure_required_setup_answers_present(&bundle_dir, &loaded_answers)
             .context("Missing required answers in --non-interactive mode")?;
     }
@@ -230,8 +238,10 @@ fn run_simple_setup(cli: &Cli, i18n: &CliI18n) -> Result<()> {
     engine.print_plan(&plan);
 
     if let Some(emit_path) = &cli.emit_answers {
+        // Emit is pure discovery — never prompt for secret values (pass
+        // `interactive = false` unconditionally). Secrets are filled at apply.
         engine
-            .emit_answers(&plan, emit_path, cli.key.as_deref(), !cli.non_interactive)
+            .emit_answers(&plan, emit_path, cli.key.as_deref(), false)
             .context(i18n.t("cli.error.failed_emit_answers"))?;
         println!(
             "\n{}",
