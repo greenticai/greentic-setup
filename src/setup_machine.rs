@@ -2307,6 +2307,44 @@ fn execute_oauth_device_code_step(
     step: &SetupMachineStep,
     state: &mut SetupMachineState,
 ) -> MachineStepResult {
+    // If an earlier step already funded this step's token via `also_fund`
+    // (e.g. graph_admin_consent funded the Azure management token), skip the
+    // second interactive sign-in entirely — the token is already persisted.
+    if oauth_device_token_already_funded(step, state) {
+        let token_store_key = step
+            .extra
+            .get("token_store_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        tracing::info!(
+            "also_fund: skipping device-code sign-in for step {} — {token_store_key} was already \
+             funded by a prior sign-in",
+            step.id
+        );
+        ensure_outputs_object(state).insert(
+            step.extra
+                .get("output_key")
+                .and_then(Value::as_str)
+                .unwrap_or("oauth_device_login")
+                .to_string(),
+            serde_json::json!({
+                "ok": true,
+                "token_store_key": token_store_key,
+                "skipped": "also_funded_by_prior_sign_in",
+            }),
+        );
+        mark_machine_step_complete(machine, step, state);
+        return MachineStepResult {
+            ok: true,
+            next: "OAuth device-code step skipped (token already funded by a prior sign-in)"
+                .to_string(),
+            detail: serde_json::json!({
+                "kind": step.kind,
+                "skipped": "also_funded_by_prior_sign_in",
+                "token_store_key": token_store_key,
+            }),
+        };
+    }
     match load_setup_machine_oauth_device_session(bundle_root, state, &step.id) {
         Ok(Some(session)) => {
             execute_oauth_device_code_poll(bundle_root, machine, step, state, session)
@@ -2320,6 +2358,29 @@ fn execute_oauth_device_code_step(
             serde_json::json!({"detail": err.to_string()}),
         ),
     }
+}
+
+/// Whether this device-code step's `token_store_key` was already funded by a
+/// prior step's `also_fund` (recorded in `state.outputs.also_funded_token_keys`).
+fn oauth_device_token_already_funded(step: &SetupMachineStep, state: &SetupMachineState) -> bool {
+    let Some(token_store_key) = step
+        .extra
+        .get("token_store_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    state
+        .outputs
+        .get("also_funded_token_keys")
+        .and_then(Value::as_array)
+        .is_some_and(|keys| {
+            keys.iter()
+                .filter_map(Value::as_str)
+                .any(|key| key == token_store_key)
+        })
 }
 
 fn execute_oauth_device_code_start(
@@ -2561,6 +2622,69 @@ fn execute_oauth_device_code_start(
     }
 }
 
+/// Redeem a device-code sign-in's refresh token for a token to a SECOND
+/// Microsoft resource (the `also_fund` block on an oauth_device_code step),
+/// so a single interactive sign-in can cover two resources. Returns
+/// `(token_store_key, access_token)` on success, or `None` when the block is
+/// malformed or Microsoft declines the refresh (e.g. the second resource's
+/// scopes were never consented) — callers treat `None` as "fall back to the
+/// dedicated second sign-in step", so this never blocks setup.
+fn fund_secondary_token(
+    session: &SetupMachineOAuthDeviceSession,
+    also_fund: &serde_json::Map<String, Value>,
+    refresh_token: &str,
+) -> Option<(String, String)> {
+    let token_store_key = also_fund
+        .get("token_store_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let scope = also_fund
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|scope| !scope.trim().is_empty())?;
+
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut response = agent
+        .post(&session.token_url)
+        .send_form([
+            ("grant_type", "refresh_token"),
+            ("client_id", session.client_id.as_str()),
+            ("refresh_token", refresh_token),
+            ("scope", scope.as_str()),
+        ])
+        .ok()?;
+    let status = response.status().as_u16();
+    let body = response.body_mut().read_json::<Value>().ok()?;
+    if status >= 400 {
+        let err = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        tracing::info!(
+            "also_fund: refresh exchange for {token_store_key} declined (HTTP {status}: {err}); \
+             the dedicated sign-in step will prompt instead"
+        );
+        return None;
+    }
+    let access_token = body.get("access_token").and_then(Value::as_str)?;
+    tracing::info!(
+        "also_fund: funded {token_store_key} from the primary sign-in (no second sign-in needed)"
+    );
+    Some((token_store_key.to_string(), access_token.to_string()))
+}
+
 fn execute_oauth_device_code_poll(
     bundle_root: &Path,
     machine: &SetupMachine,
@@ -2645,13 +2769,32 @@ fn execute_oauth_device_code_poll(
             Value::String(access_token.to_string()),
         );
     }
+    let response_refresh_token = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     if let Some(refresh_key) = session.refresh_token_store_key.as_deref()
-        && let Some(refresh_token) = body.get("refresh_token").and_then(Value::as_str)
+        && let Some(refresh_token) = response_refresh_token.as_deref()
     {
         config.insert(
             refresh_key.to_string(),
             Value::String(refresh_token.to_string()),
         );
+    }
+    // `also_fund`: use the refresh token this sign-in produced to acquire a
+    // token for a SECOND Microsoft resource (e.g. Azure management) without a
+    // second interactive device-code sign-in. This only succeeds when the
+    // user (or tenant admin) has already consented to the second resource's
+    // scopes; when it doesn't, the dedicated later step still prompts, so this
+    // is strictly a best-effort shortcut that never blocks the primary flow.
+    let mut also_funded_keys: Vec<String> = Vec::new();
+    if let Some(also_fund) = step.extra.get("also_fund").and_then(Value::as_object)
+        && let Some(refresh_token) = response_refresh_token.as_deref()
+        && let Some((funded_key, funded_token)) =
+            fund_secondary_token(&session, also_fund, refresh_token)
+    {
+        config.insert(funded_key.clone(), Value::String(funded_token));
+        also_funded_keys.push(funded_key);
     }
     if config.is_empty() {
         return pause_oauth_device_error(
@@ -2696,6 +2839,25 @@ fn execute_oauth_device_code_poll(
         }
     };
     let _ = remove_setup_machine_oauth_device_session(bundle_root, state, &step.id);
+    // Record any token store keys funded via `also_fund` so a later
+    // oauth_device_code step keyed on the same store key can skip its own
+    // sign-in (see execute_oauth_device_code_start).
+    if !also_funded_keys.is_empty() {
+        let outputs = ensure_outputs_object(state);
+        let existing = outputs
+            .get("also_funded_token_keys")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut merged: Vec<Value> = existing;
+        for key in &also_funded_keys {
+            let value = Value::String(key.clone());
+            if !merged.contains(&value) {
+                merged.push(value);
+            }
+        }
+        outputs.insert("also_funded_token_keys".to_string(), Value::Array(merged));
+    }
     ensure_outputs_object(state).insert(
         step.extra
             .get("output_key")
@@ -2706,6 +2868,7 @@ fn execute_oauth_device_code_poll(
             "ok": true,
             "token_store_key": session.token_store_key,
             "persisted_keys": persisted_keys,
+            "also_funded_token_keys": also_funded_keys,
         }),
     );
     mark_machine_step_complete(machine, step, state);
@@ -8880,5 +9043,93 @@ setup_actions:
         assert!(!repeated.setup_actions_removed);
         assert!(!repeated.empty);
         Ok(())
+    }
+
+    fn device_step_with_token_key(token_store_key: &str) -> SetupMachineStep {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "token_store_key".to_string(),
+            Value::String(token_store_key.to_string()),
+        );
+        SetupMachineStep {
+            id: "microsoft_bot_channel_registration_consent".to_string(),
+            title: None,
+            kind: "oauth_device_code".to_string(),
+            requires: vec![],
+            outputs: vec![],
+            on_success: None,
+            on_failure: vec![],
+            recover: vec![],
+            extra,
+        }
+    }
+
+    fn state_with_funded_keys(keys: &[&str]) -> SetupMachineState {
+        SetupMachineState {
+            schema_version: 1,
+            provider_id: "messaging-teams".to_string(),
+            tenant: "demo".to_string(),
+            team: "default".to_string(),
+            machine_id: "messaging-teams-default".to_string(),
+            machine_version: 1,
+            status: SetupMachineStatus::Running,
+            current_step: None,
+            completed_steps: vec![],
+            failed_step: None,
+            answers_hash: None,
+            pack_fingerprint: None,
+            outputs: serde_json::json!({ "also_funded_token_keys": keys }),
+            created_resources: vec![],
+            last_error: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn also_funded_token_is_detected_and_lets_the_second_signin_be_skipped() {
+        let step = device_step_with_token_key("azure_management_access_token");
+        // Prior step's also_fund funded exactly this token store key.
+        let funded = state_with_funded_keys(&["azure_management_access_token"]);
+        assert!(oauth_device_token_already_funded(&step, &funded));
+    }
+
+    #[test]
+    fn unfunded_token_still_requires_its_own_signin() {
+        let step = device_step_with_token_key("azure_management_access_token");
+        // A different key was funded, or none at all.
+        assert!(!oauth_device_token_already_funded(
+            &step,
+            &state_with_funded_keys(&["some_other_token"])
+        ));
+        assert!(!oauth_device_token_already_funded(
+            &step,
+            &state_with_funded_keys(&[])
+        ));
+    }
+
+    #[test]
+    fn fund_secondary_token_ignores_a_malformed_also_fund_block() {
+        let session = SetupMachineOAuthDeviceSession {
+            step_id: "graph_admin_consent".to_string(),
+            provider_id: "messaging-teams".to_string(),
+            tenant: "demo".to_string(),
+            team: "default".to_string(),
+            device_code: "dc".to_string(),
+            client_id: "cid".to_string(),
+            token_url: "https://login.example/token".to_string(),
+            token_store_key: "graph_access_token".to_string(),
+            refresh_token_store_key: None,
+            interval: 5,
+            expires_at: 0,
+            created_at: 0,
+        };
+        // No token_store_key -> None without any network call.
+        let no_key: serde_json::Map<String, Value> =
+            serde_json::from_value(serde_json::json!({ "scopes": ["s"] })).unwrap();
+        assert!(fund_secondary_token(&session, &no_key, "refresh").is_none());
+        // No scopes -> None without any network call.
+        let no_scopes: serde_json::Map<String, Value> =
+            serde_json::from_value(serde_json::json!({ "token_store_key": "k" })).unwrap();
+        assert!(fund_secondary_token(&session, &no_scopes, "refresh").is_none());
     }
 }
