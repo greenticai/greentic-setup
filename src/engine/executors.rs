@@ -136,15 +136,43 @@ fn secret_keys_or_fail_closed(
     resolved: Option<BTreeSet<String>>,
     answers: &Value,
     provider_id: &str,
+    pack_found: bool,
+    known_pack_ids: &[String],
 ) -> anyhow::Result<BTreeSet<String>> {
     match resolved {
         Some(set) => Ok(set),
+        // No pack matched `provider_id` at all. Say so. Reporting this as
+        // "the pack ships no classifiable setup metadata" is actively
+        // misleading — it sends people to inspect a pack that is fine, or one
+        // they never had. The real cause is nearly always that the answers
+        // file's top-level key does not equal the pack's manifest `pack_id`
+        // (lookup is exact string equality), and the two families do not share
+        // a convention: messaging packs use short ids (`messaging-telegram`),
+        // events packs use dotted ones (`greentic.events.webhook`).
+        None if !pack_found && answers_have_content(answers) => {
+            let known = if known_pack_ids.is_empty() {
+                "  (none — no packs were discovered in this bundle)".to_string()
+            } else {
+                known_pack_ids
+                    .iter()
+                    .map(|id| format!("  {id}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            anyhow::bail!(
+                "B12a: no pack in this bundle has pack_id `{provider_id}`, so the answers keyed \
+                 under it cannot be applied.\n\nPacks that can take setup answers here:\n{known}\n\n\
+                 The top-level key in your answers file must equal the pack's manifest pack_id \
+                 exactly. If you meant one of the above, rename the key to match.",
+            )
+        }
+        // The pack IS here, it just ships nothing we can classify against.
         None if answers_have_content(answers) => anyhow::bail!(
             "B12a: refusing to write setup-answers for `{provider_id}` — the pack ships no \
              classifiable setup metadata (no setup.yaml / qa/*.json / secret-requirements), so \
              we can't tell which answers are secrets and won't risk writing plaintext. \
              Install/repair the pack with a setup.yaml (`secret: true` flags) or an \
-             `assets/secret-requirements.json`, or pass an explicit pack ref, then retry.",
+             `assets/secret-requirements.json`, then retry.",
         ),
         None => Ok(BTreeSet::new()),
     }
@@ -491,10 +519,27 @@ pub fn execute_apply_pack_setup(
         //     setup.yaml, no qa/*.json, no secret-requirements). We cannot
         //     tell which answers are secret, so with non-empty answers we
         //     fail closed rather than silently writing plaintext.
-        // A missing pack path is the same "can't classify" situation.
+        // A missing pack path also lands on `None`, but it is a different
+        // problem with a different fix, so carry the distinction through
+        // rather than collapsing both into one misleading error.
         let resolved_secret_keys: Option<BTreeSet<String>> =
             pack_path.and_then(|pp| resolve_secret_answer_keys(pp, &provider_id));
-        let secret_keys = secret_keys_or_fail_closed(resolved_secret_keys, answers, &provider_id)?;
+        let known_pack_ids: Vec<String> = discovered
+            .as_ref()
+            .map(|d| {
+                d.setup_targets()
+                    .iter()
+                    .map(|p| p.provider_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let secret_keys = secret_keys_or_fail_closed(
+            resolved_secret_keys,
+            answers,
+            &provider_id,
+            pack_path.is_some(),
+            &known_pack_ids,
+        )?;
         let mut answers_for_disk = strip_secret_answer_keys(answers, &secret_keys);
         if let Some(team) = slack_team.as_deref() {
             apply_slack_team_to_app_url(&mut answers_for_disk, team);
@@ -2313,23 +2358,72 @@ mod tests {
         let content = serde_json::json!({"model": "gpt-4o"});
         let empty = serde_json::json!({});
 
+        let found = true;
+        let known: Vec<String> = vec![];
+
         // xhigh review C3: a pack WITH a form spec that declares zero secrets
         // resolves to Some(empty) and MUST proceed (write all answers as
         // non-secret) — not bail.
-        let r = secret_keys_or_fail_closed(Some(BTreeSet::new()), &content, "p").unwrap();
+        let r = secret_keys_or_fail_closed(Some(BTreeSet::new()), &content, "p", found, &known)
+            .unwrap();
         assert!(r.is_empty(), "Some(empty) proceeds with no redaction");
 
         // Some(nonempty) passes the set through.
         let set = secret_keys_for(&["api_key"]);
-        let r = secret_keys_or_fail_closed(Some(set.clone()), &content, "p").unwrap();
+        let r =
+            secret_keys_or_fail_closed(Some(set.clone()), &content, "p", found, &known).unwrap();
         assert_eq!(r, set);
 
         // None + content => fail closed (can't classify, won't risk plaintext).
-        assert!(secret_keys_or_fail_closed(None, &content, "p").is_err());
+        assert!(secret_keys_or_fail_closed(None, &content, "p", found, &known).is_err());
 
         // None + empty answers => nothing to leak, proceed.
         assert!(
-            secret_keys_or_fail_closed(None, &empty, "p")
+            secret_keys_or_fail_closed(None, &empty, "p", found, &known)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_pack_reports_the_key_mismatch_not_missing_metadata() {
+        let content = serde_json::json!({"api_key": "x"});
+        let known = vec![
+            "greentic.events.webhook".to_string(),
+            "messaging-telegram".to_string(),
+        ];
+
+        // The answers name a pack that is not in the bundle. Blaming the pack's
+        // METADATA here is what misleads people — the key simply does not match
+        // any pack_id. Name the ids we do have so the fix is obvious.
+        let err = secret_keys_or_fail_closed(None, &content, "events-webhook", false, &known)
+            .expect_err("a pack we do not have must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no pack in this bundle has pack_id `events-webhook`"),
+            "must say the pack_id did not match, got: {msg}",
+        );
+        assert!(
+            msg.contains("greentic.events.webhook"),
+            "must list the pack_ids we DO have, got: {msg}",
+        );
+        assert!(
+            !msg.contains("ships no classifiable setup metadata"),
+            "must not blame the pack's metadata when the pack was never found, got: {msg}",
+        );
+
+        // A pack that IS present but ships nothing classifiable still gets the
+        // original fail-closed message — that one is accurate.
+        let err = secret_keys_or_fail_closed(None, &content, "events-webhook", true, &known)
+            .expect_err("present-but-unclassifiable must still fail closed");
+        assert!(
+            err.to_string()
+                .contains("ships no classifiable setup metadata")
+        );
+
+        // Empty answers still proceed even when the pack is missing: nothing to leak.
+        assert!(
+            secret_keys_or_fail_closed(None, &serde_json::json!({}), "nope", false, &known)
                 .unwrap()
                 .is_empty()
         );
