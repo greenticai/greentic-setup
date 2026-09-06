@@ -16,6 +16,15 @@ use url::Url;
 
 const REDACTED_SECRET_MARKER: &str = "[redacted:dev-secret]";
 
+/// Top-level state key holding `config key → secrets:// URI` for the secrets
+/// this state file's last save wrote to the dev store.
+///
+/// Additive on purpose. Older binaries ignore the key (they iterate `stored`
+/// and copy unknown entries through untouched) and keep resolving secrets the
+/// old way, so a state file written by a new binary stays readable by an old
+/// one. It holds URIs, never secret material.
+pub(crate) const SECRET_REFS_KEY: &str = "secret_refs";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredProviderHttpRoute {
     pub provider_id: String,
@@ -79,20 +88,19 @@ pub fn merge_browser_config_update(
         if server_owned.contains(key) {
             continue;
         }
-        // Ephemeral tunnel URLs are engine-assigned: the browser only ever
-        // *echoes* one from an earlier render, and the echo can be stale.
-        // Merging it reverts the engine's corrected ingress URL on every
-        // "Continue" click, which un-completes dependent steps and re-runs
-        // them forever. A user-supplied *stable* URL still merges normally.
-        if key == "public_base_url"
-            && value
-                .as_str()
-                .is_some_and(crate::setup_tunnel::is_ephemeral_tunnel_url)
-        {
+        // `public_base_url` is ENGINE-OWNED, unconditionally. The browser has
+        // no field for it any more, so anything arriving under this key is an
+        // echo of an earlier render — either a stale tunnel URL or, worse, the
+        // pre-tunnel `http://127.0.0.1:<port>` the page was rendered with
+        // before a tunnel existed. Merging the latter reverted config to
+        // loopback on every "Continue" click, so the just-completed
+        // bot_framework_endpoint_registration (whose recorded runtime context
+        // names the tunnel) stopped matching and was re-registered forever.
+        if key == "public_base_url" {
             if config.get(key) != Some(value) {
                 eprintln!(
-                    "[setup config] ignoring browser-echoed ephemeral public_base_url \
-                     {value} (stored: {stored}); ephemeral tunnel URLs are engine-owned",
+                    "[setup config] ignoring browser-echoed public_base_url \
+                     {value} (stored: {stored}); the ingress URL is engine-owned",
                     stored = config.get(key).and_then(Value::as_str).unwrap_or("<unset>")
                 );
             }
@@ -2555,11 +2563,62 @@ pub fn save_backend_state(
             .with_context(|| format!("create setup backend state dir {}", parent.display()))?;
     }
     let env = backend_state_env(stored);
-    persist_sensitive_backend_config(bundle_root, &env, tenant, team, provider_id, stored)?;
-    let redacted = redact_backend_state_for_disk(stored);
+    let persisted =
+        persist_sensitive_backend_config(bundle_root, &env, tenant, team, provider_id, stored)?;
+    let mut redacted = redact_backend_state_for_disk(stored);
+    // Rebuild the ref map from THIS save rather than carrying forward whatever
+    // a previous load left in `stored`: a ref must never outlive the write that
+    // justified it, or a later load resolves a key the store no longer holds.
+    redacted.remove(SECRET_REFS_KEY);
+    let refs = backend_secret_refs(&env, tenant, team, provider_id, &persisted);
+    if !refs.is_empty() {
+        redacted.insert(SECRET_REFS_KEY.to_string(), Value::Object(refs));
+    }
     std::fs::write(&path, serde_json::to_vec_pretty(&redacted)?)
         .with_context(|| format!("write setup backend state {}", path.display()))?;
     Ok(path)
+}
+
+/// The canonical `secrets://` URI for every key this save persisted.
+///
+/// Recorded ALONGSIDE the redacted marker (never in place of it): an older
+/// binary must keep seeing the exact `[redacted:dev-secret]` string it knows,
+/// because its persist filter treats "not the marker" as "a real value to
+/// write" and would otherwise store a ref over the live secret.
+fn backend_secret_refs(
+    env: &str,
+    tenant: &str,
+    team: &str,
+    provider_id: &str,
+    persisted_keys: &[String],
+) -> JsonMap<String, Value> {
+    persisted_keys
+        .iter()
+        .map(|key| {
+            (
+                key.clone(),
+                Value::String(crate::canonical_secret_uri(
+                    env,
+                    tenant,
+                    Some(team),
+                    provider_id,
+                    key,
+                )),
+            )
+        })
+        .collect()
+}
+
+/// The `env` segment of a `secrets://{env}/{tenant}/{team}/{provider}/{key}` URI.
+///
+/// This is what makes a ref self-describing: the reader opens the store the
+/// WRITER used instead of inferring an env from ambient context and silently
+/// missing when the inference is wrong.
+fn secret_uri_env(uri: &str) -> Option<&str> {
+    uri.strip_prefix("secrets://")?
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
 }
 
 fn backend_state_env(stored: &JsonMap<String, Value>) -> String {
@@ -2581,9 +2640,9 @@ fn persist_sensitive_backend_config(
     team: &str,
     provider_id: &str,
     stored: &JsonMap<String, Value>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let Some(config) = stored.get("config").and_then(Value::as_object) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let sensitive: JsonMap<String, Value> = config
         .iter()
@@ -2593,7 +2652,7 @@ fn persist_sensitive_backend_config(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     if sensitive.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let config = Value::Object(sensitive);
     let bundle_root = bundle_root.to_path_buf();
@@ -2613,7 +2672,6 @@ fn persist_sensitive_backend_config(
         )
         .await
     })
-    .map(|_| ())
 }
 
 fn hydrate_redacted_backend_config(
@@ -2624,6 +2682,11 @@ fn hydrate_redacted_backend_config(
     provider_id: &str,
     stored: &mut JsonMap<String, Value>,
 ) -> anyhow::Result<()> {
+    let refs = stored
+        .get(SECRET_REFS_KEY)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let Some(config) = stored.get_mut("config").and_then(Value::as_object_mut) else {
         return Ok(());
     };
@@ -2642,16 +2705,51 @@ fn hydrate_redacted_backend_config(
     let tenant = tenant.to_string();
     let team = team.to_string();
     let provider_id = provider_id.to_string();
-    let lookup_provider_id = provider_id.clone();
-    let lookup_keys = keys.clone();
+    // Resolve each key to (uri, store env) BEFORE touching the store. A ref
+    // recorded by the writer is authoritative and carries its own env; a state
+    // file written before refs existed (or by an older binary) has none, so it
+    // falls back to reconstructing the URI from ambient context exactly as
+    // before. Old bundles keep working; new ones stop guessing.
+    let lookups: Vec<(String, String, String)> = keys
+        .iter()
+        .map(|key| {
+            match refs
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|uri| !uri.is_empty())
+            {
+                Some(uri) => {
+                    let store_env = secret_uri_env(uri).unwrap_or(&env).to_string();
+                    (key.clone(), uri.to_string(), store_env)
+                }
+                None => (
+                    key.clone(),
+                    crate::canonical_secret_uri(&env, &tenant, Some(&team), &provider_id, key),
+                    env.clone(),
+                ),
+            }
+        })
+        .collect();
     let hydrated = block_on_backend_secret_task(async move {
         use greentic_secrets_lib::SecretsStore;
 
-        let store = crate::secrets::open_dev_store_for_env(&bundle_root, "dev")?;
+        // Open the store for the SAME env the writer used. The dev store is a
+        // per-env file (`~/.greentic/environments/<env>/…`), and the write side
+        // (persist_sensitive_backend_config → persist_all_config_as_secrets)
+        // keys it by the env in the stored config — "local" for `gtc setup`.
+        // Opening "dev" here read a different file, missed every secret, and
+        // dropped the redacted key: a completed device login came back as
+        // `device_login_not_started` on the very next poll.
+        let mut stores: std::collections::HashMap<String, _> = std::collections::HashMap::new();
         let mut values = JsonMap::new();
-        for key in lookup_keys {
-            let uri =
-                crate::canonical_secret_uri(&env, &tenant, Some(&team), &lookup_provider_id, &key);
+        for (key, uri, store_env) in lookups {
+            let store = match stores.entry(store_env.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    crate::secrets::open_dev_store_for_env(&bundle_root, &store_env)?,
+                ),
+            };
             if let Ok(bytes) = store.get(&uri).await
                 && let Ok(text) = String::from_utf8(bytes)
                 && !text.is_empty()
@@ -2949,7 +3047,9 @@ mod tests {
         .unwrap();
 
         let config = stored.get("config").and_then(Value::as_object).unwrap();
-        assert_eq!(config["public_base_url"], "https://example.test");
+        // public_base_url is engine-owned too, so it never arrives this way —
+        // the engine sets it from the resolved ingress/tunnel.
+        assert!(config.get("public_base_url").is_none());
         assert!(config.get("oauth_device_code").is_none());
         assert!(config.get("graph_access_token").is_none());
     }
@@ -2982,7 +3082,9 @@ mod tests {
         );
         assert_eq!(config["bot_display_name"], "Greentic Bot");
 
-        // A user-supplied STABLE https URL is a deliberate override → merges.
+        // Even a stable-looking https URL is refused: the browser has no
+        // public_base_url field any more, so this can only be an echo. The
+        // engine owns the ingress URL outright.
         merge_browser_config_update(
             &mut stored,
             &json!({"public_base_url": "https://bot.example.com"}),
@@ -2991,7 +3093,74 @@ mod tests {
         )
         .unwrap();
         let config = stored.get("config").and_then(Value::as_object).unwrap();
-        assert_eq!(config["public_base_url"], "https://bot.example.com");
+        assert_eq!(
+            config["public_base_url"],
+            "https://current.trycloudflare.com"
+        );
+    }
+
+    #[test]
+    fn merge_browser_config_update_rejects_echoed_pre_tunnel_local_public_base_url() {
+        // The observed re-registration loop: the page was rendered BEFORE the
+        // engine brought a tunnel up, so every "Continue" click posts back
+        // `http://127.0.0.1:8080`. Merging it reverted config to localhost,
+        // which no longer matched the runtime context recorded by the
+        // just-completed bot_framework_endpoint_registration — so the step was
+        // marked stale and re-registered on every click, forever.
+        let contract = json!({ "server_owned_config_keys": [] });
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "public_base_url":
+                    "https://greentic-webhook-proxy.greentic.workers.dev/default-ba564"
+            }),
+        );
+
+        merge_browser_config_update(
+            &mut stored,
+            &json!({
+                "public_base_url": "http://127.0.0.1:8080",
+                "bot_display_name": "Greentic Bot"
+            }),
+            &contract,
+            JsonMap::new(),
+        )
+        .unwrap();
+
+        let config = stored.get("config").and_then(Value::as_object).unwrap();
+        assert_eq!(
+            config["public_base_url"],
+            "https://greentic-webhook-proxy.greentic.workers.dev/default-ba564",
+            "a browser-echoed loopback URL must not revert the engine's tunnel"
+        );
+        assert_eq!(
+            config["bot_display_name"], "Greentic Bot",
+            "sibling keys still merge normally"
+        );
+    }
+
+    #[test]
+    fn merge_browser_config_update_never_takes_public_base_url_from_the_browser() {
+        // Engine-owned unconditionally, in every direction — including the
+        // pre-tunnel loopback case, where the stored value is not a tunnel.
+        let contract = json!({ "server_owned_config_keys": [] });
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({"public_base_url": "http://127.0.0.1:8080"}),
+        );
+
+        merge_browser_config_update(
+            &mut stored,
+            &json!({"public_base_url": "http://127.0.0.1:9090"}),
+            &contract,
+            JsonMap::new(),
+        )
+        .unwrap();
+
+        let config = stored.get("config").and_then(Value::as_object).unwrap();
+        assert_eq!(config["public_base_url"], "http://127.0.0.1:8080");
     }
 
     #[test]
@@ -3914,6 +4083,301 @@ mod tests {
         assert_eq!(
             loaded["config"]["oauth_token_url"],
             "https://login.example/token"
+        );
+    }
+
+    #[test]
+    fn backend_state_hydrates_secrets_from_the_env_the_writer_used() {
+        // Regression: the writer keys the dev store by the env in the stored
+        // config (`local` for `gtc setup`), but the loader opened the store for
+        // a hardcoded "dev" — a different file under
+        // `~/.greentic/environments/<env>/…`. Every sensitive key missed on
+        // load and was dropped, so a device login the user had just completed
+        // came back as `device_login_not_started` on the next poll.
+        //
+        // Isolate via HOME rather than StoreOverride: the override collapses
+        // every env onto one file, which would hide exactly this mismatch.
+        let home = tempfile::tempdir().expect("home dir");
+        let _home_iso = crate::secrets::test_support::EnvStoreHome::at(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({
+                "env": "local",
+                "oauth_device_code": "device-code-secret",
+                "oauth_token_url": "https://login.example/token"
+            }),
+        );
+
+        save_backend_state(
+            temp.path(),
+            "default",
+            "default",
+            "messaging-teams",
+            &stored,
+        )
+        .expect("save state");
+
+        let loaded = load_backend_state(
+            temp.path(),
+            "local",
+            "default",
+            "default",
+            "messaging-teams",
+        )
+        .expect("load state");
+        assert_eq!(
+            loaded["config"]["oauth_device_code"],
+            "device-code-secret",
+            "device code written to the `local` store must hydrate on load, got {:?}",
+            loaded["config"].get("oauth_device_code")
+        );
+    }
+
+    /// A real `backend-contract.json` written by an older binary (identifiers
+    /// scrubbed, shape untouched): 11 top-level keys, 23 config entries, three
+    /// legacy `[redacted:dev-secret]` markers, no ref map.
+    const LEGACY_STATE_FIXTURE: &str =
+        include_str!("../tests/fixtures/legacy-backend-contract.json");
+
+    #[test]
+    fn legacy_bundle_state_round_trips_without_loss_or_corruption() {
+        // "Don't break existing bundles" checked against a file an existing
+        // bundle actually produced, not a synthetic one: load → save → load
+        // must preserve every key, leave the markers alone for keys the store
+        // can't satisfy, and never write a marker back as if it were a value.
+        let home = tempfile::tempdir().expect("home dir");
+        let _home_iso = crate::secrets::test_support::EnvStoreHome::at(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let path = backend_state_path(temp.path(), "demo", "default", "messaging-teams")
+            .expect("state path");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("state dir");
+        std::fs::write(&path, LEGACY_STATE_FIXTURE).expect("seed legacy state");
+        let original: JsonMap<String, Value> =
+            serde_json::from_str(LEGACY_STATE_FIXTURE).expect("parse fixture");
+
+        let loaded = load_backend_state(temp.path(), "local", "demo", "default", "messaging-teams")
+            .expect("load legacy state");
+
+        // Nothing outside `config` is disturbed, including the nested step
+        // history the wizard reads back.
+        for key in original.keys().filter(|key| key.as_str() != "config") {
+            assert_eq!(
+                loaded.get(key),
+                original.get(key),
+                "legacy top-level key {key} changed on load"
+            );
+        }
+        // The three markers had no backing secret in this store, so they are
+        // dropped (never passed through as credentials); everything else in
+        // config survives verbatim.
+        let original_config = original["config"].as_object().expect("config");
+        let loaded_config = loaded["config"].as_object().expect("config");
+        for (key, value) in original_config {
+            if value_is_redacted_marker(value) {
+                assert!(
+                    !loaded_config.contains_key(key),
+                    "unhydratable {key} must be dropped, not passed through"
+                );
+            } else {
+                assert_eq!(loaded_config.get(key), Some(value), "config {key} changed");
+            }
+        }
+
+        save_backend_state(temp.path(), "demo", "default", "messaging-teams", &loaded)
+            .expect("re-save");
+        let reloaded =
+            load_backend_state(temp.path(), "local", "demo", "default", "messaging-teams")
+                .expect("reload");
+        assert_eq!(reloaded, loaded, "second round trip is not stable");
+        // Scoped to `config`: nested one-way redactions elsewhere in the file
+        // (e.g. `last_reconcile.….bot_app_password_ref`) are pre-existing and
+        // are asserted unchanged by the top-level comparison above.
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+            .expect("parse saved state");
+        for (key, value) in saved["config"].as_object().expect("config") {
+            assert!(
+                !value_is_redacted_marker(value),
+                "dropped key {key} reappeared as a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_state_secret_ref_resolves_even_when_the_ambient_env_is_wrong() {
+        // The point of recording the ref: the writer's env travels WITH the
+        // secret, so the loader stops inferring it. Here the caller passes a
+        // flatly wrong ambient env ("dev") for state written under "local" —
+        // reconstruction would build a `secrets://dev/…` URI and open the dev
+        // store, missing both ways. The ref pins env, store, and URI.
+        let home = tempfile::tempdir().expect("home dir");
+        let _home_iso = crate::secrets::test_support::EnvStoreHome::at(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({ "env": "local", "oauth_device_code": "device-code-secret" }),
+        );
+
+        let path = save_backend_state(
+            temp.path(),
+            "default",
+            "default",
+            "messaging-teams",
+            &stored,
+        )
+        .expect("save state");
+        let raw = std::fs::read_to_string(&path).expect("read state");
+        let on_disk: Value = serde_json::from_str(&raw).expect("parse state");
+        assert_eq!(
+            on_disk[SECRET_REFS_KEY]["oauth_device_code"],
+            "secrets://local/default/_/messaging_teams/oauth_device_code"
+        );
+
+        let loaded =
+            load_backend_state(temp.path(), "dev", "default", "default", "messaging-teams")
+                .expect("load state");
+        assert_eq!(
+            loaded["config"]["oauth_device_code"], "device-code-secret",
+            "the recorded ref must win over the (wrong) ambient env"
+        );
+    }
+
+    #[test]
+    fn backend_state_hydrates_legacy_state_written_without_secret_refs() {
+        // Backward compatibility: bundles set up before refs existed have a
+        // bare `[redacted:dev-secret]` and no ref map. They must keep loading
+        // via URI reconstruction exactly as before.
+        let home = tempfile::tempdir().expect("home dir");
+        let _home_iso = crate::secrets::test_support::EnvStoreHome::at(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({ "env": "local", "oauth_device_code": "device-code-secret" }),
+        );
+        let path = save_backend_state(
+            temp.path(),
+            "default",
+            "default",
+            "messaging-teams",
+            &stored,
+        )
+        .expect("save state");
+
+        // Rewrite the file as an older binary would have left it: marker kept,
+        // ref map absent. The dev store keeps the secret either way.
+        let mut on_disk: JsonMap<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read state"))
+                .expect("parse state");
+        assert!(
+            on_disk.remove(SECRET_REFS_KEY).is_some(),
+            "refs were written"
+        );
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&on_disk).expect("serialize"),
+        )
+        .expect("write legacy state");
+
+        let loaded = load_backend_state(
+            temp.path(),
+            "local",
+            "default",
+            "default",
+            "messaging-teams",
+        )
+        .expect("load state");
+        assert_eq!(loaded["config"]["oauth_device_code"], "device-code-secret");
+    }
+
+    #[test]
+    fn backend_state_keeps_the_plain_redacted_marker_for_older_binaries() {
+        // Forward compatibility: the ref map is ADDITIVE. The config value must
+        // stay the exact marker string an older binary recognises — it treats
+        // "not the marker" as a real value and would write it over the live
+        // secret on its next save.
+        let home = tempfile::tempdir().expect("home dir");
+        let _home_iso = crate::secrets::test_support::EnvStoreHome::at(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({ "env": "local", "oauth_device_code": "device-code-secret" }),
+        );
+        let path = save_backend_state(
+            temp.path(),
+            "default",
+            "default",
+            "messaging-teams",
+            &stored,
+        )
+        .expect("save state");
+        let raw = std::fs::read_to_string(&path).expect("read state");
+        let on_disk: Value = serde_json::from_str(&raw).expect("parse state");
+
+        assert_eq!(
+            on_disk["config"]["oauth_device_code"],
+            REDACTED_SECRET_MARKER
+        );
+        assert!(
+            !raw.contains("device-code-secret"),
+            "the ref map must carry URIs only, never secret material"
+        );
+    }
+
+    #[test]
+    fn backend_state_rebuilds_secret_refs_instead_of_carrying_them_forward() {
+        // A ref must not outlive the write that justified it: once a key is no
+        // longer persisted, a stale ref would point at a secret this state file
+        // can no longer claim.
+        let home = tempfile::tempdir().expect("home dir");
+        let _home_iso = crate::secrets::test_support::EnvStoreHome::at(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = JsonMap::new();
+        stored.insert(
+            "config".to_string(),
+            json!({ "env": "local", "oauth_device_code": "device-code-secret" }),
+        );
+        save_backend_state(
+            temp.path(),
+            "default",
+            "default",
+            "messaging-teams",
+            &stored,
+        )
+        .expect("save state");
+
+        let mut loaded = load_backend_state(
+            temp.path(),
+            "local",
+            "default",
+            "default",
+            "messaging-teams",
+        )
+        .expect("load state");
+        loaded
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+            .expect("config")
+            .remove("oauth_device_code");
+        let path = save_backend_state(
+            temp.path(),
+            "default",
+            "default",
+            "messaging-teams",
+            &loaded,
+        )
+        .expect("re-save state");
+
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read state"))
+                .expect("parse state");
+        assert!(
+            on_disk.get(SECRET_REFS_KEY).is_none(),
+            "stale ref carried forward: {:?}",
+            on_disk.get(SECRET_REFS_KEY)
         );
     }
 

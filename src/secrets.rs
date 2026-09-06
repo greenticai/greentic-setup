@@ -603,6 +603,60 @@ pub(crate) mod test_support {
             }
         }
     }
+
+    /// Isolation that KEEPS the per-env store layout intact.
+    ///
+    /// [`StoreOverride`] collapses every env onto one file, so it cannot catch a
+    /// writer and a reader disagreeing about *which env's* store to open — the
+    /// exact shape of the `device_login_not_started` bug. This helper instead
+    /// redirects `HOME` (what `LocalFsStore::default_root` resolves) into a temp
+    /// dir and clears the override, so `~/.greentic/environments/<env>/…` still
+    /// yields a distinct file per env, just under the temp root.
+    pub(crate) struct EnvStoreHome {
+        _guard: MutexGuard<'static, ()>,
+        previous_home: Option<std::ffi::OsString>,
+        previous_override: Option<String>,
+    }
+
+    impl EnvStoreHome {
+        pub(crate) fn at(dir: &Path) -> Self {
+            let guard = env_lock();
+            let previous_home = std::env::var_os(HOME_VAR);
+            let previous_override = std::env::var(super::OVERRIDE_ENV).ok();
+            // SAFETY: the process-global env is mutated only while holding
+            // `env_lock`, and Drop restores the prior state.
+            unsafe {
+                std::env::set_var(HOME_VAR, dir);
+                std::env::remove_var(super::OVERRIDE_ENV);
+            }
+            Self {
+                _guard: guard,
+                previous_home,
+                previous_override,
+            }
+        }
+    }
+
+    impl Drop for EnvStoreHome {
+        fn drop(&mut self) {
+            // SAFETY: still holding `env_lock` (dropped after this).
+            unsafe {
+                match self.previous_home.take() {
+                    Some(value) => std::env::set_var(HOME_VAR, value),
+                    None => std::env::remove_var(HOME_VAR),
+                }
+                match self.previous_override.take() {
+                    Some(value) => std::env::set_var(super::OVERRIDE_ENV, value),
+                    None => std::env::remove_var(super::OVERRIDE_ENV),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    const HOME_VAR: &str = "USERPROFILE";
+    #[cfg(not(windows))]
+    const HOME_VAR: &str = "HOME";
 }
 
 #[cfg(test)]

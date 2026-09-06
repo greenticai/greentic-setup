@@ -108,6 +108,91 @@ pub fn derive_gtunnel_id(tenant: &str, _team: &str) -> String {
     }
 }
 
+/// The managed-tunnel id for the application rooted at `bundle_path`, in
+/// strict precedence order:
+///
+/// 1. the id already recorded in `.greentic/tunnel.json` — ALWAYS wins, so an
+///    application keeps one id for its whole life. That id is baked into the
+///    URLs registered with Slack, Webex and OAuth providers; re-deriving or
+///    re-minting over it would strand every one of them.
+/// 2. otherwise a freshly MINTED id (see [`mint_gtunnel_id`]), persisted
+///    immediately so step 1 catches it from here on. This is the creation
+///    point: two applications built from the same bundle under the same tenant
+///    name must not land on the same public URL, which is exactly what the
+///    deterministic derivation did.
+/// 3. only if that write fails, [`derive_gtunnel_id`]. A minted id we cannot
+///    persist would be different on every run, whereas the derivation is stable
+///    for (install, tenant) — and it is byte-identical to what greentic-start
+///    falls back to when no id is recorded, so the two binaries still agree.
+///
+/// Persisting BEFORE the tunnel is proven reachable is deliberate: the id must
+/// survive a failed attempt, or the retry would mint a second one. Nothing is
+/// registered against an unreachable tunnel anyway — setup bails first.
+pub fn resolve_gtunnel_id_for_bundle(bundle_path: &Path, tenant: &str) -> String {
+    if let Some(existing) = crate::platform_setup::load_tunnel_artifact(bundle_path)
+        .ok()
+        .flatten()
+        .and_then(|answers| answers.tunnel_id)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+    {
+        return existing;
+    }
+
+    let minted = mint_gtunnel_id(tenant);
+    let answers = crate::platform_setup::TunnelAnswers {
+        // Mode is owned by the wizard/UI selection; persisting merges per field.
+        mode: None,
+        tunnel_id: Some(minted.clone()),
+    };
+    match crate::platform_setup::persist_tunnel_artifact(bundle_path, &answers) {
+        Ok(path) => {
+            eprintln!(
+                "[setup tunnel-id] minted gtunnel id `{minted}` for this application in {} — \
+                 it is now fixed for the life of the application",
+                path.display()
+            );
+            minted
+        }
+        Err(err) => {
+            let derived = derive_gtunnel_id(tenant, "");
+            eprintln!(
+                "warning: could not record a minted gtunnel id ({err:#}); falling back to the \
+                 derived id `{derived}`, which greentic-start derives identically but which two \
+                 applications on the same tenant would share"
+            );
+            derived
+        }
+    }
+}
+
+/// Mint a BRAND-NEW managed-tunnel id for `tenant`.
+///
+/// Shape is identical to [`derive_gtunnel_id`] — `<sanitized tenant>-<5 hex>` —
+/// so minted and derived ids are interchangeable everywhere downstream: the
+/// Worker's path routing, the `<tenant>` segment of the webchat URL space, and
+/// greentic-start's served-tenant alias all assume that one shape.
+///
+/// Entropy is the OS-seeded CSPRNG behind `rand::random`, NOT the install seed
+/// and NOT a clock. The seed-derived suffix is a pure function of
+/// (install, tenant), so a second application created from the same bundle
+/// under the same tenant name reproduced the first one's id and therefore its
+/// public URL — the bug this exists to fix. A clock reading fails the same way
+/// for two applications created within one tick, and degrades on a clock reset.
+///
+/// 5 hex is 20 bits, kept rather than widened because the width is part of the
+/// id shape above. Two applications collide with probability ~2^-20; a
+/// collision is loud rather than silent — the Worker permits one agent socket
+/// per tunnel id, so the second application's tunnel is refused rather than
+/// quietly stealing traffic.
+pub fn mint_gtunnel_id(tenant: &str) -> String {
+    format!(
+        "{}-{:05x}",
+        sanitize_tunnel_id(tenant),
+        rand::random::<u32>() & 0x000f_ffff
+    )
+}
+
 /// Slug of `tenant`: lowercase alphanumerics and `-`, everything else folded to
 /// `-`, trimmed, empty falling back to `default`. Matches greentic-start's
 /// `sanitize_tunnel_id`.
@@ -1114,6 +1199,85 @@ mod tests {
         );
     }
 
+    // ---- minting and per-application id resolution ----
+
+    #[test]
+    fn minted_ids_have_the_derived_shape_but_are_unique_per_call() {
+        // Same shape as `derive_gtunnel_id`, so minted and derived ids are
+        // interchangeable in the URL space and in greentic-start's alias.
+        let ids: std::collections::BTreeSet<String> =
+            (0..64).map(|_| mint_gtunnel_id("Acme Corp")).collect();
+        for id in &ids {
+            let (base, suffix) = id.rsplit_once('-').expect("id carries a suffix");
+            assert_eq!(base, "acme-corp");
+            assert_eq!(suffix.len(), 5, "5-hex suffix, got {id}");
+            assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        }
+        // The whole point: creating a second application under the same tenant
+        // name must not reproduce the first one's URL. 64 draws from 2^20 will
+        // collide with probability ~1/500, so a handful of duplicates is fine
+        // but a single value is not.
+        assert!(ids.len() > 32, "minting must not be deterministic: {ids:?}");
+    }
+
+    #[test]
+    fn resolving_mints_once_and_then_adopts_the_recorded_id() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let first = resolve_gtunnel_id_for_bundle(bundle.path(), "demo");
+        assert!(first.starts_with("demo-"), "{first}");
+        assert_eq!(
+            crate::platform_setup::load_tunnel_artifact(bundle.path())
+                .expect("load")
+                .expect("artifact")
+                .tunnel_id
+                .as_deref(),
+            Some(first.as_str()),
+            "the minted id must be persisted at creation"
+        );
+
+        // Stable for the life of the application, however often setup re-runs.
+        for _ in 0..5 {
+            assert_eq!(resolve_gtunnel_id_for_bundle(bundle.path(), "demo"), first);
+        }
+        // Even if the tenant is later renamed: the registered URLs still carry
+        // the old id, so the recorded value wins over any re-derivation.
+        assert_eq!(resolve_gtunnel_id_for_bundle(bundle.path(), "other"), first);
+    }
+
+    #[test]
+    fn two_applications_from_one_tenant_get_different_ids() {
+        // The regression: `derive_gtunnel_id` is a pure function of
+        // (install, tenant), so a second application built from the same bundle
+        // under the same tenant name served the first one's public URL.
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        assert_ne!(
+            resolve_gtunnel_id_for_bundle(a.path(), "default"),
+            resolve_gtunnel_id_for_bundle(b.path(), "default"),
+        );
+    }
+
+    #[test]
+    fn resolving_preserves_the_recorded_tunnel_mode() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        crate::platform_setup::persist_tunnel_artifact(
+            bundle.path(),
+            &crate::platform_setup::TunnelAnswers {
+                mode: Some("gtunnel".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("seed mode");
+
+        let id = resolve_gtunnel_id_for_bundle(bundle.path(), "demo");
+
+        let saved = crate::platform_setup::load_tunnel_artifact(bundle.path())
+            .expect("load")
+            .expect("artifact");
+        assert_eq!(saved.tunnel_id.as_deref(), Some(id.as_str()));
+        assert_eq!(saved.mode.as_deref(), Some("gtunnel"));
+    }
+
     // ---- per-install clash suffix ----
 
     #[test]
@@ -1131,6 +1295,28 @@ mod tests {
         // Distinct per tenant, so two tenants on one install do not collide.
         let other = install_clash_suffix(dir.path(), "acme").expect("suffix");
         assert_ne!(first, other, "suffix must be tenant-scoped");
+    }
+
+    /// Known-answer vectors for the FALLBACK derivation, pinning the exact
+    /// bytes fed to sha256. greentic-start carries the identical test against
+    /// the identical constants (`gtunnel::tests::
+    /// clash_suffix_known_answers_match_greentic_setup`). The two crates cannot
+    /// share the rule through `greentic-types` (exact-pinned at `=1.1.2` across
+    /// this graph), so this pair of tests is what keeps them byte-identical:
+    /// change one side's hashing and the other side's assertion fails.
+    #[test]
+    fn clash_suffix_known_answers_match_greentic_start() {
+        const SEED: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("instance-seed"), SEED).expect("write seed");
+        assert_eq!(
+            install_clash_suffix(dir.path(), "acme").as_deref(),
+            Some("0c7fe")
+        );
+        assert_eq!(
+            install_clash_suffix(dir.path(), "default").as_deref(),
+            Some("871fd")
+        );
     }
 
     #[test]

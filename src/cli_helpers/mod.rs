@@ -101,9 +101,20 @@ pub fn maybe_start_cli_setup_tunnel(
         return Ok(None);
     }
 
-    // gtunnel context (tunnel id) falls back to env here; the interactive UI
-    // path derives it from tenant/team. See setup_tunnel::start_setup_tunnel.
-    let tunnel = crate::setup_tunnel::start_setup_tunnel(&mode, local_base_url, None)?;
+    // Resolve the managed-tunnel id from the bundle exactly as the UI path
+    // does, so both entry points adopt an id already recorded for this
+    // application (and mint the same way when there is none). Previously this
+    // path fell through to `GREENTIC_TUNNEL_ID` or the literal `default`, which
+    // is not an id greentic-start ever serves.
+    let gtunnel = (mode == "gtunnel").then(|| {
+        crate::setup_tunnel::GtunnelSetupCtx::new(
+            crate::setup_tunnel::resolve_gtunnel_id_for_bundle(
+                bundle_root,
+                loaded.tenant.as_deref().unwrap_or("default"),
+            ),
+        )
+    });
+    let tunnel = crate::setup_tunnel::start_setup_tunnel(&mode, local_base_url, gtunnel)?;
     inject_setup_public_base_url(&mut loaded.setup_answers, &tunnel.public_base_url);
     persist_tunnel_handoff(bundle_root, &tunnel);
     Ok(Some(tunnel))

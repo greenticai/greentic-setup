@@ -30,6 +30,7 @@ pub mod oauth_callback;
 pub mod oauth_device;
 pub mod plan;
 pub mod platform_setup;
+pub mod provider_answers;
 pub mod provider_commands;
 pub mod provider_registry;
 pub mod provider_state;
