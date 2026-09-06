@@ -20,10 +20,11 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use greentic_secrets_lib::core::Error as SecretError;
-use greentic_secrets_lib::{SecretFormat, SecretsStore};
+use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
 use greentic_types::{ExtensionInline, decode_pack_manifest};
 use rand::RngExt as _;
 use serde::Deserialize;
+use serde_json::Value;
 use zip::{ZipArchive, result::ZipError};
 
 const EXT_GENERATED_SECRETS_V1: &str = "greentic.generated-secrets.v1";
@@ -186,18 +187,44 @@ pub fn scope_team<'a>(
 /// target's secrets manager rather than regenerating a divergent one.
 ///
 /// - Existing values are preserved unless the pack opts into
-///   `regenerate_if_present`.
+///   `regenerate_if_present`. In the default (`false`) case, a present value
+///   is never touched — the `generated_present` short-circuit below returns
+///   before a write is even attempted, so there is nothing for
+///   [`crate::secret_collision::check`] to guard there.
 /// - Optional secrets that are absent are warned about and left for runtime
 ///   resolution (mirroring runtime-acquired secrets such as OAuth tokens).
+/// - When `regenerate_if_present` is `true`, this function unconditionally
+///   overwrites whatever is already stored — that write goes through the
+///   same collision guard as every other write in this crate.
+///
+/// `existing_answers` is threaded through for consistency with the other
+/// guarded callers, but a generated secret's key is never recorded there: it
+/// is synthesised by setup itself, not typed in by the operator, so it never
+/// appears in `state/config/<provider_id>/setup-answers.json`. There is no
+/// other did-I-write-this marker available at this call site either — the
+/// stored value can't serve as one, since [`generate_secret_value`] mints a
+/// fresh random value on every call, so even this same bundle regenerating
+/// its own secret would almost never produce byte-identical output to
+/// compare against. Passing the marker through anyway (rather than
+/// hardcoding `None`) keeps this call symmetric with the others and leaves
+/// room for a real marker later, but today it is a no-op: once a
+/// `regenerate_if_present: true` secret has been written once, any later
+/// write to that address — including by the same bundle — reads as "cannot
+/// prove I own this" and is refused, fail-closed, the same way an unreadable
+/// store is. As of this writing no pack in the workspace sets
+/// `regenerate_if_present: true` (all declared instances use `false`), so
+/// this is a real but currently unexercised trade-off, not a regression of
+/// an observed working flow.
 ///
 /// Returns the keys actually introduced (for logging).
-pub async fn introduce_into_store<S: SecretsStore + ?Sized>(
-    store: &S,
+pub async fn introduce_into_store(
+    store: &DevStore,
     env: &str,
     tenant: &str,
     team: Option<&str>,
     provider_id: &str,
     pack_path: &Path,
+    existing_answers: Option<&Value>,
 ) -> Result<Vec<String>> {
     let mut introduced = Vec::new();
     for req in load_generated_requirements_from_pack(pack_path)? {
@@ -219,6 +246,23 @@ pub async fn introduce_into_store<S: SecretsStore + ?Sized>(
             continue;
         }
         let value = generate_secret_value(&req.spec)?;
+        if let Some(collision) = crate::secret_collision::check(
+            store,
+            existing_answers,
+            tenant,
+            team,
+            provider_id,
+            &req.key,
+            &uri,
+            &value,
+        )
+        .await
+        {
+            anyhow::bail!(
+                "{}",
+                crate::secret_collision::message_unattributed(&collision)
+            );
+        }
         store
             .put(&uri, SecretFormat::Text, value.as_bytes())
             .await
@@ -342,9 +386,31 @@ mod tests {
         })
     }
 
+    /// Same declared secret as [`jwt_manifest`], but opted into unconditional
+    /// regeneration on every introduction — the only branch of
+    /// `introduce_into_store` that reaches an actual `store.put` when a value
+    /// is already present, and therefore the only branch where the collision
+    /// guard has anything to check.
+    fn jwt_manifest_regenerating() -> serde_json::Value {
+        serde_json::json!({
+            "extensions": {
+                "greentic.generated-secrets.v1": {
+                    "inline": { "secrets": [{
+                        "key": "jwt_signing_key",
+                        "required": true,
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {"level": "tenant", "team": "_"},
+                        "regenerate_if_present": true
+                    }] }
+                }
+            }
+        })
+    }
+
     #[tokio::test]
     async fn introduce_into_store_generates_persists_and_is_idempotent() {
-        use greentic_secrets_lib::DevStore;
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join("messaging-webchat-gui.gtpack");
         write_pack(
@@ -363,6 +429,7 @@ mod tests {
             Some("default"),
             "messaging-webchat-gui",
             &pack,
+            None,
         )
         .await
         .expect("introduce");
@@ -387,11 +454,169 @@ mod tests {
             Some("default"),
             "messaging-webchat-gui",
             &pack,
+            None,
         )
         .await
         .expect("introduce again");
         assert!(again.is_empty());
         assert_eq!(store.get(&uri).await.expect("still"), value);
+    }
+
+    // ── secret-collision guard (Task 3b) ───────────────────────────────────
+
+    /// A pack that opts into `regenerate_if_present: true` still introduces
+    /// cleanly on a bundle's first run — nothing is stored yet, so
+    /// `secret_collision::check` sees an absent address and does not refuse.
+    /// This is the legitimate flow for this path: the common case (a fresh
+    /// bundle generating its own secret for the first time).
+    #[tokio::test]
+    async fn regenerating_pack_introduces_cleanly_on_first_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("messaging-webchat-gui.gtpack");
+        write_pack(
+            &pack,
+            &[(
+                "pack.manifest.json",
+                serde_json::to_vec(&jwt_manifest_regenerating()).unwrap(),
+            )],
+        );
+        let store = DevStore::with_path(dir.path().join(".dev.secrets.env")).expect("store");
+
+        let introduced = introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+            None,
+        )
+        .await
+        .expect("a fresh bundle's first introduction must not be refused");
+        assert_eq!(introduced, vec!["jwt_signing_key".to_string()]);
+    }
+
+    /// A second bundle regenerating an already-occupied generated secret must
+    /// be refused, the same as any other write this crate makes to the
+    /// shared dev store. This is the concrete case the task names: two
+    /// bundles under one tenant both declaring `messaging-webchat-gui`'s
+    /// `jwt_signing_key` must not silently clobber each other.
+    ///
+    /// There is no did-I-write-this marker for a generated secret (see the
+    /// doc comment on `introduce_into_store`), so `existing_answers` is
+    /// `None` here exactly as it would be in practice — this test exercises
+    /// the fail-closed path, not a contrived one.
+    #[tokio::test]
+    async fn a_second_bundle_regenerating_an_occupied_secret_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("messaging-webchat-gui.gtpack");
+        write_pack(
+            &pack,
+            &[(
+                "pack.manifest.json",
+                serde_json::to_vec(&jwt_manifest_regenerating()).unwrap(),
+            )],
+        );
+        let store = DevStore::with_path(dir.path().join(".dev.secrets.env")).expect("store");
+
+        // Bundle A's own generated value, already resolved and stored.
+        let uri = crate::canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        store
+            .put(&uri, SecretFormat::Text, b"bundle-a-signing-key")
+            .await
+            .expect("seed bundle A's value");
+
+        // Bundle B runs setup for the same provider under the same tenant,
+        // with no record of ever having written this key.
+        let err = introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+            None,
+        )
+        .await
+        .expect_err("a second bundle must not clobber bundle A's generated secret");
+
+        let text = err.to_string();
+        assert!(text.contains("jwt_signing_key"), "{text}");
+        assert!(
+            text.contains("--team"),
+            "the error must tell the operator how to proceed: {text}"
+        );
+        assert!(
+            !text.contains("written by a different bundle"),
+            "the guard cannot verify who wrote it — bundle B is the only bundle in this \
+             test, so claiming a second one would be false: {text}"
+        );
+    }
+
+    /// The landmine this fail-closed choice creates, pinned so CI catches it
+    /// the day someone flips a pack to `regenerate_if_present: true`: the
+    /// *same* bundle, re-running `introduce_into_store` a second time for a
+    /// secret it generated itself, is refused exactly like a different
+    /// bundle would be — there is no did-I-write-this marker that can tell
+    /// the two apart (see the doc comment on `introduce_into_store`). No
+    /// pack in the workspace sets this flag today, so nothing breaks in
+    /// practice yet; this test exists so the day one does, the trade-off is
+    /// enforced by CI rather than discovered in production.
+    #[tokio::test]
+    async fn same_bundle_regenerating_an_existing_secret_is_refused_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("messaging-webchat-gui.gtpack");
+        write_pack(
+            &pack,
+            &[(
+                "pack.manifest.json",
+                serde_json::to_vec(&jwt_manifest_regenerating()).unwrap(),
+            )],
+        );
+        let store = DevStore::with_path(dir.path().join(".dev.secrets.env")).expect("store");
+
+        introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+            None,
+        )
+        .await
+        .expect("this bundle's own first introduction must not be refused");
+
+        // Same bundle, same `existing_answers` (`None`, exactly as before —
+        // a generated secret's key was never going to be in there either
+        // way), running setup again.
+        let err = introduce_into_store(
+            &store,
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            &pack,
+            None,
+        )
+        .await
+        .expect_err(
+            "fail-closed means even this same bundle's second run is refused, \
+             not just a different bundle's — that is the documented trade-off",
+        );
+
+        let text = err.to_string();
+        assert!(text.contains("jwt_signing_key"), "{text}");
+        assert!(
+            !text.contains("written by a different bundle"),
+            "no other bundle exists in this test — the message must not claim one does: {text}"
+        );
     }
 
     #[test]
