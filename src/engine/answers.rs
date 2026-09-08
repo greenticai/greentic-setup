@@ -48,7 +48,8 @@ pub fn emit_answers(
             "deployment_targets": plan.metadata.deployment_targets,
             "tunnel": tunnel_value
         },
-        "setup_answers": {}
+        "setup_answers": {},
+        "answers_schema": { "setup_answers": {} }
     });
 
     if !plan.metadata.static_routes.public_web_enabled
@@ -74,6 +75,10 @@ pub fn emit_answers(
     // Discover packs and populate question templates for all providers.
     // If a provider entry already exists but is empty, merge in the
     // questions from setup.yaml so the user sees what needs to be filled.
+    // `answers_schema` entries are accumulated separately (rather than
+    // written straight into `answers_doc`) because `setup_answers` already
+    // holds a mutable borrow of `answers_doc` for the duration of this loop.
+    let mut discovered_schemas: JsonMap<String, Value> = JsonMap::new();
     if bundle.exists() {
         let discovered = discovery::discover(bundle)?;
         for provider in discovered.setup_targets() {
@@ -83,11 +88,20 @@ pub fn emit_answers(
                 .and_then(|v| v.as_object())
                 .is_some_and(|m| m.is_empty());
             if !setup_answers.contains_key(&provider_id) || existing_is_empty {
-                let template = if let Some(form_spec) =
-                    crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider_id)
-                {
-                    template_from_form_spec(&form_spec)
-                } else if let Some(spec) = setup_input::load_setup_spec(&provider.pack_path)? {
+                let form_spec =
+                    crate::setup_to_formspec::pack_to_form_spec(&provider.pack_path, &provider_id);
+                // Loaded unconditionally, not only as the no-FormSpec
+                // fallback: `setup.yaml` is the ONLY source of `group`,
+                // `placeholder` and `docs_url`, and a provider that has a
+                // FormSpec still has those. `src/ui/mod.rs` already builds the
+                // same lookup for the browser wizard ("extra fields
+                // (placeholder, group, docs_url) from setup.yaml"); this makes
+                // the emitted schema carry what that feed carries, instead of
+                // the two disagreeing about what a question is.
+                let setup_spec = setup_input::load_setup_spec(&provider.pack_path)?;
+                let template = if let Some(form_spec) = &form_spec {
+                    template_from_form_spec(form_spec)
+                } else if let Some(spec) = &setup_spec {
                     let mut entries = JsonMap::new();
                     for question in &spec.questions {
                         let default_value = infer_default_value(question);
@@ -97,10 +111,24 @@ pub fn emit_answers(
                 } else {
                     JsonMap::new()
                 };
-                setup_answers.insert(provider_id, Value::Object(template));
+                setup_answers.insert(provider_id.clone(), Value::Object(template));
+
+                let schema = if let Some(form_spec) = &form_spec {
+                    schema_from_form_spec(form_spec, setup_spec.as_ref())
+                } else if let Some(spec) = &setup_spec {
+                    schema_from_setup_spec(spec)
+                } else {
+                    JsonMap::new()
+                };
+                discovered_schemas.insert(provider_id, Value::Object(schema));
             }
         }
     }
+
+    answers_doc["answers_schema"]["setup_answers"]
+        .as_object_mut()
+        .expect("answers_schema.setup_answers is an object")
+        .extend(discovered_schemas);
 
     // Prompt for secret values if interactive
     if interactive {
@@ -508,6 +536,110 @@ fn template_from_form_spec(form_spec: &qa_spec::FormSpec) -> JsonMap<String, Val
             .map(|default| crate::qa::prompts::parse_typed_value(question.kind, default))
             .unwrap_or_else(|| empty_value_for_question(question.kind));
         entries.insert(question.id.clone(), value);
+    }
+    entries
+}
+
+/// Build the per-question schema (required/secret/title) mirroring
+/// `template_from_form_spec`, so a shell-out consumer can classify each field.
+/// The per-question schema written into `answers_schema.setup_answers`.
+///
+/// This is what a caller that renders a FORM reads — the designer's setup
+/// gate is the one in the tree today. It used to carry three keys
+/// (`required`, `secret`, `title`), which is enough to decide whether an
+/// answer is missing and nothing else: every question came out as a free-text
+/// box. A `Boolean` rendered as a text field an operator had to type `true`
+/// into, an `Enum` lost its `choices`, and a question with a `visible_if`
+/// was shown unconditionally — so a bundle whose 17 of 26 questions are
+/// conditional presented all 26 at once.
+///
+/// The attributes below all already existed; they were simply not emitted.
+/// Adding them is backward compatible: a reader that only knows the original
+/// three keeps working, because nothing was renamed or removed.
+///
+/// `setup_yaml` supplies `group`, `placeholder` and `docs_url`, which live
+/// only in `setup.yaml` and not on a `QuestionSpec`. It is matched by
+/// question id, and a provider with no `setup.yaml` simply contributes none
+/// of the three — the FormSpec-derived keys are unaffected either way.
+fn schema_from_form_spec(
+    form_spec: &qa_spec::FormSpec,
+    setup_yaml: Option<&setup_input::SetupSpec>,
+) -> JsonMap<String, Value> {
+    let mut entries = JsonMap::new();
+    for question in &form_spec.questions {
+        let mut spec = JsonMap::new();
+        // The original three. Order and spelling are unchanged on purpose —
+        // this is the part existing readers depend on.
+        spec.insert("required".into(), Value::Bool(question.required));
+        spec.insert("secret".into(), Value::Bool(question.secret));
+        spec.insert("title".into(), Value::String(question.title.clone()));
+
+        // `kind` decides the CONTROL. Serialized through `QuestionType`'s own
+        // Serialize rather than a hand-written match, so a variant added
+        // upstream cannot silently fall through to a default here.
+        if let Ok(kind) = serde_json::to_value(question.kind) {
+            spec.insert("kind".into(), kind);
+        }
+        if let Some(choices) = &question.choices {
+            spec.insert(
+                "choices".into(),
+                Value::Array(choices.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        if let Some(default) = &question.default_value {
+            spec.insert("default_value".into(), Value::String(default.clone()));
+        }
+        // Emitted verbatim: `visible_if` is an `Expr`, and a reader that
+        // cannot evaluate one must be able to tell "conditional, shape I do
+        // not understand" from "not conditional". Flattening it to a
+        // `{field, eq}` pair here would make an unsupported expression
+        // indistinguishable from an absent one.
+        if let Some(visible_if) = &question.visible_if
+            && let Ok(expr) = serde_json::to_value(visible_if)
+        {
+            spec.insert("visible_if".into(), expr);
+        }
+        if let Some(help) = &question.description {
+            spec.insert("help".into(), Value::String(help.clone()));
+        }
+
+        if let Some(extra) =
+            setup_yaml.and_then(|s| s.questions.iter().find(|q| q.name == question.id))
+        {
+            if let Some(group) = &extra.group {
+                spec.insert("group".into(), Value::String(group.clone()));
+            }
+            if let Some(placeholder) = &extra.placeholder {
+                spec.insert("placeholder".into(), Value::String(placeholder.clone()));
+            }
+            if let Some(docs_url) = &extra.docs_url {
+                spec.insert("docs_url".into(), Value::String(docs_url.clone()));
+            }
+        }
+
+        entries.insert(question.id.clone(), Value::Object(spec));
+    }
+    entries
+}
+
+/// Build a best-effort per-question schema for providers without a
+/// FormSpec (the `setup.yaml`-only fallback), mirroring the `entries`
+/// built for those providers in `emit_answers`.
+///
+/// No FormSpec is available here, so secret classification can't be
+/// derived (setup.yaml's own `secret` flag is not wired into the
+/// prompt/encrypt paths for this fallback); `secret` is always `false`.
+fn schema_from_setup_spec(spec: &setup_input::SetupSpec) -> JsonMap<String, Value> {
+    let mut entries = JsonMap::new();
+    for question in &spec.questions {
+        entries.insert(
+            question.name.clone(),
+            serde_json::json!({
+                "required": question.required,
+                "secret": false,
+                "title": question.name.clone(),
+            }),
+        );
     }
     entries
 }
@@ -1037,6 +1169,250 @@ questions:
         assert_eq!(
             doc.pointer("/setup_answers/weather-app/weather_api_key"),
             Some(&Value::String(String::new()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn emit_answers_includes_answers_schema_with_required_and_secret_flags() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle_root = temp.path().join("bundle");
+        crate::bundle::create_demo_bundle_structure(&bundle_root, Some("weather-demo"))?;
+
+        let pack_path = bundle_root.join("packs").join("weather-app.gtpack");
+        write_app_pack(&pack_path, "weather-app", "WEATHER_API_KEY")?;
+
+        let engine = SetupEngine::new(SetupConfig {
+            tenant: "demo".to_string(),
+            team: None,
+            env: "dev".to_string(),
+            offline: false,
+            verbose: false,
+        });
+        let request = SetupRequest {
+            bundle: bundle_root.clone(),
+            tenants: vec![TenantSelection {
+                tenant: "demo".to_string(),
+                team: None,
+                allow_paths: Vec::new(),
+            }],
+            update_ops: BTreeSet::new(),
+            static_routes: StaticRoutesPolicy::default(),
+            ..Default::default()
+        };
+        let plan = engine.plan(crate::SetupMode::Create, &request, true)?;
+
+        let answers_path = temp.path().join("answers.json");
+        emit_answers(engine.config(), &plan, &answers_path, None, false)?;
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&answers_path)?)?;
+        let field = &doc["answers_schema"]["setup_answers"]["weather-app"]["weather_api_key"];
+        assert_eq!(field["required"], serde_json::json!(true));
+        assert_eq!(field["secret"], serde_json::json!(true));
+        assert!(field["title"].is_string());
+        Ok(())
+    }
+
+    /// The emitted schema is what a form-rendering caller reads, and for a
+    /// long time it carried three keys — enough to decide "is this answered"
+    /// and nothing else. Every question therefore came out as a free-text
+    /// box: a `Boolean` an operator had to type `true` into, an `Enum` with
+    /// its `choices` dropped, and a conditional question shown
+    /// unconditionally.
+    ///
+    /// Both fixtures are DESERIALIZED rather than built with struct literals.
+    /// Neither `FormSpec` nor `SetupSpec` implements `Default`, and going
+    /// through serde is the better test anyway: it is the shape these arrive
+    /// in, so a field renamed upstream fails here rather than compiling
+    /// against a literal that no longer matches the wire.
+    #[test]
+    fn schema_from_form_spec_carries_what_a_form_needs_to_render_a_control() {
+        let form_spec: qa_spec::FormSpec = serde_json::from_value(serde_json::json!({
+            "id": "webchat",
+            "title": "Webchat",
+            "version": "1",
+            "questions": [
+                {
+                    "id": "mode",
+                    "type": "enum",
+                    "title": "Mode",
+                    "required": true,
+                    "choices": ["local_queue", "direct"],
+                    "default_value": "local_queue",
+                    "description": "WebChat connection mode"
+                },
+                { "id": "oauth_enabled", "type": "boolean", "title": "Enable OAuth login" }
+            ]
+        }))
+        .expect("form spec fixture");
+
+        let schema = schema_from_form_spec(&form_spec, None);
+
+        let mode = &schema["mode"];
+        // The three original keys are untouched — a reader that knows only
+        // these keeps working, which is what makes this additive.
+        assert_eq!(mode["required"], Value::Bool(true));
+        assert_eq!(mode["secret"], Value::Bool(false));
+        assert_eq!(mode["title"], Value::String("Mode".into()));
+        // …and the ones that decide the control.
+        assert_eq!(mode["kind"], Value::String("enum".into()));
+        assert_eq!(mode["choices"][0], Value::String("local_queue".into()));
+        assert_eq!(mode["default_value"], Value::String("local_queue".into()));
+        assert_eq!(
+            mode["help"],
+            Value::String("WebChat connection mode".into())
+        );
+
+        assert_eq!(
+            schema["oauth_enabled"]["kind"],
+            Value::String("boolean".into())
+        );
+        // Absent rather than null: a question with no choices must not look
+        // like an enum whose choices failed to load.
+        assert!(schema["oauth_enabled"].get("choices").is_none());
+        assert!(schema["oauth_enabled"].get("visible_if").is_none());
+    }
+
+    /// A conditional question travels as its own expression, not flattened.
+    /// A reader that cannot evaluate an `Expr` still has to tell "conditional,
+    /// shape I do not understand" apart from "not conditional" — flattening
+    /// would make an unsupported expression indistinguishable from an absent
+    /// one, and the field would be shown when it should be hidden.
+    #[test]
+    fn schema_from_form_spec_keeps_a_visible_if_expression() {
+        let form_spec: qa_spec::FormSpec = serde_json::from_value(serde_json::json!({
+            "id": "webchat",
+            "title": "Webchat",
+            "version": "1",
+            "questions": [{
+                "id": "oauth_google_client_id",
+                "type": "string",
+                "title": "Google Client ID",
+                "visible_if": {
+                    "op": "eq",
+                    "left": { "op": "answer", "path": "oauth_enable_google" },
+                    "right": { "op": "literal", "value": "true" }
+                }
+            }]
+        }))
+        .expect("form spec fixture");
+
+        let schema = schema_from_form_spec(&form_spec, None);
+        let cond = &schema["oauth_google_client_id"]["visible_if"];
+        // Round-trips as the AST it is, rather than as a flattened pair.
+        assert_eq!(cond["op"], Value::String("eq".into()));
+        assert_eq!(
+            cond["left"]["path"],
+            Value::String("oauth_enable_google".into())
+        );
+    }
+
+    /// `group`, `placeholder` and `docs_url` exist only in `setup.yaml`, not
+    /// on a `QuestionSpec`. Without them a 26-question provider renders as
+    /// one undifferentiated wall, which is what the eight groups on the real
+    /// webchat pack exist to prevent.
+    #[test]
+    fn schema_from_form_spec_merges_the_setup_yaml_only_attributes() {
+        let form_spec: qa_spec::FormSpec = serde_json::from_value(serde_json::json!({
+            "id": "webchat",
+            "title": "Webchat",
+            "version": "1",
+            "questions": [
+                { "id": "oauth_google_client_id", "type": "string", "title": "Google Client ID" }
+            ]
+        }))
+        .expect("form spec fixture");
+        let setup_yaml: setup_input::SetupSpec = serde_json::from_value(serde_json::json!({
+            "questions": [{
+                "name": "oauth_google_client_id",
+                "group": "OAuth - Google",
+                "placeholder": "123456789.apps.googleusercontent.com",
+                "docs_url": "https://console.cloud.google.com/apis/credentials"
+            }]
+        }))
+        .expect("setup.yaml fixture");
+
+        let q = &schema_from_form_spec(&form_spec, Some(&setup_yaml))["oauth_google_client_id"];
+        assert_eq!(q["group"], Value::String("OAuth - Google".into()));
+        assert_eq!(
+            q["placeholder"],
+            Value::String("123456789.apps.googleusercontent.com".into())
+        );
+        assert_eq!(
+            q["docs_url"],
+            Value::String("https://console.cloud.google.com/apis/credentials".into())
+        );
+
+        // A provider with no setup.yaml contributes none of the three, and
+        // the FormSpec-derived keys are unaffected either way.
+        let bare = schema_from_form_spec(&form_spec, None);
+        assert!(bare["oauth_google_client_id"].get("group").is_none());
+        assert_eq!(
+            bare["oauth_google_client_id"]["title"],
+            Value::String("Google Client ID".into())
+        );
+    }
+
+    #[test]
+    fn schema_from_setup_spec_defaults_secret_false_and_uses_required_flag() {
+        let spec = setup_input::SetupSpec {
+            title: None,
+            description: None,
+            // Named rather than filled by a struct-update: develop added this
+            // field after the commit this test came from, and naming it keeps
+            // the next addition a compile error here too.
+            setup_actions: Vec::new(),
+            questions: vec![
+                setup_input::SetupQuestion {
+                    name: "api_key".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                setup_input::SetupQuestion {
+                    name: "region".to_string(),
+                    required: false,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let schema = schema_from_setup_spec(&spec);
+
+        assert_eq!(
+            schema["api_key"],
+            serde_json::json!({ "required": true, "secret": false, "title": "api_key" })
+        );
+        assert_eq!(
+            schema["region"],
+            serde_json::json!({ "required": false, "secret": false, "title": "region" })
+        );
+    }
+
+    /// Regression guard: `load_answers` must keep ignoring unknown
+    /// top-level fields such as `answers_schema` (an emit → fill →
+    /// `--answers` round trip must stay safe after Task A1 added it).
+    #[test]
+    fn load_answers_tolerates_answers_schema_field() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("answers.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "greentic_setup_version": "1.0.0",
+                "tenant": "acme", "team": null, "env": "dev",
+                "platform_setup": { "static_routes": {}, "deployment_targets": [], "tunnel": { "mode": null } },
+                "setup_answers": { "weather-app": { "weather_api_key": "k" } },
+                "answers_schema": { "setup_answers": { "weather-app": { "weather_api_key": { "required": true, "secret": true, "title": "Weather API key" } } } }
+            })
+            .to_string(),
+        )?;
+
+        let loaded = load_answers(&path, None, false)?;
+        assert_eq!(loaded.tenant.as_deref(), Some("acme"));
+        assert_eq!(
+            loaded.setup_answers["weather-app"]["weather_api_key"],
+            serde_json::json!("k")
         );
         Ok(())
     }
