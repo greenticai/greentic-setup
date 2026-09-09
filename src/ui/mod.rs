@@ -72,6 +72,17 @@ struct UiState {
     shutdown_tx: broadcast::Sender<()>,
     #[allow(dead_code)]
     result: Mutex<Option<ExecutionResult>>,
+    /// Keys this wizard session has itself successfully autosaved to the
+    /// shared secrets store, per provider — the did-I-write-this marker for
+    /// the collision guard on the draft-autosave path (`persist_ui_draft`),
+    /// which cannot use a file-based prior-answers read (drafts happen well
+    /// before anything is committed to `setup-answers.json`). A key in this
+    /// set is this same session's own value, so retyping it keeps working; a
+    /// key NOT in this set that the store already holds under a different
+    /// value belongs to another bundle, and the guard refuses it. See
+    /// `docs/secrets-flow.md`.
+    autosaved_answer_keys:
+        Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 }
 
 struct SetupRuntime {
@@ -480,6 +491,7 @@ pub async fn launch(
         setup_runtime_start: AsyncMutex::new(()),
         shutdown_tx: shutdown_tx.clone(),
         result: Mutex::new(None),
+        autosaved_answer_keys: Mutex::new(std::collections::HashMap::new()),
     });
 
     let router = build_router(state.clone());
@@ -6700,7 +6712,7 @@ async fn post_draft(
         }
     }
     match persist_ui_draft(
-        &state.bundle_path,
+        &state,
         &req.tenant,
         req.team.as_deref(),
         &req.env,
@@ -6815,7 +6827,7 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             req.provider_id, req.action_id
         );
     }
-    persist_ui_draft(&state.bundle_path, &tenant, team.as_deref(), &env, &answers).await?;
+    persist_ui_draft(state, &tenant, team.as_deref(), &env, &answers).await?;
 
     let discovered = discovery::discover(&state.bundle_path)?;
     let provider = discovered
@@ -6992,6 +7004,33 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
             req.provider_id, req.action_id
         );
     }
+    // This bundle's own prior answers for this provider, used only as the
+    // did-I-write-this marker for the collision guard below. Two sources,
+    // merged: the on-disk `setup-answers.json` (a prior, already-committed
+    // `gtc setup` run for this same bundle/provider), and this session's own
+    // `autosaved_answer_keys` — the `persist_ui_draft` call above just wrote
+    // `answers[provider_id]`'s fields straight to the shared store, and the
+    // registration op's `output` / the resolved final URL (merged into
+    // `config` above) can legitimately refine one of those same keys with a
+    // different value (e.g. a placeholder `client_id` replaced by the value
+    // the provider's own API just issued). Without the session-tracked half,
+    // that refinement looks identical to another bundle's write and gets
+    // refused, on a bundle's very first setup action for a provider — before
+    // any `setup-answers.json` exists at all.
+    let existing_answers = {
+        let mut merged =
+            crate::qa::persist::read_provider_setup_answers(&state.bundle_path, &req.provider_id)?;
+        let tracked = state
+            .autosaved_answer_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let (Some(map), Some(keys)) = (merged.as_object_mut(), tracked.get(&req.provider_id)) {
+            for key in keys {
+                map.entry(key.clone()).or_insert(Value::Null);
+            }
+        }
+        merged
+    };
     crate::qa::persist::persist_all_config_as_secrets(
         &state.bundle_path,
         &env,
@@ -7000,6 +7039,7 @@ async fn execute_setup_action(state: &UiState, req: SetupActionRequest) -> Resul
         &req.provider_id,
         &Value::Object(config.clone()),
         Some(&provider.pack_path),
+        Some(&existing_answers),
     )
     .await?;
     eprintln!(
@@ -7796,12 +7836,13 @@ async fn load_saved_secrets(
 }
 
 async fn persist_ui_draft(
-    bundle_path: &Path,
+    state: &UiState,
     tenant: &str,
     team: Option<&str>,
     env: &str,
     answers: &JsonMap<String, Value>,
 ) -> Result<JsonMap<String, Value>> {
+    let bundle_path = &state.bundle_path;
     let discovered = discovery::discover(bundle_path).ok();
     let mut persisted = JsonMap::new();
 
@@ -7818,6 +7859,32 @@ async fn persist_ui_draft(
                 .map(|provider| provider.pack_path.as_path())
         });
 
+        // This debounced autosave path runs continuously while the operator
+        // is still typing, well before anything is committed to this
+        // bundle's `state/config/<provider>/setup-answers.json` (that file
+        // is only written by the CLI's apply-pack-setup step). Passing
+        // `provider_answers` itself as the did-I-write-this marker would
+        // NOT defer the guard, it would disable it: the key being written
+        // is by construction always present in the map supplying the value,
+        // so `check()`'s `contains_key` would always find it and the guard
+        // could never fire.
+        //
+        // Instead, `state.autosaved_answer_keys` tracks the keys THIS wizard
+        // session has itself successfully autosaved so far for this
+        // provider. A key already in that set is this same session
+        // continuing to type — allowed. A key that is NOT in that set, with
+        // the store already holding a different value under it, belongs to
+        // another bundle — refused, on the first autosave that collides,
+        // rather than never (see `docs/secrets-flow.md`).
+        let existing_answers = {
+            let tracked = state
+                .autosaved_answer_keys
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracked
+                .get(provider_id)
+                .map(|keys| Value::Object(keys.iter().map(|k| (k.clone(), Value::Null)).collect()))
+        };
         let keys = crate::qa::persist::persist_all_config_as_secrets(
             bundle_path,
             env,
@@ -7826,10 +7893,21 @@ async fn persist_ui_draft(
             provider_id,
             provider_answers,
             pack_path,
+            existing_answers.as_ref(),
         )
         .await?;
 
         if !keys.is_empty() {
+            {
+                let mut tracked = state
+                    .autosaved_answer_keys
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                tracked
+                    .entry(provider_id.clone())
+                    .or_default()
+                    .extend(keys.iter().cloned());
+            }
             persisted.insert(provider_id.clone(), serde_json::to_value(keys)?);
         }
     }
@@ -8439,6 +8517,7 @@ mod tests {
             setup_runtime_start: tokio::sync::Mutex::new(()),
             shutdown_tx,
             result: Mutex::new(None),
+            autosaved_answer_keys: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -11607,6 +11686,72 @@ questions:
         assert_eq!(payload.action_id, "create_app");
     }
 
+    /// G-3 fix round 1, finding 2: `execute_setup_action` autosaves the
+    /// submitted answers to the store (`persist_ui_draft`), then runs
+    /// registration and persists the resulting config a second time. When
+    /// registration legitimately refines a key the first write just put in
+    /// the store (a placeholder `provider_client_id` replaced by the value
+    /// the provider's own API issues), the second persist must not be
+    /// refused as a collision with the first — they are the same session,
+    /// moments apart, on a bundle's very first setup action for this
+    /// provider (no `setup-answers.json` exists yet to read as prior state).
+    #[tokio::test]
+    async fn setup_action_endpoint_allows_registration_to_refine_a_freshly_drafted_key() {
+        let _store = crate::secrets::test_support::isolated_store();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let providers = temp.path().join("providers/messaging");
+        std::fs::create_dir_all(&providers).expect("providers");
+        write_pack_with_final_and_legacy_setup_actions(
+            &providers.join("messaging-combined-actions.gtpack"),
+            "messaging-combined-actions",
+        )
+        .expect("pack");
+
+        let app = build_router(test_ui_state(temp.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup-action")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider_id": "messaging-combined-actions",
+                            "action_id": "create_app",
+                            "tenant": "demo",
+                            "team": "support",
+                            "env": "dev",
+                            "tunnel": "off",
+                            "answers": {
+                                "messaging-combined-actions": {
+                                    "public_base_url": "https://runtime.example.test",
+                                    // Drafted before registration ran; the
+                                    // registration mock always returns
+                                    // `provider_client_id: generated-client`,
+                                    // refining this same key moments later
+                                    // in the same request.
+                                    "provider_client_id": "placeholder-client"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("setup action response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(
+            body["ok"] == true,
+            "registration refining a key this same request just drafted must not be refused as a collision: {body}"
+        );
+        let add_url = body["values"]["add_url"].as_str().expect("add url");
+        assert!(add_url.contains("client_id=generated-client"));
+    }
+
     #[tokio::test]
     async fn setup_action_endpoint_returns_oauth_url_without_deep_link_action() {
         let _store = crate::secrets::test_support::isolated_store();
@@ -12333,7 +12478,8 @@ setup_actions:
         }))
         .expect("answers");
 
-        let persisted = persist_ui_draft(bundle_root, "dev-tenant", None, "dev", &answers)
+        let state = test_ui_state(bundle_root);
+        let persisted = persist_ui_draft(&state, "dev-tenant", None, "dev", &answers)
             .await
             .expect("persist draft");
         assert_eq!(
@@ -12362,6 +12508,76 @@ setup_actions:
             String::from_utf8(store.get(&alias_uri).await.expect("alias")).expect("alias utf8");
         assert_eq!(base_value, "test-weather-key");
         assert_eq!(alias_value, "test-weather-key");
+    }
+
+    // ── secret-collision guard on the draft-autosave path (G-3 fix round 1) ─
+
+    #[tokio::test]
+    async fn persist_ui_draft_refuses_a_value_another_bundle_already_committed() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
+
+        // Bundle A already committed this secret (e.g. via `gtc setup`) —
+        // the shared env store now holds its value.
+        let bundle_a = tempfile::tempdir().expect("bundle a");
+        let seed_store = open_dev_store_for_env(bundle_a.path(), "dev").expect("open store");
+        let uri =
+            crate::canonical_secret_uri("dev", "demo", None, "messaging-telegram", "bot_token");
+        seed_store
+            .put(&uri, SecretFormat::Text, b"token-a")
+            .await
+            .expect("seed bundle A's committed value");
+
+        // Bundle B is a *different* bundle root: a fresh wizard session over
+        // it types a different value for the same tenant/provider/key.
+        let bundle_b = tempfile::tempdir().expect("bundle b");
+        let state = test_ui_state(bundle_b.path());
+        let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+            "messaging-telegram": { "bot_token": "token-b" }
+        }))
+        .expect("answers");
+
+        let err = persist_ui_draft(&state, "demo", None, "dev", &answers)
+            .await
+            .expect_err(
+                "a fresh session's first autosave must not silently overwrite another bundle's value",
+            );
+        let text = err.to_string();
+        assert!(text.contains("bot_token"), "{text}");
+        assert!(
+            text.contains("--team"),
+            "the error must tell the operator how to proceed: {text}"
+        );
+
+        // And the store must still hold bundle A's original value — the
+        // refusal must have actually happened before the write, not after.
+        let stored = String::from_utf8(seed_store.get(&uri).await.expect("read store"))
+            .expect("stored utf8");
+        assert_eq!(stored, "token-a", "the refused write must not have landed");
+    }
+
+    #[tokio::test]
+    async fn persist_ui_draft_allows_retyping_within_the_same_session() {
+        let _store_iso_dir = tempfile::tempdir().expect("store isolation dir");
+        let _store_iso = crate::secrets::test_support::StoreOverride::in_dir(_store_iso_dir.path());
+
+        let bundle = tempfile::tempdir().expect("bundle");
+        let state = test_ui_state(bundle.path());
+
+        // The same session revises its own draft value repeatedly (typing,
+        // corrections) — none of these may be refused as a collision with
+        // itself.
+        for value in ["t", "to", "tok", "toke", "token-final"] {
+            let answers = serde_json::from_value::<JsonMap<String, Value>>(json!({
+                "messaging-telegram": { "bot_token": value }
+            }))
+            .expect("answers");
+            persist_ui_draft(&state, "demo", None, "dev", &answers)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("retyping within one session must not be refused: {err}")
+                });
+        }
     }
 
     #[test]

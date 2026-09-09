@@ -2555,7 +2555,24 @@ pub fn save_backend_state(
             .with_context(|| format!("create setup backend state dir {}", parent.display()))?;
     }
     let env = backend_state_env(stored);
-    persist_sensitive_backend_config(bundle_root, &env, tenant, team, provider_id, stored)?;
+    // This bundle's own prior backend config for this provider, read BEFORE
+    // it is overwritten below — used only as the did-I-write-this marker for
+    // the collision guard inside `persist_sensitive_backend_config`. Its
+    // sensitive values are already redacted on disk, but that is fine: the
+    // guard only checks key presence, never the value.
+    let existing_config = read_state_file(&path)
+        .ok()
+        .flatten()
+        .and_then(|prior| prior.get("config").cloned());
+    persist_sensitive_backend_config(
+        bundle_root,
+        &env,
+        tenant,
+        team,
+        provider_id,
+        stored,
+        existing_config.as_ref(),
+    )?;
     let redacted = redact_backend_state_for_disk(stored);
     std::fs::write(&path, serde_json::to_vec_pretty(&redacted)?)
         .with_context(|| format!("write setup backend state {}", path.display()))?;
@@ -2574,6 +2591,7 @@ fn backend_state_env(stored: &JsonMap<String, Value>) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_sensitive_backend_config(
     bundle_root: &Path,
     env: &str,
@@ -2581,6 +2599,7 @@ fn persist_sensitive_backend_config(
     team: &str,
     provider_id: &str,
     stored: &JsonMap<String, Value>,
+    existing_answers: Option<&Value>,
 ) -> anyhow::Result<()> {
     let Some(config) = stored.get("config").and_then(Value::as_object) else {
         return Ok(());
@@ -2601,6 +2620,7 @@ fn persist_sensitive_backend_config(
     let tenant = tenant.to_string();
     let team = team.to_string();
     let provider_id = provider_id.to_string();
+    let existing_answers = existing_answers.cloned();
     block_on_backend_secret_task(async move {
         crate::qa::persist::persist_all_config_as_secrets(
             &bundle_root,
@@ -2610,6 +2630,7 @@ fn persist_sensitive_backend_config(
             &provider_id,
             &config,
             None,
+            existing_answers.as_ref(),
         )
         .await
     })
