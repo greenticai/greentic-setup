@@ -640,6 +640,24 @@ pub fn execute_apply_pack_setup(
             }
         }
 
+        // Sync `brand_name` / `brand_logo_url` answers to tenant config JSON for webchat-gui providers
+        match crate::tenant_config::sync_brand_to_tenant_config(
+            bundle_path,
+            &config.tenant,
+            &provider_id,
+            &persisted_answers,
+        ) {
+            Ok(true) => {
+                if config.verbose {
+                    println!("  [brand] updated tenant config for {provider_id}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                println!("  [brand] WARNING: failed to update tenant config: {e}");
+            }
+        }
+
         // Sync `nav_links_json` answer to tenant config JSON for webchat-gui providers
         if provider_id.contains("webchat-gui") && config.verbose {
             let preview = answers
