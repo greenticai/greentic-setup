@@ -325,3 +325,11 @@ The current maintained documents in this repo are:
 
 Older demo walkthroughs and stale checklist docs were removed so the repo has a
 smaller, more trustworthy surface.
+
+## Dev builds
+
+Every Dev Publish run on `develop` creates a GitHub prerelease tagged
+`v1.2.<run-id>` carrying prebuilt `greentic-setup-dev` archives, which is what
+`gtc install --channel dev` installs. The binary inside reports that same
+`1.2.<run-id>` from `--version`, so any dev binary can be traced back to the
+release and the CI run that built it.
