@@ -651,6 +651,91 @@ pub fn sync_skin_to_tenant_config(
     Ok(true)
 }
 
+/// Sync the webchat-gui `brand_name` / `brand_logo_url` answers into
+/// `brand: { name, logo_url }` in the tenant config.
+///
+/// runtime-bootstrap.js lays that object over the skin's own brand, so the
+/// hosted page shows the tenant's name and logo instead of the skin's. It is
+/// a separate object from `branding` on purpose: `branding.logo` is scaffolded
+/// from default.json with the Greentic mark, so it cannot tell an operator's
+/// choice apart from the template's.
+///
+/// An absent answer key keeps the stored value; an answered-but-empty key
+/// clears it, and clearing both removes `brand` so the page falls back to the
+/// skin. A logo that is not an absolute https URL is dropped: the page refuses
+/// to render one, so writing it would only record a value nothing uses.
+pub fn sync_brand_to_tenant_config(
+    bundle_path: &Path,
+    tenant: &str,
+    provider_id: &str,
+    answers: &Value,
+) -> Result<bool> {
+    if !provider_id.contains("webchat-gui") {
+        return Ok(false);
+    }
+    let Some(answers_obj) = answers.as_object() else {
+        return Ok(false);
+    };
+    if !answers_obj.contains_key("brand_name") && !answers_obj.contains_key("brand_logo_url") {
+        return Ok(false);
+    }
+
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant, provider_id)? else {
+        return Ok(false);
+    };
+
+    let raw = std::fs::read_to_string(&target)
+        .with_context(|| format!("read tenant config {}", target.display()))?;
+    let mut config: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse tenant config {}", target.display()))?;
+    let Some(obj) = config.as_object_mut() else {
+        return Ok(false);
+    };
+
+    let mut brand = obj
+        .get("brand")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (answer_key, brand_key) in [("brand_name", "name"), ("brand_logo_url", "logo_url")] {
+        if !answers_obj.contains_key(answer_key) {
+            continue;
+        }
+        let value = answers_obj
+            .get(answer_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .filter(|v| brand_key != "logo_url" || v.starts_with("https://"));
+        match value {
+            Some(v) => {
+                brand.insert(brand_key.to_string(), Value::String(v.to_string()));
+            }
+            None => {
+                brand.remove(brand_key);
+            }
+        }
+    }
+
+    let next = (!brand.is_empty()).then_some(Value::Object(brand));
+    if obj.get("brand") == next.as_ref() {
+        return Ok(false);
+    }
+    match next {
+        Some(value) => {
+            obj.insert("brand".to_string(), value);
+        }
+        None => {
+            obj.remove("brand");
+        }
+    }
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&target, output)
+        .with_context(|| format!("write tenant config {}", target.display()))?;
+    Ok(true)
+}
+
 /// Sync the webchat-gui setup answer `nav_links_json` into the tenant config's
 /// `nav_links` array.
 ///
@@ -799,8 +884,8 @@ pub fn sync_nav_links_to_tenant_config(
 mod tests {
     use super::{
         is_placeholder_public_base_url, resolve_or_scaffold_tenant_config, resolve_public_base_url,
-        sync_nav_links_to_tenant_config, sync_oauth_to_tenant_config, sync_skin_to_tenant_config,
-        update_tenant_config,
+        sync_brand_to_tenant_config, sync_nav_links_to_tenant_config, sync_oauth_to_tenant_config,
+        sync_skin_to_tenant_config, update_tenant_config,
     };
     use serde_json::{Map, Value, json};
 
@@ -920,6 +1005,130 @@ mod tests {
         assert_eq!(updated["skin"].as_str(), Some("3aigent"));
         // legacy_skin must be preserved (separate concern)
         assert_eq!(updated["legacy_skin"].as_str(), Some("_template"));
+    }
+
+    fn brand_bundle(initial: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let tenant_file = tenants_dir.join("demo.json");
+        std::fs::write(&tenant_file, initial).unwrap();
+        (temp, tenant_file)
+    }
+
+    fn read_json(path: &std::path::Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn sync_brand_writes_brand_object_and_keeps_branding() {
+        let (temp, tenant_file) = brand_bundle(
+            r#"{"tenant_id":"demo","branding":{"logo":"/skins/default/assets/logo.svg"}}"#,
+        );
+        let answers = json!({
+            "brand_name": "  Meridian Insurance ",
+            "brand_logo_url": "https://cdn.example.com/meridian.png"
+        });
+        let changed =
+            sync_brand_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap();
+        assert!(changed);
+        let updated = read_json(&tenant_file);
+        assert_eq!(
+            updated["brand"],
+            json!({"name": "Meridian Insurance", "logo_url": "https://cdn.example.com/meridian.png"})
+        );
+        assert_eq!(
+            updated["branding"]["logo"].as_str(),
+            Some("/skins/default/assets/logo.svg")
+        );
+    }
+
+    #[test]
+    fn sync_brand_skips_when_no_brand_answer_is_present() {
+        let (temp, tenant_file) = brand_bundle(r#"{"tenant_id":"demo","brand":{"name":"Kept"}}"#);
+        let changed = sync_brand_to_tenant_config(
+            temp.path(),
+            "demo",
+            "messaging-webchat-gui",
+            &json!({ "skin": "default" }),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(
+            read_json(&tenant_file)["brand"]["name"].as_str(),
+            Some("Kept")
+        );
+    }
+
+    #[test]
+    fn sync_brand_keeps_a_field_the_answers_do_not_mention() {
+        let (temp, tenant_file) = brand_bundle(
+            r#"{"tenant_id":"demo","brand":{"name":"Old","logo_url":"https://cdn.example.com/a.png"}}"#,
+        );
+        let changed = sync_brand_to_tenant_config(
+            temp.path(),
+            "demo",
+            "messaging-webchat-gui",
+            &json!({ "brand_name": "New" }),
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            read_json(&tenant_file)["brand"],
+            json!({"name": "New", "logo_url": "https://cdn.example.com/a.png"})
+        );
+    }
+
+    #[test]
+    fn sync_brand_empty_answers_remove_the_brand_object() {
+        let (temp, tenant_file) = brand_bundle(
+            r#"{"tenant_id":"demo","brand":{"name":"Old","logo_url":"https://cdn.example.com/a.png"}}"#,
+        );
+        let changed = sync_brand_to_tenant_config(
+            temp.path(),
+            "demo",
+            "messaging-webchat-gui",
+            &json!({ "brand_name": "", "brand_logo_url": "  " }),
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(read_json(&tenant_file).get("brand").is_none());
+    }
+
+    #[test]
+    fn sync_brand_drops_a_non_https_logo() {
+        let (temp, tenant_file) = brand_bundle(r#"{"tenant_id":"demo"}"#);
+        sync_brand_to_tenant_config(
+            temp.path(),
+            "demo",
+            "messaging-webchat-gui",
+            &json!({ "brand_name": "Meridian", "brand_logo_url": "http://cdn.example.com/a.png" }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json(&tenant_file)["brand"],
+            json!({"name": "Meridian"})
+        );
+    }
+
+    #[test]
+    fn sync_brand_is_idempotent_and_ignores_other_providers() {
+        let (temp, tenant_file) = brand_bundle(r#"{"tenant_id":"demo"}"#);
+        let answers = json!({ "brand_name": "Meridian" });
+        assert!(
+            !sync_brand_to_tenant_config(temp.path(), "demo", "messaging-telegram", &answers)
+                .unwrap()
+        );
+        assert!(read_json(&tenant_file).get("brand").is_none());
+        assert!(
+            sync_brand_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap()
+        );
+        assert!(
+            !sync_brand_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
+                .unwrap()
+        );
     }
 
     #[test]
