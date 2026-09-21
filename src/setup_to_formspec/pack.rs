@@ -57,13 +57,21 @@ pub fn pack_to_form_spec(pack_path: &Path, provider_id: &str) -> Option<FormSpec
     // setup surface is its MCP servers reaches here as `None`, and augmenting
     // before the fallback would drop its questions on exactly that pack — the
     // meridian demo bundle is one.
-    match augmented {
-        Some(form) => Some(crate::mcp_setup::augment_with_mcp_routes(form, pack_path)),
-        None if !crate::mcp_setup::routes_from_pack(pack_path).is_empty() => Some(
-            crate::mcp_setup::augment_with_mcp_routes(empty_form_spec(provider_id), pack_path),
-        ),
-        None => None,
-    }
+    //
+    // A pack's A2A agents are the same case (`crate::a2a_setup`): an A2A-only
+    // pack must reach the augmentation too, so the fallback fires when EITHER
+    // sidecar carries routes.
+    let form = match augmented {
+        Some(form) => form,
+        None if !crate::mcp_setup::routes_from_pack(pack_path).is_empty()
+            || !crate::a2a_setup::routes_from_pack(pack_path).is_empty() =>
+        {
+            empty_form_spec(provider_id)
+        }
+        None => return None,
+    };
+    let form = crate::mcp_setup::augment_with_mcp_routes(form, pack_path);
+    Some(crate::a2a_setup::augment_with_a2a_routes(form, pack_path))
 }
 
 /// Read `qa/*.json` files from inside a `.gtpack` ZIP archive and convert
