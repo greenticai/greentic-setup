@@ -3,6 +3,7 @@
 //! Provides pack discovery, QA-driven configuration, secrets persistence,
 //! and bundle lifecycle management as a library crate.
 
+pub mod a2a_setup;
 pub mod admin;
 pub mod answers_crypto;
 pub mod bundle;

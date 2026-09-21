@@ -177,6 +177,15 @@ pub async fn persist_all_config_as_secrets(
         saved_keys.push(crate::mcp_setup::token_question_id(&server_id));
     }
 
+    // A2A credentials take the same detour for the same reasons: env pinned to
+    // `default`, `a2a` as the category, the agent id verbatim, and the team
+    // taken from the sidecar row's `auth_team` (normalised).
+    for agent_id in
+        crate::a2a_setup::persist_a2a_secrets(&store, tenant, team, config, pack_path).await?
+    {
+        saved_keys.push(crate::a2a_setup::token_question_id(&agent_id));
+    }
+
     // Introduce pack-declared generated secrets (e.g. messaging-webchat-gui's
     // jwt_signing_key) into the local store regardless of answer values, so
     // `gtc start` can move the already-resolved value into the deployment
