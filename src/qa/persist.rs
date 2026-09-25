@@ -595,8 +595,16 @@ pub fn emit_pack_config_input(
         .with_context(|| format!("create pack-config-input dir {}", dir.display()))?;
     let path = dir.join(format!("{pack_id}.json"));
     let body = serde_json::to_string_pretty(&input).context("serialize pack-config-input.v1")?;
-    std::fs::write(&path, format!("{body}\n"))
-        .with_context(|| format!("write pack-config-input {}", path.display()))?;
+    // Never `std::fs::write` here: it truncates the target before writing, so
+    // an interrupted or failed write (ENOSPC, a killed process) left a 0-byte
+    // `<pack_id>.json` that the caller soft-failed past and baked into the
+    // bundle, where greentic-deployer's pack-config stage refused it at boot
+    // and took down every container in the environment.
+    pack_config_write::write_or_remove_corrupt(
+        &path,
+        format!("{body}\n").as_bytes(),
+        pack_config_write::atomic_write,
+    )?;
 
     tracing::debug!(
         pack_id,
@@ -629,6 +637,8 @@ fn validate_segment(label: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
+
+mod pack_config_write;
 
 #[cfg(test)]
 mod tests {

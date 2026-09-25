@@ -177,7 +177,10 @@ fn answers_have_content(answers: &Value) -> bool {
 
 /// C7: attempt to emit a `pack-config-input.v1` file for one provider.
 /// Soft-fails on error — the C4.2 compat shim still serves these keys from
-/// DevStore.
+/// DevStore. Soft-failing is only safe because the emitter never leaves a
+/// truncated `state/pack-configs/<pack_id>.json` behind on failure: an ABSENT
+/// file falls back to the shim, an unparseable one is refused by the
+/// deployer at runtime boot and kills the whole environment.
 fn try_emit_pack_config_input(
     bundle_path: &Path,
     pack_path: &Path,
@@ -202,8 +205,8 @@ fn try_emit_pack_config_input(
         tracing::warn!(
             provider_id = %provider_id,
             env = %env,
-            error = %err,
-            "pack-config-input emission failed ({trace_context}); runtime falls back to DevStore via C4.2 compat shim",
+            error = %format_args!("{err:#}"),
+            "pack-config-input emission failed ({trace_context}); the error says what was left at the path; runtime falls back to DevStore via C4.2 compat shim",
         );
     }
 }
