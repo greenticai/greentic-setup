@@ -1057,6 +1057,7 @@ mod tests {
             cluster: None,
             updates: None,
             vault_bootstrap: None,
+            sor_units: None,
         }
     }
 
@@ -1171,6 +1172,7 @@ mod tests {
             cluster: None,
             updates: None,
             vault_bootstrap: None,
+            sor_units: None,
         };
         let back = round_trip(&original);
         assert_eq!(
