@@ -1705,7 +1705,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.3",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1846,7 +1846,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2329,9 +2329,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "1.2.0-dev.36239797401"
+version = "1.2.0-dev.36609371089"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7219352da609a83cf2f429b06be6124a05a0ff349de46b698b819fa1669dfba5"
+checksum = "b8742a09c2fbfbd2852850e1050fa3ccc2304466d6ca0e5cadd8955db60c1ffa"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2350,9 +2350,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.2.0-dev.36410881968"
+version = "1.2.0-dev.36609371089"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcc4440b569be30cbdf2c9820c65b130a37da04f99d1ea353ebb78079b6609b8"
+checksum = "842be174d1673121177d8a031de794b59839bae820687d14459dbd1ec6792068"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4154,7 +4154,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4883,7 +4883,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4982,7 +4982,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5508,7 +5508,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5599,7 +5599,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6538,7 +6538,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
