@@ -661,6 +661,24 @@ pub fn execute_apply_pack_setup(
             }
         }
 
+        // Sync `typing_indicator` answer to tenant config JSON for webchat-gui providers
+        match crate::tenant_config::sync_typing_indicator_to_tenant_config(
+            bundle_path,
+            &config.tenant,
+            &provider_id,
+            &persisted_answers,
+        ) {
+            Ok(true) => {
+                if config.verbose {
+                    println!("  [typing_indicator] updated tenant config for {provider_id}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                println!("  [typing_indicator] WARNING: failed to update tenant config: {e}");
+            }
+        }
+
         // Sync `nav_links_json` answer to tenant config JSON for webchat-gui providers
         if provider_id.contains("webchat-gui") && config.verbose {
             let preview = answers

@@ -736,6 +736,68 @@ pub fn sync_brand_to_tenant_config(
     Ok(true)
 }
 
+/// The typing-indicator styles the webchat-gui SPA knows how to render.
+const TYPING_INDICATOR_VALUES: [&str; 3] = ["shimmer", "pulse", "dots"];
+
+/// Sync the webchat-gui `typing_indicator` answer into the top-level
+/// `typing_indicator` field of the tenant config.
+///
+/// Same shape as the brand sync: only `webchat-gui` providers, and the tenant
+/// file is scaffolded from `default.json` when missing. An absent (or blank)
+/// answer leaves the file untouched, so the SPA keeps its own default
+/// (`shimmer`). A value outside `shimmer | pulse | dots` is skipped with a
+/// warning rather than written, because the SPA would not render it.
+pub fn sync_typing_indicator_to_tenant_config(
+    bundle_path: &Path,
+    tenant: &str,
+    provider_id: &str,
+    answers: &Value,
+) -> Result<bool> {
+    if !provider_id.contains("webchat-gui") {
+        return Ok(false);
+    }
+    let Some(value) = answers
+        .as_object()
+        .and_then(|m| m.get("typing_indicator"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(false);
+    };
+    if !TYPING_INDICATOR_VALUES.contains(&value) {
+        eprintln!(
+            "  WARNING: ignoring typing_indicator `{value}` for {provider_id}: expected one of {}",
+            TYPING_INDICATOR_VALUES.join(", ")
+        );
+        return Ok(false);
+    }
+
+    let Some(target) = resolve_or_scaffold_tenant_config(bundle_path, tenant, provider_id)? else {
+        return Ok(false);
+    };
+
+    let raw = std::fs::read_to_string(&target)
+        .with_context(|| format!("read tenant config {}", target.display()))?;
+    let mut config: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse tenant config {}", target.display()))?;
+    let Some(obj) = config.as_object_mut() else {
+        return Ok(false);
+    };
+    if obj.get("typing_indicator").and_then(Value::as_str) == Some(value) {
+        return Ok(false);
+    }
+    obj.insert(
+        "typing_indicator".to_string(),
+        Value::String(value.to_string()),
+    );
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&target, output)
+        .with_context(|| format!("write tenant config {}", target.display()))?;
+    Ok(true)
+}
+
 /// Sync the webchat-gui setup answer `nav_links_json` into the tenant config's
 /// `nav_links` array.
 ///
@@ -885,7 +947,7 @@ mod tests {
     use super::{
         is_placeholder_public_base_url, resolve_or_scaffold_tenant_config, resolve_public_base_url,
         sync_brand_to_tenant_config, sync_nav_links_to_tenant_config, sync_oauth_to_tenant_config,
-        sync_skin_to_tenant_config, update_tenant_config,
+        sync_skin_to_tenant_config, sync_typing_indicator_to_tenant_config, update_tenant_config,
     };
     use serde_json::{Map, Value, json};
 
@@ -1129,6 +1191,107 @@ mod tests {
             !sync_brand_to_tenant_config(temp.path(), "demo", "messaging-webchat-gui", &answers)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn sync_typing_indicator_writes_a_valid_value() {
+        let (temp, tenant_file) = brand_bundle(r#"{"tenant_id":"demo","skin":"default"}"#);
+        let answers = json!({ "typing_indicator": " pulse " });
+        let changed = sync_typing_indicator_to_tenant_config(
+            temp.path(),
+            "demo",
+            "messaging-webchat-gui",
+            &answers,
+        )
+        .unwrap();
+        assert!(changed);
+        let updated = read_json(&tenant_file);
+        assert_eq!(updated["typing_indicator"].as_str(), Some("pulse"));
+        assert_eq!(updated["skin"].as_str(), Some("default"));
+        assert!(
+            !sync_typing_indicator_to_tenant_config(
+                temp.path(),
+                "demo",
+                "messaging-webchat-gui",
+                &answers,
+            )
+            .unwrap(),
+            "no-op when value already matches"
+        );
+    }
+
+    #[test]
+    fn sync_typing_indicator_leaves_the_file_untouched_when_absent() {
+        let initial = r#"{"tenant_id":"demo","typing_indicator":"dots"}"#;
+        let (temp, tenant_file) = brand_bundle(initial);
+        for answers in [
+            json!({ "skin": "default" }),
+            json!({ "typing_indicator": "" }),
+        ] {
+            let changed = sync_typing_indicator_to_tenant_config(
+                temp.path(),
+                "demo",
+                "messaging-webchat-gui",
+                &answers,
+            )
+            .unwrap();
+            assert!(!changed);
+            assert_eq!(std::fs::read_to_string(&tenant_file).unwrap(), initial);
+        }
+    }
+
+    #[test]
+    fn sync_typing_indicator_skips_an_invalid_value() {
+        let initial = r#"{"tenant_id":"demo","typing_indicator":"dots"}"#;
+        let (temp, tenant_file) = brand_bundle(initial);
+        for bad in ["bounce", "Shimmer"] {
+            let changed = sync_typing_indicator_to_tenant_config(
+                temp.path(),
+                "demo",
+                "messaging-webchat-gui",
+                &json!({ "typing_indicator": bad }),
+            )
+            .unwrap();
+            assert!(!changed);
+            assert_eq!(std::fs::read_to_string(&tenant_file).unwrap(), initial);
+        }
+    }
+
+    #[test]
+    fn sync_typing_indicator_ignores_other_providers() {
+        let (temp, tenant_file) = brand_bundle(r#"{"tenant_id":"demo"}"#);
+        let changed = sync_typing_indicator_to_tenant_config(
+            temp.path(),
+            "demo",
+            "messaging-telegram",
+            &json!({ "typing_indicator": "dots" }),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert!(read_json(&tenant_file).get("typing_indicator").is_none());
+    }
+
+    #[test]
+    fn sync_typing_indicator_scaffolds_tenant_json_from_default_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let tenants_dir = temp.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&tenants_dir).unwrap();
+        let default_file = tenants_dir.join("default.json");
+        std::fs::write(&default_file, r#"{"tenant_id":"default","skin":"default"}"#).unwrap();
+
+        let changed = sync_typing_indicator_to_tenant_config(
+            temp.path(),
+            "demo",
+            "messaging-webchat-gui",
+            &json!({ "typing_indicator": "dots" }),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let demo = read_json(&tenants_dir.join("demo.json"));
+        assert_eq!(demo["tenant_id"].as_str(), Some("demo"));
+        assert_eq!(demo["typing_indicator"].as_str(), Some("dots"));
+        assert!(read_json(&default_file).get("typing_indicator").is_none());
     }
 
     #[test]
