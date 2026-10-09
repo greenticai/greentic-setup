@@ -1012,6 +1012,7 @@ mod tests {
             }],
             bundles: vec![ManifestBundle {
                 bundle_id: "realbot".to_string(),
+                runtime_image_digest: None,
                 bundle_path: Some(PathBuf::from("./bundles/realbot.gtbundle")),
                 revisions: None,
                 revenue_share: None,
