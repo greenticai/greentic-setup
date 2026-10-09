@@ -407,14 +407,15 @@ fn derive_required_secrets(
         let tenant = bundle_tenant(bundle);
         // A bundle declares either a single `bundle_path` or a multi-revision
         // `revisions[]` list (mutually exclusive). For secret auto-detection,
-        // resolve the single artifact, or the first revision as a representative
-        // (revisions of one deployment share the same tenant/secrets).
+        // resolve the single artifact, or the first revision that carries a
+        // local artifact as a representative (revisions of one deployment share
+        // the same tenant/secrets). A remote-only revision (no `bundle_path`,
+        // only `bundle_source_uri` + `bundle_digest`) has nothing to scan here.
         let Some(raw) = bundle.bundle_path.as_ref().or_else(|| {
             bundle
                 .revisions
                 .as_ref()
-                .and_then(|revs| revs.first())
-                .map(|rev| &rev.bundle_path)
+                .and_then(|revs| revs.iter().find_map(|rev| rev.bundle_path.as_ref()))
         }) else {
             skipped = true;
             continue;
@@ -878,13 +879,13 @@ pub fn manifest_to_answers(manifest: &EnvManifest) -> Result<AnswerSet> {
                 let mut row = JsonMap::new();
                 row.insert("bundle_id".to_string(), Value::String(b.bundle_id.clone()));
                 // Single-revision bundles carry `bundle_path`; multi-revision
-                // (JSON-first) bundles use the first revision's artifact as a
-                // representative for the wizard answer-set (which models one path).
+                // (JSON-first) bundles use the first revision carrying a local
+                // artifact as a representative for the wizard answer-set (which
+                // models one path); remote-only revisions have no path to offer.
                 if let Some(bp) = b.bundle_path.as_ref().or_else(|| {
                     b.revisions
                         .as_ref()
-                        .and_then(|revs| revs.first())
-                        .map(|rev| &rev.bundle_path)
+                        .and_then(|revs| revs.iter().find_map(|rev| rev.bundle_path.as_ref()))
                 }) {
                     row.insert(
                         "bundle_path".to_string(),
@@ -1011,6 +1012,7 @@ mod tests {
             }],
             bundles: vec![ManifestBundle {
                 bundle_id: "realbot".to_string(),
+                runtime_image_digest: None,
                 bundle_path: Some(PathBuf::from("./bundles/realbot.gtbundle")),
                 revisions: None,
                 revenue_share: None,
@@ -1057,6 +1059,7 @@ mod tests {
             cluster: None,
             updates: None,
             vault_bootstrap: None,
+            sor_units: None,
         }
     }
 
@@ -1171,6 +1174,7 @@ mod tests {
             cluster: None,
             updates: None,
             vault_bootstrap: None,
+            sor_units: None,
         };
         let back = round_trip(&original);
         assert_eq!(
@@ -1554,5 +1558,36 @@ mod tests {
         assert!(rb.hosts.is_empty(), "route_hosts stays empty in basic mode");
         assert!(manifest.messaging_endpoints[0].welcome_flow.is_none());
         assert!(manifest.messaging_endpoints[0].secret_refs.is_empty());
+    }
+
+    #[test]
+    fn a_remote_only_first_revision_does_not_hide_a_local_one() {
+        // greentic-deployer's remote-only revisions carry no `bundle_path`
+        // (only `bundle_source_uri` + `bundle_digest`). The representative
+        // path must come from the first revision that HAS a local artifact,
+        // not be dropped because the first revision is remote-only.
+        let revisions: Vec<greentic_deployer::cli::env_manifest::ManifestRevision> =
+            serde_json::from_value(json!([
+                {
+                    "name": "baseline",
+                    "bundle_source_uri": "oci://example.com/realbot:1",
+                    "bundle_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                { "name": "candidate", "bundle_path": "./bundles/candidate.gtbundle" }
+            ]))
+            .expect("revisions deserialize");
+        let mut manifest = full_manifest();
+        manifest.bundles[0].bundle_path = None;
+        manifest.bundles[0].revisions = Some(revisions.clone());
+        let answers = manifest_to_answers(&manifest).unwrap();
+        assert_eq!(
+            answers.answers["bundles"][0]["bundle_path"],
+            json!("./bundles/candidate.gtbundle")
+        );
+
+        // Every revision remote-only: no path is offered rather than a bogus one.
+        manifest.bundles[0].revisions = Some(vec![revisions[0].clone()]);
+        let answers = manifest_to_answers(&manifest).unwrap();
+        assert!(answers.answers["bundles"][0].get("bundle_path").is_none());
     }
 }

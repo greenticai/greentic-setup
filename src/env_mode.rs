@@ -108,6 +108,11 @@ pub fn apply_manifest_with_store(
         yes: false,
         non_interactive,
         prefilled_secrets,
+        // Setup only composes and upserts; removing what a manifest no longer
+        // declares is an explicit operator decision (`op env apply --prune`),
+        // never something a setup run does on the operator's behalf.
+        prune: false,
+        confirm_prune: false,
     };
     env_apply::apply(store, &flags, opts)
         .with_context(|| format!("env-manifest apply failed for `{}`", answers_path.display()))

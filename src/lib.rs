@@ -3,6 +3,7 @@
 //! Provides pack discovery, QA-driven configuration, secrets persistence,
 //! and bundle lifecycle management as a library crate.
 
+pub mod a2a_setup;
 pub mod admin;
 pub mod answers_crypto;
 pub mod bundle;
@@ -25,6 +26,7 @@ pub mod flow;
 pub mod generated_secrets;
 pub mod gtbundle;
 pub mod http_client;
+pub mod mcp_setup;
 pub mod no_ui_oauth;
 pub mod oauth_callback;
 pub mod oauth_device;
@@ -244,7 +246,7 @@ mod tests {
 
     #[test]
     fn version_is_correct() {
-        assert!(version().starts_with("1.1"));
+        assert!(version().starts_with("1.2"));
     }
 
     #[test]

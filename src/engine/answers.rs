@@ -561,63 +561,128 @@ fn template_from_form_spec(form_spec: &qa_spec::FormSpec) -> JsonMap<String, Val
 /// only in `setup.yaml` and not on a `QuestionSpec`. It is matched by
 /// question id, and a provider with no `setup.yaml` simply contributes none
 /// of the three — the FormSpec-derived keys are unaffected either way.
+/// What a form needs to draw ONE question's control.
+///
+/// Split out of [`schema_from_form_spec`] so a list question's COLUMNS get the
+/// same projection its top-level questions do. They are `QuestionSpec`s too,
+/// and giving them a reduced one by hand is how a column ends up as a text box
+/// while the identical question one level up renders as a select.
+///
+/// `setup_yaml` extras are keyed by top-level question name, so a nested
+/// column is passed `None` — there is nothing in `setup.yaml` to match it
+/// against, and matching on the bare id would let a column silently inherit a
+/// different question's group or docs link.
+fn question_spec(
+    question: &qa_spec::QuestionSpec,
+    setup_yaml: Option<&setup_input::SetupSpec>,
+) -> JsonMap<String, Value> {
+    let mut spec = JsonMap::new();
+    // The original three. Order and spelling are unchanged on purpose —
+    // this is the part existing readers depend on.
+    spec.insert("required".into(), Value::Bool(question.required));
+    spec.insert("secret".into(), Value::Bool(question.secret));
+    spec.insert("title".into(), Value::String(question.title.clone()));
+
+    // `kind` decides the CONTROL. Serialized through `QuestionType`'s own
+    // Serialize rather than a hand-written match, so a variant added
+    // upstream cannot silently fall through to a default here.
+    if let Ok(kind) = serde_json::to_value(question.kind) {
+        spec.insert("kind".into(), kind);
+    }
+    if let Some(choices) = &question.choices {
+        spec.insert(
+            "choices".into(),
+            Value::Array(choices.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    if let Some(default) = &question.default_value {
+        spec.insert("default_value".into(), Value::String(default.clone()));
+    }
+    // Emitted verbatim: `visible_if` is an `Expr`, and a reader that
+    // cannot evaluate one must be able to tell "conditional, shape I do
+    // not understand" from "not conditional". Flattening it to a
+    // `{field, eq}` pair here would make an unsupported expression
+    // indistinguishable from an absent one.
+    if let Some(visible_if) = &question.visible_if
+        && let Ok(expr) = serde_json::to_value(visible_if)
+    {
+        spec.insert("visible_if".into(), expr);
+    }
+    if let Some(help) = &question.description {
+        spec.insert("help".into(), Value::String(help.clone()));
+    }
+
+    // A list question's ROW SHAPE. `kind: "list"` says the answer is a list of
+    // rows and nothing about what a row holds, so without this a form knows it
+    // has a list and cannot know what to put in it — which is why every reader
+    // fell back to one text box. `messaging-webchat-gui` is the worked
+    // example: it declares `nav_links` as a list and writes help text telling
+    // the operator to fill in cells and add a per-row translation, rendered
+    // above a plain input because the columns never left this function.
+    //
+    // Emitted only when the pack declares one. `list` present but empty would
+    // read as "a list with no columns", a different claim from "not a list".
+    if let Some(list) = &question.list {
+        let mut projected = JsonMap::new();
+        if !list.fields.is_empty() {
+            projected.insert(
+                "fields".into(),
+                Value::Array(
+                    list.fields
+                        .iter()
+                        .map(|column| {
+                            let mut inner = question_spec(column, None);
+                            // The id is the KEY at the top level and has to be
+                            // carried inside the object here, because these
+                            // travel as an ARRAY: they are a table's columns,
+                            // and their order is the pack author's.
+                            // `serde_json`'s default map is a `BTreeMap`, so
+                            // keying by id would alphabetise them.
+                            inner.insert("id".into(), Value::String(column.id.clone()));
+                            Value::Object(inner)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(item_label) = &list.item_label {
+            projected.insert("item_label".into(), Value::String(item_label.clone()));
+        }
+        if let Some(min) = list.min_items {
+            projected.insert("min_items".into(), Value::from(min));
+        }
+        if let Some(max) = list.max_items {
+            projected.insert("max_items".into(), Value::from(max));
+        }
+        spec.insert("list".into(), Value::Object(projected));
+    }
+
+    if let Some(extra) = setup_yaml.and_then(|s| s.questions.iter().find(|q| q.name == question.id))
+    {
+        if let Some(group) = &extra.group {
+            spec.insert("group".into(), Value::String(group.clone()));
+        }
+        if let Some(placeholder) = &extra.placeholder {
+            spec.insert("placeholder".into(), Value::String(placeholder.clone()));
+        }
+        if let Some(docs_url) = &extra.docs_url {
+            spec.insert("docs_url".into(), Value::String(docs_url.clone()));
+        }
+    }
+
+    spec
+}
+
 fn schema_from_form_spec(
     form_spec: &qa_spec::FormSpec,
     setup_yaml: Option<&setup_input::SetupSpec>,
 ) -> JsonMap<String, Value> {
     let mut entries = JsonMap::new();
     for question in &form_spec.questions {
-        let mut spec = JsonMap::new();
-        // The original three. Order and spelling are unchanged on purpose —
-        // this is the part existing readers depend on.
-        spec.insert("required".into(), Value::Bool(question.required));
-        spec.insert("secret".into(), Value::Bool(question.secret));
-        spec.insert("title".into(), Value::String(question.title.clone()));
-
-        // `kind` decides the CONTROL. Serialized through `QuestionType`'s own
-        // Serialize rather than a hand-written match, so a variant added
-        // upstream cannot silently fall through to a default here.
-        if let Ok(kind) = serde_json::to_value(question.kind) {
-            spec.insert("kind".into(), kind);
-        }
-        if let Some(choices) = &question.choices {
-            spec.insert(
-                "choices".into(),
-                Value::Array(choices.iter().cloned().map(Value::String).collect()),
-            );
-        }
-        if let Some(default) = &question.default_value {
-            spec.insert("default_value".into(), Value::String(default.clone()));
-        }
-        // Emitted verbatim: `visible_if` is an `Expr`, and a reader that
-        // cannot evaluate one must be able to tell "conditional, shape I do
-        // not understand" from "not conditional". Flattening it to a
-        // `{field, eq}` pair here would make an unsupported expression
-        // indistinguishable from an absent one.
-        if let Some(visible_if) = &question.visible_if
-            && let Ok(expr) = serde_json::to_value(visible_if)
-        {
-            spec.insert("visible_if".into(), expr);
-        }
-        if let Some(help) = &question.description {
-            spec.insert("help".into(), Value::String(help.clone()));
-        }
-
-        if let Some(extra) =
-            setup_yaml.and_then(|s| s.questions.iter().find(|q| q.name == question.id))
-        {
-            if let Some(group) = &extra.group {
-                spec.insert("group".into(), Value::String(group.clone()));
-            }
-            if let Some(placeholder) = &extra.placeholder {
-                spec.insert("placeholder".into(), Value::String(placeholder.clone()));
-            }
-            if let Some(docs_url) = &extra.docs_url {
-                spec.insert("docs_url".into(), Value::String(docs_url.clone()));
-            }
-        }
-
-        entries.insert(question.id.clone(), Value::Object(spec));
+        entries.insert(
+            question.id.clone(),
+            Value::Object(question_spec(question, setup_yaml)),
+        );
     }
     entries
 }
@@ -1272,6 +1337,149 @@ questions:
         // like an enum whose choices failed to load.
         assert!(schema["oauth_enabled"].get("choices").is_none());
         assert!(schema["oauth_enabled"].get("visible_if").is_none());
+    }
+
+    /// A LIST question travels with its columns.
+    ///
+    /// `QuestionType::List` says "this answer is a list of rows" and nothing
+    /// about what a row contains — the row's shape is `ListSpec.fields`, and
+    /// it was dropped here. A form reading this schema therefore knew a
+    /// question was a list and could not know what to put in it, so every
+    /// front end fell back to a single text box.
+    ///
+    /// That is not theoretical. `messaging-webchat-gui` declares
+    /// `nav_links` as a list of `{label, href}` and writes help text telling
+    /// the operator to fill in Label and Tooltip cells and to add a
+    /// translation from inside a row — instructions for a table, rendered
+    /// above a text box, because the columns never left this function.
+    #[test]
+    fn schema_from_form_spec_carries_a_list_questions_columns() {
+        let form_spec: qa_spec::FormSpec = serde_json::from_value(serde_json::json!({
+            "id": "webchat",
+            "title": "Webchat",
+            "version": "1",
+            "questions": [
+                {
+                    "id": "nav_links",
+                    "type": "list",
+                    "title": "Top-menu nav links",
+                    "list": {
+                        "item_label": "link",
+                        "max_items": 6,
+                        "fields": [
+                            { "id": "label", "type": "string", "title": "Label", "required": true },
+                            {
+                                "id": "target",
+                                "type": "enum",
+                                "title": "Opens in",
+                                "choices": ["same_tab", "new_tab"],
+                                "default_value": "same_tab"
+                            }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .expect("form spec fixture");
+
+        let schema = schema_from_form_spec(&form_spec, None);
+        let list = &schema["nav_links"]["list"];
+
+        // An ARRAY, not a map keyed by id: these are a table's columns, and
+        // their order is the pack author's. `serde_json`'s default map is a
+        // `BTreeMap`, so keying by id would silently alphabetise them and
+        // render "Opens in" before "Label".
+        assert_eq!(list["fields"][0]["id"], Value::String("label".into()));
+        assert_eq!(list["fields"][1]["id"], Value::String("target".into()));
+
+        // A column is a question, so it carries what a control needs — the
+        // same projection the top level gets, not a reduced one.
+        assert_eq!(list["fields"][0]["title"], Value::String("Label".into()));
+        assert_eq!(list["fields"][0]["required"], Value::Bool(true));
+        assert_eq!(list["fields"][1]["kind"], Value::String("enum".into()));
+        assert_eq!(
+            list["fields"][1]["choices"][1],
+            Value::String("new_tab".into())
+        );
+        assert_eq!(
+            list["fields"][1]["default_value"],
+            Value::String("same_tab".into())
+        );
+
+        // The row affordance and the bounds a form has to enforce.
+        assert_eq!(list["item_label"], Value::String("link".into()));
+        assert_eq!(list["max_items"], serde_json::json!(6));
+        // Absent rather than null, like every other optional here.
+        assert!(list.get("min_items").is_none());
+    }
+
+    /// The whole path, from the shape a pack actually ships to the schema a
+    /// form reads.
+    ///
+    /// The unit test above starts from a `FormSpec`, which is one hop too far
+    /// in: a pack does not write `kind: list` with `list.fields`. It writes
+    /// `kind: table` with `columns`, and `setup_to_formspec` bridges that to
+    /// `QuestionType::List` + `ListSpec.fields`. Asserting only the second hop
+    /// would let the first one rot and still pass — and the first hop is the
+    /// one carrying the column NAMES.
+    ///
+    /// The fixture is `messaging-webchat-gui`'s own `nav_links`, trimmed:
+    /// `kind: table`, `min_rows`/`max_rows`, and columns keyed by `key`.
+    #[test]
+    fn a_packs_table_question_reaches_the_schema_with_its_columns() {
+        let setup: setup_input::SetupSpec = serde_yaml_bw::from_str(
+            r#"
+questions:
+  - name: nav_links
+    title: "Top-menu nav links"
+    kind: table
+    required: false
+    min_rows: 0
+    max_rows: 8
+    columns:
+      - key: label
+        title: "Label"
+        kind: string
+        required: true
+      - key: href
+        title: "Link"
+        kind: string
+"#,
+        )
+        .expect("setup.yaml fixture");
+
+        let form_spec = crate::setup_to_formspec::setup_spec_to_form_spec(&setup, "webchat");
+        let schema = schema_from_form_spec(&form_spec, Some(&setup));
+
+        let list = &schema["nav_links"]["list"];
+        assert_eq!(
+            schema["nav_links"]["kind"],
+            Value::String("list".into()),
+            "a table question must arrive as a list"
+        );
+        // In the pack's order, which is the whole reason `fields` is an array.
+        assert_eq!(list["fields"][0]["id"], Value::String("label".into()));
+        assert_eq!(list["fields"][0]["title"], Value::String("Label".into()));
+        assert_eq!(list["fields"][0]["required"], Value::Bool(true));
+        assert_eq!(list["fields"][1]["id"], Value::String("href".into()));
+        assert_eq!(list["fields"][1]["title"], Value::String("Link".into()));
+    }
+
+    /// A question that is not a list says nothing about one. `list` present
+    /// and empty would read as "a list with no columns", which is a different
+    /// claim from "not a list".
+    #[test]
+    fn schema_from_form_spec_omits_list_for_a_scalar_question() {
+        let form_spec: qa_spec::FormSpec = serde_json::from_value(serde_json::json!({
+            "id": "webchat",
+            "title": "Webchat",
+            "version": "1",
+            "questions": [{ "id": "route", "type": "string", "title": "Route" }]
+        }))
+        .expect("form spec fixture");
+
+        let schema = schema_from_form_spec(&form_spec, None);
+        assert!(schema["route"].get("list").is_none());
     }
 
     /// A conditional question travels as its own expression, not flattened.

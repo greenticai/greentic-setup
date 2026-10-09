@@ -47,7 +47,31 @@ pub fn pack_to_form_spec(pack_path: &Path, provider_id: &str) -> Option<FormSpec
     // "declares zero secrets" from "ships no classifiable metadata" (None).
     // Without this a stock 0-config pack (e.g. state-memory: `questions: []` +
     // `secret-requirements.json` `[]`) would false-trip the fail-closed guard.
-    augmented.or_else(|| has_setup_metadata.then(|| empty_form_spec(provider_id)))
+    let augmented = augmented.or_else(|| has_setup_metadata.then(|| empty_form_spec(provider_id)));
+
+    // A pack's MCP servers need a host and a credential that no other setup
+    // surface collects: the sidecar deliberately carries no token, and a bundle
+    // booted by `gtc start` has no admin to have written one.
+    //
+    // This runs AFTER the empty-form fallback on purpose. A pack whose only
+    // setup surface is its MCP servers reaches here as `None`, and augmenting
+    // before the fallback would drop its questions on exactly that pack — the
+    // meridian demo bundle is one.
+    //
+    // A pack's A2A agents are the same case (`crate::a2a_setup`): an A2A-only
+    // pack must reach the augmentation too, so the fallback fires when EITHER
+    // sidecar carries routes.
+    let form = match augmented {
+        Some(form) => form,
+        None if !crate::mcp_setup::routes_from_pack(pack_path).is_empty()
+            || !crate::a2a_setup::routes_from_pack(pack_path).is_empty() =>
+        {
+            empty_form_spec(provider_id)
+        }
+        None => return None,
+    };
+    let form = crate::mcp_setup::augment_with_mcp_routes(form, pack_path);
+    Some(crate::a2a_setup::augment_with_a2a_routes(form, pack_path))
 }
 
 /// Read `qa/*.json` files from inside a `.gtpack` ZIP archive and convert

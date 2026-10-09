@@ -168,6 +168,24 @@ pub async fn persist_all_config_as_secrets(
     let store = crate::secrets::open_dev_store_for_env(bundle_root, env)?;
     let mut saved_keys = Vec::new();
 
+    // MCP credentials go to their own URI shape — env pinned to `default`,
+    // `mcp` as the provider segment, and the server id verbatim. The universal
+    // write below canonicalizes the key and uses the wizard's env, producing a
+    // URI greentic-runner never reads. This is the path the wizard actually
+    // takes (`engine::executors`), so the MCP write has to happen here.
+    for server_id in crate::mcp_setup::persist_mcp_secrets(&store, tenant, team, config).await? {
+        saved_keys.push(crate::mcp_setup::token_question_id(&server_id));
+    }
+
+    // A2A credentials take the same detour for the same reasons: env pinned to
+    // `default`, `a2a` as the category, the agent id verbatim, and the team
+    // taken from the sidecar row's `auth_team` (normalised).
+    for agent_id in
+        crate::a2a_setup::persist_a2a_secrets(&store, tenant, team, config, pack_path).await?
+    {
+        saved_keys.push(crate::a2a_setup::token_question_id(&agent_id));
+    }
+
     // Introduce pack-declared generated secrets (e.g. messaging-webchat-gui's
     // jwt_signing_key) into the local store regardless of answer values, so
     // `gtc start` can move the already-resolved value into the deployment
@@ -577,8 +595,16 @@ pub fn emit_pack_config_input(
         .with_context(|| format!("create pack-config-input dir {}", dir.display()))?;
     let path = dir.join(format!("{pack_id}.json"));
     let body = serde_json::to_string_pretty(&input).context("serialize pack-config-input.v1")?;
-    std::fs::write(&path, format!("{body}\n"))
-        .with_context(|| format!("write pack-config-input {}", path.display()))?;
+    // Never `std::fs::write` here: it truncates the target before writing, so
+    // an interrupted or failed write (ENOSPC, a killed process) left a 0-byte
+    // `<pack_id>.json` that the caller soft-failed past and baked into the
+    // bundle, where greentic-deployer's pack-config stage refused it at boot
+    // and took down every container in the environment.
+    pack_config_write::write_or_remove_corrupt(
+        &path,
+        format!("{body}\n").as_bytes(),
+        pack_config_write::atomic_write,
+    )?;
 
     tracing::debug!(
         pack_id,
@@ -611,6 +637,8 @@ fn validate_segment(label: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
+
+mod pack_config_write;
 
 #[cfg(test)]
 mod tests {
