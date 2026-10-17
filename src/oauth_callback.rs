@@ -383,6 +383,9 @@ async fn persist_setup_action_oauth_token_response(
         .into_iter()
         .map(|(key, value)| (key, Value::String(value)))
         .collect::<JsonMap<String, Value>>();
+    // This bundle's own prior answers for this provider, used only as the
+    // did-I-write-this marker for the collision guard below.
+    let existing_answers = load_provider_setup_answers(bundle_root, &state.provider_id)?;
     let persisted_keys = crate::qa::persist::persist_all_config_as_secrets(
         bundle_root,
         env,
@@ -391,6 +394,7 @@ async fn persist_setup_action_oauth_token_response(
         &state.provider_id,
         &Value::Object(config),
         None,
+        Some(&existing_answers),
     )
     .await?;
     eprintln!(
